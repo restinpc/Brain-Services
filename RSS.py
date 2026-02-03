@@ -40,7 +40,6 @@ def get_selenium_driver():
         _selenium_driver = webdriver.Chrome(options=options)
     return _selenium_driver
 
-
 def cleanup_selenium():
     global _selenium_driver
     if _selenium_driver:
@@ -49,7 +48,6 @@ def cleanup_selenium():
         except:
             pass
         _selenium_driver = None
-
 
 def get_full_text_selenium(url, timeout=10):
     """Fallback: Selenium парсинг."""
@@ -92,7 +90,6 @@ def get_full_text_selenium(url, timeout=10):
         print(f" [Selenium Error] {e}")
         return ""
 
-
 class RSSCollector:
     def __init__(self):
         self.session = requests.Session()
@@ -103,6 +100,8 @@ class RSSCollector:
         """Создает подключение к MySQL."""
         return mysql.connector.connect(
             host=os.getenv("DB_HOST"),
+            # Добавляем порт и преобразуем его в число
+            port=int(os.getenv("DB_PORT", 3306)),
             user=os.getenv("DB_USER"),
             password=os.getenv("DB_PASSWORD"),
             database=os.getenv("DB_NAME")
