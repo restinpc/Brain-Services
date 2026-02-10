@@ -10,12 +10,17 @@ import bisect
 
 load_dotenv()
 
-DB_USER = os.getenv("DB_USER", "root")
+DB_USER = os.getenv("DB_USER", "vlad")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "")
 DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_PORT = os.getenv("DB_PORT", "3306")
-DB_NAME = os.getenv("DB_NAME", "rss_db")
+DB_PORT = os.getenv("DB_PORT", "3307")
+DB_NAME = os.getenv("DB_NAME", "vlad")
 DATABASE_URL = f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+
+print(f"  Host: {DB_HOST}:{DB_PORT}")
+print(f"  Database: {DB_NAME}")
+print(f"  User: {DB_USER}")
+print(f"  Connection URL: mysql+aiomysql://{DB_USER}:@{DB_HOST}:{DB_PORT}/{DB_NAME}")
 
 engine = create_async_engine(DATABASE_URL, pool_size=10, echo=False)
 
@@ -25,7 +30,7 @@ GLOBAL_CALENDAR = {}
 GLOBAL_HISTORY = {}
 GLOBAL_LAST_CANDLES = {}
 GLOBAL_WEIGHT_CODES = []
-GLOBAL_EVENT_TYPES = {}  # event_id -> event_type (0/1)
+GLOBAL_EVENT_TYPES = {}
 
 
 def get_rates_table_name(pair_id, day_flag):
@@ -47,14 +52,13 @@ def get_modification_factor(pair_id):
 
 
 def parse_date_string(date_str):
-    # Убираем лишние символы (если пришел мусор)
     date_str = date_str.strip()
 
     formats = [
         "%Y-%d-%m %H:%M:%S",
         "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%dT%H:%M:%S",  # ISO формат с T
-        "%Y-%m-%d"  # только дата (время 00:00:00)
+        "%Y-%m-%dT%H:%M:%S",  
+        "%Y-%m-%d" 
     ]
 
     for fmt in formats:
@@ -70,7 +74,6 @@ async def preload_all_data():
     print("STARTING FULL DATA LOAD")
     async with engine.connect() as conn:
 
-        # 1) Weight Codes
         print("  Loading Weight Codes...")
         q_weights = "SELECT weight_code FROM vlad_investing_weights_table"
         try:
@@ -83,7 +86,6 @@ async def preload_all_data():
         except Exception as e:
             print(f"  Weight Codes Load Error: {e}")
 
-        # 2) Event Types (цикличность из event_index: occurrence_count > 1 -> event_type=1)
         print("  Loading Event Types...")
         q_etypes = """
         SELECT event_id, occurrence_count
@@ -101,7 +103,6 @@ async def preload_all_data():
         except Exception as e:
             print(f"  Event Types Load Error: {e}")
 
-        # 3) Calendar & History
         print("  Loading Calendar & Event History...")
         q_cal = """
         SELECT c.event_id, c.occurrence_time_utc, c.importance
@@ -114,7 +115,7 @@ async def preload_all_data():
             for r in rows:
                 dt = r['occurrence_time_utc']
                 eid = r['event_id']
-                imp = r['importance']  # TINYINT: 1=low, 2=medium, 3=high
+                imp = r['importance']  
 
                 if eid not in GLOBAL_HISTORY:
                     GLOBAL_HISTORY[eid] = []
@@ -131,7 +132,7 @@ async def preload_all_data():
         except Exception as e:
             print(f"  Calendar Load Error: {e}")
 
-        # 4) Rates Tables (если у тебя их нет — убери этот блок)
+        
         tables = [
             "brain_rates_eur_usd", "brain_rates_eur_usd_day",
             "brain_rates_btc_usd", "brain_rates_btc_usd_day",
@@ -227,7 +228,7 @@ async def calculate_pure_memory(pair, day, date_str):
         diff = target_date - event['event_date']
         shift = int(diff.total_seconds() / 3600) if day == 0 else diff.days
 
-        # "rare" = medium/high (2 или 3)
+        
         is_rare = event['Importance'] in [2, 3]
         evt_id = event['EventId']
         evt_type = GLOBAL_EVENT_TYPES.get(evt_id, 0)
@@ -279,24 +280,24 @@ async def calculate_pure_memory(pair, day, date_str):
 @app.get("/")
 async def get_metadata():
     required_tables = [
-        "vlad_investing_weights_table",  # вы используете именно эту таблицу, а не vlad_weight_codes!
+        "vlad_investing_weights_table",  
         "vlad_investing_event_index",
         "brain_rates_eur_usd",
         "brain_rates_btc_usd",
         "brain_rates_eth_usd",
         "version_microservice"
     ]
-    brain_table = "vlad_investing_calendar"  # вы читаете из неё, а не из brain_calendar
+    brain_table = "vlad_investing_calendar" 
 
     async with engine.connect() as conn:
-        # Проверка всех таблиц в одной БД
+       
         for table in required_tables + [brain_table]:
             try:
                 await conn.execute(text(f"SELECT 1 FROM `{table}` LIMIT 1"))
             except Exception as e:
                 return {"status": "error", "error": f"Table {table} inaccessible: {e}"}
 
-        # Чтение версии
+       
         try:
             res = await conn.execute(
                 text("SELECT version FROM version_microservice WHERE microservice_id = 25")
@@ -334,7 +335,7 @@ async def get_values(
 @app.post("/patch")
 async def patch_service():
     service_id = 25
-    async with engine.begin() as conn:  # используем основной engine
+    async with engine.begin() as conn:  
         res = await conn.execute(
             text("SELECT version FROM version_microservice WHERE microservice_id = :id"),
             {"id": service_id}
@@ -374,8 +375,7 @@ async def get_new_weights(code: str = Query(...)):
     except ValueError:
         raise HTTPException(status_code=400, detail="All components must be integers")
 
-    async with engine.connect() as conn:  # <-- используем основной engine
-        # Защита от NULL: COALESCE(hour_shift, -999999)
+    async with engine.connect() as conn:  
         query = """
             SELECT weight_code
             FROM vlad_investing_weights_table
