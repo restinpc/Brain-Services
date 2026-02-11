@@ -1,154 +1,190 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 import os
+import sys
+import argparse
 import time
-import requests
-from bs4 import BeautifulSoup
-from urllib.parse import urljoin
 from datetime import datetime
 import mysql.connector
+from mysql.connector import Error
+import traceback
 from dotenv import load_dotenv
 
-# Загрузка переменных из .env файла
 load_dotenv()
+# === Конфигурация трассировки ошибок ===
+TRACE_URL = "https://server.brain-project.online/trace.php"
+NODE_NAME = os.getenv("NODE_NAME", "ecb_parser_loader")
+EMAIL = os.getenv("ALERT_EMAIL", "vladyurjevitch@yandex.ru")
 
-# Настройки
+def send_error_trace(exc: Exception, script_name: str = "ecb_parser.py"):
+    logs = (
+        f"Node: {NODE_NAME}\n"
+        f"Script: {script_name}\n"
+        f"Exception: {repr(exc)}\n\n"
+        f"Traceback:\n{traceback.format_exc()}"
+    )
+    payload = {
+        "url": "cli_script",
+        "node": NODE_NAME,
+        "email": EMAIL,
+        "logs": logs,
+    }
+    print(f"\n📤 [POST] Отправляем отчёт об ошибке на {TRACE_URL}")
+    try:
+        import requests
+        response = requests.post(TRACE_URL, data=payload, timeout=10)
+        print(f"✅ [POST] Успешно отправлено! Статус: {response.status_code}")
+    except Exception as e:
+        print(f"⚠️ [POST] Не удалось отправить отчёт: {e}")
+
+# === Аргументы командной строки + .env fallback ===
+parser = argparse.ArgumentParser(description="ECB RSS Feeds Parser → MySQL (no local files)")
+parser.add_argument("host", nargs="?", default=os.getenv("DB_HOST"), help="Хост базы данных")
+parser.add_argument("port", nargs="?", default=os.getenv("DB_PORT", "3306"), help="Порт базы данных")
+parser.add_argument("user", nargs="?", default=os.getenv("DB_USER"), help="Пользователь БД")
+parser.add_argument("password", nargs="?", default=os.getenv("DB_PASSWORD"), help="Пароль БД")
+parser.add_argument("database", nargs="?", default=os.getenv("DB_NAME"), help="Имя базы данных")
+args = parser.parse_args()
+
+if not all([args.host, args.user, args.password, args.database]):
+    print("❌ Ошибка: не указаны все параметры подключения к БД (через аргументы или .env)")
+    sys.exit(1)
+
+DB_CONFIG = {
+    'host': args.host,
+    'port': int(args.port),
+    'user': args.user,
+    'password': args.password,
+    'database': args.database,
+}
+
 BASE_URL = "https://www.ecb.europa.eu/home/html/rss.en.html"
-ECB_HOST = "https://www.ecb.europa.eu"
 CHECK_INTERVAL = 3600  # 1 час
-
 
 class ECBCollector:
     def __init__(self):
         self.init_db()
 
     def get_db_connection(self):
-        """Создает подключение к MySQL."""
-        return mysql.connector.connect(
-            host=os.getenv("DB_HOST"),
-            # Добавляем порт и преобразуем его в число
-            port=int(os.getenv("DB_PORT", 3306)),
-            user=os.getenv("DB_USER"),
-            password=os.getenv("DB_PASSWORD"),
-            database=os.getenv("DB_NAME")
-        )
+        return mysql.connector.connect(**DB_CONFIG)
 
     def init_db(self):
-        """Создаем таблицу в MySQL."""
-        conn = None
         try:
-            conn = self.get_db_connection()
-            cursor = conn.cursor()
-
-            # Синтаксис MySQL
-            # Используем LONGTEXT для XML, так как они могут быть большими
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS vlad_ecb_xml_storage (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
-                    feed_url VARCHAR(255),
-                    feed_title VARCHAR(255),
-                    saved_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    xml_content LONGTEXT
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-            """)
-            conn.commit()
-            print(f"Подключение к MySQL ({os.getenv('DB_HOST')}) успешно. Таблица проверена.")
-        except mysql.connector.Error as err:
+            with self.get_db_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS vlad_ecb_xml_storage (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        feed_url VARCHAR(255) NOT NULL,
+                        feed_title VARCHAR(255),
+                        saved_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        xml_content LONGTEXT,
+                        UNIQUE KEY unique_feed_url (feed_url)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+                """)
+                conn.commit()
+                print(f"Подключение к MySQL ({args.host}) успешно. Таблица готова.")
+        except Error as err:
             print(f"Ошибка БД при инициализации: {err}")
-        finally:
-            if conn and conn.is_connected():
-                cursor.close()
-                conn.close()
 
-    def get_feed_urls(self):
-        """Получаем список ссылок на RSS."""
+    def fetch_and_parse_feeds(self):
+        from playwright.sync_api import sync_playwright
+
         print(f"Поиск RSS лент на {BASE_URL}...")
-        try:
-            resp = requests.get(BASE_URL, timeout=15)
-            if resp.status_code != 200:
-                print(f"Ошибка доступа к сайту ECB: статус {resp.status_code}")
-                return []
+        feeds = []
 
-            soup = BeautifulSoup(resp.text, 'html.parser')
-            feeds = []
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                locale="en-US",
+                timezone_id="UTC"
+            )
+            page = context.new_page()
+            page.goto(BASE_URL, timeout=30000)
+            page.wait_for_timeout(1000)
 
-            for a in soup.select("a[href]"):
-                href = a['href']
+            links = page.query_selector_all("a[href]")
+            for link in links:
+                href = link.get_attribute("href")
+                title = link.text_content().strip() or "ECB Feed"
+                if not href:
+                    continue
                 if "/rss/" in href or href.endswith(".xml") or href.endswith(".rss"):
                     if "fxref" in href:
                         continue
-
-                    full_url = urljoin(ECB_HOST, href)
-                    title = a.get_text(strip=True) or "ECB Feed"
+                    from urllib.parse import urljoin
+                    full_url = urljoin("https://www.ecb.europa.eu", href)
                     feeds.append((full_url, title))
+            browser.close()
 
-            unique_feeds = list(set(feeds))
-            print(f"Найдено {len(unique_feeds)} лент.")
-            return unique_feeds
-
-        except Exception as e:
-            print(f"Ошибка при поиске лент: {e}")
-            return []
+        unique_feeds = list(set(feeds))
+        print(f"Найдено {len(unique_feeds)} лент.")
+        return unique_feeds
 
     def download_feeds(self):
-        """Скачивает и сохраняет данные в MySQL."""
-        feeds = self.get_feed_urls()
+        feeds = self.fetch_and_parse_feeds()
         if not feeds:
             print("Ленты не найдены.")
             return
 
-        conn = None
+        new_count = 0
         try:
-            conn = self.get_db_connection()
-            cursor = conn.cursor()
-            count = 0
+            with self.get_db_connection() as conn:
+                cursor = conn.cursor()
+                for url, title in feeds:
+                    try:
+                        import requests
+                        resp = requests.get(url, timeout=30)
+                        if resp.status_code != 200:
+                            continue
+                        content = resp.text
 
-            print(f"Скачивание {len(feeds)} файлов...")
+                        cursor.execute("""
+                            INSERT INTO vlad_ecb_xml_storage (feed_url, feed_title, xml_content)
+                            VALUES (%s, %s, %s)
+                            ON DUPLICATE KEY UPDATE
+                                xml_content = VALUES(xml_content),
+                                saved_at = NOW()
+                        """, (url, title, content))
 
-            for url, title in feeds:
-                try:
-                    r = requests.get(url, timeout=30)
-                    if r.status_code != 200:
-                        continue
+                        if cursor.rowcount > 0:
+                            new_count += 1
+                            print(f"Обновлено: {title}")
 
-                    content = r.text
+                    except Exception as e:
+                        print(f"Ошибка при обработке {url}: {e}")
 
-                    # В MySQL плейсхолдеры это %s, а не ?
-                    cursor.execute("""
-                        INSERT INTO vlad_ecb_xml_storage (feed_url, feed_title, xml_content)
-                        VALUES (%s, %s, %s)
-                    """, (url, title, content))
+                conn.commit()
+                print(f"Цикл завершен. Обновлено записей: {new_count}")
 
-                    print(f"Сохранено: {title}")
-                    count += 1
+        except Error as err:
+            print(f"Ошибка БД: {err}")
 
-                except Exception as e:
-                    print(f"Ошибка {url}: {e}")
-
-            conn.commit()
-            print(f"Цикл завершен. Сохранено записей в MySQL: {count}")
-
-        except mysql.connector.Error as err:
-            print(f"Ошибка соединения с БД: {err}")
-        finally:
-            if conn and conn.is_connected():
-                cursor.close()
-                conn.close()
-
-
-if __name__ == "__main__":
-    print(f"Запуск ECB Collector (MySQL Mode)")
-    print(f"Хост: {os.getenv('DB_HOST')}")
+def main():
+    print(f"Запуск ECB Collector (MySQL Mode, без файлов)")
+    print(f"Хост: {args.host}:{args.port}/{args.database}")
     print(f"Интервал: {CHECK_INTERVAL} сек.")
     print("=" * 40)
-
     collector = ECBCollector()
 
     try:
         while True:
             print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Обновление данных...")
             collector.download_feeds()
-
             print(f"Жду {CHECK_INTERVAL} сек...")
             time.sleep(CHECK_INTERVAL)
-
     except KeyboardInterrupt:
-        print("\nСтоп.")
+        print("\n🛑 Прервано пользователем")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except SystemExit:
+        pass
+    except KeyboardInterrupt:
+        print("\n🛑 Прервано пользователем")
+    except Exception as e:
+        print(f"\n❌ Критическая ошибка: {e!r}")
+        send_error_trace(e)
+        sys.exit(1)

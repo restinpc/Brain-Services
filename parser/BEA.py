@@ -1,27 +1,48 @@
 import requests
 import json
 import os
-import time
+import sys
+import argparse
 import pandas as pd
 import mysql.connector
-from sqlalchemy import create_engine, text
-# ИМПОРТИРУЕМ ПРАВИЛЬНЫЕ ТИПЫ
+from sqlalchemy import create_engine, text, MetaData, Table, select
 from sqlalchemy.types import String, Text, Date, Float
-from datetime import datetime
+from datetime import datetime, date
 from dotenv import load_dotenv
+import requests
+import traceback
+import os
 
-# ========== КОНФИГ ==========
+TRACE_URL = "https://server.brain-project.online/trace.php"
+NODE_NAME = os.getenv("NODE_NAME", "BEA_Data_Loader")
+EMAIL = os.getenv("ALERT_EMAIL", "vladyurjevitch@yandex.ru")
+
+# Загружаем .env по умолчанию (на случай, если аргументы не переданы)
 load_dotenv()
 
+# === Настройка аргументов командной строки ===
+parser = argparse.ArgumentParser(description="Загрузчик данных BEA в MySQL")
+parser.add_argument("host", nargs="?", default=os.getenv("DB_HOST"), help="Хост базы данных")
+parser.add_argument("port", nargs="?", default=os.getenv("DB_PORT", "3306"), help="Порт базы данных")
+parser.add_argument("login", nargs="?", default=os.getenv("DB_USER"), help="Логин к БД")
+parser.add_argument("password", nargs="?", default=os.getenv("DB_PASSWORD"), help="Пароль к БД")
+parser.add_argument("db_name", nargs="?", default=os.getenv("DB_NAME"), help="Имя базы данных")
+args = parser.parse_args()
+
+# Приоритет: аргументы > .env
 BEA_API_KEY = os.getenv("BEA_API_KEY")
 BASE_API_URL = "https://apps.bea.gov/api/data"
-OUTPUT_DIR = "bea_datasets_json"
 
-DB_HOST = os.getenv("DB_HOST")
-DB_PORT = int(os.getenv("DB_PORT", 3306))
-DB_USER = os.getenv("DB_USER")
-DB_PASS = os.getenv("DB_PASSWORD")
-DB_NAME = os.getenv("DB_NAME")
+# Используем аргументы, если они заданы
+DB_HOST = args.host
+DB_PORT = int(args.port)
+DB_USER = args.login
+DB_PASS = args.password
+DB_NAME = args.db_name
+
+if not all([DB_HOST, DB_PORT, DB_USER, DB_PASS, DB_NAME]):
+    print("❌ Ошибка: Не указаны все параметры подключения к БД (через аргументы или .env)")
+    sys.exit(1)
 
 DB_CONNECTION_STR = f"mysql+mysqlconnector://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
@@ -31,24 +52,44 @@ DATASETS = {
         "Dataset": "NIPA",
         "Params": {"TableName": "T20804", "Frequency": "M", "Year": "2023,2024,2025"},
         "LineFilter": "1",
-        "Description": "US Personal Consumption Expenditures (PCE) Price Index. The primary inflation gauge used by the Federal Reserve."
+        "Description": "US Personal Consumption Expenditures (PCE) Price Index"
     },
     "Macro_USA_GDP_Growth": {
         "Dataset": "NIPA",
         "Params": {"TableName": "T10101", "Frequency": "Q", "Year": "ALL"},
         "LineFilter": "1",
-        "Description": "US Real Gross Domestic Product (GDP) - Percent Change From Preceding Period. Main indicator of economic health."
+        "Description": "US Real Gross Domestic Product (GDP)"
     },
     "Macro_USA_Trade_Balance": {
         "Dataset": "NIPA",
         "Params": {"TableName": "T10105", "Frequency": "Q", "Year": "2020,2021,2022,2023,2024,2025"},
         "FilterFunc": lambda df: df[df['LineDescription'].str.contains("Net exports", case=False, na=False)],
-        "Description": "US Net Exports of Goods and Services (Trade Balance). Negative value indicates a trade deficit."
+        "Description": "US Net Exports of Goods and Services"
     }
 }
 
+def send_error_trace(exc: Exception, script_name: str = "bea_loader.py"):
+    """Отправляет информацию об ошибке на удалённый сервер"""
+    logs = (
+        f"Node: {NODE_NAME}\n"
+        f"Script: {script_name}\n"
+        f"Exception: {repr(exc)}\n\n"
+        f"Traceback:\n{traceback.format_exc()}"
+    )
 
-# ========== ФУНКЦИИ СКАЧИВАНИЯ (Без изменений) ==========
+    payload = {
+        "url": "cli_script",
+        "node": NODE_NAME,
+        "email": EMAIL,
+        "logs": logs,
+    }
+
+    print(f"\n📤 [POST] Отправляем отчёт об ошибке на {TRACE_URL}")
+    try:
+        response = requests.post(TRACE_URL, data=payload, timeout=10)
+        print(f"✅ [POST] Успешно отправлено! Статус: {response.status_code}")
+    except Exception as e:
+        print(f"⚠️ [POST] Не удалось отправить отчёт: {e}")
 
 def fetch_bea_data(dataset_key, config):
     print(f"🚀 Скачивание: {dataset_key}...")
@@ -82,37 +123,17 @@ def fetch_bea_data(dataset_key, config):
         print(f"   ❌ Ошибка соединения: {e}")
         return None
 
-
-def save_json(name, data, description):
-    if not os.path.exists(OUTPUT_DIR):
-        os.makedirs(OUTPUT_DIR)
-    filepath = os.path.join(OUTPUT_DIR, f"{name}.json")
-    with open(filepath, 'w', encoding='utf-8') as f:
-        json.dump({"meta": {"description": description, "source": "BEA.gov"}, "data": data}, f, ensure_ascii=False,
-                  indent=2)
-    print(f"   💾 Сохранено в JSON")
-
-
-# ========== ИСПРАВЛЕННАЯ ЗАГРУЗКА В SQL ==========
-
 def get_sqlalchemy_engine():
     return create_engine(DB_CONNECTION_STR, pool_recycle=3600)
 
 
-def process_and_load(dataset_key, config):
-    filepath = os.path.join(OUTPUT_DIR, f"{dataset_key}.json")
-    if not os.path.exists(filepath):
-        print(f"⚠️ Файл {filepath} не найден, пропускаем.")
-        return
+def prepare_dataframe(df, config):
+    """Подготовка DataFrame к загрузке"""
+    if df.empty:
+        return df
 
-    with open(filepath, 'r', encoding='utf-8') as f:
-        content = json.load(f)
-        raw_data = content.get('data', [])
-        meta_desc = content.get('meta', {}).get('description', '')
-
-    if not raw_data: return
-
-    df = pd.DataFrame(raw_data)
+    # Создаем копию, чтобы избежать предупреждений
+    df = df.copy()
 
     # 1. Фильтрация
     if "LineFilter" in config:
@@ -121,8 +142,7 @@ def process_and_load(dataset_key, config):
         df = config["FilterFunc"](df)
 
     if df.empty:
-        print(f"   ⚠️ Данных нет после фильтрации")
-        return
+        return df
 
     # 2. Очистка
     if 'DataValue' in df.columns:
@@ -147,34 +167,110 @@ def process_and_load(dataset_key, config):
     df_final = df[[c for c in cols_to_keep if c in df.columns]].copy()
     df_final['loaded_at'] = datetime.now()
 
+    return df_final
+
+
+def get_latest_date_from_db(table_name, engine):
+    """Получает последнюю дату из таблицы в БД"""
+    try:
+        with engine.connect() as conn:
+            # Проверяем, существует ли таблица
+            result = conn.execute(
+                text(f"SHOW TABLES LIKE '{table_name}'")
+            )
+            if not result.fetchone():
+                return None
+
+            # Получаем максимальную дату
+            result = conn.execute(
+                text(f"SELECT MAX(date_iso) as latest_date FROM `{table_name}`")
+            )
+            row = result.fetchone()
+            return row[0] if row and row[0] else None
+    except Exception as e:
+        print(f"   ⚠️ Ошибка при получении даты из БД: {e}")
+        return None
+
+
+def process_and_load_incremental(dataset_key, config):
+    """Загрузка только новых данных (инкрементально)"""
+    print(f"\n📊 Обработка: {dataset_key}")
+
+    # Получаем свежие данные
+    raw_data = fetch_bea_data(dataset_key, config)
+    if not raw_data:
+        print(f"   ⚠️ Не удалось получить данные")
+        return
+
+    # Подготавливаем DataFrame
+    df = pd.DataFrame(raw_data)
+    df_new = prepare_dataframe(df, config)
+
+    if df_new.empty:
+        print(f"   ⚠️ Нет данных после фильтрации")
+        return
+
     table_name = dataset_key.lower()
     engine = get_sqlalchemy_engine()
 
     try:
-        # === ИСПРАВЛЕНИЕ ЗДЕСЬ ===
-        # Используем классы типов (String, Text, Date), а не text()
-        df_final.to_sql(table_name, engine, if_exists='replace', index=False, dtype={
-            'LineDescription': Text(),  # <--- Правильный тип
-            'SeriesCode': String(50),  # <--- Правильный тип
-            'value_clean': Float(),
-            'date_iso': Date()
-        })
+        # Получаем последнюю дату из БД
+        latest_date_in_db = get_latest_date_from_db(table_name, engine)
 
-        # Добавляем комментарий к таблице
-        safe_comment = meta_desc.replace("'", "''")
+        if latest_date_in_db:
+            print(f"   📅 Последняя дата в БД: {latest_date_in_db}")
+
+            # Фильтруем только данные новее последней даты
+            df_to_load = df_new[df_new['date_iso'] > latest_date_in_db].copy()
+
+            if df_to_load.empty:
+                print(f"   ✅ Новых данных нет (все данные актуальны)")
+                return
+            else:
+                print(f"   🔄 Найдено {len(df_to_load)} новых строк для загрузки")
+                # Загружаем только новые строки
+                df_to_load.to_sql(
+                    table_name,
+                    engine,
+                    if_exists='append',
+                    index=False,
+                    dtype={
+                        'LineDescription': Text(),
+                        'SeriesCode': String(50),
+                        'value_clean': Float(),
+                        'date_iso': Date()
+                    }
+                )
+                print(f"   ✅ Загружено новых строк: {len(df_to_load)}")
+        else:
+            # Таблица не существует или пуста - создаем с нуля
+            print(f"   📝 Таблица не существует, создаем новую")
+            df_new.to_sql(
+                table_name,
+                engine,
+                if_exists='replace',
+                index=False,
+                dtype={
+                    'LineDescription': Text(),
+                    'SeriesCode': String(50),
+                    'value_clean': Float(),
+                    'date_iso': Date()
+                }
+            )
+            print(f"   ✅ Создана новая таблица с {len(df_new)} строками")
+
+        # Добавляем/обновляем комментарий к таблице
         with engine.connect() as conn:
+            safe_comment = config.get('Description', '').replace("'", "''")
             sql_comment = text(f"ALTER TABLE `{table_name}` COMMENT = '{safe_comment}'")
             conn.execute(sql_comment)
             conn.commit()
 
-        print(f"   ✅ Загружено в БД: `{table_name}` ({len(df_final)} строк)")
-        print(f"      📝 Комментарий: {meta_desc[:50]}...")
-
     except Exception as e:
-        print(f"   ❌ Ошибка SQL: {e}")
+        print(f"   ❌ Ошибка: {e}")
+        import traceback
+        traceback.print_exc()
 
-
-# ========== MAIN ==========
 
 def main():
     print(f"База данных: {DB_HOST}:{DB_PORT}")
@@ -182,20 +278,22 @@ def main():
         print("❌ Ошибка: Не указан BEA_API_KEY")
         return
 
-    # Скачивание (файлы уже есть - пропустит или перезапишет быстро)
-    print("\n=== ЭТАП 1: СКАЧИВАНИЕ ===")
-    for key, config in DATASETS.items():
-        data = fetch_bea_data(key, config)
-        if data: save_json(key, data, config["Description"])
-        time.sleep(0.1)
+    print("\n=== ЗАГРУЗКА ДАННЫХ В SQL (ИНКРЕМЕНТАЛЬНАЯ) ===")
 
-    # Загрузка
-    print("\n=== ЭТАП 2: ЗАГРУЗКА В SQL ===")
     for key, config in DATASETS.items():
-        process_and_load(key, config)
+        process_and_load_incremental(key, config)
 
     print("\n🏁 ВСЕ ЗАДАЧИ ВЫПОЛНЕНЫ")
 
-
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        # sys.exit() вызывает SystemExit — не считаем это ошибкой
+        pass
+    except KeyboardInterrupt:
+        print("\n🛑 Скрипт прерван пользователем")
+    except Exception as e:
+        print(f"\n❌ Критическая ошибка при выполнении скрипта: {e!r}")
+        send_error_trace(e)
+        sys.exit(1)

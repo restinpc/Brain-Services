@@ -1,11 +1,66 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+import os
+import sys
+import argparse
 import asyncio
 import json
-import aiohttp
-import websockets
-import aiofiles
-import os
+import traceback
 from datetime import datetime
+import websockets
+import aiohttp
+import mysql.connector
+from mysql.connector import Error
+from dotenv import load_dotenv
 
+load_dotenv()
+# === Конфигурация трассировки ошибок ===
+TRACE_URL = "https://server.brain-project.online/trace.php"
+NODE_NAME = os.getenv("NODE_NAME", "bynance_loader")
+EMAIL = os.getenv("ALERT_EMAIL", "vladyurjevitch@yandex.ru")
+
+def send_error_trace(exc: Exception, script_name: str = "bynance.py"):
+    logs = (
+        f"Node: {NODE_NAME}\n"
+        f"Script: {script_name}\n"
+        f"Exception: {repr(exc)}\n\n"
+        f"Traceback:\n{traceback.format_exc()}"
+    )
+    payload = {
+        "url": "cli_script",
+        "node": NODE_NAME,
+        "email": EMAIL,
+        "logs": logs,
+    }
+    print(f"\n📤 [POST] Отправляем отчёт об ошибке на {TRACE_URL}")
+    try:
+        import requests
+        response = requests.post(TRACE_URL, data=payload, timeout=10)
+        print(f"✅ [POST] Успешно отправлено! Статус: {response.status_code}")
+    except Exception as e:
+        print(f"⚠️ [POST] Не удалось отправить отчёт: {e}")
+
+# === Аргументы командной строки + .env fallback ===
+parser = argparse.ArgumentParser(description="Binance OrderBook Stream → MySQL")
+parser.add_argument("host", nargs="?", default=os.getenv("DB_HOST"), help="Хост базы данных")
+parser.add_argument("port", nargs="?", default=os.getenv("DB_PORT", "3306"), help="Порт базы данных")
+parser.add_argument("user", nargs="?", default=os.getenv("DB_USER"), help="Пользователь БД")
+parser.add_argument("password", nargs="?", default=os.getenv("DB_PASSWORD"), help="Пароль БД")
+parser.add_argument("database", nargs="?", default=os.getenv("DB_NAME"), help="Имя базы данных")
+args = parser.parse_args()
+
+if not all([args.host, args.user, args.password, args.database]):
+    print("❌ Ошибка: не указаны все параметры подключения к БД (через аргументы или .env)")
+    sys.exit(1)
+
+DB_CONFIG = {
+    'host': args.host,
+    'port': int(args.port),
+    'user': args.user,
+    'password': args.password,
+    'database': args.database,
+    'autocommit': False,
+}
 
 class BinanceOrderBook:
     def __init__(self, symbol, dump_interval=5):
@@ -19,9 +74,7 @@ class BinanceOrderBook:
         self.buffer = []
         self.is_synchronized = False
         self.dump_interval = dump_interval
-
-        # Создаем папку
-        os.makedirs("orderbooks", exist_ok=True)
+        self.table_name = f"vlad_binance_{self.symbol}_orderbook"
 
     async def fetch_snapshot(self):
         async with aiohttp.ClientSession() as session:
@@ -40,9 +93,8 @@ class BinanceOrderBook:
         if u <= self.last_update_id:
             return
 
-        if self.is_synchronized:
-            if self.prev_u and U != self.prev_u + 1:
-                print(f"[{self.symbol.upper()}] !!! РАЗРЫВ ПОТОКА !!!")
+        if self.is_synchronized and self.prev_u is not None and U != self.prev_u + 1:
+            print(f"[{self.symbol.upper()}] !!! РАЗРЫВ ПОТОКА !!!")
 
         for price_str, qty_str in data['b']:
             price = float(price_str)
@@ -66,43 +118,70 @@ class BinanceOrderBook:
         if u % 100 == 0:
             print(f"[{self.symbol.upper()}] Active... UpdateID: {u}")
 
-    async def dumper_task(self):
-        while True:
-            await asyncio.sleep(self.dump_interval)
-            if self.is_synchronized:
-                await self.save_to_json()
-
-    async def save_to_json(self):
+    async def save_to_db(self):
         # Сортируем топ-50
         sorted_bids = sorted(self.bids.items(), reverse=True)[:50]
         sorted_asks = sorted(self.asks.items())[:50]
 
-        # --- РАСЧЕТ СПРЕДА ---
         best_bid = sorted_bids[0][0] if sorted_bids else 0.0
         best_ask = sorted_asks[0][0] if sorted_asks else 0.0
-
-        # Спред = Лучшая продажа - Лучшая покупка
-        # Округляем до 8 знаков, чтобы избежать мусора вроде 0.00000000001
         spread = round(best_ask - best_bid, 8) if (best_bid and best_ask) else 0.0
 
         data = {
             "symbol": self.symbol,
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.utcnow(),
             "last_update_id": self.last_update_id,
-            "spread": spread,  # <--- Добавлено поле spread
-            "best_bid": best_bid,  # <--- Добавлено для удобства проверки
-            "best_ask": best_ask,  # <--- Добавлено для удобства проверки
-            "bids": sorted_bids,
-            "asks": sorted_asks
+            "spread": spread,
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "bids_json": json.dumps(sorted_bids),
+            "asks_json": json.dumps(sorted_asks),
         }
 
-        filename = f"orderbooks/{self.symbol}_history.jsonl"
-
         try:
-            async with aiofiles.open(filename, mode='a') as f:
-                await f.write(json.dumps(data) + "\n")
-        except Exception as e:
-            print(f"Ошибка записи JSON: {e}")
+            conn = mysql.connector.connect(**DB_CONFIG)
+            cursor = conn.cursor()
+
+            # Создаём таблицу при первом вызове
+            cursor.execute(f"""
+                CREATE TABLE IF NOT EXISTS `{self.table_name}` (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                    timestamp DATETIME(6) NOT NULL,
+                    last_update_id BIGINT NOT NULL,
+                    spread DECIMAL(20,10) NULL,
+                    best_bid DECIMAL(20,10) NULL,
+                    best_ask DECIMAL(20,10) NULL,
+                    bids_json LONGTEXT NULL,
+                    asks_json LONGTEXT NULL,
+                    INDEX idx_timestamp (timestamp),
+                    INDEX idx_update_id (last_update_id)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                COMMENT='Binance orderbook stream for {self.symbol}';
+            """)
+            conn.commit()
+
+            # Вставка
+            sql = f"""
+                INSERT INTO `{self.table_name}` 
+                (timestamp, last_update_id, spread, best_bid, best_ask, bids_json, asks_json)
+                VALUES (%(timestamp)s, %(last_update_id)s, %(spread)s, %(best_bid)s, %(best_ask)s, %(bids_json)s, %(asks_json)s)
+            """
+            cursor.execute(sql, data)
+            conn.commit()
+            print(f"[{self.symbol.upper()}] ✅ Записано в БД (UpdateID: {self.last_update_id})")
+
+        except Error as e:
+            print(f"[{self.symbol.upper()}] ❌ Ошибка БД: {e}")
+        finally:
+            if 'conn' in locals() and conn.is_connected():
+                cursor.close()
+                conn.close()
+
+    async def dumper_task(self):
+        while True:
+            await asyncio.sleep(self.dump_interval)
+            if self.is_synchronized:
+                await self.save_to_db()
 
     async def start(self):
         asyncio.create_task(self.dumper_task())
@@ -125,24 +204,26 @@ class BinanceOrderBook:
                                 if event['U'] <= self.last_update_id + 1 <= event['u']:
                                     self.process_update(event)
                                     self.prev_u = event['u']
-                                else:
-                                    pass
-
+                                # else: пропускаем (не покрывает снапшот)
                         self.buffer = []
                         self.is_synchronized = True
-                        print(f"[{self.symbol.upper()}] Синхронизация OK. Пишем историю в .jsonl")
+                        print(f"[{self.symbol.upper()}] Синхронизация OK. Пишем в БД каждые {self.dump_interval} сек.")
                 else:
                     self.process_update(data)
-
 
 async def main():
     btc = BinanceOrderBook("btcusdt")
     eth = BinanceOrderBook("ethusdt")
     await asyncio.gather(btc.start(), eth.start())
 
-
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
+        print("\n🛑 Прервано пользователем")
+    except SystemExit:
         pass
+    except Exception as e:
+        print(f"\n❌ Критическая ошибка: {e!r}")
+        send_error_trace(e)
+        sys.exit(1)
