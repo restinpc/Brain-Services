@@ -14,6 +14,7 @@ from mysql.connector import Error
 from dotenv import load_dotenv
 
 load_dotenv()
+
 # === Конфигурация трассировки ошибок ===
 TRACE_URL = "https://server.brain-project.online/trace.php"
 NODE_NAME = os.getenv("NODE_NAME", "investing_cal_loader")
@@ -42,6 +43,7 @@ def send_error_trace(exc: Exception, script_name: str = "investing_cal.py"):
 
 # === Аргументы командной строки + .env fallback ===
 parser = argparse.ArgumentParser(description="Investing.com Economic Calendar → MySQL")
+parser.add_argument("table_name", help="Имя целевой таблицы в БД")
 parser.add_argument("host", nargs="?", default=os.getenv("DB_HOST"), help="Хост базы данных")
 parser.add_argument("port", nargs="?", default=os.getenv("DB_PORT", "3306"), help="Порт базы данных")
 parser.add_argument("user", nargs="?", default=os.getenv("DB_USER"), help="Пользователь БД")
@@ -69,7 +71,6 @@ SETTINGS = {
     "limit": 500,
     "countries": "5,72,35,4,6,25,12,37,17,11,19,14,10,22,39,36,43",
 }
-TABLE_NAME = "vlad_investing_calendar"
 IMPORTANCE_MAP = {"low": 1, "medium": 2, "high": 3}
 START_FALLBACK = date(1970, 1, 1)
 END_DATE_UTC = datetime.now(timezone.utc).date()
@@ -97,6 +98,9 @@ def month_ranges(start_d: date, end_d: date) -> List[Tuple[date, date]]:
 
 # ---------- DB ----------
 class DB:
+    def __init__(self, table_name: str):
+        self.table_name = table_name
+
     def get_db_connection(self):
         return mysql.connector.connect(**DB_CONFIG)
 
@@ -104,7 +108,7 @@ class DB:
         with self.get_db_connection() as conn:
             cur = conn.cursor()
             cur.execute(f"""
-                CREATE TABLE IF NOT EXISTS `{TABLE_NAME}` (
+                CREATE TABLE IF NOT EXISTS `{self.table_name}` (
                     occurrence_id BIGINT PRIMARY KEY,
                     occurrence_time_utc DATETIME NULL,
                     event_id INT NULL,
@@ -135,7 +139,7 @@ class DB:
     def get_max_time(self) -> Optional[datetime]:
         with self.get_db_connection() as conn:
             cur = conn.cursor()
-            cur.execute(f"SELECT MAX(occurrence_time_utc) FROM `{TABLE_NAME}`")
+            cur.execute(f"SELECT MAX(occurrence_time_utc) FROM `{self.table_name}`")
             (mx,) = cur.fetchone()
             return mx
 
@@ -143,7 +147,7 @@ class DB:
         if not batch:
             return 0
         sql = f"""
-            INSERT IGNORE INTO `{TABLE_NAME}` (
+            INSERT IGNORE INTO `{self.table_name}` (
                 occurrence_id, occurrence_time_utc, event_id,
                 currency, importance, event_name,
                 actual, forecast, previous,
@@ -298,7 +302,7 @@ def occurrence_to_db_row(o: Dict[str, Any], event_map: Dict[int, Dict[str, Any]]
 
 # ---------- MAIN ----------
 def main() -> int:
-    db = DB()
+    db = DB(args.table_name)
     db.ensure_table()
     last_time = db.get_max_time()
     if last_time:
@@ -311,7 +315,7 @@ def main() -> int:
         log(f"DB empty. Full start: {start_d.isoformat()}")
     end_d = END_DATE_UTC
     log(f"End date (today UTC): {end_d.isoformat()}")
-    log(f"DB={args.database} Table={TABLE_NAME}")
+    log(f"DB={args.database} Table={args.table_name}")
 
     try:
         from playwright.sync_api import sync_playwright

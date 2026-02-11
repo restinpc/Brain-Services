@@ -20,6 +20,7 @@ TRACE_URL = "https://server.brain-project.online/trace.php"
 NODE_NAME = os.getenv("NODE_NAME", "data_gov_loader")
 EMAIL = os.getenv("ALERT_EMAIL", "vladyurjevitch@yandex.ru")
 
+
 def send_error_trace(exc: Exception, script_name: str = "data_gov.py"):
     logs = (
         f"Node: {NODE_NAME}\n"
@@ -40,8 +41,10 @@ def send_error_trace(exc: Exception, script_name: str = "data_gov.py"):
     except Exception as e:
         print(f"⚠️ [POST] Не удалось отправить отчёт: {e}")
 
+
 # === Аргументы командной строки + .env fallback ===
 parser = argparse.ArgumentParser(description="Загрузчик данных Treasury.gov в MySQL")
+parser.add_argument("table_name", help="Имя целевой таблицы в БД")
 parser.add_argument("host", nargs="?", default=os.getenv("DB_HOST"), help="Хост базы данных")
 parser.add_argument("port", nargs="?", default=os.getenv("DB_PORT", "3306"), help="Порт базы данных")
 parser.add_argument("user", nargs="?", default=os.getenv("DB_USER"), help="Пользователь БД")
@@ -63,21 +66,24 @@ DB_CONFIG = {
 
 BASE_TREASURY_URL = "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/pages/xml"
 
+# Настройки для каждой категории
 DATA_TYPES_CONFIG = {
-    "Nominal_Yield": {
+    "vlad_treasury_nominal_yield": {
         "code": "daily_treasury_yield_curve",
         "start_year": 1990,
         "description": "Номинальная кривая доходности (Nominal Yield Curve). Основной индикатор."
     },
-    "Real_Yield": {
+    "vlad_treasury_real_yield": {
         "code": "daily_treasury_real_yield_curve",
         "start_year": 2003,
         "description": "Реальная доходность (Real Yield) с поправкой на инфляцию."
     }
 }
 
+
 def clean_tag(tag):
     return tag.split('}')[-1] if '}' in tag else tag
+
 
 def get_latest_date_from_db(table_name: str) -> date | None:
     """Возвращает последнюю дату из таблицы или None, если таблицы нет / пусто."""
@@ -98,6 +104,7 @@ def get_latest_date_from_db(table_name: str) -> date | None:
             cursor.close()
             conn.close()
 
+
 def download_and_parse_xml(data_type_code: str, year: int):
     """Скачивает XML напрямую в память и парсит его → список записей."""
     session = requests.Session()
@@ -106,7 +113,6 @@ def download_and_parse_xml(data_type_code: str, year: int):
     session.mount('http://', adapter)
     session.mount('https://', adapter)
     headers = {'User-Agent': 'Mozilla/5.0'}
-
     params = {'data': data_type_code, 'field_tdr_date_value': year}
     try:
         response = session.get(BASE_TREASURY_URL, params=params, headers=headers, timeout=30)
@@ -150,6 +156,7 @@ def download_and_parse_xml(data_type_code: str, year: int):
         if 'record_date' in row_data:
             data_rows.append(row_data)
     return data_rows
+
 
 def save_to_db_incremental(data, table_name, table_comment=""):
     if not data:
@@ -200,8 +207,8 @@ def save_to_db_incremental(data, table_name, table_comment=""):
             cursor.close()
             conn.close()
 
-def process_data_type(name: str, config: dict, current_year: int):
-    table_name = f"vlad_treasury_{name.lower()}"
+
+def process_data_type(table_name: str, config: dict, current_year: int):
     latest_date = get_latest_date_from_db(table_name)
     start_year = config['start_year']
 
@@ -235,16 +242,24 @@ def process_data_type(name: str, config: dict, current_year: int):
     else:
         print("   ⚠️ Нет данных для загрузки")
 
+
 def main():
     print(f"🚀 TREASURY.GOV COLLECTOR (инкрементальный, без файлов)")
     print(f"База: {args.host}:{args.port}/{args.database}")
+
+    # Определяем, какую категорию обрабатывать по имени таблицы
+    if args.table_name not in DATA_TYPES_CONFIG:
+        print(f"❌ Ошибка: неизвестное имя таблицы '{args.table_name}'. Допустимые значения:")
+        for name in DATA_TYPES_CONFIG.keys():
+            print(f"  - {name}")
+        sys.exit(1)
+
     current_year = datetime.now().year
-
-    for name, config in DATA_TYPES_CONFIG.items():
-        print(f"\n=== Категория: {name} ===")
-        process_data_type(name, config, current_year)
-
+    config = DATA_TYPES_CONFIG[args.table_name]
+    print(f"\n=== Обработка таблицы: {args.table_name} ===")
+    process_data_type(args.table_name, config, current_year)
     print("\n🏁 ЗАГРУЗКА ЗАВЕРШЕНА")
+
 
 if __name__ == "__main__":
     try:

@@ -14,6 +14,7 @@ from mysql.connector import Error
 from dotenv import load_dotenv
 
 load_dotenv()
+
 # === Конфигурация трассировки ошибок ===
 TRACE_URL = "https://server.brain-project.online/trace.php"
 NODE_NAME = os.getenv("NODE_NAME", "bynance_loader")
@@ -42,6 +43,7 @@ def send_error_trace(exc: Exception, script_name: str = "bynance.py"):
 
 # === Аргументы командной строки + .env fallback ===
 parser = argparse.ArgumentParser(description="Binance OrderBook Stream → MySQL")
+parser.add_argument("table_name", help="Имя целевой таблицы в БД")
 parser.add_argument("host", nargs="?", default=os.getenv("DB_HOST"), help="Хост базы данных")
 parser.add_argument("port", nargs="?", default=os.getenv("DB_PORT", "3306"), help="Порт базы данных")
 parser.add_argument("user", nargs="?", default=os.getenv("DB_USER"), help="Пользователь БД")
@@ -62,8 +64,15 @@ DB_CONFIG = {
     'autocommit': False,
 }
 
+def extract_symbol_from_table_name(table_name: str) -> str:
+    """Извлекает символ из имени таблицы vlad_binance_{symbol}_orderbook"""
+    if not table_name.startswith("vlad_binance_") or not table_name.endswith("_orderbook"):
+        raise ValueError("Неверный формат имени таблицы")
+    return table_name[len("vlad_binance_"):-len("_orderbook")]
+
 class BinanceOrderBook:
-    def __init__(self, symbol, dump_interval=5):
+    def __init__(self, table_name: str, symbol: str, dump_interval=5):
+        self.table_name = table_name
         self.symbol = symbol.lower()
         self.bids = {}
         self.asks = {}
@@ -74,7 +83,6 @@ class BinanceOrderBook:
         self.buffer = []
         self.is_synchronized = False
         self.dump_interval = dump_interval
-        self.table_name = f"vlad_binance_{self.symbol}_orderbook"
 
     async def fetch_snapshot(self):
         async with aiohttp.ClientSession() as session:
@@ -89,13 +97,10 @@ class BinanceOrderBook:
     def process_update(self, data):
         U = data['U']
         u = data['u']
-
         if u <= self.last_update_id:
             return
-
         if self.is_synchronized and self.prev_u is not None and U != self.prev_u + 1:
             print(f"[{self.symbol.upper()}] !!! РАЗРЫВ ПОТОКА !!!")
-
         for price_str, qty_str in data['b']:
             price = float(price_str)
             qty = float(qty_str)
@@ -103,7 +108,6 @@ class BinanceOrderBook:
                 self.bids.pop(price, None)
             else:
                 self.bids[price] = qty
-
         for price_str, qty_str in data['a']:
             price = float(price_str)
             qty = float(qty_str)
@@ -111,22 +115,15 @@ class BinanceOrderBook:
                 self.asks.pop(price, None)
             else:
                 self.asks[price] = qty
-
         self.prev_u = u
         self.last_update_id = u
 
-        if u % 100 == 0:
-            print(f"[{self.symbol.upper()}] Active... UpdateID: {u}")
-
     async def save_to_db(self):
-        # Сортируем топ-50
         sorted_bids = sorted(self.bids.items(), reverse=True)[:50]
         sorted_asks = sorted(self.asks.items())[:50]
-
         best_bid = sorted_bids[0][0] if sorted_bids else 0.0
         best_ask = sorted_asks[0][0] if sorted_asks else 0.0
         spread = round(best_ask - best_bid, 8) if (best_bid and best_ask) else 0.0
-
         data = {
             "symbol": self.symbol,
             "timestamp": datetime.utcnow(),
@@ -137,12 +134,9 @@ class BinanceOrderBook:
             "bids_json": json.dumps(sorted_bids),
             "asks_json": json.dumps(sorted_asks),
         }
-
         try:
             conn = mysql.connector.connect(**DB_CONFIG)
             cursor = conn.cursor()
-
-            # Создаём таблицу при первом вызове
             cursor.execute(f"""
                 CREATE TABLE IF NOT EXISTS `{self.table_name}` (
                     id BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -159,17 +153,14 @@ class BinanceOrderBook:
                 COMMENT='Binance orderbook stream for {self.symbol}';
             """)
             conn.commit()
-
-            # Вставка
             sql = f"""
-                INSERT INTO `{self.table_name}` 
+                INSERT INTO `{self.table_name}`
                 (timestamp, last_update_id, spread, best_bid, best_ask, bids_json, asks_json)
                 VALUES (%(timestamp)s, %(last_update_id)s, %(spread)s, %(best_bid)s, %(best_ask)s, %(bids_json)s, %(asks_json)s)
             """
             cursor.execute(sql, data)
             conn.commit()
             print(f"[{self.symbol.upper()}] ✅ Записано в БД (UpdateID: {self.last_update_id})")
-
         except Error as e:
             print(f"[{self.symbol.upper()}] ❌ Ошибка БД: {e}")
         finally:
@@ -178,33 +169,34 @@ class BinanceOrderBook:
                 conn.close()
 
     async def dumper_task(self):
+        """Фоновая задача для периодической записи в БД"""
         while True:
             await asyncio.sleep(self.dump_interval)
             if self.is_synchronized:
                 await self.save_to_db()
 
     async def start(self):
+        """Основной цикл работы с WebSocket"""
+        # Запускаем фоновую задачу записи
         asyncio.create_task(self.dumper_task())
 
         async with websockets.connect(self.ws_url) as ws:
             print(f"[{self.symbol.upper()}] Подключено к WebSocket")
-            snapshot_task = asyncio.create_task(self.fetch_snapshot())
-
+            # Получаем снапшот
+            await self.fetch_snapshot()
+            # Основной цикл получения обновлений
             while True:
                 msg = await ws.recv()
                 data = json.loads(msg)
-
                 if not self.is_synchronized:
                     self.buffer.append(data)
-                    if snapshot_task.done():
-                        await snapshot_task
-
+                    # После получения достаточного количества обновлений синхронизируемся
+                    if len(self.buffer) > 10:
                         for event in self.buffer:
                             if event['u'] > self.last_update_id:
                                 if event['U'] <= self.last_update_id + 1 <= event['u']:
                                     self.process_update(event)
                                     self.prev_u = event['u']
-                                # else: пропускаем (не покрывает снапшот)
                         self.buffer = []
                         self.is_synchronized = True
                         print(f"[{self.symbol.upper()}] Синхронизация OK. Пишем в БД каждые {self.dump_interval} сек.")
@@ -212,9 +204,13 @@ class BinanceOrderBook:
                     self.process_update(data)
 
 async def main():
-    btc = BinanceOrderBook("btcusdt")
-    eth = BinanceOrderBook("ethusdt")
-    await asyncio.gather(btc.start(), eth.start())
+    try:
+        symbol = extract_symbol_from_table_name(args.table_name)
+        orderbook = BinanceOrderBook(args.table_name, symbol)
+        await orderbook.start()
+    except ValueError as e:
+        print(f"❌ Ошибка: {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     try:

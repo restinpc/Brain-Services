@@ -13,6 +13,7 @@ import traceback
 from dotenv import load_dotenv
 
 load_dotenv()
+
 # === Конфигурация трассировки ошибок ===
 TRACE_URL = "https://server.brain-project.online/trace.php"
 NODE_NAME = os.getenv("NODE_NAME", "tradingview_loader")
@@ -41,6 +42,7 @@ def send_error_trace(exc: Exception, script_name: str = "TradingView.py"):
 
 # === Аргументы командной строки + .env fallback ===
 parser = argparse.ArgumentParser(description="TradingView Data Collector → MySQL")
+parser.add_argument("table_name", help="Имя целевой таблицы в БД")
 parser.add_argument("host", nargs="?", default=os.getenv("DB_HOST"), help="Хост базы данных")
 parser.add_argument("port", nargs="?", default=os.getenv("DB_PORT", "3306"), help="Порт базы данных")
 parser.add_argument("user", nargs="?", default=os.getenv("DB_USER"), help="Пользователь БД")
@@ -52,13 +54,6 @@ if not all([args.host, args.user, args.password, args.database]):
     print("❌ Ошибка: не указаны все параметры подключения к БД (через аргументы или .env)")
     sys.exit(1)
 
-DB_CONFIG = {
-    'host': args.host,
-    'port': int(args.port),
-    'user': args.user,
-    'password': args.password,
-    'database': args.database,
-}
 SQLALCHEMY_URL = f"mysql+mysqlconnector://{args.user}:{args.password}@{args.host}:{args.port}/{args.database}"
 
 ASSETS = {
@@ -75,31 +70,29 @@ ASSETS = {
 }
 
 class TradingViewCollector:
-    def __init__(self):
+    def __init__(self, table_name: str):
+        self.table_name = table_name
         self.engine = create_engine(SQLALCHEMY_URL, pool_recycle=3600)
 
-    def get_last_datetime(self, table_name: str) -> datetime.datetime | None:
+    def get_last_datetime(self) -> datetime.datetime | None:
         try:
             with self.engine.connect() as conn:
-                result = conn.execute(text(f"SELECT MAX(`datetime`) FROM `{table_name}`"))
+                result = conn.execute(text(f"SELECT MAX(`datetime`) FROM `{self.table_name}`"))
                 row = result.fetchone()
                 return row[0] if row and row[0] else None
         except Exception as e:
-            print(f"   ⚠️ Не удалось получить последнюю дату из {table_name}: {e}")
+            print(f"   ⚠️ Не удалось получить последнюю дату из {self.table_name}: {e}")
             return None
 
     def get_market_data(self, last_dt: datetime.datetime | None) -> pd.DataFrame | None:
         print("[*] Скачивание рыночных данных (Yahoo Finance)...")
-
-        # Определяем период: если есть last_dt — качаем с него, иначе 2 года
         if last_dt:
-            start_date = last_dt - datetime.timedelta(days=1)  # буфер на случай корректировок
+            start_date = last_dt - datetime.timedelta(days=1)
             period_str = None
             start_str = start_date.strftime('%Y-%m-%d')
         else:
             period_str = "2y"
             start_str = None
-
         tickers = list(ASSETS.values())
         try:
             if period_str:
@@ -109,7 +102,6 @@ class TradingViewCollector:
         except Exception as e:
             print(f"   -> Ошибка Yahoo: {e}")
             return None
-
         dfs = {}
         for name, ticker in ASSETS.items():
             try:
@@ -120,30 +112,23 @@ class TradingViewCollector:
                         continue
                 else:
                     df = data.copy()
-
                 cols_map = {}
                 if 'Close' in df.columns: cols_map['Close'] = f'{name}_Close'
                 if 'Volume' in df.columns: cols_map['Volume'] = f'{name}_Volume'
-
                 if not cols_map:
                     continue
-
                 df = df.rename(columns=cols_map)[list(cols_map.values())]
                 df.index = pd.to_datetime(df.index).tz_localize(None)
                 dfs[name] = df
             except Exception:
                 continue
-
         if not dfs:
             return None
-
         full_df = pd.concat(dfs.values(), axis=1)
         full_df.sort_index(inplace=True)
         full_df.dropna(how='all', inplace=True)
-
         if last_dt:
             full_df = full_df[full_df.index > last_dt]
-
         return full_df if not full_df.empty else None
 
     def get_crypto_metrics(self) -> pd.DataFrame | None:
@@ -159,47 +144,16 @@ class TradingViewCollector:
             metrics['Hashrate'] = df.resample('1h').ffill()
         except Exception:
             pass
-
         if metrics:
             return pd.concat(metrics.values(), axis=1)
         return pd.DataFrame()
-
-    def get_economic_calendar(self) -> pd.DataFrame | None:
-        print("[*] Скачивание календаря событий...")
-        url = "https://economic-calendar.tradingview.com/events"
-        payload = {
-            "from": (datetime.datetime.now() - datetime.timedelta(days=730)).isoformat() + "Z",
-            "to": datetime.datetime.now().isoformat() + "Z",
-            "countries": "US,EU,DE",
-            "min_importance": "1"
-        }
-        headers = {'origin': 'https://ru.tradingview.com', 'referer': 'https://ru.tradingview.com/'}
-
-        try:
-            r = crequests.get(url, params=payload, headers=headers, impersonate="chrome120")
-            data = r.json().get('result', [])
-
-            rows = []
-            for i in data:
-                rows.append({
-                    'datetime': pd.to_datetime(i['date']).replace(tzinfo=None),
-                    'Country': i['country'],
-                    'Title': i['title'],
-                    'Actual': i['actual'],
-                    'Previous': i['previous'],
-                    'Forecast': i['forecast'],
-                    'Importance': i['importance']
-                })
-            return pd.DataFrame(rows)
-        except Exception:
-            return pd.DataFrame()
 
     def save_market_data_incremental(self, df_matrix: pd.DataFrame):
         if df_matrix.empty:
             return
         try:
             df_matrix.to_sql(
-                name='vlad_market_history',
+                name=self.table_name,
                 con=self.engine,
                 if_exists='append',
                 index=True,
@@ -207,65 +161,21 @@ class TradingViewCollector:
                 chunksize=1000,
                 method='multi'
             )
-            print(f"   -> Матрица: добавлено {len(df_matrix)} строк в 'vlad_market_history'")
+            print(f"   -> Матрица: добавлено {len(df_matrix)} строк в '{self.table_name}'")
         except Exception as e:
             print(f"   -> Ошибка записи матрицы: {e}")
 
-    def save_events_incremental(self, df_events: pd.DataFrame):
-        if df_events.empty:
-            return
-        try:
-            # Для событий используем INSERT IGNORE по (datetime, Title)
-            df_events.to_sql(
-                name='vlad_macro_calendar_events',
-                con=self.engine,
-                if_exists='append',
-                index=False,
-                chunksize=1000,
-                method='multi'
-            )
-            print(f"   -> Календарь: добавлено {len(df_events)} событий в 'vlad_macro_calendar_events'")
-        except Exception as e:
-            print(f"   -> Ошибка записи календаря: {e}")
-
-    def ensure_events_table(self):
-        create_sql = """
-        CREATE TABLE IF NOT EXISTS `vlad_macro_calendar_events` (
-            `datetime` DATETIME NOT NULL,
-            `Country` VARCHAR(10),
-            `Title` VARCHAR(255),
-            `Actual` VARCHAR(64),
-            `Previous` VARCHAR(64),
-            `Forecast` VARCHAR(64),
-            `Importance` TINYINT,
-            INDEX idx_datetime (datetime)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-        """
-        with self.engine.connect() as conn:
-            conn.execute(text(create_sql))
-            conn.commit()
-
 def main():
-    collector = TradingViewCollector()
-    collector.ensure_events_table()
-
-    # 1. Рынок
-    last_dt = collector.get_last_datetime('vlad_market_history')
+    collector = TradingViewCollector(args.table_name)
+    last_dt = collector.get_last_datetime()
     df_market = collector.get_market_data(last_dt)
     df_onchain = collector.get_crypto_metrics()
-
     if df_market is not None:
         if not df_onchain.empty:
             final_df = df_market.join(df_onchain, how='left').ffill()
         else:
             final_df = df_market
         collector.save_market_data_incremental(final_df)
-
-    # 2. События
-    df_events = collector.get_economic_calendar()
-    if not df_events.empty:
-        collector.save_events_incremental(df_events)
-
     print("✅ Готово! Данные добавлены в базу.")
 
 if __name__ == "__main__":

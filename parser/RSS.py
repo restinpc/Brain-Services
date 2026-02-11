@@ -16,6 +16,7 @@ import traceback
 from dotenv import load_dotenv
 
 load_dotenv()
+
 # === Конфигурация трассировки ошибок ===
 TRACE_URL = "https://server.brain-project.online/trace.php"
 NODE_NAME = os.getenv("NODE_NAME", "rss_fed_loader")
@@ -43,6 +44,7 @@ def send_error_trace(exc: Exception, script_name: str = "RSS.py"):
 
 # === Аргументы командной строки + .env fallback ===
 parser = argparse.ArgumentParser(description="Federal Reserve RSS Parser → MySQL")
+parser.add_argument("table_name", help="Имя целевой таблицы в БД")
 parser.add_argument("host", nargs="?", default=os.getenv("DB_HOST"), help="Хост базы данных")
 parser.add_argument("port", nargs="?", default=os.getenv("DB_PORT", "3306"), help="Порт базы данных")
 parser.add_argument("user", nargs="?", default=os.getenv("DB_USER"), help="Пользователь БД")
@@ -63,7 +65,6 @@ DB_CONFIG = {
 }
 
 FEEDS_URL = "https://www.federalreserve.gov/feeds/feeds.htm"
-CHECK_INTERVAL = 3600  # 1 час
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
 IGNORE_KEYWORDS = [
@@ -72,7 +73,8 @@ IGNORE_KEYWORDS = [
 ]
 
 class RSSCollector:
-    def __init__(self):
+    def __init__(self, table_name: str):
+        self.table_name = table_name
         self.session = requests.Session()
         self.session.headers.update({'User-Agent': USER_AGENT})
         self.init_db()
@@ -84,8 +86,8 @@ class RSSCollector:
         try:
             with self.get_db_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS vlad_rss_feed_entries (
+                cursor.execute(f"""
+                    CREATE TABLE IF NOT EXISTS `{self.table_name}` (
                         id INT AUTO_INCREMENT PRIMARY KEY,
                         feed_title VARCHAR(255),
                         feed_url VARCHAR(255),
@@ -101,9 +103,9 @@ class RSSCollector:
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
                 """)
                 conn.commit()
-                print("MySQL: Таблица готова.")
+                print(f"✅ Таблица `{self.table_name}` готова.")
         except Error as err:
-            print(f"Ошибка БД при старте: {err}")
+            print(f"❌ Ошибка БД при старте: {err}")
 
     def clean_html_content(self, soup):
         for tag in soup.select('script, style, nav, header, footer, aside, .header, .footer, .breadcrumb, .social-share'):
@@ -124,13 +126,11 @@ class RSSCollector:
                 page = context.new_page()
                 page.goto(url, timeout=30000)
                 page.wait_for_timeout(1000)
-
                 # Удаляем мусор
                 page.evaluate("""() => {
                     const trash = document.querySelectorAll('nav, header, footer, .header, .footer, .breadcrumb, .social-share');
                     trash.forEach(el => el.remove());
                 }""")
-
                 text = ""
                 selectors = ["#article", "#content .col-md-8", "#content", ".data-article"]
                 for sel in selectors:
@@ -141,12 +141,10 @@ class RSSCollector:
                             text += t + "\n"
                     if len(text) > 100:
                         break
-
                 if not text:
                     body = page.query_selector("body")
                     if body:
                         text = body.text_content().strip()
-
                 browser.close()
                 return text if len(text) > 50 else ""
         except Exception as e:
@@ -172,7 +170,6 @@ class RSSCollector:
                         return text
         except Exception:
             pass
-
         print(f"   -> Переход на Playwright для: {url[-30:]}")
         return self.get_full_text_playwright(url)
 
@@ -180,44 +177,34 @@ class RSSCollector:
         try:
             feed = feedparser.parse(feed_url)
             new_count = 0
-
             with self.get_db_connection() as conn:
                 cursor = conn.cursor()
-
                 for entry in feed.entries[:10]:  # только последние 10
                     entry_guid = (entry.get('id') or entry.link)[:190]
                     if not entry_guid:
                         continue
-
-                    cursor.execute("SELECT id FROM vlad_rss_feed_entries WHERE entry_guid = %s", (entry_guid,))
+                    cursor.execute(f"SELECT id FROM `{self.table_name}` WHERE entry_guid = %s", (entry_guid,))
                     if cursor.fetchone():
                         continue
-
                     print(f" [{feed_name}] Новая статья: {entry.title[:50]}...")
-
                     full_text = ""
                     if 'link' in entry:
                         full_text = self.get_full_text(entry.link)
-
                     description = entry.get('description', '')
                     if not full_text:
                         full_text = BeautifulSoup(description, 'html.parser').get_text(strip=True)
-
                     published = entry.get('published') or entry.get('updated') or datetime.now().isoformat()
-
-                    cursor.execute("""
-                        INSERT INTO vlad_rss_feed_entries 
+                    cursor.execute(f"""
+                        INSERT INTO `{self.table_name}` 
                         (feed_title, feed_url, entry_title, entry_link, entry_guid,
                          entry_description, full_text, published)
                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                     """, (feed_name, feed_url, entry.title, entry.link, entry_guid,
                           description, full_text, published))
                     new_count += 1
-
                 if new_count > 0:
                     conn.commit()
                     print(f" -> Сохранено {new_count} записей.")
-
         except Exception as e:
             print(f"Ошибка фида {feed_name}: {e}")
 
@@ -228,38 +215,26 @@ class RSSCollector:
             soup = BeautifulSoup(resp.text, 'html.parser')
             feeds = []
             seen = set()
-
             for a in soup.find_all('a', href=True):
                 href = a['href']
                 name = a.text.strip()
-
                 if any(ignored in name for ignored in IGNORE_KEYWORDS):
                     continue
-
                 if href.endswith('.xml'):
                     full_url = urljoin("https://www.federalreserve.gov", href)
                     if full_url not in seen:
                         seen.add(full_url)
                         feeds.append({'url': full_url, 'name': name})
-
             print(f"Отобрано {len(feeds)} полезных лент (пресс-релизы, речи).")
-
             for feed in feeds:
                 self.process_feed(feed['url'], feed['name'])
-
         except Exception as e:
             print(f"Сбой цикла: {e}")
 
 def main():
-    collector = RSSCollector()
-    try:
-        while True:
-            print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Старт обновления...")
-            collector.run_cycle()
-            print(f"Сон {CHECK_INTERVAL} сек...")
-            time.sleep(CHECK_INTERVAL)
-    except KeyboardInterrupt:
-        print("\n🛑 Прервано пользователем")
+    collector = RSSCollector(args.table_name)
+    collector.run_cycle()
+    print("\n🏁 ЗАГРУЗКА ЗАВЕРШЕНА")
 
 if __name__ == "__main__":
     try:
