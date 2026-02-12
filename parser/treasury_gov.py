@@ -67,36 +67,36 @@ BASE_API_URL = "https://api.fiscaldata.treasury.gov/services/api/fiscal_service/
 
 # === ТОЧНЫЙ СПИСОК ЭНДПОИНТОВ И ТАБЛИЦ ===
 RAW_DATASETS = {
-    "Daily_Treasury_Statement_All": "v1/accounting/dts/dts_all",
-    "Debt_to_the_Penny": "v2/accounting/od/debt_to_penny",
-    "Debt_Outstanding": "v2/accounting/od/debt_outstanding",
-    "Average_Interest_Rates": "v2/accounting/od/avg_interest_rates",
-    "FRN_Daily_Indexes": "v1/accounting/od/frn_daily_indexes",
-    "TIPS_CPI_Data": "v1/accounting/od/tips_cpi_data",
-    "Gold_Reserve": "v2/accounting/od/gold_reserve",
-    "Auctions_Query": "v1/accounting/od/auctions_query",
-    "Upcoming_Auctions": "v1/accounting/od/upcoming_auctions",
-    "Record_Setting_Auction": "v2/accounting/od/record_setting_auction",
-    "Buybacks_Operations": "v1/accounting/od/buybacks_operations",
-    "Buybacks_Security_Details": "v1/accounting/od/buybacks_security_details",
-    "MSPD_Table_1": "v1/debt/mspd/mspd_table_1",
-    "MSPD_Table_2": "v1/debt/mspd/mspd_table_2",
-    "MSPD_Table_3": "v1/debt/mspd/mspd_table_3",
-    "MSPD_Table_3_Market": "v1/debt/mspd/mspd_table_3_market",
-    "MSPD_Table_3_NonMarket": "v1/debt/mspd/mspd_table_3_nonmarket",
-    "MSPD_Table_4": "v1/debt/mspd/mspd_table_4",
-    "MSPD_Table_5": "v1/debt/mspd/mspd_table_5",
-    "Interest_Expense": "v2/accounting/od/interest_expense",
-    "Interest_Uninvested": "v2/accounting/od/interest_uninvested",
-    "Federal_Maturity_Rates": "v1/accounting/od/federal_maturity_rates",
-    "Receipts_by_Department": "v1/accounting/od/receipts_by_department",
-}
+        "Daily_Treasury_Statement_All": "v1/accounting/dts/dts_all",
+        "Debt_to_the_Penny": "v2/accounting/od/debt_to_penny",
+        "Debt_Outstanding": "v2/accounting/od/debt_outstanding",
+        "Average_Interest_Rates": "v2/accounting/od/avg_interest_rates",
+        "FRN_Daily_Indexes": "v1/accounting/od/frn_daily_indexes",
+        "TIPS_CPI_Data": "v1/accounting/od/tips_cpi_data",
+        "Gold_Reserve": "v2/accounting/od/gold_reserve",
+        "Auctions_Query": "v1/accounting/od/auctions_query",
+        "Upcoming_Auctions": "v1/accounting/od/upcoming_auctions",
+        "Record_Setting_Auction": "v2/accounting/od/record_setting_auction",
+        "Buybacks_Operations": "v1/accounting/od/buybacks_operations",
+        "Buybacks_Security_Details": "v1/accounting/od/buybacks_security_details",
+        "MSPD_Table_1": "v1/debt/mspd/mspd_table_1",
+        "MSPD_Table_2": "v1/debt/mspd/mspd_table_2",
+        "MSPD_Table_3": "v1/debt/mspd/mspd_table_3",
+        "MSPD_Table_3_Market": "v1/debt/mspd/mspd_table_3_market",
+        "MSPD_Table_3_NonMarket": "v1/debt/mspd/mspd_table_3_nonmarket",
+        "MSPD_Table_4": "v1/debt/mspd/mspd_table_4",
+        "MSPD_Table_5": "v1/debt/mspd/mspd_table_5",
+        "Interest_Expense": "v2/accounting/od/interest_expense",
+        "Interest_Uninvested": "v2/accounting/od/interest_uninvested",
+        "Federal_Maturity_Rates": "v1/accounting/od/federal_maturity_rates",
+        "Receipts_by_Department": "v1/accounting/od/receipts_by_department",
+    }
 
-# Создаём DATASETS с префиксом vlad_
-DATASETS = {}
-for key, endpoint in RAW_DATASETS.items():
-    table_name = f"vlad_tr_{key.lower()}"
-    DATASETS[table_name] = endpoint
+    # Создаём DATASETS с префиксом vlad_
+    DATASETS = {}
+    for key, endpoint in RAW_DATASETS.items():
+        table_name = f"vlad_tr_{key.lower()}"
+        DATASETS[table_name] = endpoint
 
 PAGE_SIZE = 5000
 MAX_RETRIES = 3
