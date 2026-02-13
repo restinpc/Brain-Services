@@ -37,19 +37,25 @@ def send_error_trace(exc: Exception, script_name: str = "server.py"):
 
 load_dotenv()
 
-DB_USER = os.getenv("DB_USER", "vlad")
+# Чтение переменных из .env файла
+DB_HOST = os.getenv("DB_HOST", "")
+DB_PORT = os.getenv("DB_PORT", "")
+DB_USER = os.getenv("DB_USER", "")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "")
-DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_PORT = os.getenv("DB_PORT", "3307")
-DB_NAME = os.getenv("DB_NAME", "vlad")
-BRAIN_DB_NAME = "brain"
+DB_NAME = os.getenv("DB_NAME", "")
+MASTER_HOST = os.getenv("MASTER_HOST", "")
+MASTER_PORT = os.getenv("MASTER_PORT", "")
+MASTER_USER = os.getenv("MASTER_USER", "")
+MASTER_PASSWORD = os.getenv("MASTER_PASSWORD", "")
+MASTER_NAME = os.getenv("MASTER_NAME", "")
 
+# Используем MASTER_* для brain базы данных
 DATABASE_URL = f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
-BRAIN_DATABASE_URL = f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{BRAIN_DB_NAME}"
+BRAIN_DATABASE_URL = f"mysql+aiomysql://{MASTER_USER}:{MASTER_PASSWORD}@{MASTER_HOST}:{MASTER_PORT}/{MASTER_NAME}"
 
-print(f"  Host: {DB_HOST}:{DB_PORT}")
-print(f"  DB (vlad): {DB_NAME}")
-print(f"  DB (brain): {BRAIN_DB_NAME}")
+print(f"📊 Конфигурация подключения:")
+print(f"  Основная БД (vlad): {DB_USER}@{DB_HOST}:{DB_PORT}/{DB_NAME}")
+print(f"  Мастер БД (brain): {MASTER_USER}@{MASTER_HOST}:{MASTER_PORT}/{MASTER_NAME}")
 
 engine_vlad = create_async_engine(DATABASE_URL, pool_size=10, echo=False)
 engine_brain = create_async_engine(BRAIN_DATABASE_URL, pool_size=5, echo=False)
