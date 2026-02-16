@@ -2,7 +2,6 @@
 # -*- coding: utf-8 -*-
 """
 Парсер новостей Binance Square → MySQL
-Стиль: investing_cal.py (без ограничения на количество новостей)
 """
 import os
 import sys
@@ -11,6 +10,7 @@ import time
 import random
 import re
 import traceback
+import tempfile
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -18,8 +18,33 @@ import mysql.connector
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
+import os
+import tempfile
+
+# Создаем папку для временных файлов в домашней директории
+TEMP_DIR = os.path.join(os.path.expanduser("~"), ".playwright-tmp")
+os.makedirs(TEMP_DIR, exist_ok=True)
+
+# Перенаправляем все временные файлы туда
+os.environ["PLAYWRIGHT_TMPDIR"] = TEMP_DIR
+os.environ["TMPDIR"] = TEMP_DIR
+os.environ["TEMP"] = TEMP_DIR
+os.environ["TMP"] = TEMP_DIR
+tempfile.tempdir = TEMP_DIR
+
+print(f"Временная директория Playwright: {TEMP_DIR}")
 
 load_dotenv()
+
+# === РЕШЕНИЕ ПРОБЛЕМЫ С ВРЕМЕННОЙ ДИРЕКТОРИЕЙ ===
+# Создаем временную папку в домашней директории пользователя
+HOME_TEMP = os.path.join(os.path.expanduser("~"), ".playwright-tmp")
+os.makedirs(HOME_TEMP, exist_ok=True)
+os.environ["PLAYWRIGHT_BROWSERS_PATH"] = HOME_TEMP
+os.environ["PLAYWRIGHT_TMPDIR"] = HOME_TEMP
+
+# Также устанавливаем глобальную временную директорию Python
+tempfile.tempdir = HOME_TEMP
 
 # === Настройка временной директории ===
 # Создаем папку для временных файлов Playwright в текущей директории
