@@ -17,8 +17,14 @@ from dateutil import parser as date_parser
 import mysql.connector
 from mysql.connector import Error
 from dotenv import load_dotenv
+import tempfile
 
 load_dotenv()
+
+# Создаем рабочую директорию в домашней папке
+WORK_DIR = os.path.join(os.path.expanduser("~"), ".ecb_parser")
+os.makedirs(WORK_DIR, exist_ok=True)
+print(f"📁 Рабочая директория: {WORK_DIR}")
 
 TRACE_URL = "https://server.brain-project.online/trace.php"
 NODE_NAME = os.getenv("NODE_NAME", "ecb_parser")
@@ -41,10 +47,11 @@ def send_error_trace(exc: Exception):
 def download_and_read_zip_csv(url):
     """
     Скачивает ZIP-архив по URL, извлекает из него CSV-файл
-    и возвращает DataFrame.
+    и возвращает DataFrame. Сохраняет файл в рабочую директорию.
     """
-    local_zip = "eurofxref-hist.zip"
-    csv_filename_in_zip = "eurofxref-hist.csv"  # Предполагаемое имя файла внутри архива
+    # Сохраняем в рабочую директорию, а не в корень проекта
+    local_zip = os.path.join(WORK_DIR, "eurofxref-hist.zip")
+    csv_filename_in_zip = "eurofxref-hist.csv"
 
     try:
         # 1. Скачиваем ZIP-архив
@@ -52,7 +59,7 @@ def download_and_read_zip_csv(url):
         response = requests.get(url, timeout=15, stream=True)
         response.raise_for_status()
 
-        # Сохраняем ZIP на диск (чтобы иметь локальную копию)
+        # Сохраняем ZIP в рабочую директорию
         with open(local_zip, 'wb') as f:
             for chunk in response.iter_content(chunk_size=8192):
                 f.write(chunk)
@@ -71,6 +78,52 @@ def download_and_read_zip_csv(url):
                 print(f"   Найден CSV файл: {csv_filename_in_zip}")
 
             # Читаем CSV сразу в pandas из архива (без распаковки всех файлов)
+            with zf.open(csv_filename_in_zip) as csv_file:
+                df = pd.read_csv(csv_file)
+
+        # 3. Выводим информацию
+        num_rows = df.shape[0]
+        print(f"   ✅ CSV загружен, строк: {num_rows}")
+        print(f"   Последняя дата: {df['Date'].max()}")
+
+        if df['Date'].max() < '2026-01-01':
+            raise ValueError(f"Данные старые! Max дата {df['Date'].max()}")
+
+        return df
+
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Ошибка при скачивании: {e}")
+        raise
+    except zipfile.BadZipFile:
+        print("❌ Ошибка: скачанный файл не является ZIP архивом или повреждён.")
+        raise
+    except Exception as e:
+        print(f"❌ Произошла ошибка: {e}")
+        raise
+
+
+# Альтернативная версия без сохранения на диск (работает в памяти)
+def download_and_read_zip_csv_memory(url):
+    """
+    Скачивает ZIP-архив по URL и читает CSV напрямую из памяти
+    """
+    csv_filename_in_zip = "eurofxref-hist.csv"
+
+    try:
+        print(f"1. Скачиваю архив из: {url}")
+        response = requests.get(url, timeout=15)
+        response.raise_for_status()
+
+        # Читаем ZIP из памяти
+        print("2. Читаю ZIP архив из памяти...")
+        with zipfile.ZipFile(io.BytesIO(response.content)) as zf:
+            if csv_filename_in_zip not in zf.namelist():
+                csv_files = [f for f in zf.namelist() if f.endswith('.csv')]
+                if not csv_files:
+                    raise Exception("В архиве не найдено CSV файлов.")
+                csv_filename_in_zip = csv_files[0]
+                print(f"   Найден CSV файл: {csv_filename_in_zip}")
+
             with zf.open(csv_filename_in_zip) as csv_file:
                 df = pd.read_csv(csv_file)
 
@@ -175,8 +228,11 @@ class ECBParser:
     def run_rates(self):
         print("\n📊 Скачиваем полную историю курсов из eurofxref-hist.zip...")
         try:
-            # Используем функцию для скачивания и чтения ZIP
+            # Используем версию с сохранением в рабочую директорию
             df = download_and_read_zip_csv(ZIP_URL)
+
+            # Альтернативно можно использовать версию без сохранения на диск:
+            # df = download_and_read_zip_csv_memory(ZIP_URL)
 
             # Преобразуем DataFrame в длинный формат для БД
             print("\n3. Преобразую данные для загрузки в БД...")
@@ -251,9 +307,9 @@ class ECBParser:
 
             # Жёсткий фильтр: только настоящие RSS
             if not (
-                href.startswith("/rss/fxref-") or          # валюты
-                "/rss/" in href and href.endswith((".html", ".rss", ".xml")) or
-                href.endswith((".rss", ".xml"))
+                    href.startswith("/rss/fxref-") or  # валюты
+                    "/rss/" in href and href.endswith((".html", ".rss", ".xml")) or
+                    href.endswith((".rss", ".xml"))
             ):
                 continue
 
@@ -344,7 +400,8 @@ class ECBParser:
                                     full_text=VALUES(full_text),
                                     scraped_at=NOW()
                             """, (
-                            feed_url, guid, feed_type, entry.get('title'), link, published, desc[:50000], full_text))
+                                feed_url, guid, feed_type, entry.get('title'), link, published, desc[:50000],
+                                full_text))
 
                             if cursor.rowcount != 0:
                                 count_new += 1
