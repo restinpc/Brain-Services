@@ -19,9 +19,12 @@ from mysql.connector import Error
 from dotenv import load_dotenv
 import tempfile
 
+# Новая библиотека для PDF
+from pypdf import PdfReader
+
 load_dotenv()
 
-# Создаем рабочую директорию в домашней папке
+# Создаём рабочую директорию в домашней папке
 WORK_DIR = os.path.join(os.path.expanduser("~"), ".ecb_parser")
 os.makedirs(WORK_DIR, exist_ok=True)
 print(f"📁 Рабочая директория: {WORK_DIR}")
@@ -49,39 +52,31 @@ def download_and_read_zip_csv(url):
     Скачивает ZIP-архив по URL, извлекает из него CSV-файл
     и возвращает DataFrame. Сохраняет файл в рабочую директорию.
     """
-    # Сохраняем в рабочую директорию, а не в корень проекта
     local_zip = os.path.join(WORK_DIR, "eurofxref-hist.zip")
     csv_filename_in_zip = "eurofxref-hist.csv"
 
     try:
-        # 1. Скачиваем ZIP-архив
         print(f"1. Скачиваю архив из: {url}")
         response = requests.get(url, timeout=15, stream=True)
         response.raise_for_status()
 
-        # Сохраняем ZIP в рабочую директорию
         with open(local_zip, 'wb') as f:
             for chunk in response.iter_content(chunk_size=8192):
                 f.write(chunk)
         print(f"   Архив сохранён как: {local_zip}")
 
-        # 2. Распаковываем ZIP и читаем CSV
         print(f"2. Извлекаю '{csv_filename_in_zip}' из архива...")
         with zipfile.ZipFile(local_zip, 'r') as zf:
-            # Проверяем, есть ли нужный файл в архиве
             if csv_filename_in_zip not in zf.namelist():
-                # Если имя другое, берём первый CSV файл
                 csv_files = [f for f in zf.namelist() if f.endswith('.csv')]
                 if not csv_files:
                     raise Exception("В архиве не найдено CSV файлов.")
                 csv_filename_in_zip = csv_files[0]
                 print(f"   Найден CSV файл: {csv_filename_in_zip}")
 
-            # Читаем CSV сразу в pandas из архива (без распаковки всех файлов)
             with zf.open(csv_filename_in_zip) as csv_file:
                 df = pd.read_csv(csv_file)
 
-        # 3. Выводим информацию
         num_rows = df.shape[0]
         print(f"   ✅ CSV загружен, строк: {num_rows}")
         print(f"   Последняя дата: {df['Date'].max()}")
@@ -102,7 +97,6 @@ def download_and_read_zip_csv(url):
         raise
 
 
-# Альтернативная версия без сохранения на диск (работает в памяти)
 def download_and_read_zip_csv_memory(url):
     """
     Скачивает ZIP-архив по URL и читает CSV напрямую из памяти
@@ -114,7 +108,6 @@ def download_and_read_zip_csv_memory(url):
         response = requests.get(url, timeout=15)
         response.raise_for_status()
 
-        # Читаем ZIP из памяти
         print("2. Читаю ZIP архив из памяти...")
         with zipfile.ZipFile(io.BytesIO(response.content)) as zf:
             if csv_filename_in_zip not in zf.namelist():
@@ -127,7 +120,6 @@ def download_and_read_zip_csv_memory(url):
             with zf.open(csv_filename_in_zip) as csv_file:
                 df = pd.read_csv(csv_file)
 
-        # 3. Выводим информацию
         num_rows = df.shape[0]
         print(f"   ✅ CSV загружен, строк: {num_rows}")
         print(f"   Последняя дата: {df['Date'].max()}")
@@ -148,7 +140,37 @@ def download_and_read_zip_csv_memory(url):
         raise
 
 
-parser = argparse.ArgumentParser(description="ECB Parser: rates из ZIP/CSV + items с полным текстом")
+def extract_text_from_pdf(pdf_url):
+    """
+    Скачивает PDF по URL и извлекает текст с помощью pypdf.
+    Возвращает строку текста или None при ошибке.
+    """
+    try:
+        print(f"      → Скачиваем PDF: {pdf_url}")
+        response = requests.get(pdf_url, timeout=30)
+        response.raise_for_status()
+
+        reader = PdfReader(io.BytesIO(response.content))
+        text = ""
+
+        for page in reader.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text += page_text + "\n\n"
+
+        if not text.strip():
+            print("      → Текст не извлечён (возможно, PDF-скан или защита)")
+            return None
+
+        print(f"      → Извлечено ~{len(text):,} символов")
+        return text[:1000000]  # ограничим размер
+
+    except Exception as e:
+        print(f"      → Ошибка pypdf: {e}")
+        return None
+
+
+parser = argparse.ArgumentParser(description="ECB Parser: rates из ZIP/CSV + items с полным текстом (включая PDF)")
 parser.add_argument("table_name", help="Префикс таблиц (vlad, vlad_ecb_rates, vlad_ecb_items и т.д.)")
 parser.add_argument("host", nargs="?", default=os.getenv("DB_HOST"))
 parser.add_argument("port", nargs="?", default=os.getenv("DB_PORT", "3306"))
@@ -228,26 +250,18 @@ class ECBParser:
     def run_rates(self):
         print("\n📊 Скачиваем полную историю курсов из eurofxref-hist.zip...")
         try:
-            # Используем версию с сохранением в рабочую директорию
             df = download_and_read_zip_csv(ZIP_URL)
 
-            # Альтернативно можно использовать версию без сохранения на диск:
-            # df = download_and_read_zip_csv_memory(ZIP_URL)
-
-            # Преобразуем DataFrame в длинный формат для БД
             print("\n3. Преобразую данные для загрузки в БД...")
             df_melted = df.melt(id_vars=['Date'], var_name='currency', value_name='rate')
             df_melted['rate_date'] = pd.to_datetime(df_melted['Date'])
             df_melted = df_melted.drop('Date', axis=1)
-
-            # Убираем строки с пустыми значениями
             df_melted = df_melted.dropna(subset=['rate'])
 
             print(f"   Всего записей для загрузки: {len(df_melted):,}")
             print(f"   Диапазон дат: {df_melted['rate_date'].min()} → {df_melted['rate_date'].max()}")
             print(f"   Уникальных валют: {df_melted['currency'].nunique()}")
 
-            # Загружаем в БД батчами
             print("\n4. Загружаю данные в БД...")
             batch_size = 10000
             total_inserted = 0
@@ -258,14 +272,11 @@ class ECBParser:
 
                 for i in range(0, len(df_melted), batch_size):
                     batch = df_melted.iloc[i:i + batch_size]
-
-                    # Подготавливаем данные для вставки
                     values = [
                         (row['currency'], row['rate_date'].strftime('%Y-%m-%d'), float(row['rate']))
                         for _, row in batch.iterrows()
                     ]
 
-                    # Вставка с обновлением при дубликате
                     cursor.executemany(f"""
                         INSERT INTO `{self.rates_table}` (currency, rate_date, rate)
                         VALUES (%s, %s, %s)
@@ -275,7 +286,6 @@ class ECBParser:
                     """, values)
 
                     conn.commit()
-                    batch_inserted = cursor.rowcount
                     total_inserted += len(batch)
                     print(f"      Загружено {total_inserted:,} / {len(df_melted):,} записей...")
 
@@ -293,7 +303,6 @@ class ECBParser:
         soup = BeautifulSoup(resp.text, "html.parser")
         feeds = []
 
-        # Игнорируем языковые страницы и не-RSS ссылки
         language_titles = {
             "Български", "Čeština", "Dansk", "Deutsch", "Eλληνικά", "English", "Español",
             "Eesti keel", "Suomi", "Français", "Gaeilge", "Hrvatski", "Magyar", "Italiano",
@@ -305,15 +314,13 @@ class ECBParser:
             href = a["href"].strip()
             title = a.get_text(strip=True) or "ECB Feed"
 
-            # Жёсткий фильтр: только настоящие RSS
             if not (
-                    href.startswith("/rss/fxref-") or  # валюты
+                    href.startswith("/rss/fxref-") or
                     "/rss/" in href and href.endswith((".html", ".rss", ".xml")) or
                     href.endswith((".rss", ".xml"))
             ):
                 continue
 
-            # Пропускаем языковые и мусор
             if re.match(r'^/rss\.[a-z]{2,3}\.html?$', href) or title in language_titles:
                 continue
 
@@ -321,14 +328,11 @@ class ECBParser:
                 continue
 
             full_url = urljoin("https://www.ecb.europa.eu", href)
-
-            # Дополнительно: проверяем, что это действительно RSS (опционально, но полезно)
-            # Можно добавить HEAD-запрос, но для скорости оставим так
             feeds.append((full_url, title))
 
         feeds = list(dict.fromkeys(feeds))
         print(f" Найдено {len(feeds)} реальных RSS-фидов")
-        for url, t in feeds[:10]:  # покажем первые 10 для отладки
+        for url, t in feeds[:10]:
             print(f"   - {t}: {url}")
         return feeds
 
@@ -371,23 +375,33 @@ class ECBParser:
                             full_text = None
 
                             if link:
-                                try:
-                                    html_r = self.session.get(link, timeout=30)
-                                    html_r.raise_for_status()
-                                    soup = BeautifulSoup(html_r.text, 'html.parser')
+                                # Если ссылка ведёт на PDF — используем pypdf
+                                if link.lower().endswith('.pdf'):
+                                    print(f"      → PDF-файл: {link}")
+                                    full_text = extract_text_from_pdf(link)
+                                else:
+                                    # Обычная HTML-страница
+                                    try:
+                                        html_r = self.session.get(link, timeout=30)
+                                        html_r.raise_for_status()
+                                        soup = BeautifulSoup(html_r.text, 'html.parser')
 
-                                    for tag in soup(['header', 'footer', 'nav', 'aside', 'script', 'style', 'form']):
-                                        tag.decompose()
+                                        for tag in soup(['header', 'footer', 'nav', 'aside', 'script', 'style', 'form']):
+                                            tag.decompose()
 
-                                    content = soup.find('main') or soup.find('article') or \
-                                              soup.find('div', class_=['content', 'article', 'rte', 'ecb-article'])
-                                    if content:
-                                        full_text = content.get_text(separator='\n', strip=True)
-                                    else:
-                                        full_text = soup.get_text(separator='\n', strip=True)[:200000]
+                                        content = soup.find('main') or soup.find('article') or \
+                                                  soup.find('div', class_=['content', 'article', 'rte', 'ecb-article'])
+                                        if content:
+                                            full_text = content.get_text(separator='\n', strip=True)
+                                        else:
+                                            full_text = soup.get_text(separator='\n', strip=True)[:200000]
 
-                                except Exception as e:
-                                    print(f"        Не удалось спарсить статью {link}: {e}")
+                                    except Exception as e:
+                                        print(f"        Не удалось спарсить статью {link}: {e}")
+
+                            # Если полный текст не получен, используем описание
+                            if not full_text:
+                                full_text = desc
 
                             cursor.execute(f"""
                                 INSERT INTO `{self.items_table}` 
@@ -401,7 +415,8 @@ class ECBParser:
                                     scraped_at=NOW()
                             """, (
                                 feed_url, guid, feed_type, entry.get('title'), link, published, desc[:50000],
-                                full_text))
+                                full_text
+                            ))
 
                             if cursor.rowcount != 0:
                                 count_new += 1
