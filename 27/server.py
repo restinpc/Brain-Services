@@ -516,7 +516,7 @@ async def get_values(
 
 @app.post("/patch")
 async def patch_service():
-    service_id = 27
+    service_id = 28
     async with engine_vlad.begin() as conn:
         res = await conn.execute(
             text("SELECT version FROM version_microservice WHERE microservice_id = :id"),
