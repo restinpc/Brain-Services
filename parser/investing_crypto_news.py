@@ -158,7 +158,7 @@ async def parse_and_save_incrementally(table_name, max_pages=None):
         page_num = 1
         max_limit = max_pages if max_pages else MAX_PAGES
         consecutive_failures = 0  # Счётчик последовательных неудач
-        MAX_CONSECUTIVE_FAILURES = 10  # Остановка после 10 неудач подряд
+        MAX_CONSECUTIVE_FAILURES = 100  # Остановка после 10 неудач подряд
 
         while page_num <= max_limit and consecutive_failures < MAX_CONSECUTIVE_FAILURES:
             try:
