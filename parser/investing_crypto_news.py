@@ -212,7 +212,6 @@ async def parse_and_save_incrementally(table_name, max_pages=None):
 
                 print(f"   ✓ Найдено новостей: {count}")
 
-                # Парсим новости
                 news_items = await page.locator(selector).all()
                 page_news = []
 
@@ -228,19 +227,35 @@ async def parse_and_save_incrementally(table_name, max_pages=None):
                             title = await title_elem.inner_text()
                             href = await title_elem.get_attribute('href')
                         except:
-                            # Пробуем по href
+
                             try:
                                 link_elem = item.locator('a[href*="/article-"]').first
                                 title = await link_elem.inner_text()
                                 href = await link_elem.get_attribute('href')
                             except:
-                                # Любая ссылка
+
                                 try:
                                     link_elem = item.locator('a').first
                                     title = await link_elem.inner_text()
                                     href = await link_elem.get_attribute('href')
                                 except:
                                     continue
+
+                        if title:
+                            title = title.strip()
+                        if href:
+                            href = href.strip()
+
+                        # Проверяем что не пустые после очистки
+                        if not title or not href:
+                            continue
+
+                        if len(title) < 10:
+                            continue
+
+                        # Полный URL
+                        if not href.startswith('http'):
+                            href = f"https://ru.investing.com{href}"
 
                         title = title.strip()
                         if len(title) < 10:
