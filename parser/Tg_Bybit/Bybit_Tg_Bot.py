@@ -226,7 +226,7 @@ def parse_args():
 
 
 async def main_async(args):
-    db_url = f"mysql+mysqlconnector://{args.user}:{args.password}@{args.host}:{args.port}/{args.database}"
+    db_url = f"mysql+mysqlconnector://{args.user}:{args.password}@{args.host}:{args.port}/{args.database}?auth_plugin=mysql_native_password"
     engine = create_engine(db_url, pool_recycle=3600)
 
     ensure_table_exists(engine, args.table_name)
