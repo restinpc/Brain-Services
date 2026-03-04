@@ -26,7 +26,7 @@ POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", 3600))
 RESPONSE_TIMEOUT = int(os.getenv("RESPONSE_TIMEOUT", 30))
 MAX_WAIT = int(os.getenv("MAX_WAIT", 120))
 
-SESSION_FILE = os.getenv("SESSION_FILE", "test_session")
+SESSION_FILE = os.getenv("SESSION_FILE", "/brain/Brain-Services/parser/Tg_Bybit/test_session")
 
 TRACE_URL = os.getenv("TRACE_URL", "https://server.brain-project.online/trace.php")
 NODE_NAME = os.getenv("NODE_NAME", "bybit_trend_bot")
