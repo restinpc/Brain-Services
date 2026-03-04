@@ -193,8 +193,7 @@ def make_weight_code(event_id: int, currency: str, importance: str,
     fcd_c = FORECAST_MAP.get(fcd, "X")
     scd_c = SURPRISE_MAP.get(scd, "X")
     rcd_c = REVISION_MAP.get(rcd, "X")
-    # Убираем префикс E{event_id} и оставляем только валюту
-    base  = f"{currency}_{imp_c}_{fcd_c}_{scd_c}_{rcd_c}_{mode}"
+    base  = f"E{event_id}_{currency}_{imp_c}_{fcd_c}_{scd_c}_{rcd_c}_{mode}"
     return base if hour_shift is None else f"{base}_{hour_shift}"
 
 
@@ -536,7 +535,7 @@ async def get_metadata():
         try:
             res = await conn.execute(text(
                 "SELECT version FROM version_microservice "
-                "WHERE microservice_id = 33"))
+                "WHERE microservice_id = 32"))
             row = res.fetchone()
             version = row[0] if row else 0
         except Exception as e:
@@ -602,7 +601,7 @@ async def get_values(
 
 @app.post("/patch")
 async def patch_service():
-    service_id = 32
+    service_id = 33
     async with engine_vlad.begin() as conn:
         res = await conn.execute(text(
             "SELECT version FROM version_microservice "
@@ -629,7 +628,7 @@ async def patch_service():
 if __name__ == "__main__":
     try:
         uvicorn.run("server:app",
-                    host="0.0.0.0", port=8896,
+                    host="0.0.0.0", port=8895,
                     reload=False, workers=1)
     except KeyboardInterrupt:
         print("\n🛑 Сервер остановлен")
