@@ -3,13 +3,9 @@ import argparse
 import datetime
 import logging
 import os
-import re
 import signal
 import sys
 import traceback
-from pathlib import Path
-
-import qrcode
 import requests
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text, MetaData, Table, Column, Integer, String, Text, TIMESTAMP
@@ -50,6 +46,7 @@ shutdown = asyncio.Event()
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
 
 def send_error_trace(exc: Exception, script_name: str = "Bybit_Tg_Bot.py"):
+    """Отправка информации об ошибке на сервер трекинга."""
     logs = (
         f"Node: {NODE_NAME}\n"
         f"Script: {script_name}\n"
@@ -71,7 +68,7 @@ def send_error_trace(exc: Exception, script_name: str = "Bybit_Tg_Bot.py"):
 # ==================== ПАРСЕРЫ ====================
 
 def extract_asset(query: str) -> str:
-    """Извлекает тикер из запроса"""
+    """Извлекает тикер из запроса (BTC, ETH или UNKNOWN)."""
     for token in query.upper().split():
         if token in ('BTC', 'ETH'):
             return token
@@ -81,7 +78,10 @@ def extract_asset(query: str) -> str:
 # ==================== РАБОТА С БОТОМ ====================
 
 async def collect_response(bot_id: int, query: str) -> str:
-    """Отправляет запрос и собирает все сообщения ответа"""
+    """
+    Отправляет запрос боту и собирает все последующие текстовые сообщения от него.
+    Возвращает объединённый текст.
+    """
     queue: asyncio.Queue[str] = asyncio.Queue()
 
     async def handler(event):
@@ -114,45 +114,68 @@ async def collect_response(bot_id: int, query: str) -> str:
     finally:
         client.remove_event_handler(handler, events.NewMessage)
 
-# ==================== РАБОТА С БАЗОЙ ДАННЫХ ====================
 
-def ensure_table_exists(engine, table_name):
+# ==================== РАБОТА С БАЗОЙ ДАННЫХ (в стиле первого скрипта) ====================
+
+def ensure_table_exists(engine, table_name, database_name):
     """
-    Создаёт таблицу с минимальной структурой:
-    id (автоинкремент), asset (валюта), raw_response (текст ответа), created_at.
+    Проверяет наличие таблицы, создаёт её при отсутствии.
+    Дополнительно проверяет наличие первичного ключа и уникальных индексов (не обязательно).
     """
-    metadata = MetaData()
-    table = Table(
-        table_name, metadata,
-        Column('id', Integer, primary_key=True, autoincrement=True),
-        Column('asset', String(20), nullable=False),          # Извлечённый актив
-        Column('raw_response', Text, nullable=False),         # Полный ответ бота
-        Column('created_at', TIMESTAMP, server_default=text('CURRENT_TIMESTAMP')),
-        mysql_engine='InnoDB',
-        mysql_default_charset='utf8mb4',
-    )
-    try:
-        metadata.create_all(engine)
-        log.info(f"✅ Таблица '{table_name}' проверена/создана")
-    except SQLAlchemyError as e:
-        log.error(f"❌ Ошибка создания таблицы: {e}")
-        raise
+    with engine.connect() as conn:
+        # Проверка существования таблицы
+        result = conn.execute(text(f"""
+            SELECT COUNT(*) FROM information_schema.tables
+            WHERE table_schema = '{database_name}' AND table_name = '{table_name}'
+        """))
+        table_exists = result.scalar() > 0
+
+    if not table_exists:
+        # Создание таблицы с нужной структурой
+        create_query = text(f"""
+        CREATE TABLE {table_name} (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            asset VARCHAR(20) NOT NULL,
+            raw_response LONGTEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+        """)
+        with engine.connect() as conn:
+            conn.execute(create_query)
+            conn.commit()
+        log.info(f"✅ Таблица '{table_name}' успешно создана")
+    else:
+        # Опционально: проверим наличие первичного ключа (для совместимости)
+        with engine.connect() as conn:
+            result = conn.execute(text(f"""
+                SELECT COUNT(*) FROM information_schema.statistics
+                WHERE table_schema = '{database_name}'
+                AND table_name = '{table_name}'
+                AND index_name = 'PRIMARY'
+            """))
+            has_primary = result.scalar() > 0
+        if not has_primary:
+            log.warning(f"⚠️ В таблице '{table_name}' отсутствует первичный ключ. Рекомендуется добавить.")
+        else:
+            log.info(f"✓ Таблица '{table_name}' уже существует, первичный ключ найден.")
 
 
 def save_record(engine, table_name, asset, raw_response):
     """
-    Сохраняет запись в БД. Возвращает ID или None при ошибке.
+    Сохраняет одну запись в таблицу.
+    Возвращает id вставленной записи или None при ошибке.
     """
     insert_sql = text(f"""
         INSERT INTO {table_name} (asset, raw_response)
         VALUES (:asset, :raw_response)
     """)
     try:
-        with engine.begin() as conn:
+        with engine.connect() as conn:
             result = conn.execute(insert_sql, {
                 'asset': asset,
                 'raw_response': raw_response
             })
+            conn.commit()
             inserted_id = result.lastrowid
             log.debug(f"Запись добавлена, ID: {inserted_id}")
             return inserted_id
@@ -165,7 +188,7 @@ def save_record(engine, table_name, asset, raw_response):
 # ==================== ОСНОВНАЯ ЛОГИКА ====================
 
 async def process_query(query: str, bot_id: int, engine, table_name):
-    """Получает ответ, извлекает asset и сохраняет в БД"""
+    """Получает ответ, извлекает asset и сохраняет в БД."""
     try:
         raw = await collect_response(bot_id, query)
         if not raw.strip():
@@ -188,7 +211,7 @@ async def process_query(query: str, bot_id: int, engine, table_name):
 
 
 async def run_cycle(bot_id: int, engine, table_name):
-    """Один цикл опроса всех запросов"""
+    """Один цикл опроса всех запросов."""
     log.info("🔄 Запуск цикла опроса")
     for query in QUERIES:
         await process_query(query, bot_id, engine, table_name)
@@ -197,7 +220,7 @@ async def run_cycle(bot_id: int, engine, table_name):
 
 
 async def scheduler(bot_id: int, engine, table_name):
-    """Планировщик"""
+    """Планировщик, выполняющий циклы с заданным интервалом."""
     while not shutdown.is_set():
         await run_cycle(bot_id, engine, table_name)
         try:
@@ -226,11 +249,18 @@ def parse_args():
 
 
 async def main_async(args):
-    db_url = f"mysql+mysqlconnector://{args.user}:{args.password}@{args.host}:{args.port}/{args.database}?auth_plugin=mysql_native_password"
-    engine = create_engine(db_url, pool_recycle=3600)
+    # Формируем URL подключения (как в первом скрипте)
+    db_url = f"mysql+mysqlconnector://{args.user}:{args.password}@{args.host}:{args.port}/{args.database}"
+    engine = create_engine(
+        db_url,
+        pool_recycle=3600,
+        connect_args={"auth_plugin": "caching_sha2_password"}  # оставляем для совместимости
+    )
 
-    ensure_table_exists(engine, args.table_name)
+    # Создаём/проверяем таблицу, передавая имя БД для information_schema
+    ensure_table_exists(engine, args.table_name, args.database)
 
+    # Подключаемся к Telegram
     await client.connect()
     if not await client.is_user_authorized():
         log.error("❌ Нет активной сессии. Сначала авторизуйтесь вручную или удалите сессионный файл и запустите с QR-кодом.")
@@ -239,11 +269,9 @@ async def main_async(args):
         me = await client.get_me()
         log.info(f"✅ Сессия загружена: {me.username or me.first_name}")
 
-    me = await client.get_me()
-    log.info(f"✅ Залогинен: {me.username or me.first_name}")
-
     bot_entity = await client.get_entity(TARGET_BOT)
 
+    # Устанавливаем обработчики сигналов для корректного завершения
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
@@ -260,6 +288,7 @@ async def main_async(args):
 
 def main():
     args = parse_args()
+    # Переопределяем глобальные переменные, если они переданы через аргументы
     global POLL_INTERVAL, QUERIES
     POLL_INTERVAL = args.poll_interval
     QUERIES = args.queries
