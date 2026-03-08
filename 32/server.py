@@ -422,7 +422,7 @@ async def get_new_weights(code: str = Query(...)):
 
 if __name__ == "__main__":
     try:
-        uvicorn.run("server:app", host="0.0.0.0", port=8895, reload=False, workers=1)
+        uvicorn.run("server:app", host="0.0.0.0", port=8895, reload=False, workers=32)
     except KeyboardInterrupt:
         print("\n🛑 Сервер остановлен пользователем")
     except SystemExit:
