@@ -659,7 +659,7 @@ if __name__ == "__main__":
     try:
         uvicorn.run("server:app",
                     host="0.0.0.0", port=8894,
-                    reload=False, workers=1)
+                    reload=False, workers=16)
     except KeyboardInterrupt:
         print("\n🛑 Сервер остановлен")
     except SystemExit:
