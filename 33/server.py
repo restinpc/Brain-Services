@@ -4,6 +4,7 @@ import asyncio
 import bisect
 import traceback
 import requests
+from pprint import pprint
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from fastapi import FastAPI, HTTPException, Query
@@ -533,6 +534,9 @@ async def calculate_pure_memory(pair: int, day: int, date_str: str,
             if d + delta_unit * shift <= target_date
         ]
         shift_arg = shift if is_recurring else None
+
+        # Валидация дат
+        pprint(t_dates)
 
         # mode=0: T1
         if calc_type in (0, 1):
