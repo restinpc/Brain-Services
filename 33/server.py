@@ -536,7 +536,7 @@ async def calculate_pure_memory(pair: int, day: int, date_str: str,
         shift_arg = shift if is_recurring else None
 
         # Валидация дат
-        pprint(t_dates)
+        # pprint(t_dates)
 
         # mode=0: T1
         if calc_type in (0, 1):
