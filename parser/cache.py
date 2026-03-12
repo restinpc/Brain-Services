@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy import text
 load_dotenv()
 
-# ── ID модели (задаётся здесь) ─────────────────────────────────────────────────
+# ── ID модели ──────────────────────────────────────────────────────────────────
 MODEL_ID = 33
 
 # ── Логирование ────────────────────────────────────────────────────────────────
@@ -327,9 +327,6 @@ async def fetch_candles(engine_brain, pair: int, day: int,
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Шаг 1: Заполнение кеша
-#
-#  Идемпотентность: SELECT всех уже закешированных дат одним запросом в начале,
-#  затем INSERT IGNORE — защита от двойной записи при параллельных вызовах.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def fill_cache(engine_vlad, candles: list[dict],
@@ -343,7 +340,6 @@ async def fill_cache(engine_vlad, candles: list[dict],
     total  = len(candles)
     done   = errors = skipped = 0
 
-    # ── Идемпотентность: загружаем уже закешированные даты одним SELECT ────────
     async with engine_vlad.connect() as conn:
         res = await conn.execute(text("""
             SELECT date_val FROM vlad_values_cache
@@ -356,8 +352,6 @@ async def fill_cache(engine_vlad, candles: list[dict],
 
     async with aiohttp.ClientSession() as session:
         for candle in candles:
-
-            # ── Проверка таймаута ──────────────────────────────────────────────
             if deadline.exceeded():
                 log.warning(f"\n  ⏰ Таймаут! Осталось обработать "
                             f"{total - done} свечей этой комбинации")
@@ -365,7 +359,6 @@ async def fill_cache(engine_vlad, candles: list[dict],
 
             date_val = candle["date"]
 
-            # ── Идемпотентность: уже есть — пропускаем ────────────────────────
             if date_val in cached_dates:
                 done += 1
                 _print_progress(done, total, "cache", errors, skipped)
@@ -382,7 +375,6 @@ async def fill_cache(engine_vlad, candles: list[dict],
                 _print_progress(done, total, "cache", errors, skipped)
                 continue
 
-            # ── INSERT IGNORE — защита от двойной записи при параллельных ─────
             try:
                 async with engine_vlad.begin() as conn:
                     await conn.execute(text("""
@@ -397,7 +389,7 @@ async def fill_cache(engine_vlad, candles: list[dict],
                         "rj":   json.dumps(result,       ensure_ascii=False),
                     })
             except Exception:
-                pass  # UNIQUE-конфликт при параллельном запуске — игнорируем
+                pass
 
             done += 1
             _print_progress(done, total, "cache", errors, skipped)
@@ -408,10 +400,6 @@ async def fill_cache(engine_vlad, candles: list[dict],
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Шаг 2: Бэктест (читает из кеша — без HTTP)
-#
-#  Идемпотентность: проверяет наличие готового результата через SELECT,
-#  если уже есть — пропускает расчёт. INSERT ... ON DUPLICATE KEY UPDATE
-#  защищает от двойной записи.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def run_backtest(engine_vlad, candles: list[dict],
@@ -424,7 +412,6 @@ async def run_backtest(engine_vlad, candles: list[dict],
 
     p_hash = _params_hash(extra_params)
 
-    # ── Идемпотентность: уже посчитано? ───────────────────────────────────────
     async with engine_vlad.connect() as conn:
         existing = (await conn.execute(text("""
             SELECT value_score, accuracy, trade_count FROM vlad_backtest_results
@@ -445,11 +432,9 @@ async def run_backtest(engine_vlad, candles: list[dict],
             "skipped":     True,
         }
 
-    # ── Таймаут ────────────────────────────────────────────────────────────────
     if deadline.exceeded():
         return {"error": "timeout"}
 
-    # ── Загружаем кеш одним запросом ──────────────────────────────────────────
     async with engine_vlad.connect() as conn:
         res = await conn.execute(text("""
             SELECT date_val, result_json FROM vlad_values_cache
@@ -515,7 +500,6 @@ async def run_backtest(engine_vlad, candles: list[dict],
         "params_hash":   p_hash,
     }
 
-    # ── INSERT IGNORE / ON DUPLICATE KEY UPDATE ────────────────────────────────
     try:
         async with engine_vlad.begin() as conn:
             await conn.execute(text("""
@@ -623,16 +607,21 @@ async def upsert_summary(engine_vlad, service_url: str, model_id: int,
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def run(args) -> None:
-    # ── Таймер ─────────────────────────────────────────────────────────────────
     deadline = Deadline(hours=args.timeout_hours)
     log.info(f"⏰ Таймаут: {args.timeout_hours}h  "
              f"(дедлайн: {deadline.deadline.strftime('%Y-%m-%d %H:%M:%S')})")
 
-    # ── Подключения ────────────────────────────────────────────────────────────
     vlad_url = (
         f"mysql+aiomysql://{args.user}:{args.password}"
         f"@{args.host}:{args.port}/{args.database}"
     )
+
+    super_host     = os.getenv("SUPER_HOST",     args.host)
+    super_port     = os.getenv("SUPER_PORT",     str(args.port))
+    super_user     = os.getenv("SUPER_USER",     args.user)
+    super_password = os.getenv("SUPER_PASSWORD", args.password)
+    super_name     = os.getenv("SUPER_NAME",     "brain")
+
     brain_host     = os.getenv("MASTER_HOST",     args.host)
     brain_port     = os.getenv("MASTER_PORT",     str(args.port))
     brain_user     = os.getenv("MASTER_USER",     args.user)
@@ -643,25 +632,26 @@ async def run(args) -> None:
         f"mysql+aiomysql://{brain_user}:{brain_password}"
         f"@{brain_host}:{brain_port}/{brain_name}"
     )
-    brain_sync_url = (
-        f"mysql+mysqlconnector://{brain_user}:{brain_password}"
-        f"@{brain_host}:{brain_port}/{brain_name}"
+    super_sync_url = (
+        f"mysql+mysqlconnector://{super_user}:{super_password}"
+        f"@{super_host}:{super_port}/{super_name}"
     )
 
     log.info("=" * 60)
-    log.info(f"🚀 model_id={args.model_id}")
+    log.info(f"🚀 model_id={MODEL_ID}")
     log.info(f"   vlad  DB : {args.user}@{args.host}:{args.port}/{args.database}")
     log.info(f"   brain DB : {brain_user}@{brain_host}:{brain_port}/{brain_name}")
+    log.info(f"   super DB : {super_user}@{super_host}:{super_port}/{super_name}")
     log.info("=" * 60)
 
-    # ── Синхронно: URL + параметры модели ─────────────────────────────────────
+    # ── Синхронно: URL + параметры модели через супер-ноду ────────────────────
     try:
         sync_engine  = create_engine(
-            brain_sync_url, pool_recycle=3600,
+            super_sync_url, pool_recycle=3600,
             connect_args={"auth_plugin": "caching_sha2_password"},
         )
-        service_url  = get_service_url(sync_engine, args.model_id)
-        param_combos = discover_param_combos(sync_engine, args.model_id)
+        service_url  = get_service_url(sync_engine, MODEL_ID)
+        param_combos = discover_param_combos(sync_engine, MODEL_ID)
         sync_engine.dispose()
     except Exception as e:
         log.critical(f"❌ Не удалось получить конфигурацию модели: {e}")
@@ -671,19 +661,16 @@ async def run(args) -> None:
     engine_vlad  = create_async_engine(vlad_url,  pool_size=10, echo=False)
     engine_brain = create_async_engine(brain_url, pool_size=6,  echo=False)
 
-    # Счётчики для итогового отчёта
     stats_cache    = {"new": 0, "skipped": 0, "errors": 0}
     stats_backtest = {"done": 0, "skipped": 0, "failed": 0}
     timed_out      = False
 
     try:
-        # Создаём таблицы
         async with engine_vlad.begin() as conn:
             for ddl in (DDL_CACHE, DDL_BACKTEST, DDL_SUMMARY):
                 await conn.execute(text(ddl))
         log.info("✅ Таблицы проверены/созданы")
 
-        # Диапазон дат
         date_from = _parse_dt(args.date_from) if args.date_from else datetime(2025, 1, 15)
         date_to   = (_parse_dt(args.date_to) if args.date_to
                      else datetime.now().replace(hour=0, minute=0, second=0, microsecond=0))
@@ -694,7 +681,6 @@ async def run(args) -> None:
         log.info(f"  Дни       : {args.days}")
         log.info(f"  Тиры      : {args.tiers}")
 
-        # ── Основной цикл ──────────────────────────────────────────────────────
         for pair in args.pairs:
             for day in args.days:
 
@@ -742,9 +728,8 @@ async def run(args) -> None:
                         )
 
                     if not timed_out:
-                        # ── Трассировка: кеш завершён ─────────────────────────
                         send_trace(
-                            f"✅ Кеш завершён — pair={pair} day={day} model={args.model_id}",
+                            f"✅ Кеш завершён — pair={pair} day={day} model={MODEL_ID}",
                             f"pair={PAIR_NAMES.get(pair)}  day={DAY_NAMES.get(day)}\n"
                             f"new={stats_cache['new']}  "
                             f"skipped={stats_cache['skipped']}  "
@@ -781,7 +766,7 @@ async def run(args) -> None:
                             engine_vlad, candles,
                             service_url, pair, day, tier,
                             combo, date_from, date_to,
-                            args.model_id, deadline,
+                            MODEL_ID, deadline,
                         )
 
                         if r.get("skipped"):
@@ -806,9 +791,8 @@ async def run(args) -> None:
                                 f"trades={r['trade_count']}"
                             )
 
-                    # Обновляем summary после каждого тира
                     await upsert_summary(
-                        engine_vlad, service_url, args.model_id,
+                        engine_vlad, service_url, MODEL_ID,
                         pair, day, tier, date_from, date_to,
                     )
 
@@ -830,11 +814,10 @@ async def run(args) -> None:
                         )
 
                     if not timed_out:
-                        # ── Трассировка: бэктест завершён ─────────────────────
                         best_score = max((r["value_score"] for r in results), default=0)
                         send_trace(
                             f"✅ Бэктест завершён — pair={pair} day={day} "
-                            f"tier={tier} model={args.model_id}",
+                            f"tier={tier} model={MODEL_ID}",
                             f"pair={PAIR_NAMES.get(pair)}  "
                             f"day={DAY_NAMES.get(day)}  tier={tier}\n"
                             f"done={len(results)}  "
@@ -848,7 +831,6 @@ async def run(args) -> None:
             if timed_out:
                 break
 
-        # ── Финальный отчёт ────────────────────────────────────────────────────
         elapsed = deadline.elapsed_str()
 
         if timed_out:
@@ -864,10 +846,7 @@ async def run(args) -> None:
                 f"Запусти повторно — скрипт продолжит с места остановки."
             )
             log.warning(f"\n{msg}")
-            send_trace(
-                f"⏰ Таймаут — model={args.model_id}",
-                msg, is_error=False,
-            )
+            send_trace(f"⏰ Таймаут — model={MODEL_ID}", msg, is_error=False)
         else:
             msg = (
                 f"✅ Расчёт завершён полностью.\n"
@@ -882,10 +861,7 @@ async def run(args) -> None:
             log.info(f"\n{'='*55}")
             log.info(msg)
             log.info("=" * 55)
-            send_trace(
-                f"✅ Готово — model={args.model_id}",
-                msg,
-            )
+            send_trace(f"✅ Готово — model={MODEL_ID}", msg)
 
     except Exception as e:
         log.critical(f"❌ Критическая ошибка: {e!r}")
@@ -906,12 +882,12 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Примеры:
-  python cache.py vlad_data_bot localhost 3307 vlad pass vlad 33
-  python cache.py vlad_data_bot localhost 3307 vlad pass vlad 33 --date-from 2025-01-15 --date-to 2026-03-12
-  python cache.py vlad_data_bot localhost 3307 vlad pass vlad 25 --pair 1 --day 0
-  python cache.py vlad_data_bot localhost 3307 vlad pass vlad 33 --skip-fill
-  python cache.py vlad_data_bot localhost 3307 vlad pass vlad 33 --only-fill
-  python cache.py vlad_data_bot localhost 3307 vlad pass vlad 33 --timeout-hours 12
+  python cache.py vlad_data_bot localhost 3307 vlad pass vlad
+  python cache.py vlad_data_bot localhost 3307 vlad pass vlad --date-from 2025-01-15 --date-to 2026-03-12
+  python cache.py vlad_data_bot localhost 3307 vlad pass vlad --pair 1 --day 0
+  python cache.py vlad_data_bot localhost 3307 vlad pass vlad --skip-fill
+  python cache.py vlad_data_bot localhost 3307 vlad pass vlad --only-fill
+  python cache.py vlad_data_bot localhost 3307 vlad pass vlad --timeout-hours 12
         """,
     )
 
@@ -947,7 +923,6 @@ def parse_args():
 
 def main():
     args = parse_args()
-    args.model_id = MODEL_ID
 
     log.info("=" * 60)
     log.info("⚙️  Параметры запуска")

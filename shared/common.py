@@ -48,8 +48,8 @@ def log(msg: str, node: str = "", level: str = "info", force: bool = False) -> N
 
 # ── Стандартные ответы ────────────────────────────────────────────────────────
 def ok_response(payload: dict | list) -> dict:
-    """{"status": "ok", "payload": payload}"""
-    return {"status": "ok", "payload": payload}
+    """{"status": "ok", "payLoad": payload}"""
+    return {"status": "ok", "payLoad": payload}
 
 
 def err_response(
@@ -59,7 +59,7 @@ def err_response(
     script: str = "server.py",
 ) -> dict:
     """
-    {"status": "error", "error": message, "payload": {}}
+    {"status": "error", "error": message, "payLoad": {}}
 
     Если передан exc — отправляет трассировку и перебрасывает исключение,
     чтобы FastAPI вернул 500.
@@ -67,7 +67,7 @@ def err_response(
     if exc is not None:
         send_error_trace(exc, node=node, script=script)
         raise exc
-    return {"status": "error", "error": message, "payload": {}}
+    return {"status": "error", "error": message, "payLoad": {}}
 
 
 # ── Engine builder ────────────────────────────────────────────────────────────

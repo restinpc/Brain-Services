@@ -291,7 +291,7 @@ async def get_metadata():
 @app.get("/weights")
 async def get_weights():
     try:
-        return ok_response({"weights": GLOBAL_WEIGHT_CODES})
+        return ok_response(GLOBAL_WEIGHT_CODES)
     except Exception as e:
         return err_response(str(e), exc=e, node=NODE_NAME, script="get_weights")
 
@@ -319,7 +319,7 @@ async def get_new_weights(code: str = Query(...)):
                 "eid": eid, "etype": etype, "mval": mval,
                 "hshift": hshift if hshift is not None else -999999,
             })
-        return ok_response({"weights": [r["weight_code"] for r in res.mappings().all()]})
+        return ok_response([r["weight_code"] for r in res.mappings().all()])
     except Exception as e:
         return err_response(str(e), exc=e, node=NODE_NAME, script="get_new_weights")
 
