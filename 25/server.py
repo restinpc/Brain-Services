@@ -23,7 +23,7 @@ from cache_helper import ensure_cache_table, load_service_url, cached_values
 
 SERVICE_ID = 25
 NODE_NAME  = os.getenv("NODE_NAME", "brain-investing-weights-microservice")
-PORT       = 8895
+PORT       = 8890
 
 load_dotenv()
 DB_HOST         = os.getenv("DB_HOST",         "127.0.0.1")

@@ -24,7 +24,7 @@ from cache_helper import ensure_cache_table, load_service_url, cached_values
 # ── Идентификаторы ─────────────────────────────────────────────────────────────
 SERVICE_ID = 32
 NODE_NAME  = os.getenv("NODE_NAME", "brain-investing-weights-microservice-32")
-PORT       = 8897
+PORT       = 8895
 
 # ── Конфигурация БД ───────────────────────────────────────────────────────────
 load_dotenv()
