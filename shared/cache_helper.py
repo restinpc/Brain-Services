@@ -68,10 +68,21 @@ def cache_hash(params: dict) -> str:
 
 
 async def ensure_cache_table(engine_vlad: AsyncEngine) -> None:
-    """Создаёт vlad_values_cache если нет. Вызвать один раз при старте."""
-    async with engine_vlad.begin() as conn:
-        await conn.execute(text(_DDL))
-    log.info("✅ vlad_values_cache — готова")
+    """Создаёт vlad_values_cache, только если её нет."""
+    # Проверяем существование таблицы
+    async with engine_vlad.connect() as conn:
+        result = await conn.execute(text("""
+            SELECT COUNT(*) FROM information_schema.tables
+            WHERE table_schema = DATABASE() AND table_name = 'vlad_values_cache'
+        """))
+        exists = (await result.scalar()) > 0
+
+    if not exists:
+        async with engine_vlad.begin() as conn:
+            await conn.execute(text(_DDL))
+        log.info("✅ vlad_values_cache создана")
+    else:
+        log.debug("vlad_values_cache уже существует")
 
 
 async def load_service_url(engine_super: AsyncEngine, service_id: int) -> str:
