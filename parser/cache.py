@@ -19,12 +19,12 @@ from sqlalchemy import text
 load_dotenv()
 
 # ── ID моделей ─────────────────────────────────────────────────────────────────
-MODEL_IDS = [25, 26]
+MODEL_IDS = [23, 25, 26, 28, 30, 31, 32, 33]
 
-# ── Логирование (теперь всегда DEBUG, всё в консоль) ───────────────────────────
+# ── Логирование ────────────────────────────────────────────────────────────────
 logging.basicConfig(
-    level=logging.DEBUG,  # 🔍 изменено с INFO на DEBUG
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger(__name__)
@@ -167,7 +167,6 @@ class Deadline:
         self.limit    = timedelta(hours=hours)
         self.started  = datetime.now()
         self.deadline = self.started + self.limit
-        log.debug(f"⏰ Deadline создан: лимит {hours} ч, дедлайн {self.deadline}")
 
     def exceeded(self) -> bool:
         return datetime.now() >= self.deadline
@@ -192,7 +191,6 @@ class Deadline:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def get_service_url(sync_engine, model_id: int) -> str:
-    log.debug(f"▶️ get_service_url(model_id={model_id})")
     with sync_engine.connect() as conn:
         row = conn.execute(
             sa_text("SELECT url FROM brain_service WHERE id = :mid"),
@@ -210,14 +208,12 @@ def discover_param_combos(sync_engine, model_id: int) -> list[dict]:
     Читает brain_signal<model_id> → список уникальных комбинаций type/var.
     Если таблицы нет или колонок нет → [{}] (одна пустая комбинация).
     """
-    log.debug(f"▶️ discover_param_combos(model_id={model_id})")
     table = f"brain_signal{model_id}"
     with sync_engine.connect() as conn:
         try:
             desc = conn.execute(sa_text(f"DESCRIBE `{table}`")).fetchall()
-            log.debug(f"DESCRIBE {table} вернул {len(desc)} строк")
-        except Exception as e:
-            log.warning(f"  ⚠️  Таблица {table} не найдена — одна комбинация {{}}", exc_info=True)
+        except Exception:
+            log.warning(f"  ⚠️  Таблица {table} не найдена — одна комбинация {{}}")
             return [{}]
 
         available  = {row[0] for row in desc}
@@ -232,9 +228,8 @@ def discover_param_combos(sync_engine, model_id: int) -> list[dict]:
             rows = conn.execute(
                 sa_text(f"SELECT DISTINCT {cols_str} FROM `{table}` ORDER BY {cols_str}")
             ).fetchall()
-            log.debug(f"Найдено {len(rows)} уникальных комбинаций")
         except Exception as e:
-            log.warning(f"  ⚠️  Ошибка чтения {table}: {e} → одна комбинация", exc_info=True)
+            log.warning(f"  ⚠️  Ошибка чтения {table}: {e} → одна комбинация")
             return [{}]
 
     combos = [
@@ -251,23 +246,30 @@ def discover_param_combos(sync_engine, model_id: int) -> list[dict]:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _params_hash(params: dict) -> str:
-    h = hashlib.md5(
+    return hashlib.md5(
         json.dumps(params, sort_keys=True, ensure_ascii=False).encode()
     ).hexdigest()
-    log.debug(f"🔑 Хеш параметров {params} -> {h}")
-    return h
 
 
 def _parse_dt(s: str) -> datetime:
-    log.debug(f"▶️ _parse_dt({s})")
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
         try:
-            dt = datetime.strptime(s.strip(), fmt)
-            log.debug(f"Распознано как {dt}")
-            return dt
+            return datetime.strptime(s.strip(), fmt)
         except ValueError:
             continue
     raise ValueError(f"Неверный формат даты: {s!r}")
+
+
+def _print_progress(done: int, total: int, label: str,
+                    errors: int = 0, skipped: int = 0) -> None:
+    pct   = done / total * 100 if total else 0
+    extra = ""
+    if skipped:
+        extra += f"  skip={skipped}"
+    if errors:
+        extra += f"  err={errors}"
+    print(f"\r    {label} [{done}/{total}] {pct:.1f}%{extra}",
+          end="", flush=True)
 
 
 def _compute_signal(values: dict, tier: int) -> int:
@@ -278,9 +280,7 @@ def _compute_signal(values: dict, tier: int) -> int:
         if tier == 0
         else sum(values.values())
     )
-    signal = 1 if total > 0 else (-1 if total < 0 else 0)
-    log.debug(f"Сигнал: values={values}, tier={tier} -> {signal}")
-    return signal
+    return 1 if total > 0 else (-1 if total < 0 else 0)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -289,7 +289,6 @@ def _compute_signal(values: dict, tier: int) -> int:
 
 async def _call_values(session: aiohttp.ClientSession,
                        url: str, params: dict) -> dict | None:
-    log.debug(f"▶️ _call_values: {url}/values params={params}")
     try:
         async with session.get(
             f"{url}/values",
@@ -297,21 +296,14 @@ async def _call_values(session: aiohttp.ClientSession,
             timeout=aiohttp.ClientTimeout(total=15),
         ) as r:
             if r.status != 200:
-                log.warning(f"HTTP {r.status} от {url}/values params={params}")
                 return None
             data = await r.json()
-            log.debug(f"Ответ от {url}/values: {str(data)[:200]}...")
-            if "payload" in data:
-                return data["payload"]
+            if "payLoad" in data:
+                return data["payLoad"]
             if "status" not in data:
                 return data
-            log.warning(f"Неожиданный формат ответа: {data}")
             return None
-    except asyncio.TimeoutError:
-        log.warning(f"Таймаут запроса к {url}/values params={params}")
-        return None
-    except Exception as e:
-        log.warning(f"Ошибка запроса к {url}/values: {e}", exc_info=True)
+    except Exception:
         return None
 
 
@@ -321,10 +313,8 @@ async def _call_values(session: aiohttp.ClientSession,
 
 async def fetch_candles(engine_brain, pair: int, day: int,
                         date_from: datetime, date_to: datetime) -> list[dict]:
-    log.debug(f"▶️ fetch_candles(pair={pair}, day={day}, from={date_from}, to={date_to})")
     table = RATES_TABLE.get((pair, day))
     if not table:
-        log.warning(f"Нет таблицы для пары {pair} дня {day}")
         return []
     async with engine_brain.connect() as conn:
         res = await conn.execute(text(f"""
@@ -332,13 +322,10 @@ async def fetch_candles(engine_brain, pair: int, day: int,
             WHERE date >= :df AND date < :dt
             ORDER BY date ASC
         """), {"df": date_from, "dt": date_to})
-        rows = res.fetchall()
-        candles = [
+        return [
             {"date": r[0], "open": float(r[1] or 0), "close": float(r[2] or 0)}
-            for r in rows
+            for r in res.fetchall()
         ]
-    log.info(f"Загружено свечей: {len(candles)} из {table}")
-    return candles
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -356,7 +343,6 @@ async def fill_cache(engine_vlad, candles: list[dict],
     total  = len(candles)
     done   = errors = skipped = 0
 
-    # Проверяем, какие даты уже есть в кеше
     async with engine_vlad.connect() as conn:
         res = await conn.execute(text("""
             SELECT date_val FROM vlad_values_cache
@@ -364,31 +350,32 @@ async def fill_cache(engine_vlad, candles: list[dict],
               AND day_flag = :day AND params_hash = :ph
         """), {"url": service_url, "pair": pair, "day": day, "ph": p_hash})
         cached_dates = {row[0] for row in res.fetchall()}
-    log.debug(f"Уже в кеше: {len(cached_dates)} дат для этой комбинации")
+
+    skipped = sum(1 for c in candles if c["date"] in cached_dates)
 
     async with aiohttp.ClientSession() as session:
-        for i, candle in enumerate(candles, 1):
+        for candle in candles:
             if deadline.exceeded():
-                log.warning(f"⏰ Таймаут в fill_cache, обработано {done}/{total}")
+                log.warning(f"\n  ⏰ Таймаут! Осталось обработать "
+                            f"{total - done} свечей этой комбинации")
                 break
 
             date_val = candle["date"]
+
             if date_val in cached_dates:
-                skipped += 1
                 done += 1
-                log.debug(f"⏭  [{i}/{total}] {date_val} уже в кеше")
+                _print_progress(done, total, "cache", errors, skipped)
                 continue
 
-            date_str = date_val.strftime("%Y-%m-%d %H:%M:%S")
+            date_str    = date_val.strftime("%Y-%m-%d %H:%M:%S")
             call_params = {"pair": pair, "day": day,
                            "date": date_str, **extra_params}
-            log.debug(f"📡 [{i}/{total}] Запрос для {date_val} params={call_params}")
             result = await _call_values(session, service_url, call_params)
 
             if result is None:
                 errors += 1
                 done   += 1
-                log.debug(f"❌ [{i}/{total}] Нет данных для {date_val}")
+                _print_progress(done, total, "cache", errors, skipped)
                 continue
 
             try:
@@ -404,14 +391,13 @@ async def fill_cache(engine_vlad, candles: list[dict],
                         "pj":   json.dumps(extra_params, ensure_ascii=False),
                         "rj":   json.dumps(result,       ensure_ascii=False),
                     })
-                log.debug(f"✅ [{i}/{total}] Сохранено в кеш для {date_val}")
-            except Exception as e:
-                log.error(f"Ошибка вставки в кеш для {date_val}: {e}", exc_info=True)
+            except Exception:
+                pass
 
             done += 1
+            _print_progress(done, total, "cache", errors, skipped)
 
-    log.info(f"Кеш завершён: total={total}, new={done - skipped - errors}, "
-             f"skip={skipped}, err={errors}")
+    print()
     return {"done": done, "total": total, "errors": errors, "skipped": skipped}
 
 
@@ -429,7 +415,6 @@ async def run_backtest(engine_vlad, candles: list[dict],
 
     p_hash = _params_hash(extra_params)
 
-    # Проверяем, есть ли уже результат в БД
     async with engine_vlad.connect() as conn:
         existing = (await conn.execute(text("""
             SELECT value_score, accuracy, trade_count FROM vlad_backtest_results
@@ -441,7 +426,6 @@ async def run_backtest(engine_vlad, candles: list[dict],
         )).fetchone()
 
     if existing:
-        log.debug(f"⏭  Результат уже есть: score={existing[0]}, acc={existing[1]}")
         return {
             "value_score": float(existing[0]),
             "accuracy":    float(existing[1]),
@@ -452,10 +436,8 @@ async def run_backtest(engine_vlad, candles: list[dict],
         }
 
     if deadline.exceeded():
-        log.warning("⏰ Таймаут перед бэктестом")
         return {"error": "timeout"}
 
-    # Загружаем значения из кеша
     async with engine_vlad.connect() as conn:
         res = await conn.execute(text("""
             SELECT date_val, result_json FROM vlad_values_cache
@@ -463,7 +445,6 @@ async def run_backtest(engine_vlad, candles: list[dict],
               AND day_flag = :day AND params_hash = :ph
         """), {"url": service_url, "pair": pair, "day": day, "ph": p_hash})
         cache_map = {row[0]: json.loads(row[1]) for row in res.fetchall()}
-    log.debug(f"Загружено значений из кеша: {len(cache_map)}")
 
     spread, modification, lot_divisor = PAIR_CFG.get(
         pair, (0.0002, 100_000.0, 10_000.0)
@@ -475,15 +456,15 @@ async def run_backtest(engine_vlad, candles: list[dict],
     trade_count  = win_count = 0
     total        = len(candles)
 
-    for i, candle in enumerate(candles, 1):
+    for i, candle in enumerate(candles):
+        _print_progress(i + 1, total, f"backtest tier={tier}")
+
         values = cache_map.get(candle["date"])
         if not values:
-            log.debug(f"⏭  [{i}/{total}] Нет значений для {candle['date']}")
             continue
 
         signal = _compute_signal(values, tier)
         if signal == 0:
-            log.debug(f"⏭  [{i}/{total}] Сигнал 0 для {candle['date']}")
             continue
 
         raw_move = candle["close"] - candle["open"]
@@ -501,10 +482,9 @@ async def run_backtest(engine_vlad, candles: list[dict],
         if drawdown > 0:
             summary_lost += drawdown / highest
 
-        log.debug(f"📈 [{i}/{total}] Сделка: signal={signal}, amount={amount:.2f}, balance={balance:.2f}")
+    print()
 
     if trade_count < 10:
-        log.debug(f"❌ Недостаточно сделок: {trade_count}")
         return {"error": "not enough trades", "trade_count": trade_count}
 
     total_result = balance - INITIAL_BALANCE
@@ -522,8 +502,6 @@ async def run_backtest(engine_vlad, candles: list[dict],
         "params":        extra_params,
         "params_hash":   p_hash,
     }
-
-    log.info(f"✅ Результат: score={result['value_score']}, acc={result['accuracy']}, trades={trade_count}")
 
     try:
         async with engine_vlad.begin() as conn:
@@ -561,7 +539,7 @@ async def run_backtest(engine_vlad, candles: list[dict],
                 "acc":  result["accuracy"],
             })
     except Exception as e:
-        log.error(f"Не удалось сохранить результат бэктеста: {e}", exc_info=True)
+        log.warning(f"  ⚠️  Не удалось сохранить результат бэктеста: {e}")
 
     return result
 
@@ -573,7 +551,6 @@ async def run_backtest(engine_vlad, candles: list[dict],
 async def upsert_summary(engine_vlad, service_url: str, model_id: int,
                           pair: int, day: int, tier: int,
                           date_from: datetime, date_to: datetime) -> None:
-    log.debug(f"▶️ upsert_summary: pair={pair}, day={day}, tier={tier}")
     async with engine_vlad.connect() as conn:
         row = (await conn.execute(text("""
             SELECT
@@ -597,7 +574,6 @@ async def upsert_summary(engine_vlad, service_url: str, model_id: int,
         )).fetchone()
 
     if not row or not row[0]:
-        log.debug("Нет данных для summary")
         return
 
     async with engine_vlad.begin() as conn:
@@ -627,7 +603,6 @@ async def upsert_summary(engine_vlad, service_url: str, model_id: int,
             "ba":  float(row[3] or 0), "aa":  float(row[4] or 0),
             "bpj": row[5],
         })
-    log.info(f"✅ Summary обновлён: комбинаций {row[0]}, best_score={row[1]}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -675,6 +650,7 @@ async def run(args) -> None:
     engine_vlad  = create_async_engine(vlad_url,  pool_size=10, echo=False)
     engine_brain = create_async_engine(brain_url, pool_size=6,  echo=False)
 
+    # Общая статистика по всем моделям
     stats_cache    = {"new": 0, "skipped": 0, "errors": 0}
     stats_backtest = {"done": 0, "skipped": 0, "failed": 0}
     timed_out      = False
@@ -682,7 +658,6 @@ async def run(args) -> None:
     try:
         async with engine_vlad.begin() as conn:
             for ddl in (DDL_CACHE, DDL_BACKTEST, DDL_SUMMARY):
-                log.debug(f"Выполнение DDL: {ddl[:60]}...")
                 await conn.execute(text(ddl))
         log.info("✅ Таблицы проверены/созданы")
 
@@ -712,13 +687,14 @@ async def run(args) -> None:
                 param_combos = discover_param_combos(sync_engine, model_id)
                 sync_engine.dispose()
             except Exception as e:
-                log.error(f"❌ Не удалось получить конфигурацию для модели {model_id}: {e}", exc_info=True)
+                log.error(f"❌ Не удалось получить конфигурацию для модели {model_id}: {e}")
                 send_error_trace(e, f"get_service_config model={model_id}")
-                continue
+                continue   # переходим к следующей модели
 
             log.info(f"  URL модели {model_id}: {service_url}")
             log.info(f"  Комбинаций параметров: {len(param_combos)}")
 
+            # ── Далее идёт исходный код для одной модели (с заменой MODEL_ID на model_id) ──
             for pair in args.pairs:
                 for day in args.days:
 
@@ -872,6 +848,10 @@ async def run(args) -> None:
                 if timed_out:
                     break
 
+            # Конец цикла по парам/дням для текущей модели
+
+        # Конец цикла по моделям
+
         elapsed = deadline.elapsed_str()
 
         if timed_out:
@@ -906,7 +886,7 @@ async def run(args) -> None:
             send_trace(f"✅ Готово — models={MODEL_IDS}", msg)
 
     except Exception as e:
-        log.critical(f"❌ Критическая ошибка: {e!r}", exc_info=True)
+        log.critical(f"❌ Критическая ошибка: {e!r}")
         send_error_trace(e, "main_loop")
         raise
     finally:
@@ -987,7 +967,7 @@ def main():
         log.info("🛑 Прервано пользователем (Ctrl+C)")
         sys.exit(0)
     except Exception as e:
-        log.critical(f"❌ Завершено с ошибкой: {e!r}", exc_info=True)
+        log.critical(f"❌ Завершено с ошибкой: {e!r}")
         send_error_trace(e, "main")
         sys.exit(1)
 
