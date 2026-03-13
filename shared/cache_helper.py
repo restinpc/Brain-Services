@@ -68,14 +68,12 @@ def cache_hash(params: dict) -> str:
 
 
 async def ensure_cache_table(engine_vlad: AsyncEngine) -> None:
-    """Создаёт vlad_values_cache, только если её нет."""
-    # Проверяем существование таблицы
     async with engine_vlad.connect() as conn:
         result = await conn.execute(text("""
             SELECT COUNT(*) FROM information_schema.tables
             WHERE table_schema = DATABASE() AND table_name = 'vlad_values_cache'
         """))
-        exists = (await result.scalar()) > 0
+        exists = result.scalar() > 0   # <-- убрать await
 
     if not exists:
         async with engine_vlad.begin() as conn:
