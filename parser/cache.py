@@ -313,11 +313,12 @@ async def fill_cache(engine_vlad, candles: list[dict],
                      extra_params: dict,
                      deadline: Deadline) -> dict:
     if not candles:
-        return {"done": 0, "total": 0, "errors": 0, "skipped": 0, "new": 0}
+        return {"done": 0, "total": 0, "errors": 0, "skipped": 0, "new": 0, "error_dates": []}
 
     p_hash = _params_hash(extra_params)
     total  = len(candles)
     done   = errors = skipped = 0
+    error_dates = []   # накапливаем даты с ошибками
 
     async with engine_vlad.connect() as conn:
         res = await conn.execute(text("""
@@ -348,6 +349,7 @@ async def fill_cache(engine_vlad, candles: list[dict],
             if result is None:
                 errors += 1
                 done   += 1
+                error_dates.append(date_str)
                 _print_progress(done, total, "cache", errors, skipped)
                 continue
 
@@ -372,7 +374,8 @@ async def fill_cache(engine_vlad, candles: list[dict],
 
     print()
     new = done - skipped - errors
-    return {"done": done, "total": total, "errors": errors, "skipped": skipped, "new": new}
+    return {"done": done, "total": total, "errors": errors, "skipped": skipped,
+            "new": new, "error_dates": error_dates}
 
 
 async def run_backtest(engine_vlad, candles: list[dict],
@@ -618,6 +621,18 @@ async def run_model(
                     stats_cache["skipped"] += r["skipped"]
                     stats_cache["errors"]  += r["errors"]
                     log.info(f"  ✓ total={r['total']}  new={r['new']}  skip={r['skipped']}  err={r['errors']}")
+
+                    if r["errors"] > 0:
+                        sample = r["error_dates"][:50]
+                        tail   = f"\n  ... и ещё {len(r["error_dates"]) - 50}" if len(r["error_dates"]) > 50 else ""
+                        send_trace(
+                            f"⚠️ Ошибки кеша — model={model_id} pair={pair} day={day} params={combo_str}",
+                            f"model={model_id}  pair={PAIR_NAMES.get(pair)}  day={DAY_NAMES.get(day)}\n"
+                            f"params={combo_str}\nurl={service_url}\n\n"
+                            f"Ошибок: {r["errors"]} из {r["total"]}\n"
+                            f"Примеры дат:\n" + "\n".join(f"  {d}" for d in sample) + tail,
+                            is_error=True,
+                        )
 
                 if not timed_out:
                     send_trace(
