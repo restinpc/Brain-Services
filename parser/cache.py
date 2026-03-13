@@ -8,16 +8,18 @@ import os
 import sys
 import traceback
 from datetime import datetime, timedelta
+
 import aiohttp
 import requests
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text as sa_text
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy import text
+
 load_dotenv()
 
-# ── ID модели ──────────────────────────────────────────────────────────────────
-MODEL_ID = 33
+# ── ID моделей ─────────────────────────────────────────────────────────────────
+MODEL_IDS = [25, 26, 28, 30, 31, 32]
 
 # ── Логирование ────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -638,29 +640,16 @@ async def run(args) -> None:
     )
 
     log.info("=" * 60)
-    log.info(f"🚀 model_id={MODEL_ID}")
+    log.info(f"🚀 Будут обработаны модели: {MODEL_IDS}")
     log.info(f"   vlad  DB : {args.user}@{args.host}:{args.port}/{args.database}")
     log.info(f"   brain DB : {brain_user}@{brain_host}:{brain_port}/{brain_name}")
     log.info(f"   super DB : {super_user}@{super_host}:{super_port}/{super_name}")
     log.info("=" * 60)
 
-    # ── Синхронно: URL + параметры модели через супер-ноду ────────────────────
-    try:
-        sync_engine  = create_engine(
-            super_sync_url, pool_recycle=3600,
-            connect_args={"auth_plugin": "caching_sha2_password"},
-        )
-        service_url  = get_service_url(sync_engine, MODEL_ID)
-        param_combos = discover_param_combos(sync_engine, MODEL_ID)
-        sync_engine.dispose()
-    except Exception as e:
-        log.critical(f"❌ Не удалось получить конфигурацию модели: {e}")
-        send_error_trace(e, "get_service_config")
-        sys.exit(1)
-
     engine_vlad  = create_async_engine(vlad_url,  pool_size=10, echo=False)
     engine_brain = create_async_engine(brain_url, pool_size=6,  echo=False)
 
+    # Общая статистика по всем моделям
     stats_cache    = {"new": 0, "skipped": 0, "errors": 0}
     stats_backtest = {"done": 0, "skipped": 0, "failed": 0}
     timed_out      = False
@@ -676,160 +665,191 @@ async def run(args) -> None:
                      else datetime.now().replace(hour=0, minute=0, second=0, microsecond=0))
 
         log.info(f"  Период    : {date_from} → {date_to}")
-        log.info(f"  Комбинации: {len(param_combos)}")
         log.info(f"  Пары      : {args.pairs}")
         log.info(f"  Дни       : {args.days}")
         log.info(f"  Тиры      : {args.tiers}")
 
-        for pair in args.pairs:
-            for day in args.days:
+        # ── Цикл по всем моделям ──────────────────────────────────────────────
+        for model_id in MODEL_IDS:
+            if timed_out:
+                break
 
-                if deadline.exceeded():
-                    timed_out = True
-                    break
+            log.info(f"\n{'='*60}\n🚀 Обработка модели {model_id}\n{'='*60}")
 
-                log.info(
-                    f"\n{'='*55}\n"
-                    f"  pair={pair} ({PAIR_NAMES.get(pair)})  "
-                    f"day={day} ({DAY_NAMES.get(day)})  "
-                    f"[осталось: {deadline.remaining_str()}]"
+            # Получаем конфигурацию для текущей модели (синхронно)
+            try:
+                sync_engine = create_engine(
+                    super_sync_url, pool_recycle=3600,
+                    connect_args={"auth_plugin": "caching_sha2_password"},
                 )
+                service_url  = get_service_url(sync_engine, model_id)
+                param_combos = discover_param_combos(sync_engine, model_id)
+                sync_engine.dispose()
+            except Exception as e:
+                log.error(f"❌ Не удалось получить конфигурацию для модели {model_id}: {e}")
+                send_error_trace(e, f"get_service_config model={model_id}")
+                continue   # переходим к следующей модели
 
-                candles = await fetch_candles(
-                    engine_brain, pair, day, date_from, date_to
-                )
-                if not candles:
-                    log.warning("  ⚠️  Нет свечей — пропускаем")
-                    continue
-                log.info(f"  Свечей: {len(candles)}")
+            log.info(f"  URL модели {model_id}: {service_url}")
+            log.info(f"  Комбинаций параметров: {len(param_combos)}")
 
-                # ── Шаг 1: Кеш ────────────────────────────────────────────────
-                if not args.skip_fill:
-                    log.info(f"\n  📥 Кеш ({len(param_combos)} комбинаций)...")
-                    for idx, combo in enumerate(param_combos, 1):
-                        if deadline.exceeded():
-                            timed_out = True
-                            break
+            # ── Далее идёт исходный код для одной модели (с заменой MODEL_ID на model_id) ──
+            for pair in args.pairs:
+                for day in args.days:
 
-                        combo_str = json.dumps(combo) if combo else "{}"
-                        log.info(f"  [{idx}/{len(param_combos)}] params={combo_str}")
-
-                        r = await fill_cache(
-                            engine_vlad, candles,
-                            service_url, pair, day, combo, deadline,
-                        )
-                        new = r["done"] - r["skipped"] - r["errors"]
-                        stats_cache["new"]     += new
-                        stats_cache["skipped"] += r["skipped"]
-                        stats_cache["errors"]  += r["errors"]
-                        log.info(
-                            f"  ✓ total={r['total']}  new={new}  "
-                            f"skip={r['skipped']}  err={r['errors']}"
-                        )
-
-                    if not timed_out:
-                        send_trace(
-                            f"✅ Кеш завершён — pair={pair} day={day} model={MODEL_ID}",
-                            f"pair={PAIR_NAMES.get(pair)}  day={DAY_NAMES.get(day)}\n"
-                            f"new={stats_cache['new']}  "
-                            f"skipped={stats_cache['skipped']}  "
-                            f"errors={stats_cache['errors']}\n"
-                            f"Прошло: {deadline.elapsed_str()}  "
-                            f"Осталось: {deadline.remaining_str()}",
-                        )
-                else:
-                    log.info("  ⏭️  Кеш пропущен (--skip-fill)")
-
-                if args.only_fill or timed_out:
-                    continue
-
-                # ── Шаг 2: Бэктест ────────────────────────────────────────────
-                for tier in args.tiers:
                     if deadline.exceeded():
                         timed_out = True
                         break
 
                     log.info(
-                        f"\n  🧪 Бэктест tier={tier} "
-                        f"({len(param_combos)} комбинаций)..."
+                        f"\n{'='*55}\n"
+                        f"  pair={pair} ({PAIR_NAMES.get(pair)})  "
+                        f"day={day} ({DAY_NAMES.get(day)})  "
+                        f"[осталось: {deadline.remaining_str()}]"
                     )
-                    results = []
-                    for idx, combo in enumerate(param_combos, 1):
+
+                    candles = await fetch_candles(
+                        engine_brain, pair, day, date_from, date_to
+                    )
+                    if not candles:
+                        log.warning("  ⚠️  Нет свечей — пропускаем")
+                        continue
+                    log.info(f"  Свечей: {len(candles)}")
+
+                    # ── Шаг 1: Кеш ────────────────────────────────────────────
+                    if not args.skip_fill:
+                        log.info(f"\n  📥 Кеш ({len(param_combos)} комбинаций)...")
+                        for idx, combo in enumerate(param_combos, 1):
+                            if deadline.exceeded():
+                                timed_out = True
+                                break
+
+                            combo_str = json.dumps(combo) if combo else "{}"
+                            log.info(f"  [{idx}/{len(param_combos)}] params={combo_str}")
+
+                            r = await fill_cache(
+                                engine_vlad, candles,
+                                service_url, pair, day, combo, deadline,
+                            )
+                            new = r["done"] - r["skipped"] - r["errors"]
+                            stats_cache["new"]     += new
+                            stats_cache["skipped"] += r["skipped"]
+                            stats_cache["errors"]  += r["errors"]
+                            log.info(
+                                f"  ✓ total={r['total']}  new={new}  "
+                                f"skip={r['skipped']}  err={r['errors']}"
+                            )
+
+                        if not timed_out:
+                            send_trace(
+                                f"✅ Кеш завершён — pair={pair} day={day} model={model_id}",
+                                f"pair={PAIR_NAMES.get(pair)}  day={DAY_NAMES.get(day)}\n"
+                                f"new={stats_cache['new']}  "
+                                f"skipped={stats_cache['skipped']}  "
+                                f"errors={stats_cache['errors']}\n"
+                                f"Прошло: {deadline.elapsed_str()}  "
+                                f"Осталось: {deadline.remaining_str()}",
+                            )
+                    else:
+                        log.info("  ⏭️  Кеш пропущен (--skip-fill)")
+
+                    if args.only_fill or timed_out:
+                        continue
+
+                    # ── Шаг 2: Бэктест ────────────────────────────────────────
+                    for tier in args.tiers:
                         if deadline.exceeded():
                             timed_out = True
                             break
 
-                        combo_str = json.dumps(combo) if combo else "{}"
-                        log.info(f"  [{idx}/{len(param_combos)}] params={combo_str}")
-
-                        r = await run_backtest(
-                            engine_vlad, candles,
-                            service_url, pair, day, tier,
-                            combo, date_from, date_to,
-                            MODEL_ID, deadline,
-                        )
-
-                        if r.get("skipped"):
-                            stats_backtest["skipped"] += 1
-                            log.info(
-                                f"  ⏭  уже посчитано: "
-                                f"score={r['value_score']}  "
-                                f"acc={r['accuracy']}"
-                            )
-                        elif "error" in r:
-                            stats_backtest["failed"] += 1
-                            log.info(
-                                f"  ✗ {r['error']} "
-                                f"(trades={r.get('trade_count', 0)})"
-                            )
-                        else:
-                            stats_backtest["done"] += 1
-                            results.append(r)
-                            log.info(
-                                f"  ✓ score={r['value_score']:>10.2f}  "
-                                f"acc={r['accuracy']:.3f}  "
-                                f"trades={r['trade_count']}"
-                            )
-
-                    await upsert_summary(
-                        engine_vlad, service_url, MODEL_ID,
-                        pair, day, tier, date_from, date_to,
-                    )
-
-                    log.info(
-                        f"\n  📊 tier={tier}: "
-                        f"done={len(results)}  "
-                        f"skip={stats_backtest['skipped']}  "
-                        f"fail={stats_backtest['failed']}"
-                    )
-
-                    if results:
-                        best = max(results, key=lambda x: x["value_score"])
                         log.info(
-                            f"  🏆 Лучший: "
-                            f"score={best['value_score']}  "
-                            f"acc={best['accuracy']}  "
-                            f"trades={best['trade_count']}  "
-                            f"params={best['params']}"
+                            f"\n  🧪 Бэктест tier={tier} "
+                            f"({len(param_combos)} комбинаций)..."
+                        )
+                        results = []
+                        for idx, combo in enumerate(param_combos, 1):
+                            if deadline.exceeded():
+                                timed_out = True
+                                break
+
+                            combo_str = json.dumps(combo) if combo else "{}"
+                            log.info(f"  [{idx}/{len(param_combos)}] params={combo_str}")
+
+                            r = await run_backtest(
+                                engine_vlad, candles,
+                                service_url, pair, day, tier,
+                                combo, date_from, date_to,
+                                model_id, deadline,
+                            )
+
+                            if r.get("skipped"):
+                                stats_backtest["skipped"] += 1
+                                log.info(
+                                    f"  ⏭  уже посчитано: "
+                                    f"score={r['value_score']}  "
+                                    f"acc={r['accuracy']}"
+                                )
+                            elif "error" in r:
+                                stats_backtest["failed"] += 1
+                                log.info(
+                                    f"  ✗ {r['error']} "
+                                    f"(trades={r.get('trade_count', 0)})"
+                                )
+                            else:
+                                stats_backtest["done"] += 1
+                                results.append(r)
+                                log.info(
+                                    f"  ✓ score={r['value_score']:>10.2f}  "
+                                    f"acc={r['accuracy']:.3f}  "
+                                    f"trades={r['trade_count']}"
+                                )
+
+                        await upsert_summary(
+                            engine_vlad, service_url, model_id,
+                            pair, day, tier, date_from, date_to,
                         )
 
-                    if not timed_out:
-                        best_score = max((r["value_score"] for r in results), default=0)
-                        send_trace(
-                            f"✅ Бэктест завершён — pair={pair} day={day} "
-                            f"tier={tier} model={MODEL_ID}",
-                            f"pair={PAIR_NAMES.get(pair)}  "
-                            f"day={DAY_NAMES.get(day)}  tier={tier}\n"
+                        log.info(
+                            f"\n  📊 tier={tier}: "
                             f"done={len(results)}  "
                             f"skip={stats_backtest['skipped']}  "
-                            f"fail={stats_backtest['failed']}\n"
-                            f"best_score={best_score}\n"
-                            f"Прошло: {deadline.elapsed_str()}  "
-                            f"Осталось: {deadline.remaining_str()}",
+                            f"fail={stats_backtest['failed']}"
                         )
 
-            if timed_out:
-                break
+                        if results:
+                            best = max(results, key=lambda x: x["value_score"])
+                            log.info(
+                                f"  🏆 Лучший: "
+                                f"score={best['value_score']}  "
+                                f"acc={best['accuracy']}  "
+                                f"trades={best['trade_count']}  "
+                                f"params={best['params']}"
+                            )
+
+                        if not timed_out:
+                            best_score = max((r["value_score"] for r in results), default=0)
+                            send_trace(
+                                f"✅ Бэктест завершён — pair={pair} day={day} "
+                                f"tier={tier} model={model_id}",
+                                f"pair={PAIR_NAMES.get(pair)}  "
+                                f"day={DAY_NAMES.get(day)}  tier={tier}\n"
+                                f"done={len(results)}  "
+                                f"skip={stats_backtest['skipped']}  "
+                                f"fail={stats_backtest['failed']}\n"
+                                f"best_score={best_score}\n"
+                                f"Прошло: {deadline.elapsed_str()}  "
+                                f"Осталось: {deadline.remaining_str()}",
+                            )
+
+                    if timed_out:
+                        break
+
+                if timed_out:
+                    break
+
+            # Конец цикла по парам/дням для текущей модели
+
+        # Конец цикла по моделям
 
         elapsed = deadline.elapsed_str()
 
@@ -843,10 +863,10 @@ async def run(args) -> None:
                 f"Бэктест: done={stats_backtest['done']}  "
                 f"skip={stats_backtest['skipped']}  "
                 f"fail={stats_backtest['failed']}\n\n"
-                f"Запусти повторно — скрипт продолжит с места остановки."
+                f"Обработано моделей: {MODEL_IDS}"
             )
             log.warning(f"\n{msg}")
-            send_trace(f"⏰ Таймаут — model={MODEL_ID}", msg, is_error=False)
+            send_trace(f"⏰ Таймаут — models={MODEL_IDS}", msg, is_error=False)
         else:
             msg = (
                 f"✅ Расчёт завершён полностью.\n"
@@ -856,12 +876,13 @@ async def run(args) -> None:
                 f"err={stats_cache['errors']}\n"
                 f"Бэктест: done={stats_backtest['done']}  "
                 f"skip={stats_backtest['skipped']}  "
-                f"fail={stats_backtest['failed']}"
+                f"fail={stats_backtest['failed']}\n\n"
+                f"Обработано моделей: {MODEL_IDS}"
             )
             log.info(f"\n{'='*55}")
             log.info(msg)
             log.info("=" * 55)
-            send_trace(f"✅ Готово — model={MODEL_ID}", msg)
+            send_trace(f"✅ Готово — models={MODEL_IDS}", msg)
 
     except Exception as e:
         log.critical(f"❌ Критическая ошибка: {e!r}")
@@ -928,7 +949,7 @@ def main():
     log.info("⚙️  Параметры запуска")
     log.info(f"   host          : {args.host}:{args.port}")
     log.info(f"   database      : {args.database}")
-    log.info(f"   model_id      : {MODEL_ID}")
+    log.info(f"   model_ids     : {MODEL_IDS}")
     log.info(f"   date_from     : {args.date_from or '2025-01-15 (default)'}")
     log.info(f"   date_to       : {args.date_to   or 'today (default)'}")
     log.info(f"   pairs         : {args.pairs}")
