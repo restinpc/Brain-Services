@@ -94,11 +94,7 @@ def build_engines():
             os.getenv("DB_PASSWORD", ""),
             os.getenv("DB_NAME",     ""),
         ),
-        pool_size=20,  # вместо 10
-        max_overflow=20,  # вместо 10
-        pool_timeout=60,  # таймаут ожидания соединения
-        pool_pre_ping=True,  # проверка соединения перед использованием
-        echo=False,
+        pool_size=20, echo=False,
     )
 
     engine_brain = create_async_engine(

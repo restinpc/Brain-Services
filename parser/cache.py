@@ -14,10 +14,11 @@ from dotenv import load_dotenv
 from sqlalchemy import create_engine, text as sa_text
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy import text
+
 load_dotenv()
 
 # ── ID моделей — перечисли нужные через запятую ───────────────────────────────
-MODEL_IDS = [31, 32, 33, 30]
+MODEL_IDS = [23, 25, 26, 28, 30, 31, 32, 33]
 
 # ── Логирование ────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -282,43 +283,6 @@ def _compute_signal(values: dict, tier: int) -> int:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Диагностика БД — вызывается один раз при старте
-# ═══════════════════════════════════════════════════════════════════════════════
-
-async def db_diagnostics(engine_vlad) -> None:
-    """Выводит количество записей в каждой таблице — чтобы убедиться,
-    что подключение рабочее и данные действительно туда пишутся."""
-    log.info("🔍 [DB DIAG] Проверяем таблицы...")
-    tables = ["vlad_values_cache", "vlad_backtest_results", "vlad_backtest_summary"]
-    try:
-        async with engine_vlad.connect() as conn:
-            for tbl in tables:
-                try:
-                    row = (await conn.execute(
-                        text(f"SELECT COUNT(*) FROM `{tbl}`")
-                    )).fetchone()
-                    cnt = row[0] if row else "?"
-                    log.info(f"  [DB DIAG] {tbl}: {cnt} строк")
-                except Exception as e:
-                    log.warning(f"  [DB DIAG] {tbl}: ошибка — {e}")
-    except Exception as e:
-        log.error(f"  [DB DIAG] Не удалось подключиться к vlad DB: {e}")
-
-
-async def db_count(engine_vlad, table: str, where: str, params: dict) -> int:
-    """Быстрый SELECT COUNT(*) для проверки после INSERT."""
-    try:
-        async with engine_vlad.connect() as conn:
-            row = (await conn.execute(
-                text(f"SELECT COUNT(*) FROM `{table}` WHERE {where}"), params
-            )).fetchone()
-            return row[0] if row else 0
-    except Exception as e:
-        log.warning(f"  [DB COUNT] {table}: {e}")
-        return -1
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
 #  HTTP вызов /values
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -331,7 +295,6 @@ async def _call_values(session: aiohttp.ClientSession,
             timeout=aiohttp.ClientTimeout(total=15),
         ) as r:
             if r.status != 200:
-                log.debug(f"  [HTTP] {url}/values → HTTP {r.status}")
                 return None
             data = await r.json()
             if "payload" in data:
@@ -341,10 +304,8 @@ async def _call_values(session: aiohttp.ClientSession,
                 return data["payLoad"]
             if "status" not in data:
                 return data
-            log.debug(f"  [HTTP] {url}/values → нет payload, ключи: {list(data.keys())}")
             return None
-    except Exception as e:
-        log.debug(f"  [HTTP] {url}/values → {e}")
+    except Exception:
         return None
 
 
@@ -363,13 +324,10 @@ async def fetch_candles(engine_brain, pair: int, day: int,
             WHERE date >= :df AND date < :dt
             ORDER BY date ASC
         """), {"df": date_from, "dt": date_to})
-        rows = res.fetchall()
-    log.info(f"  [CANDLES] Таблица {table}: найдено {len(rows)} свечей "
-             f"({date_from} → {date_to})")
-    return [
-        {"date": r[0], "open": float(r[1] or 0), "close": float(r[2] or 0)}
-        for r in rows
-    ]
+        return [
+            {"date": r[0], "open": float(r[1] or 0), "close": float(r[2] or 0)}
+            for r in res.fetchall()
+        ]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -381,15 +339,11 @@ async def fill_cache(engine_vlad, candles: list[dict],
                      extra_params: dict,
                      deadline: Deadline) -> dict:
     if not candles:
-        log.warning("  [CACHE] fill_cache вызван с пустым списком свечей — пропуск")
-        return {"done": 0, "total": 0, "errors": 0, "skipped": 0, "new": 0}
+        return {"done": 0, "total": 0, "errors": 0, "skipped": 0}
 
     p_hash = _params_hash(extra_params)
     total  = len(candles)
-    done   = errors = skipped = inserted = 0
-
-    log.info(f"  [CACHE] Запрашиваем уже закешированные даты "
-             f"(url={service_url}, pair={pair}, day={day}, hash={p_hash})...")
+    done   = errors = skipped = 0
 
     async with engine_vlad.connect() as conn:
         res = await conn.execute(text("""
@@ -399,13 +353,10 @@ async def fill_cache(engine_vlad, candles: list[dict],
         """), {"url": service_url, "pair": pair, "day": day, "ph": p_hash})
         cached_dates = {row[0] for row in res.fetchall()}
 
-    log.info(f"  [CACHE] Уже в кеше: {len(cached_dates)} дат  "
-             f"| Надо обработать: {total - len(cached_dates)} свечей")
-
     async with aiohttp.ClientSession() as session:
         for candle in candles:
             if deadline.exceeded():
-                log.warning(f"\n  ⏰ [CACHE] Таймаут! Осталось обработать "
+                log.warning(f"\n  ⏰ Таймаут! Осталось обработать "
                             f"{total - done} свечей этой комбинации")
                 break
 
@@ -425,15 +376,12 @@ async def fill_cache(engine_vlad, candles: list[dict],
             if result is None:
                 errors += 1
                 done   += 1
-                if errors <= 5 or errors % 50 == 0:
-                    log.warning(f"\n  [CACHE] HTTP ошибка #{errors} "
-                                f"для date={date_str}  params={call_params}")
                 _print_progress(done, total, "cache", errors, skipped)
                 continue
 
             try:
                 async with engine_vlad.begin() as conn:
-                    exec_result = await conn.execute(text("""
+                    await conn.execute(text("""
                         INSERT IGNORE INTO vlad_values_cache
                             (service_url, pair, day_flag, date_val,
                              params_hash, params_json, result_json)
@@ -444,47 +392,16 @@ async def fill_cache(engine_vlad, candles: list[dict],
                         "pj":   json.dumps(extra_params, ensure_ascii=False),
                         "rj":   json.dumps(result,       ensure_ascii=False),
                     })
-                    rowcount = exec_result.rowcount
-
-                if rowcount > 0:
-                    inserted += 1
-                    if inserted <= 3 or inserted % 100 == 0:
-                        log.info(f"\n  [CACHE] ✅ INSERT OK #{inserted}  "
-                                 f"date={date_str}  rowcount={rowcount}  "
-                                 f"result_keys={list(result.keys()) if isinstance(result, dict) else type(result)}")
-                else:
-                    # rowcount=0 при INSERT IGNORE означает дубликат — это нормально
-                    log.debug(f"\n  [CACHE] INSERT IGNORE пропустил дубликат: date={date_str}")
-
-            except Exception as e:
-                log.error(f"\n  [CACHE] ❌ Ошибка записи в БД: {e!r}  "
-                          f"date={date_str}  params={extra_params}")
-                errors += 1
-                done   += 1
-                _print_progress(done, total, "cache", errors, skipped)
-                continue
+            except Exception:
+                pass
 
             done += 1
             _print_progress(done, total, "cache", errors, skipped)
 
     print()
-
+    # BUG FIX: new = done - skipped (уже посчитан точно) - errors
     new = done - skipped - errors
-    log.info(f"  [CACHE] Итог: total={total}  new_inserted={inserted}  "
-             f"new_calc={new}  skipped={skipped}  errors={errors}")
-
-    # Верификация: SELECT COUNT после записи
-    count_after = await db_count(
-        engine_vlad,
-        "vlad_values_cache",
-        "service_url=:url AND pair=:pair AND day_flag=:day AND params_hash=:ph",
-        {"url": service_url, "pair": pair, "day": day, "ph": p_hash},
-    )
-    log.info(f"  [CACHE] 🔎 SELECT COUNT после записи: {count_after} строк "
-             f"(ожидалось ≥ {len(cached_dates) + inserted})")
-
-    return {"done": done, "total": total, "errors": errors,
-            "skipped": skipped, "new": new}
+    return {"done": done, "total": total, "errors": errors, "skipped": skipped, "new": new}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -501,18 +418,6 @@ async def run_backtest(engine_vlad, candles: list[dict],
 
     p_hash = _params_hash(extra_params)
 
-    # ── Проверка: есть ли данные в кеше для этого запроса? ──────────────────
-    cache_count = await db_count(
-        engine_vlad,
-        "vlad_values_cache",
-        "service_url=:url AND pair=:pair AND day_flag=:day AND params_hash=:ph",
-        {"url": service_url, "pair": pair, "day": day, "ph": p_hash},
-    )
-    log.info(f"  [BACKTEST] Кеш для hash={p_hash}: {cache_count} записей")
-    if cache_count == 0:
-        log.warning(f"  [BACKTEST] ⚠️  Кеш ПУСТ! Бэктест без данных не имеет смысла. "
-                    f"Убедись, что fill_cache отработал и данные записались.")
-
     async with engine_vlad.connect() as conn:
         existing = (await conn.execute(text("""
             SELECT value_score, accuracy, trade_count FROM vlad_backtest_results
@@ -524,8 +429,6 @@ async def run_backtest(engine_vlad, candles: list[dict],
         )).fetchone()
 
     if existing:
-        log.info(f"  [BACKTEST] Уже посчитано (skip): "
-                 f"score={existing[0]}  acc={existing[1]}  trades={existing[2]}")
         return {
             "value_score": float(existing[0]),
             "accuracy":    float(existing[1]),
@@ -546,15 +449,6 @@ async def run_backtest(engine_vlad, candles: list[dict],
         """), {"url": service_url, "pair": pair, "day": day, "ph": p_hash})
         cache_map = {row[0]: json.loads(row[1]) for row in res.fetchall()}
 
-    log.info(f"  [BACKTEST] Загружено из кеша: {len(cache_map)} записей  "
-             f"| Свечей: {len(candles)}")
-
-    if not cache_map:
-        log.error(f"  [BACKTEST] ❌ cache_map пуст — данных в vlad_values_cache нет! "
-                  f"Проверь: service_url='{service_url}', pair={pair}, "
-                  f"day={day}, params_hash='{p_hash}'")
-        return {"error": "empty cache_map"}
-
     spread, modification, lot_divisor = PAIR_CFG.get(
         pair, (0.0002, 100_000.0, 10_000.0)
     )
@@ -564,17 +458,13 @@ async def run_backtest(engine_vlad, candles: list[dict],
     summary_lost = 0.0
     trade_count  = win_count = 0
     total        = len(candles)
-    cache_hits   = 0
-    cache_misses = 0
 
     for i, candle in enumerate(candles):
         _print_progress(i + 1, total, f"backtest tier={tier}")
 
         values = cache_map.get(candle["date"])
         if not values:
-            cache_misses += 1
             continue
-        cache_hits += 1
 
         signal = _compute_signal(values, tier)
         if signal == 0:
@@ -597,12 +487,7 @@ async def run_backtest(engine_vlad, candles: list[dict],
 
     print()
 
-    log.info(f"  [BACKTEST] cache_hits={cache_hits}  cache_misses={cache_misses}  "
-             f"trade_count={trade_count}")
-
     if trade_count < 10:
-        log.warning(f"  [BACKTEST] Недостаточно сделок: {trade_count} < 10  "
-                    f"(cache_hits={cache_hits}, cache_misses={cache_misses})")
         return {"error": "not enough trades", "trade_count": trade_count}
 
     total_result = balance - INITIAL_BALANCE
@@ -623,7 +508,7 @@ async def run_backtest(engine_vlad, candles: list[dict],
 
     try:
         async with engine_vlad.begin() as conn:
-            exec_result = await conn.execute(text("""
+            await conn.execute(text("""
                 INSERT INTO vlad_backtest_results
                     (service_url, model_id, pair, day_flag, tier,
                      params_hash, params_json, date_from, date_to,
@@ -656,32 +541,8 @@ async def run_backtest(engine_vlad, candles: list[dict],
                 "wc":   win_count,
                 "acc":  result["accuracy"],
             })
-            rowcount = exec_result.rowcount
-
-        log.info(f"  [BACKTEST] ✅ INSERT backtest_results  "
-                 f"rowcount={rowcount}  "
-                 f"score={result['value_score']}  "
-                 f"acc={result['accuracy']}  "
-                 f"trades={trade_count}")
-
-        # Верификация
-        count_after = await db_count(
-            engine_vlad,
-            "vlad_backtest_results",
-            "service_url=:url AND pair=:pair AND day_flag=:day "
-            "AND tier=:tier AND params_hash=:ph AND date_from=:df AND date_to=:dt",
-            {"url": service_url, "pair": pair, "day": day,
-             "tier": tier, "ph": p_hash, "df": date_from, "dt": date_to},
-        )
-        log.info(f"  [BACKTEST] 🔎 SELECT COUNT после INSERT: {count_after} "
-                 f"(должно быть 1)")
-        if count_after != 1:
-            log.error(f"  [BACKTEST] ❌ Данные НЕ записались! count={count_after}  "
-                      f"Проверь права пользователя и название БД.")
-
     except Exception as e:
-        log.error(f"  [BACKTEST] ❌ Ошибка записи в vlad_backtest_results: {e!r}")
-        log.error(traceback.format_exc())
+        log.warning(f"  ⚠️  Не удалось сохранить результат бэктеста: {e}")
 
     return result
 
@@ -716,15 +577,10 @@ async def upsert_summary(engine_vlad, service_url: str, model_id: int,
         )).fetchone()
 
     if not row or not row[0]:
-        log.warning(f"  [SUMMARY] Нет данных в backtest_results для "
-                    f"pair={pair} day={day} tier={tier} — summary не обновляем")
         return
 
-    log.info(f"  [SUMMARY] Агрегируем: cnt={row[0]}  "
-             f"best_score={row[1]}  avg_score={float(row[2] or 0):.2f}")
-
     async with engine_vlad.begin() as conn:
-        exec_result = await conn.execute(text("""
+        await conn.execute(text("""
             INSERT INTO vlad_backtest_summary
                 (model_id, service_url, pair, day_flag, tier,
                  date_from, date_to,
@@ -750,22 +606,6 @@ async def upsert_summary(engine_vlad, service_url: str, model_id: int,
             "ba":  float(row[3] or 0), "aa":  float(row[4] or 0),
             "bpj": row[5],
         })
-        rowcount = exec_result.rowcount
-
-    log.info(f"  [SUMMARY] ✅ UPSERT summary  rowcount={rowcount}  "
-             f"pair={pair} day={day} tier={tier} model={model_id}")
-
-    # Верификация
-    count_after = await db_count(
-        engine_vlad,
-        "vlad_backtest_summary",
-        "model_id=:mid AND pair=:pair AND day_flag=:day "
-        "AND tier=:tier AND date_from=:df AND date_to=:dt",
-        {"mid": model_id, "pair": pair, "day": day,
-         "tier": tier, "df": date_from, "dt": date_to},
-    )
-    log.info(f"  [SUMMARY] 🔎 SELECT COUNT после UPSERT: {count_after} "
-             f"(должно быть 1)")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -959,21 +799,28 @@ async def run(args) -> None:
     log.info(f"⏰ Таймаут: {args.timeout_hours}h  "
              f"(дедлайн: {deadline.deadline.strftime('%Y-%m-%d %H:%M:%S')})")
 
+    # ── Параметры подключения к vlad берём из переменных окружения ───────────
+    vlad_host = os.getenv("VLAD_HOST", "localhost")
+    vlad_port = os.getenv("VLAD_PORT", "3306")
+    vlad_user = os.getenv("VLAD_USER", "vlad")
+    vlad_password = os.getenv("VLAD_PASSWORD", "pass")
+    vlad_database = os.getenv("VLAD_DATABASE", "vlad")
+
     vlad_url = (
-        f"mysql+aiomysql://{args.user}:{args.password}"
-        f"@{args.host}:{args.port}/{args.database}"
+        f"mysql+aiomysql://{vlad_user}:{vlad_password}"
+        f"@{vlad_host}:{vlad_port}/{vlad_database}"
     )
 
-    super_host     = os.getenv("SUPER_HOST",     args.host)
-    super_port     = os.getenv("SUPER_PORT",     str(args.port))
-    super_user     = os.getenv("SUPER_USER",     args.user)
-    super_password = os.getenv("SUPER_PASSWORD", args.password)
+    super_host     = os.getenv("SUPER_HOST",     vlad_host)
+    super_port     = os.getenv("SUPER_PORT",     vlad_port)
+    super_user     = os.getenv("SUPER_USER",     vlad_user)
+    super_password = os.getenv("SUPER_PASSWORD", vlad_password)
     super_name     = os.getenv("SUPER_NAME",     "brain")
 
-    brain_host     = os.getenv("MASTER_HOST",     args.host)
-    brain_port     = os.getenv("MASTER_PORT",     str(args.port))
-    brain_user     = os.getenv("MASTER_USER",     args.user)
-    brain_password = os.getenv("MASTER_PASSWORD", args.password)
+    brain_host     = os.getenv("MASTER_HOST",     vlad_host)
+    brain_port     = os.getenv("MASTER_PORT",     vlad_port)
+    brain_user     = os.getenv("MASTER_USER",     vlad_user)
+    brain_password = os.getenv("MASTER_PASSWORD", vlad_password)
     brain_name     = os.getenv("MASTER_NAME",     "brain")
 
     brain_url = (
@@ -987,7 +834,7 @@ async def run(args) -> None:
 
     log.info("=" * 60)
     log.info(f"🚀 models={MODEL_IDS}")
-    log.info(f"   vlad  DB : {args.user}@{args.host}:{args.port}/{args.database}")
+    log.info(f"   vlad  DB : {vlad_user}@{vlad_host}:{vlad_port}/{vlad_database}")
     log.info(f"   brain DB : {brain_user}@{brain_host}:{brain_port}/{brain_name}")
     log.info(f"   super DB : {super_user}@{super_host}:{super_port}/{super_name}")
     log.info("=" * 60)
@@ -1007,6 +854,7 @@ async def run(args) -> None:
             except Exception as e:
                 log.error(f"❌ Модель {model_id}: не удалось получить конфигурацию: {e}")
                 send_error_trace(e, f"get_service_config model={model_id}")
+                # Пропускаем проблемную модель, продолжаем остальные
         sync_engine.dispose()
     except Exception as e:
         log.critical(f"❌ Не удалось подключиться к super DB: {e}")
@@ -1030,9 +878,6 @@ async def run(args) -> None:
         log.critical(f"❌ Ошибка создания таблиц: {e}")
         send_error_trace(e, "ensure_tables")
         sys.exit(1)
-
-    # ── Диагностика: состояние БД на старте ──────────────────────────────────
-    await db_diagnostics(engine_vlad)
 
     date_from = _parse_dt(args.date_from) if args.date_from else datetime(2025, 1, 15)
     date_to   = (_parse_dt(args.date_to) if args.date_to
@@ -1098,10 +943,6 @@ async def run(args) -> None:
                 log.info("=" * 55)
                 send_trace(f"✅ Готово — model={model_id}", msg)
 
-        # ── Итоговое состояние БД ──────────────────────────────────────────────
-        log.info("\n📊 Финальная диагностика БД:")
-        await db_diagnostics(engine_vlad)
-
         # ── Итоговое сообщение ─────────────────────────────────────────────────
         elapsed = deadline.elapsed_str()
         completed = [m[0] for m in model_configs]
@@ -1139,41 +980,36 @@ async def run(args) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Аргументы
+#  Аргументы (теперь только опциональные, подключение из env)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Универсальный парсер: кеш + бэктест за один запуск (мульти-модель)",
+        description="Универсальный парсер: кеш + бэктест за один запуск (мульти-модель). "
+                    "Параметры подключения к vlad БД берутся из переменных окружения "
+                    "(VLAD_HOST, VLAD_PORT, VLAD_USER, VLAD_PASSWORD, VLAD_DATABASE).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Примеры:
-  # Одна модель
-  python cache.py vlad_data_bot localhost 3307 vlad pass vlad --models 33
+  # Базовый запуск (все пары, дни, тиры, модели из MODEL_IDS)
+  python cache.py
 
-  # Несколько моделей через запятую
-  python cache.py vlad_data_bot localhost 3307 vlad pass vlad --models 33,25,10
+  # С указанием периода
+  python cache.py --date-from 2025-01-15 --date-to 2026-03-12
 
-  # С диапазоном дат
-  python cache.py vlad_data_bot localhost 3307 vlad pass vlad --models 33,25 --date-from 2025-01-15 --date-to 2026-03-12
+  # Только конкретная пара и день
+  python cache.py --pair 1 --day 0
 
-  # Только кеш для конкретной пары
-  python cache.py vlad_data_bot localhost 3307 vlad pass vlad --models 33 --pair 1 --day 0 --only-fill
+  # Только кеш
+  python cache.py --only-fill
 
   # Только бэктест (кеш уже заполнен)
-  python cache.py vlad_data_bot localhost 3307 vlad pass vlad --models 33,25 --skip-fill
+  python cache.py --skip-fill
 
   # С таймаутом 12 часов
-  python cache.py vlad_data_bot localhost 3307 vlad pass vlad --models 33,25 --timeout-hours 12
+  python cache.py --timeout-hours 12
         """,
     )
-
-    parser.add_argument("table_name", help="Имя сессии (совместимость с Bybit_Tg_Bot.py)")
-    parser.add_argument("host",       help="Хост MySQL (vlad БД)")
-    parser.add_argument("port",       type=int, help="Порт MySQL")
-    parser.add_argument("user",       help="Пользователь MySQL")
-    parser.add_argument("password",   help="Пароль MySQL")
-    parser.add_argument("database",   help="База данных (vlad)")
 
     parser.add_argument("--date-from", default=None,
                         help="Начало диапазона (по умолчанию: 2025-01-15)")
@@ -1202,9 +1038,7 @@ def main():
     args = parse_args()
 
     log.info("=" * 60)
-    log.info("⚙️  Параметры запуска")
-    log.info(f"   host          : {args.host}:{args.port}")
-    log.info(f"   database      : {args.database}")
+    log.info("⚙️  Параметры запуска (из env + аргументы)")
     log.info(f"   models        : {MODEL_IDS}")
     log.info(f"   date_from     : {args.date_from or '2025-01-15 (default)'}")
     log.info(f"   date_to       : {args.date_to   or 'today (default)'}")

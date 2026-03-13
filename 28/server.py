@@ -212,7 +212,7 @@ async def preload_all_data():
         log(f"  {table}: {len(GLOBAL_RATES[table])} candles", NODE_NAME)
 
     SERVICE_URL      = await load_service_url(engine_super, SERVICE_ID)
-    await ensure_cache_table(engine_brain)
+    await ensure_cache_table(engine_vlad)
     LAST_RELOAD_TIME = datetime.now()
     log("✅ FULL DATA RELOAD COMPLETED", NODE_NAME, force=True)
 
@@ -396,7 +396,7 @@ async def get_values(
 ):
     try:
         return await cached_values(
-            engine_vlad=engine_brain,
+            engine_vlad=engine_vlad,
             service_url  = SERVICE_URL,
             pair         = pair,
             day          = day,
