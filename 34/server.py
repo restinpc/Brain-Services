@@ -146,7 +146,7 @@ async def lifespan(app: FastAPI):
             text("SELECT url FROM brain_service WHERE id = :sid"), {"sid": SERVICE_ID}
         )).fetchone()
     app.state.service_url = row[0].rstrip("/") if row and row[0] else f"http://localhost:{PORT}"
-    await ensure_cache_table(engine_vlad)
+    await ensure_cache_table(engine_brain)
     log(f"SERVICE_URL (self): {app.state.service_url}", NODE_NAME, force=True)
 
     yield
@@ -247,7 +247,7 @@ async def get_values(
     # Кешируем весь составной результат: ключ кеша включает params JSON
     try:
         return await cached_values(
-            engine_vlad  = engine_vlad,
+            engine_vlad=engine_brain,
             service_url  = app.state.service_url,
             pair         = pair,
             day          = day,

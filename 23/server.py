@@ -159,7 +159,7 @@ async def preload_all_data():
 
     # ── Загружаем URL сервиса через супер-ноду и создаём таблицу кеша ─────────
     SERVICE_URL = await load_service_url(engine_super, SERVICE_ID)
-    await ensure_cache_table(engine_vlad)
+    await ensure_cache_table(engine_brain)
 
     log("SERVER READY. ALL DATA PRELOADED.", NODE_NAME, force=True)
 
@@ -332,7 +332,7 @@ async def get_values(
 ):
     try:
         return await cached_values(
-            engine_vlad  = engine_vlad,
+            engine_vlad=engine_brain,
             service_url  = SERVICE_URL,
             pair         = pair,
             day          = day,
