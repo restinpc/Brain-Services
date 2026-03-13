@@ -10,7 +10,6 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 
 from fastapi import FastAPI, HTTPException, Query
-from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy import text
 from dotenv import load_dotenv
 
@@ -19,6 +18,7 @@ from common import (
     log, send_error_trace,
     ok_response, err_response,
     resolve_workers,
+    build_engines,
 )
 from cache_helper import ensure_cache_table, load_service_url, cached_values
 
@@ -31,26 +31,11 @@ TREND_MAP       = {"UNKNOWN": "X", "ABOVE": "A", "BELOW": "B", "AT": "T"}
 MOMENTUM_MAP    = {"UNKNOWN": "X", "UP": "U", "DOWN": "D", "FLAT": "F"}
 
 load_dotenv()
-DB_HOST         = os.getenv("DB_HOST",         "127.0.0.1")
-DB_PORT         = os.getenv("DB_PORT",         "3306")
-DB_USER         = os.getenv("DB_USER",         "vlad")
-DB_PASSWORD     = os.getenv("DB_PASSWORD",     "")
-DB_NAME         = os.getenv("DB_NAME",         "vlad")
-MASTER_HOST     = os.getenv("MASTER_HOST",     "127.0.0.1")
-MASTER_PORT     = os.getenv("MASTER_PORT",     "3306")
-MASTER_USER     = os.getenv("MASTER_USER",     "vlad")
-MASTER_PASSWORD = os.getenv("MASTER_PASSWORD", "")
-MASTER_NAME     = os.getenv("MASTER_NAME",     "brain")
 
-DATABASE_URL       = f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
-BRAIN_DATABASE_URL = f"mysql+aiomysql://{MASTER_USER}:{MASTER_PASSWORD}@{MASTER_HOST}:{MASTER_PORT}/{MASTER_NAME}"
-
-engine_vlad  = create_async_engine(DATABASE_URL,       pool_size=10, echo=False)
-engine_brain = create_async_engine(BRAIN_DATABASE_URL, pool_size=5,  echo=False)
+engine_vlad, engine_brain, engine_super = build_engines()
 
 log(f"MODE={MODE}", NODE_NAME, force=True)
-log(f"vlad:  {DB_USER}@{DB_HOST}:{DB_PORT}/{DB_NAME}", NODE_NAME)
-log(f"brain: {MASTER_USER}@{MASTER_HOST}:{MASTER_PORT}/{MASTER_NAME}", NODE_NAME)
+log(f"engines built via build_engines()", NODE_NAME)
 
 SMA_SHORT    = int(os.getenv("SMA_SHORT",    "24"))
 SMA_LONG     = int(os.getenv("SMA_LONG",     "168"))
@@ -261,7 +246,7 @@ async def preload_all_data():
         except Exception as e:
             log(f"❌ {table}: {e}", NODE_NAME, level="error")
 
-    SERVICE_URL      = await load_service_url(engine_brain, SERVICE_ID)
+    SERVICE_URL      = await load_service_url(engine_super, SERVICE_ID)
     await ensure_cache_table(engine_vlad)
     LAST_RELOAD_TIME = datetime.now()
     log("✅ MARKET FULL DATA RELOAD COMPLETED", NODE_NAME, force=True)
@@ -285,6 +270,7 @@ async def lifespan(app: FastAPI):
     task.cancel()
     await engine_vlad.dispose()
     await engine_brain.dispose()
+    await engine_super.dispose()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -392,7 +378,7 @@ async def get_metadata():
 @app.get("/weights")
 async def get_weights():
     try:
-        return ok_response({"weights": GLOBAL_WEIGHT_CODES, "total": len(GLOBAL_WEIGHT_CODES)})
+        return ok_response(GLOBAL_WEIGHT_CODES)
     except Exception as e:
         return err_response(str(e), exc=e, node=NODE_NAME, script="get_weights")
 
@@ -438,7 +424,7 @@ async def patch_service():
 if __name__ == "__main__":
     import asyncio as _asyncio
     async def _get_workers():
-        return await resolve_workers(engine_brain, SERVICE_ID, default=1)
+        return await resolve_workers(engine_super, SERVICE_ID, default=1)
     _workers = _asyncio.run(_get_workers())
     log(f"Starting with {_workers} worker(s) in {MODE} mode", NODE_NAME, force=True)
     try:

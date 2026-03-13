@@ -14,7 +14,8 @@ MODE   = os.getenv("MODE", "dev").lower()   # "dev" | "prod"
 IS_DEV = MODE == "dev"
 
 # ── Трассировка ошибок ────────────────────────────────────────────────────────
-TRACE_URL = "https://server.brain-project.online/trace.php"
+_HANDLER  = os.getenv("HANDLER", "https://server.brain-project.online").rstrip("/")
+TRACE_URL = f"{_HANDLER}/trace.php"
 EMAIL     = os.getenv("ALERT_EMAIL", "vladyurjevitch@yandex.ru")
 
 

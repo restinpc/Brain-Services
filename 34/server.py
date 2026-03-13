@@ -9,7 +9,6 @@ import requests
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query
-from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy import text
 from dotenv import load_dotenv
 
@@ -18,6 +17,7 @@ from common import (
     log, send_error_trace,
     ok_response, err_response,
     resolve_workers,
+    build_engines,
 )
 from cache_helper import ensure_cache_table, cached_values
 
@@ -29,26 +29,11 @@ BEST_URL   = "https://server.brain-project.online/best.php"
 NODE_NAME  = f"brain-complex-{MODEL_A_ID}-{MODEL_B_ID}-microservice"
 
 load_dotenv()
-DB_HOST         = os.getenv("DB_HOST",         "127.0.0.1")
-DB_PORT         = os.getenv("DB_PORT",         "3306")
-DB_USER         = os.getenv("DB_USER",         "vlad")
-DB_PASSWORD     = os.getenv("DB_PASSWORD",     "")
-DB_NAME         = os.getenv("DB_NAME",         "vlad")
-MASTER_HOST     = os.getenv("MASTER_HOST",     "127.0.0.1")
-MASTER_PORT     = os.getenv("MASTER_PORT",     "3306")
-MASTER_USER     = os.getenv("MASTER_USER",     "vlad")
-MASTER_PASSWORD = os.getenv("MASTER_PASSWORD", "")
-MASTER_NAME     = os.getenv("MASTER_NAME",     "brain")
 
-DATABASE_URL  = f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
-BRAIN_DB_URL  = f"mysql+aiomysql://{MASTER_USER}:{MASTER_PASSWORD}@{MASTER_HOST}:{MASTER_PORT}/{MASTER_NAME}"
-
-engine_vlad  = create_async_engine(DATABASE_URL, pool_size=10, echo=False)
-engine_brain = create_async_engine(BRAIN_DB_URL, pool_size=6,  echo=False)
+engine_vlad, engine_brain, engine_super = build_engines()
 
 log(f"MODE={MODE}", NODE_NAME, force=True)
-log(f"vlad:  {DB_USER}@{DB_HOST}:{DB_PORT}/{DB_NAME}",              NODE_NAME)
-log(f"brain: {MASTER_USER}@{MASTER_HOST}:{MASTER_PORT}/{MASTER_NAME}", NODE_NAME)
+log(f"engines built via build_engines()", NODE_NAME)
 
 
 def _fetch_weights_from_child(url: str, model_id: int) -> list[str]:
@@ -56,8 +41,8 @@ def _fetch_weights_from_child(url: str, model_id: int) -> list[str]:
     r = requests.get(f"{url}/weights", timeout=10)
     r.raise_for_status()
     data = r.json()
-    if "payload" in data and "weights" in data["payload"]:
-        return data["payload"]["weights"]
+    if "payLoad" in data:
+        return data["payLoad"]
     if "weights" in data:
         return data["weights"]
     raise ValueError(f"Model {model_id}: no 'weights' in response")
@@ -81,8 +66,8 @@ async def _compute_composite(pair, day, date, param_dict, state) -> dict | None:
         try:
             r   = requests.get(f"{url}/values", params=query_params, timeout=10)
             res = r.json()
-            if "payload" in res:
-                res = res["payload"]
+            if "payLoad" in res:
+                res = res["payLoad"]
             if "error" in res:
                 return None
             for key, val in res.items():
@@ -96,7 +81,7 @@ async def _compute_composite(pair, day, date, param_dict, state) -> dict | None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 1. URL-ы из brain_service
-    async with engine_brain.connect() as conn:
+    async with engine_super.connect() as conn:
         res  = await conn.execute(text(
             "SELECT id, url FROM brain_service WHERE id IN (:a, :b) AND active = 1"
         ), {"a": MODEL_A_ID, "b": MODEL_B_ID})
@@ -156,7 +141,7 @@ async def lifespan(app: FastAPI):
 
     # 5. URL этого сервиса и таблица кеша
     # Для составной модели SERVICE_URL читается из brain_service по SERVICE_ID=34
-    async with engine_brain.connect() as conn:
+    async with engine_super.connect() as conn:
         row = (await conn.execute(
             text("SELECT url FROM brain_service WHERE id = :sid"), {"sid": SERVICE_ID}
         )).fetchone()
@@ -167,6 +152,7 @@ async def lifespan(app: FastAPI):
     yield
     await engine_vlad.dispose()
     await engine_brain.dispose()
+    await engine_super.dispose()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -221,7 +207,7 @@ async def get_weights():
                             node=NODE_NAME, script="get_weights")
     combined = [f"{MODEL_A_ID}_" + w for w in w_a] + [f"{MODEL_B_ID}_" + w for w in w_b]
     deduped  = list(dict.fromkeys(combined))
-    return ok_response({"weights": deduped, "total": len(deduped)})
+    return ok_response(deduped)
 
 
 @app.get("/new_weights")
@@ -241,7 +227,7 @@ async def new_weights():
                 weights = getattr(app.state, attr) or []
             all_weights += [f"{model_id}_" + w for w in weights]
         deduped = list(dict.fromkeys(all_weights))
-        return ok_response({"weights": deduped})
+        return ok_response(deduped)
     except Exception as e:
         return err_response(str(e), exc=e, node=NODE_NAME, script="new_weights")
 
@@ -376,7 +362,7 @@ async def patch_service():
 if __name__ == "__main__":
     import asyncio as _asyncio
     async def _get_workers():
-        return await resolve_workers(engine_brain, SERVICE_ID, default=1)
+        return await resolve_workers(engine_super, SERVICE_ID, default=1)
     _workers = _asyncio.run(_get_workers())
     log(f"Starting with {_workers} worker(s) in {MODE} mode", NODE_NAME, force=True)
     try:
