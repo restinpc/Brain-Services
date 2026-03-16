@@ -353,7 +353,10 @@ async def get_weights():
 
 
 @app.get("/new_weights")
-async def get_new_weights(code: str = Query(...)):
+async def get_new_weights(
+    code: str = Query(...),
+    limit: int = Query(500, ge=1, le=5000),
+):
     try:
         parts = code.split("__")
         if len(parts) < 5:
@@ -381,9 +384,10 @@ async def get_new_weights(code: str = Query(...)):
                     OR (event_id = :event_id AND forecast_direction = :fdir AND surprise_direction = :sdir AND actual_direction = :adir AND `mode_val` = :mode AND COALESCE(hour_shift, -999999) > :hour)
                 ORDER BY event_id, forecast_direction, surprise_direction, actual_direction,
                          `mode_val`, hour_shift IS NULL, hour_shift
+                LIMIT :limit
             """), {
                 "event_id": event_id, "fdir": fdir, "sdir": sdir, "adir": adir,
-                "mode": mode, "hour": hour_val,
+                "mode": mode, "hour": hour_val, "limit": limit,
             })
         return ok_response([r["weight_code"] for r in res.mappings().all()])
     except Exception as e:
