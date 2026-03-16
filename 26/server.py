@@ -101,13 +101,24 @@ def get_rates_table_name(pair_id, day_flag):
 def get_modification_factor(pair_id):
     return {1: 0.001, 3: 1000.0, 4: 100.0}.get(pair_id, 1.0)
 
+_DATE_FORMATS_26 = (
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%d %H:%M:%S.%f",    # ← NEW
+    "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%dT%H:%M:%S.%f",    # ← NEW
+    "%Y-%m-%d",
+    "%Y-%d-%m %H:%M:%S",
+    "%Y-%d-%m %H:%M:%S.%f",    # ← NEW
+)
 
 def parse_date_string(date_str):
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d", "%Y-%d-%m %H:%M:%S"):
+    for fmt in _DATE_FORMATS_26:
         try:
             return datetime.strptime(date_str.strip(), fmt)
         except ValueError:
             continue
+    # FIX: логируем точное значение, которое не распарсилось
+    log(f"⚠️  parse_date_string failed: repr={date_str!r}", NODE_NAME, level="error", force=True)
     return None
 
 
@@ -245,32 +256,38 @@ async def calculate_pure_memory(pair: int, day: int, date_str: str,
     """Основная логика расчёта weights."""
     target_date = parse_date_string(date_str)
     if not target_date:
+        # parse_date_string уже залогировал repr(date_str)
+        log(f"❌ calculate_pure_memory: date parse failed | "
+            f"date_str={date_str!r} pair={pair} day={day} var={var}",
+            NODE_NAME, level="error", force=True)
         return None
-
+ 
     var_cfg = VAR_CONFIGS.get(var)
     if var_cfg is None:
+        # FIX: раньше это молча давало "Invalid date format" на стороне PHP —
+        #      теперь видно что реальная причина — неизвестный var
+        log(f"❌ calculate_pure_memory: unknown var={var} (not in VAR_CONFIGS 0-19) | "
+            f"date={date_str!r} pair={pair} day={day}",
+            NODE_NAME, level="error", force=True)
         return None
+ 
     wl, wr, candle_pct, conf_name, conf_param = var_cfg
     conf_fn = CONFIDENCE_FUNCS[conf_name]
-
+ 
     rates_table = get_rates_table_name(pair, day)
     modification = get_modification_factor(pair)
-
-    # формируем окно дат вокруг целевой
+ 
     if day == 0:
         check_dates = [target_date + timedelta(hours=h) for h in range(wl, wr + 1)]
     else:
         check_dates = [target_date + timedelta(days=d) for d in range(wl, wr + 1)]
-
-    # собираем события в окне
+ 
     events_in_window = []
     for dt in check_dates:
         for e in GLOBAL_CALENDAR.get(dt, []):
-            # пропускаем "low" важность, кроме самой целевой даты
             if e["Importance"] != 1 or dt == target_date:
                 events_in_window.append(e)
-
-    # фильтруем по типу события (регулярное/нерегулярное)
+ 
     needed_events = []
     for e in events_in_window:
         diff = target_date - e["event_date"]
@@ -279,45 +296,45 @@ async def calculate_pure_memory(pair: int, day: int, date_str: str,
         if (evt_type == 0 and shift != 0) or (evt_type == 1 and abs(shift) > 12):
             continue
         needed_events.append((e, shift, evt_type))
-
+ 
     if not needed_events:
+        log(f"ℹ️  calculate_pure_memory: no events in window | "
+            f"date={date_str!r} pair={pair} day={day} var={var}",
+            NODE_NAME, force=False)
         return {}
-
-    # подготовленные структуры
+ 
     ram_rates = GLOBAL_RATES.get(rates_table, {})
     ram_ext = GLOBAL_EXTREMUMS.get(rates_table, {"min": set(), "max": set()})
     prev_candle = find_prev_candle_trend(rates_table, target_date)
-
+ 
     size_threshold = 0
     if candle_pct is not None:
         size_threshold = GLOBAL_CANDLE_THRESHOLD.get(rates_table, {}).get(candle_pct, 0)
-
+ 
     result = {}
     for e, shift, evt_type in needed_events:
         valid_dates = [d for d in GLOBAL_HISTORY.get(e["EventId"], []) if d < target_date]
         if not valid_dates:
             continue
-
+ 
         key0 = f"{e['EventId']}_{evt_type}_0" + (f"_{shift}" if evt_type == 1 else "")
         key1 = f"{e['EventId']}_{evt_type}_1" + (f"_{shift}" if evt_type == 1 else "")
-
+ 
         delta = timedelta(hours=shift) if day == 0 else timedelta(days=shift)
         t_dates = [d + delta for d in valid_dates if (d + delta) < target_date]
-
+ 
         if size_threshold > 0:
             filtered = [td for td in t_dates
                         if GLOBAL_CANDLE_SIZES.get(rates_table, {}).get(td, 0) >= size_threshold]
         else:
             filtered = t_dates
-
+ 
         n = len(filtered)
         conf = conf_fn(n, conf_param)
-
-        # type_ = 0 (mode 0) — сумма t1
+ 
         sum_t1 = sum(ram_rates.get(td, 0) for td in filtered)
         result[key0] = sum_t1 * conf
-
-        # type_ = 1 (mode 1) — экстремумы
+ 
         if prev_candle:
             _, is_bull = prev_candle
             ext_set = ram_ext["max" if is_bull else "min"]
@@ -326,8 +343,7 @@ async def calculate_pure_memory(pair: int, day: int, date_str: str,
             if total > 0:
                 val = (matches / total) * 2 - 1
                 result[key1] = val * conf * modification
-
-    # убираем нулевые значения
+ 
     return {k: round(v, 6) for k, v in result.items() if v != 0}
 
 
