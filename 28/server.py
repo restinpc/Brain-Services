@@ -57,12 +57,24 @@ def get_rates_table_name(pair_id, day_flag):
 def get_modification_factor(pair_id):
     return {1: 0.001, 3: 1000.0, 4: 100.0}.get(pair_id, 1.0)
 
+_DATE_FORMATS_28 = (
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%d %H:%M:%S.%f",    # ← NEW
+    "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%dT%H:%M:%S.%f",    # ← NEW
+    "%Y-%m-%d",
+    "%Y-%d-%m %H:%M:%S",
+    "%Y-%d-%m %H:%M:%S.%f",    # ← NEW
+)
+ 
+ 
 def parse_date_string(date_str):
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d", "%Y-%d-%m %H:%M:%S"):
+    for fmt in _DATE_FORMATS_28:
         try:
             return datetime.strptime(date_str.strip(), fmt)
         except ValueError:
             continue
+    log(f"⚠️  parse_date_string failed: repr={date_str!r}", NODE_NAME, level="error", force=True)
     return None
 
 def find_prev_candle_trend(table, target_date):
@@ -244,8 +256,11 @@ app = FastAPI(lifespan=lifespan)
 async def calculate_pure_memory(pair, day, date_str, calc_type=0, calc_var=0):
     target_date = parse_date_string(date_str)
     if not target_date:
+        log(f"❌ calculate_pure_memory: date parse failed | "
+            f"date_str={date_str!r} pair={pair} day={day} calc_type={calc_type} calc_var={calc_var}",
+            NODE_NAME, level="error", force=True)
         return None
-
+ 
     rates_table  = get_rates_table_name(pair, day)
     modification = get_modification_factor(pair)
     window       = 12
@@ -254,51 +269,54 @@ async def calculate_pure_memory(pair, day, date_str, calc_type=0, calc_var=0):
         if day == 0 else
         [target_date + timedelta(days=d)  for d in range(-window, window + 1)]
     )
-
+ 
     events_in_window = [
         e for dt in check_dates for e in GLOBAL_CALENDAR.get(dt, [])
         if e["Importance"] != 1 or dt == target_date
     ]
     if not events_in_window:
+        log(f"ℹ️  calculate_pure_memory: no events in window | "
+            f"date={date_str!r} pair={pair} day={day}",
+            NODE_NAME, force=False)
         return {}
-
+ 
     ram_rates   = GLOBAL_RATES.get(rates_table, {})
     ram_ranges  = GLOBAL_CANDLE_RANGES.get(rates_table, {})
     avg_range   = GLOBAL_AVG_RANGE.get(rates_table, 0.0)
     ram_ext     = GLOBAL_EXTREMUMS.get(rates_table, {"min": set(), "max": set()})
     prev_candle = find_prev_candle_trend(rates_table, target_date)
-
+ 
     result = {}
     for e in events_in_window:
         diff  = target_date - e["event_date"]
         shift = int(diff.total_seconds() / 3600) if day == 0 else diff.days
         eid   = e["EventId"]
-
+ 
         fdir, sdir, adir = get_last_known_context(eid, target_date)
         ctx_key  = (eid, fdir, sdir, adir)
         ctx_info = GLOBAL_CTX_INDEX.get(ctx_key)
         if ctx_info is None:
             continue
-
+ 
         is_recurring = ctx_info["occurrence_count"] >= RECURRING_MIN_COUNT
         if not is_recurring and shift != 0:
             continue
         if is_recurring and abs(shift) > window:
             continue
-
+ 
         valid_dates = [d for d in GLOBAL_HISTORY.get(eid, []) if d < target_date]
         if not valid_dates:
             continue
-
+ 
         delta  = timedelta(hours=shift) if day == 0 else timedelta(days=shift)
         t_dates = [d + delta for d in valid_dates if (d + delta) < target_date]
         hour_arg = shift if is_recurring else None
-
+ 
         if calc_type in (0, 1):
             t1_sum = compute_t1_value(t_dates, calc_var, ram_rates, ram_ranges, avg_range)
             wc     = build_weight_code(eid, fdir, sdir, adir, 0, hour_arg)
             result[wc] = result.get(wc, 0.0) + t1_sum
-
+ 
         if calc_type in (0, 2) and prev_candle:
             _, is_bull = prev_candle
             ext_set    = ram_ext["max" if is_bull else "min"]
@@ -307,7 +325,7 @@ async def calculate_pure_memory(pair, day, date_str, calc_type=0, calc_var=0):
             if ext_val is not None:
                 wc = build_weight_code(eid, fdir, sdir, adir, 1, hour_arg)
                 result[wc] = result.get(wc, 0.0) + ext_val
-
+ 
     return {k: round(v, 6) for k, v in result.items() if v != 0}
 
 
