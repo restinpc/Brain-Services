@@ -488,33 +488,34 @@ class PolymarketHistoryCollector:
         except: pass
         return []
 
-    def extract_market_meta(self, m):
-        """Извлекает все метаданные рынка в dict (как в vlad_polymarket_direct)."""
+        def extract_market_meta(self, m):
+        """Извлекает все метаданные рынка в dict (как в vlad_polymarket_direct).
+        Поддерживает ОБОИ формата: старый CLOB (tokens) + новый Gamma (clobTokenIds)."""
         cid = m.get("condition_id", m.get("conditionId", ""))
         if not cid:
             return None
 
-        # Сначала пробуем CLOB-формат (tokens array)
         tokens = m.get("tokens", [])
+        clob_ids = m.get("clobTokenIds", [])          
         tid = ""
         yes_p = no_p = None
 
+        # 1. CLOB-формат 
         if isinstance(tokens, list) and tokens:
             tid = tokens[0].get("token_id", "")
             yes_p = _sf(tokens[0].get("price"))
             if len(tokens) >= 2:
                 no_p = _sf(tokens[1].get("price"))
 
-        # Fallback: Gamma API формат (clobTokenIds)
+        # 2. Fallback: Gamma API 
         if not tid:
-            clob_ids = m.get("clobTokenIds", [])
             if isinstance(clob_ids, list) and clob_ids:
-                tid = str(clob_ids[0])
+                tid = str(clob_ids[0])                
 
         if not tid:
-            return None
+            return None                               
 
-        # Outcomes from outcomePrices
+        # 3. Цены из outcomePrices 
         outcomes = m.get("outcomePrices", [])
         if isinstance(outcomes, list):
             if len(outcomes) >= 1 and yes_p is None:
@@ -529,7 +530,16 @@ class PolymarketHistoryCollector:
 
         # Tags
         tags_raw = m.get("tags", [])
-        tags_str = ",".join(str(t.get("label", t) if isinstance(t, dict) else t) for t in (tags_raw or [])[:15])
+        tags_str = ",".join(
+            str(t.get("label", t) if isinstance(t, dict) else t)
+            for t in (tags_raw or [])[:15]
+        )
+
+        # num_outcomes тоже robust
+        num_outcomes = (
+            len(tokens) if isinstance(tokens, list) and tokens else
+            (len(clob_ids) if isinstance(clob_ids, list) and clob_ids else None)
+        )
 
         return {
             "condition_id": cid[:100],
@@ -544,7 +554,7 @@ class PolymarketHistoryCollector:
             "outcome_yes": yes_p,
             "outcome_no": no_p,
             "spread": spread,
-            "num_outcomes": len(tokens) if isinstance(tokens, list) else None,
+            "num_outcomes": num_outcomes,
             "active": 1 if m.get("active", True) else 0,
             "raw_json": json.dumps(m, ensure_ascii=False, default=str)[:5000],
         }
