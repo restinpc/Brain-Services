@@ -488,21 +488,29 @@ class PolymarketHistoryCollector:
         except: pass
         return []
 
-    def extract_market_meta(self, m):
-        """Извлекает все метаданные рынка в dict (как в vlad_polymarket_direct)."""
-        cid = m.get("condition_id", m.get("conditionId", ""))
-        if not cid: return None
+def extract_market_meta(self, m):
+    """Извлекает все метаданные рынка в dict (как в vlad_polymarket_direct)."""
+    cid = m.get("condition_id", m.get("conditionId", ""))
+    if not cid: return None
 
-        tokens = m.get("tokens", [])
-        tid = ""
-        yes_p = no_p = None
-        if isinstance(tokens, list) and tokens:
-            tid = tokens[0].get("token_id", "")
-            yes_p = _sf(tokens[0].get("price"))
-            if len(tokens) >= 2:
-                no_p = _sf(tokens[1].get("price"))
+    # Сначала пробуем CLOB-формат (tokens array)
+    tokens = m.get("tokens", [])
+    tid = ""
+    yes_p = no_p = None
 
-        if not tid: return None
+    if isinstance(tokens, list) and tokens:
+        tid = tokens[0].get("token_id", "")
+        yes_p = _sf(tokens[0].get("price"))
+        if len(tokens) >= 2:
+            no_p = _sf(tokens[1].get("price"))
+
+    # Fallback: Gamma API формат (clobTokenIds)
+    if not tid:
+        clob_ids = m.get("clobTokenIds", [])
+        if isinstance(clob_ids, list) and clob_ids:
+            tid = str(clob_ids[0])
+
+    if not tid: return None
 
         # Outcomes from outcomePrices
         outcomes = m.get("outcomePrices", [])
