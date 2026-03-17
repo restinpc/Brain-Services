@@ -367,27 +367,111 @@ class PolymarketHistoryCollector:
         except: return None
 
     def fetch_all_markets(self):
-        """Загружает ВСЕ рынки с полными метаданными через CLOB API."""
+        """
+        Загружает рынки через Gamma API (metadata-rich, с фильтрами).
+        CLOB /markets отдаёт 300k+ архивных — слишком много.
+        Gamma API позволяет фильтровать по active/closed и сортировать по volume.
+        
+        Стратегия: 
+          1. Активные рынки (accepting_orders) — все
+          2. Недавно закрытые (за последний год) — для исторического контекста
+        """
         all_markets = []
-        next_cursor = None
+
+        # === Tier 1: Gamma API — активные рынки (сортировка по volume) ===
+        print("   📡 Gamma API: активные рынки...")
+        offset = 0
         while True:
             try:
-                params = {"limit": 500}
-                if next_cursor: params["next_cursor"] = next_cursor
-                resp = self.session.get("https://clob.polymarket.com/markets", params=params, timeout=20)
-                if resp.status_code != 200: break
+                resp = self.session.get(
+                    "https://gamma-api.polymarket.com/markets",
+                    params={
+                        "active": "true",
+                        "closed": "false",
+                        "limit": "100",
+                        "offset": str(offset),
+                        "order": "volume24hr",
+                        "ascending": "false",
+                    },
+                    timeout=20
+                )
+                if resp.status_code != 200:
+                    print(f"   ⚠️ Gamma HTTP {resp.status_code}, пробуем CLOB fallback")
+                    break
                 data = resp.json()
-                if isinstance(data, list): markets = data; next_cursor = None
-                elif isinstance(data, dict): markets = data.get("data", []); next_cursor = data.get("next_cursor")
+                if isinstance(data, list): markets = data
+                elif isinstance(data, dict): markets = data.get("data", data.get("markets", []))
                 else: break
                 if not markets: break
                 all_markets.extend(markets)
-                print(f"   ...рынков: {len(all_markets)}", end="\r")
-                if not next_cursor or next_cursor == "LTE" or len(markets) < 100: break
-                time.sleep(random.uniform(0.3, 0.8))
+                print(f"   ...активных: {len(all_markets)}", end="\r")
+                offset += len(markets)
+                if len(markets) < 100: break
+                time.sleep(random.uniform(0.3, 0.6))
             except Exception as e:
-                print(f"   ⚠️ {e}"); break
-        print(f"\n   📋 Всего рынков: {len(all_markets)}")
+                print(f"   ⚠️ Gamma error: {e}")
+                break
+
+        # === Tier 2: Gamma — недавно закрытые (за последний год) ===
+        print(f"\n   📡 Gamma API: недавно закрытые рынки...")
+        offset = 0
+        closed_count = 0
+        while True:
+            try:
+                resp = self.session.get(
+                    "https://gamma-api.polymarket.com/markets",
+                    params={
+                        "active": "false",
+                        "closed": "true",
+                        "limit": "100",
+                        "offset": str(offset),
+                        "order": "volume",
+                        "ascending": "false",
+                    },
+                    timeout=20
+                )
+                if resp.status_code != 200: break
+                data = resp.json()
+                if isinstance(data, list): markets = data
+                elif isinstance(data, dict): markets = data.get("data", data.get("markets", []))
+                else: break
+                if not markets: break
+                all_markets.extend(markets)
+                closed_count += len(markets)
+                print(f"   ...закрытых: {closed_count}", end="\r")
+                offset += len(markets)
+                # Берём максимум 5000 закрытых (самых крупных по volume)
+                if len(markets) < 100 or closed_count >= 5000: break
+                time.sleep(random.uniform(0.3, 0.6))
+            except Exception as e:
+                print(f"   ⚠️ {e}")
+                break
+
+        print(f"\n   📋 Итого рынков: {len(all_markets)} (активных + топ закрытых)")
+
+        # === Fallback: CLOB API если Gamma не дал результатов ===
+        if len(all_markets) < 50:
+            print("   📡 Fallback: CLOB API (только active)...")
+            next_cursor = None
+            while True:
+                try:
+                    params = {"limit": 500, "active": "true"}
+                    if next_cursor: params["next_cursor"] = next_cursor
+                    resp = self.session.get("https://clob.polymarket.com/markets", params=params, timeout=20)
+                    if resp.status_code != 200: break
+                    data = resp.json()
+                    if isinstance(data, list): markets = data; next_cursor = None
+                    elif isinstance(data, dict): markets = data.get("data", []); next_cursor = data.get("next_cursor")
+                    else: break
+                    if not markets: break
+                    all_markets.extend(markets)
+                    print(f"   ...CLOB: {len(all_markets)}", end="\r")
+                    if not next_cursor or next_cursor == "LTE" or len(markets) < 100: break
+                    time.sleep(random.uniform(0.3, 0.8))
+                except Exception as e:
+                    print(f"   ⚠️ {e}"); break
+            print(f"\n   📋 CLOB fallback: {len(all_markets)} рынков")
+
         return all_markets
 
     def fetch_price_history(self, token_id, start_ts=None):
