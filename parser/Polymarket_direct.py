@@ -1,12 +1,8 @@
 """
 Polymarket History Collector
 Загружает список рынков (активные + топ-5000 закрытых по volume)
-и делает incremental backfill ценовой истории через /prices-history
-
-Таблица: vlad_polymarket_history
-
 Запуск:
-  python Polymarket_direct.py vlad_polymarket_history [host] [port] [user] [password] [database]
+  python Polymarket_direct.py vlad_polymarket [host] [port] [user] [password] [database]
 """
 import os
 import sys
@@ -41,7 +37,7 @@ def send_error_trace(exc, script_name="Polymarket_direct.py"):
 # ────────────────────────────────────────────────
 
 parser = argparse.ArgumentParser(description="Polymarket History → MySQL")
-parser.add_argument("table_name", help="Должно быть: vlad_polymarket_history")
+parser.add_argument("table_name", help="Имя таблицы для записи (например, vlad_polymarket)")
 parser.add_argument("host", nargs="?", default=os.getenv("DB_HOST"))
 parser.add_argument("port", nargs="?", default=os.getenv("DB_PORT", "3306"))
 parser.add_argument("user", nargs="?", default=os.getenv("DB_USER"))
@@ -50,10 +46,7 @@ parser.add_argument("database", nargs="?", default=os.getenv("DB_NAME"))
 
 args = parser.parse_args()
 
-if args.table_name != "vlad_polymarket_history":
-    print("❌ Ожидалось: vlad_polymarket_history")
-    sys.exit(1)
-
+# Проверка наличия параметров подключения
 if not all([args.host, args.user, args.password, args.database]):
     print("❌ Не указаны параметры подключения к базе")
     sys.exit(1)
