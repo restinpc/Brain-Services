@@ -1,4 +1,4 @@
-﻿"""
+"""
 server.py — brain-calendar-weights-microservice (port 8896, SERVICE_ID=33)
 Папка: 33/
 Режим запуска: MODE=dev | MODE=prod
@@ -35,6 +35,12 @@ FORECAST_MAP   = {"UNKNOWN": "X", "BEAT": "B", "MISS": "M", "INLINE": "I"}
 SURPRISE_MAP   = {"UNKNOWN": "X", "UP":   "U", "DOWN": "D", "FLAT":   "F"}
 REVISION_MAP   = {"NONE":    "N", "FLAT": "T", "UP":   "U", "DOWN":   "D", "UNKNOWN": "X"}
 IMPORTANCE_MAP = {"high": "H", "medium": "M", "low": "L", "none": "N"}
+
+# Обратные словари: однобуквенный код → полное слово (для /new_weights)
+FORECAST_MAP_REV   = {v: k for k, v in FORECAST_MAP.items()}
+SURPRISE_MAP_REV   = {v: k for k, v in SURPRISE_MAP.items()}
+REVISION_MAP_REV   = {v: k for k, v in REVISION_MAP.items()}
+IMPORTANCE_MAP_REV = {v: k for k, v in IMPORTANCE_MAP.items()}
 
 load_dotenv()
 
@@ -395,31 +401,48 @@ async def get_new_weights(code: str = Query(...)):
             event_id = int(parts[0])
         except ValueError:
             return err_response("event_id must be an integer")
-        currency, imp_c, fcd_c, scd_c, rcd_c = parts[1], parts[2], parts[3], parts[4], parts[5]
+
+        # Извлекаем однобуквенные коды из weight_code
+        currency_code = parts[1]
+        imp_c, fcd_c, scd_c, rcd_c = parts[2], parts[3], parts[4], parts[5]
+
+        # Декодируем однобуквенные коды в полные слова — именно они хранятся в таблице
+        importance   = IMPORTANCE_MAP_REV.get(imp_c, imp_c)
+        forecast_dir = FORECAST_MAP_REV.get(fcd_c, fcd_c)
+        surprise_dir = SURPRISE_MAP_REV.get(scd_c, scd_c)
+        revision_dir = REVISION_MAP_REV.get(rcd_c, rcd_c)
+
         try:
-            mode       = int(parts[6])
+            mode_val   = int(parts[6])
             hour_shift = int(parts[7]) if len(parts) > 7 else None
         except ValueError:
             return err_response("mode/hour_shift must be integers")
+
         hs_val = hour_shift if hour_shift is not None else -999999
+
         async with engine_vlad.connect() as conn:
             res = await conn.execute(text("""
                 SELECT weight_code FROM brain_calendar_weights
                 WHERE
                     event_id > :event_id
-                    OR (event_id = :event_id AND currency > :currency)
-                    OR (event_id = :event_id AND currency = :currency AND imp_c > :imp_c)
-                    OR (event_id = :event_id AND currency = :currency AND imp_c = :imp_c AND fcd_c > :fcd_c)
-                    OR (event_id = :event_id AND currency = :currency AND imp_c = :imp_c AND fcd_c = :fcd_c AND scd_c > :scd_c)
-                    OR (event_id = :event_id AND currency = :currency AND imp_c = :imp_c AND fcd_c = :fcd_c AND scd_c = :scd_c AND rcd_c > :rcd_c)
-                    OR (event_id = :event_id AND currency = :currency AND imp_c = :imp_c AND fcd_c = :fcd_c AND scd_c = :scd_c AND rcd_c = :rcd_c AND mode > :mode)
-                    OR (event_id = :event_id AND currency = :currency AND imp_c = :imp_c AND fcd_c = :fcd_c AND scd_c = :scd_c AND rcd_c = :rcd_c AND mode = :mode AND COALESCE(hour_shift, -999999) > :hs)
-                ORDER BY event_id, currency, imp_c, fcd_c, scd_c, rcd_c, mode,
+                    OR (event_id = :event_id AND currency_code > :currency_code)
+                    OR (event_id = :event_id AND currency_code = :currency_code AND importance > :importance)
+                    OR (event_id = :event_id AND currency_code = :currency_code AND importance = :importance AND forecast_dir > :forecast_dir)
+                    OR (event_id = :event_id AND currency_code = :currency_code AND importance = :importance AND forecast_dir = :forecast_dir AND surprise_dir > :surprise_dir)
+                    OR (event_id = :event_id AND currency_code = :currency_code AND importance = :importance AND forecast_dir = :forecast_dir AND surprise_dir = :surprise_dir AND revision_dir > :revision_dir)
+                    OR (event_id = :event_id AND currency_code = :currency_code AND importance = :importance AND forecast_dir = :forecast_dir AND surprise_dir = :surprise_dir AND revision_dir = :revision_dir AND mode_val > :mode_val)
+                    OR (event_id = :event_id AND currency_code = :currency_code AND importance = :importance AND forecast_dir = :forecast_dir AND surprise_dir = :surprise_dir AND revision_dir = :revision_dir AND mode_val = :mode_val AND COALESCE(hour_shift, -999999) > :hs)
+                ORDER BY event_id, currency_code, importance, forecast_dir, surprise_dir, revision_dir, mode_val,
                          hour_shift IS NULL, hour_shift
             """), {
-                "event_id": event_id, "currency": currency,
-                "imp_c": imp_c, "fcd_c": fcd_c, "scd_c": scd_c, "rcd_c": rcd_c,
-                "mode": mode, "hs": hs_val,
+                "event_id":     event_id,
+                "currency_code": currency_code,
+                "importance":   importance,
+                "forecast_dir": forecast_dir,
+                "surprise_dir": surprise_dir,
+                "revision_dir": revision_dir,
+                "mode_val":     mode_val,
+                "hs":           hs_val,
             })
         return ok_response([r["weight_code"] for r in res.mappings().all()])
     except Exception as e:
