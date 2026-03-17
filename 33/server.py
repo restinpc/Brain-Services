@@ -390,7 +390,10 @@ async def get_weights():
 
 
 @app.get("/new_weights")
-async def get_new_weights(code: str = Query(...)):
+async def get_new_weights(
+    code: str = Query(...),
+    limit: int = Query(500, ge=1, le=5000),
+):
     try:
         if not code.startswith("E"):
             return err_response("weight_code must start with 'E'")
@@ -402,11 +405,9 @@ async def get_new_weights(code: str = Query(...)):
         except ValueError:
             return err_response("event_id must be an integer")
 
-        # Извлекаем однобуквенные коды из weight_code
         currency_code = parts[1]
         imp_c, fcd_c, scd_c, rcd_c = parts[2], parts[3], parts[4], parts[5]
 
-        # Декодируем однобуквенные коды в полные слова — именно они хранятся в таблице
         importance   = IMPORTANCE_MAP_REV.get(imp_c, imp_c)
         forecast_dir = FORECAST_MAP_REV.get(fcd_c, fcd_c)
         surprise_dir = SURPRISE_MAP_REV.get(scd_c, scd_c)
@@ -434,6 +435,7 @@ async def get_new_weights(code: str = Query(...)):
                     OR (event_id = :event_id AND currency_code = :currency_code AND importance = :importance AND forecast_dir = :forecast_dir AND surprise_dir = :surprise_dir AND revision_dir = :revision_dir AND mode_val = :mode_val AND COALESCE(hour_shift, -999999) > :hs)
                 ORDER BY event_id, currency_code, importance, forecast_dir, surprise_dir, revision_dir, mode_val,
                          hour_shift IS NULL, hour_shift
+                LIMIT :limit
             """), {
                 "event_id":     event_id,
                 "currency_code": currency_code,
@@ -443,6 +445,7 @@ async def get_new_weights(code: str = Query(...)):
                 "revision_dir": revision_dir,
                 "mode_val":     mode_val,
                 "hs":           hs_val,
+                "limit":        limit,
             })
         return ok_response([r["weight_code"] for r in res.mappings().all()])
     except Exception as e:
