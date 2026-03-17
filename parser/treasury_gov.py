@@ -101,6 +101,10 @@ for key, endpoint in RAW_DATASETS.items():
 PAGE_SIZE = 5000
 MAX_RETRIES = 3
 
+# Колонки с датами — для определения поля фильтрации
+DATE_COLUMNS = ['record_date', 'record_date_time', 'date', 'as_of_date']
+
+
 class TreasuryCollector:
     def __init__(self, table_name: str):
         self.table_name = table_name
@@ -110,33 +114,78 @@ class TreasuryCollector:
     def get_db_connection(self):
         return mysql.connector.connect(**DB_CONFIG)
 
-    def get_last_record_date(self) -> str | None:
-        """Возвращает самую свежую дату из таблицы по колонке с датой."""
+    def get_last_record_date(self) -> tuple:
+        """
+        Возвращает (last_date, date_column_name).
+        Нужно имя колонки чтобы передать серверу в filter=.
+        """
         try:
             with self.get_db_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("SHOW TABLES LIKE %s", (self.table_name,))
                 if not cursor.fetchone():
-                    return None
-                for date_col in ['record_date', 'record_date_time', 'date', 'as_of_date']:
+                    return None, None
+                for date_col in DATE_COLUMNS:
                     try:
                         cursor.execute(f"SELECT MAX(`{date_col}`) FROM `{self.table_name}`")
                         row = cursor.fetchone()
                         if row and row[0]:
-                            return str(row[0])
+                            return str(row[0])[:10], date_col
                     except Error:
                         continue
-                return None
+                return None, None
         except Exception as e:
             print(f"   ⚠️ Ошибка при получении последней даты из {self.table_name}: {e}")
-            return None
+            return None, None
 
-    def fetch_all_pages(self, endpoint: str, last_date: str | None = None) -> list[dict]:
+    def detect_date_column(self, endpoint: str) -> str:
+        """Определяет имя колонки с датой, запросив 1 строку из API."""
+        full_url = urljoin(BASE_API_URL, endpoint)
+        try:
+            resp = self.session.get(full_url, params={'page[size]': 1}, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+            rows = data.get('data', [])
+            if rows:
+                for col in DATE_COLUMNS:
+                    if col in rows[0]:
+                        return col
+        except Exception:
+            pass
+        return 'record_date'
+
+    def fetch_all_pages(self, endpoint: str, last_date: str = None) -> list:
+        """
+        Загружает данные с СЕРВЕРНОЙ фильтрацией.
+
+        FIX: ранее парсер загружал ВСЕ страницы с 2005 года и фильтровал в Python.
+        API возвращает данные по умолчанию ASC → страница 1 = данные 2005 →
+        все отбрасываются фильтром (row_date <= last_date) →
+        len(filtered) == 0 < PAGE_SIZE → break →
+        парсер останавливался на 1й странице, никогда не дойдя до новых данных.
+
+        Теперь: параметр filter=record_date:gt:YYYY-MM-DD передаётся серверу.
+        API сам возвращает только строки новее last_date. Парсер получает
+        ТОЛЬКО новые данные, пагинация работает корректно.
+        """
         full_url = urljoin(BASE_API_URL, endpoint)
         all_data = []
         page = 1
+
+        # Определяем колонку с датой для серверного фильтра
+        date_col = self.detect_date_column(endpoint) if last_date else 'record_date'
+
         while True:
-            params = {'page[number]': page, 'page[size]': PAGE_SIZE}
+            params = {
+                'page[number]': page,
+                'page[size]': PAGE_SIZE,
+                'sort': date_col,
+            }
+
+            # Серверная фильтрация — API отдаёт только строки новее last_date
+            if last_date:
+                params['filter'] = f'{date_col}:gt:{last_date}'
+
             attempts = 0
             while attempts < MAX_RETRIES:
                 try:
@@ -152,26 +201,22 @@ class TreasuryCollector:
                     if attempts >= MAX_RETRIES:
                         raise e
                     time.sleep(3 * attempts)
+
             data = resp.json()
             page_data = data.get('data', [])
+
             if not page_data:
                 break
-            if last_date:
-                filtered = []
-                for row in page_data:
-                    row_date = None
-                    for key in ['record_date', 'record_date_time', 'date', 'as_of_date']:
-                        if key in row and row[key]:
-                            row_date = str(row[key])[:10]
-                            break
-                    if row_date and row_date > last_date:
-                        filtered.append(row)
-                page_data = filtered
+
             all_data.extend(page_data)
-            print(f"   ...страница {page}, всего строк: {len(all_data)}", end='\r')
+
+            total_count = data.get('meta', {}).get('total-count', '?')
+            print(f"   ...страница {page}, строк: {len(all_data)}/{total_count}", end='\r')
+
             page += 1
             if len(page_data) < PAGE_SIZE:
                 break
+
         print()
         return all_data
 
@@ -194,7 +239,7 @@ class TreasuryCollector:
     def sanitize_column_name(self, name: str) -> str:
         return name.replace('-', '_').replace('.', '_').replace('/', '_').lower()
 
-    def insert_batch(self, data: list[dict]):
+    def insert_batch(self, data: list):
         if not data:
             return 0
         sample = data[0]
@@ -227,9 +272,12 @@ class TreasuryCollector:
 
     def process_dataset(self, endpoint: str):
         print(f"\n=== Обработка таблицы: {self.table_name} ===")
-        last_date = self.get_last_record_date()
+        last_date, date_col = self.get_last_record_date()
         if last_date:
-            print(f"   📅 Последняя запись: {last_date} → загружаем только новее")
+            print(f"   📅 Последняя запись: {last_date} (колонка: {date_col}) → загружаем только новее")
+            print(f"   🔍 Серверный фильтр: filter={date_col}:gt:{last_date}")
+        else:
+            print(f"   📦 Таблица пуста — полная загрузка")
         try:
             all_data = self.fetch_all_pages(endpoint, last_date)
         except Exception as e:
@@ -238,14 +286,15 @@ class TreasuryCollector:
         if not all_data:
             print("   ⚠️ Нет новых данных")
             return
+        print(f"   📊 Получено {len(all_data)} новых строк")
         self.create_table_from_sample(all_data[0])
         inserted = self.insert_batch(all_data)
         print(f"   ✅ Вставлено новых записей: {inserted}")
 
+
 def main():
     print(f"Запуск Treasury.gov Collector (MySQL Mode)")
     print(f"База: {args.host}:{args.port}/{args.database}")
-    # Находим эндпоинт по имени таблицы
     if args.table_name not in DATASETS:
         print(f"❌ Ошибка: неизвестное имя таблицы '{args.table_name}'. Допустимые значения:")
         for name in DATASETS.keys():
@@ -255,6 +304,7 @@ def main():
     collector = TreasuryCollector(args.table_name)
     collector.process_dataset(endpoint)
     print("\n🏁 Завершено!")
+
 
 if __name__ == "__main__":
     try:
