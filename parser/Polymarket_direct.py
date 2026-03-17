@@ -1,11 +1,22 @@
 """
-WorldMonitor фильтрует рынки по тегам: politics, geopolitics, elections, ukraine, china, middle-east, iran
+Polymarket History Collector
+Загружает список рынков (активные + топ-5000 закрытых по volume)
+и делает incremental backfill ценовой истории через /prices-history
+
 Таблица: vlad_polymarket_history
+
 Запуск:
   python Polymarket_direct.py vlad_polymarket_history [host] [port] [user] [password] [database]
 """
-import os, sys, argparse, json, time, random, traceback
+import os
+import sys
+import argparse
+import json
+import time
+import random
+import traceback
 from datetime import datetime
+
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -15,7 +26,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 TRACE_URL = "https://server.brain-project.online/trace.php"
-NODE_NAME = os.getenv("NODE_NAME", "polymarket_direct")
+NODE_NAME = os.getenv("NODE_NAME", "polymarket_history")
 EMAIL = os.getenv("ALERT_EMAIL", "vladyurjevitch@yandex.ru")
 
 def send_error_trace(exc, script_name="Polymarket_direct.py"):
@@ -25,17 +36,26 @@ def send_error_trace(exc, script_name="Polymarket_direct.py"):
     except:
         pass
 
-parser = argparse.ArgumentParser(description="Polymarket Direct → MySQL")
-parser.add_argument("table_name")
+# ────────────────────────────────────────────────
+# Аргументы
+# ────────────────────────────────────────────────
+
+parser = argparse.ArgumentParser(description="Polymarket History → MySQL")
+parser.add_argument("table_name", help="Должно быть: vlad_polymarket_history")
 parser.add_argument("host", nargs="?", default=os.getenv("DB_HOST"))
 parser.add_argument("port", nargs="?", default=os.getenv("DB_PORT", "3306"))
 parser.add_argument("user", nargs="?", default=os.getenv("DB_USER"))
 parser.add_argument("password", nargs="?", default=os.getenv("DB_PASSWORD"))
 parser.add_argument("database", nargs="?", default=os.getenv("DB_NAME"))
+
 args = parser.parse_args()
 
+if args.table_name != "vlad_polymarket_history":
+    print("❌ Ожидалось: vlad_polymarket_history")
+    sys.exit(1)
+
 if not all([args.host, args.user, args.password, args.database]):
-    print("❌ Ошибка: не указаны параметры подключения")
+    print("❌ Не указаны параметры подключения к базе")
     sys.exit(1)
 
 DB_CONFIG = {
@@ -45,6 +65,10 @@ DB_CONFIG = {
     'password': args.password,
     'database': args.database
 }
+
+# ────────────────────────────────────────────────
+# Утилиты
+# ────────────────────────────────────────────────
 
 def _sf(v):
     if v is None or v == "":
@@ -64,6 +88,10 @@ def build_session():
     })
     return s
 
+# ────────────────────────────────────────────────
+# Класс коллектора истории
+# ────────────────────────────────────────────────
+
 class PolymarketHistoryCollector:
     def __init__(self, table_name):
         self.table_name = table_name
@@ -72,69 +100,66 @@ class PolymarketHistoryCollector:
     def get_db_connection(self):
         return mysql.connector.connect(**DB_CONFIG)
 
-        def ensure_table(self):
+    def ensure_table(self):
         conn = self.get_db_connection()
         c = conn.cursor()
 
-        # 1. Создаём таблицу, если её вообще нет
+        # Базовая структура
         c.execute(f"""
-            CREATE TABLE IF NOT EXISTS `{self.table_name}` (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                condition_id VARCHAR(100) NOT NULL,
-                token_id VARCHAR(100) NOT NULL,
-                question TEXT,
-                price_timestamp DATETIME NOT NULL,
-                price FLOAT NOT NULL,
-                loaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE KEY uq_cond_ts (condition_id, price_timestamp)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        CREATE TABLE IF NOT EXISTS `{self.table_name}` (
+            id                  INT AUTO_INCREMENT PRIMARY KEY,
+            condition_id        VARCHAR(100) NOT NULL,
+            token_id            VARCHAR(100) NOT NULL,
+            question            TEXT,
+            price_timestamp     DATETIME NOT NULL,
+            price               FLOAT NOT NULL,
+            loaded_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE KEY uq_cond_ts (condition_id, price_timestamp)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         """)
 
-        # 2. Список всех нужных колонок и их типов
-        required_columns = {
-            "volume": "DECIMAL(20,2) COMMENT 'Общий объём торгов (USDC)'",
-            "volume_24h": "DECIMAL(20,2) COMMENT 'Объём за 24ч'",
-            "liquidity": "DECIMAL(20,2) COMMENT 'Ликвидность в orderbook'",
-            "end_date": "VARCHAR(50) COMMENT 'Дата разрешения рынка'",
-            "slug": "VARCHAR(255) COMMENT 'URL slug рынка'",
-            "tags": "VARCHAR(500) COMMENT 'Теги рынка'",
-            "outcome_yes": "FLOAT COMMENT 'Текущая цена YES'",
-            "outcome_no": "FLOAT COMMENT 'Текущая цена NO'",
-            "spread": "FLOAT COMMENT 'Bid-ask spread'",
-            "num_outcomes": "INT COMMENT 'Кол-во исходов'",
-            "active": "TINYINT(1) COMMENT 'Рынок активен (1) или закрыт (0)'",
-            "raw_json": "TEXT COMMENT 'Полный JSON рынка'"
+        # Добавляем все остальные колонки, если их нет
+        columns = {
+            "volume":       "DECIMAL(20,2)      COMMENT 'Общий объём торгов (USDC)'",
+            "volume_24h":   "DECIMAL(20,2)      COMMENT 'Объём за 24ч'",
+            "liquidity":    "DECIMAL(20,2)      COMMENT 'Ликвидность'",
+            "end_date":     "VARCHAR(50)        COMMENT 'Дата экспирации'",
+            "slug":         "VARCHAR(255)       COMMENT 'Slug рынка'",
+            "tags":         "VARCHAR(500)       COMMENT 'Теги через запятую'",
+            "outcome_yes":  "FLOAT              COMMENT 'Текущая цена YES'",
+            "outcome_no":   "FLOAT              COMMENT 'Текущая цена NO'",
+            "spread":       "FLOAT              COMMENT 'Спред bid-ask'",
+            "num_outcomes": "INT                COMMENT 'Количество исходов'",
+            "active":       "TINYINT(1)         COMMENT 'Активен (1) / закрыт (0)'",
+            "raw_json":     "TEXT               COMMENT 'Полный JSON рынка'"
         }
 
-        # 3. Проверяем, какие колонки уже есть
         c.execute(f"SHOW COLUMNS FROM `{self.table_name}`")
         existing = {row[0] for row in c.fetchall()}
 
-        # 4. Добавляем отсутствующие
-        for col, definition in required_columns.items():
+        for col, definition in columns.items():
             if col not in existing:
+                print(f"   → Добавляю колонку: {col}")
                 try:
-                    print(f"   Добавляю колонку: {col}")
                     c.execute(f"ALTER TABLE `{self.table_name}` ADD COLUMN `{col}` {definition}")
-                except mysql.connector.Error as err:
-                    print(f"   Ошибка при добавлении {col}: {err}")
-                    # продолжаем, чтобы не прерывать
+                except Exception as e:
+                    print(f"   Не удалось добавить {col}: {e}")
 
-        # 5. Добавляем индексы, если их нет
+        # Индексы
         try:
-            c.execute(f"ALTER TABLE `{self.table_name}` ADD INDEX idx_token (token_id)")
-            c.execute(f"ALTER TABLE `{self.table_name}` ADD INDEX idx_timestamp (price_timestamp)")
-            c.execute(f"ALTER TABLE `{self.table_name}` ADD INDEX idx_price (price)")
-            c.execute(f"ALTER TABLE `{self.table_name}` ADD INDEX idx_volume (volume DESC)")
-            c.execute(f"ALTER TABLE `{self.table_name}` ADD INDEX idx_slug (slug)")
-            c.execute(f"ALTER TABLE `{self.table_name}` ADD INDEX idx_active (active)")
+            c.execute(f"ALTER TABLE `{self.table_name}` ADD INDEX idx_token        (token_id)")
+            c.execute(f"ALTER TABLE `{self.table_name}` ADD INDEX idx_timestamp    (price_timestamp)")
+            c.execute(f"ALTER TABLE `{self.table_name}` ADD INDEX idx_price        (price)")
+            c.execute(f"ALTER TABLE `{self.table_name}` ADD INDEX idx_volume       (volume DESC)")
+            c.execute(f"ALTER TABLE `{self.table_name}` ADD INDEX idx_slug         (slug)")
+            c.execute(f"ALTER TABLE `{self.table_name}` ADD INDEX idx_active       (active)")
         except:
-            pass  # индексы уже есть или ошибка
+            pass
 
         conn.commit()
         c.close()
         conn.close()
-        print("   Таблица проверена и обновлена")
+        print("   Таблица готова")
 
     def get_last_timestamp(self, condition_id):
         try:
@@ -150,56 +175,76 @@ class PolymarketHistoryCollector:
 
     def fetch_all_markets(self):
         all_markets = []
-        # Активные
-        print(" 📡 Gamma API: активные рынки...")
+
+        # Активные рынки
+        print(" 📡 Gamma API → активные рынки...")
         offset = 0
         while True:
             try:
-                resp = self.session.get(
+                r = self.session.get(
                     "https://gamma-api.polymarket.com/markets",
-                    params={"active": "true", "closed": "false", "limit": "100", "offset": str(offset), "order": "volume24hr", "ascending": "false"},
+                    params={
+                        "active": "true",
+                        "closed": "false",
+                        "limit": "100",
+                        "offset": str(offset),
+                        "order": "volume24hr",
+                        "ascending": "false"
+                    },
                     timeout=20
                 )
-                if resp.status_code != 200: break
-                data = resp.json()
+                if r.status_code != 200:
+                    break
+                data = r.json()
                 markets = data if isinstance(data, list) else data.get("data", data.get("markets", []))
-                if not markets: break
+                if not markets:
+                    break
                 all_markets.extend(markets)
-                print(f" ...активных: {len(all_markets)}", end="\r")
+                print(f" ...активных: {len(all_markets):,}", end="\r")
                 offset += len(markets)
-                if len(markets) < 100: break
-                time.sleep(random.uniform(0.3, 0.6))
+                if len(markets) < 100:
+                    break
+                time.sleep(random.uniform(0.4, 0.9))
             except Exception as e:
-                print(f" ⚠️ Gamma error: {e}")
+                print(f"\n ⚠️ Gamma active error: {e}")
                 break
 
-        # ТОП-5000 закрытых
-        print(f"\n 📡 Gamma API: недавно закрытые рынки...")
+        # Топ-5000 закрытых по volume
+        print(f"\n 📡 Gamma API → топ-5000 закрытых...")
         offset = 0
         closed_count = 0
         while True:
             try:
-                resp = self.session.get(
+                r = self.session.get(
                     "https://gamma-api.polymarket.com/markets",
-                    params={"active": "false", "closed": "true", "limit": "100", "offset": str(offset), "order": "volume", "ascending": "false"},
+                    params={
+                        "active": "false",
+                        "closed": "true",
+                        "limit": "100",
+                        "offset": str(offset),
+                        "order": "volume",
+                        "ascending": "false"
+                    },
                     timeout=20
                 )
-                if resp.status_code != 200: break
-                data = resp.json()
+                if r.status_code != 200:
+                    break
+                data = r.json()
                 markets = data if isinstance(data, list) else data.get("data", data.get("markets", []))
-                if not markets: break
+                if not markets:
+                    break
                 all_markets.extend(markets)
                 closed_count += len(markets)
-                print(f" ...закрытых: {closed_count}", end="\r")
+                print(f" ...закрытых: {closed_count:,}", end="\r")
                 offset += len(markets)
                 if len(markets) < 100 or closed_count >= 5000:
                     break
-                time.sleep(random.uniform(0.3, 0.6))
+                time.sleep(random.uniform(0.4, 0.9))
             except Exception as e:
-                print(f" ⚠️ {e}")
+                print(f"\n ⚠️ Gamma closed error: {e}")
                 break
 
-        print(f"\n 📋 Итого рынков: {len(all_markets)} (активных + топ-5000 закрытых)")
+        print(f"\n 📋 Всего рынков: {len(all_markets):,}")
         return all_markets
 
     def fetch_price_history(self, token_id, start_ts=None):
@@ -209,30 +254,33 @@ class PolymarketHistoryCollector:
             params["startTs"] = start_ts
             params["endTs"] = int(time.time())
         try:
-            resp = self.session.get("https://clob.polymarket.com/prices-history", params=params, timeout=20)
-            if resp.status_code == 200:
-                return resp.json().get("history", [])
+            r = self.session.get("https://clob.polymarket.com/prices-history", params=params, timeout=25)
+            if r.status_code == 200:
+                return r.json().get("history", [])
         except:
             pass
         return []
 
-    def extract_market_meta(self, m):
-        cid = m.get("condition_id", m.get("conditionId", ""))
+    def extract_market_meta(self, market):
+        cid = market.get("condition_id") or market.get("conditionId") or ""
         if not cid:
             return None
 
-        tokens = m.get("tokens", [])
-        clob_raw = m.get("clobTokenIds")
+        tokens = market.get("tokens", [])
+        clob_raw = market.get("clobTokenIds")
+
         tid = ""
         yes_p = no_p = None
 
+        # CLOB формат
         if isinstance(tokens, list) and tokens:
             tid = tokens[0].get("token_id", "")
             yes_p = _sf(tokens[0].get("price"))
             if len(tokens) >= 2:
                 no_p = _sf(tokens[1].get("price"))
 
-        if not tid:
+        # Gamma формат (list или строка JSON)
+        if not tid and clob_raw:
             clob_ids = clob_raw
             if isinstance(clob_raw, str):
                 try:
@@ -245,77 +293,95 @@ class PolymarketHistoryCollector:
         if not tid:
             return None
 
-        outcomes = m.get("outcomePrices", [])
+        # outcomePrices как fallback для цен
+        outcomes = market.get("outcomePrices", [])
         if isinstance(outcomes, list):
             if len(outcomes) >= 1 and yes_p is None:
                 yes_p = _sf(outcomes[0])
             if len(outcomes) >= 2 and no_p is None:
                 no_p = _sf(outcomes[1])
 
-        best_bid = _sf(m.get("bestBid"))
-        best_ask = _sf(m.get("bestAsk"))
-        spread = round(best_ask - best_bid, 4) if best_bid and best_ask else None
+        best_bid  = _sf(market.get("bestBid"))
+        best_ask  = _sf(market.get("bestAsk"))
+        spread    = round(best_ask - best_bid, 4) if best_bid is not None and best_ask is not None else None
 
-        tags_raw = m.get("tags", [])
-        tags_str = ",".join(str(t.get("label", t) if isinstance(t, dict) else t) for t in (tags_raw or [])[:15])
+        tags_raw = market.get("tags", [])
+        tags_str = ",".join(str(t.get("label", t) if isinstance(t, dict) else t) for t in tags_raw[:15])
 
-        num_outcomes = len(tokens) if isinstance(tokens, list) and tokens else (len(clob_ids) if isinstance(clob_ids, list) and clob_ids else None)
+        num_out = len(tokens) if isinstance(tokens, list) else (len(clob_ids) if 'clob_ids' in locals() and isinstance(clob_ids, list) else None)
 
         return {
             "condition_id": cid[:100],
-            "token_id": tid[:100],
-            "question": m.get("question", "")[:2000],
-            "volume": _sf(m.get("volume", m.get("volumeNum"))),
-            "volume_24h": _sf(m.get("volume24hr", m.get("volume_24h"))),
-            "liquidity": _sf(m.get("liquidity", m.get("liquidityNum"))),
-            "end_date": str(m.get("endDate", m.get("end_date_iso", "")))[:50],
-            "slug": str(m.get("market_slug", m.get("slug", "")))[:255],
-            "tags": tags_str[:500] if tags_str else None,
-            "outcome_yes": yes_p,
-            "outcome_no": no_p,
-            "spread": spread,
-            "num_outcomes": num_outcomes,
-            "active": 1 if m.get("active", True) else 0,
-            "raw_json": json.dumps(m, ensure_ascii=False, default=str)[:5000],
+            "token_id":     tid[:100],
+            "question":     (market.get("question") or "").strip()[:2000],
+            "volume":       _sf(market.get("volume") or market.get("volumeNum")),
+            "volume_24h":   _sf(market.get("volume24hr") or market.get("volume_24h")),
+            "liquidity":    _sf(market.get("liquidity") or market.get("liquidityNum")),
+            "end_date":     str(market.get("endDate") or market.get("end_date_iso") or "")[:50],
+            "slug":         str(market.get("slug") or market.get("market_slug") or "")[:255],
+            "tags":         tags_str[:500] or None,
+            "outcome_yes":  yes_p,
+            "outcome_no":   no_p,
+            "spread":       spread,
+            "num_outcomes": num_out,
+            "active":       1 if market.get("active", True) else 0,
+            "raw_json":     json.dumps(market, ensure_ascii=False, default=str)[:8000]
         }
 
     def process(self):
         self.ensure_table()
+
         print(" 📡 Загрузка списка рынков...")
         markets = self.fetch_all_markets()
         if not markets:
-            print(" ⚠️ Нет рынков")
+            print(" ⚠️ Не удалось загрузить рынки")
             return
 
-        market_metas = [meta for m in markets if (meta := self.extract_market_meta(m))]
-        print(f" 🎯 Рынков с token_id: {len(market_metas)}")
+        market_metas = []
+        for m in markets:
+            meta = self.extract_market_meta(m)
+            if meta:
+                market_metas.append(meta)
+
+        print(f" 🎯 Рынков с token_id: {len(market_metas):,}")
+
+        if not market_metas:
+            print("   → нет рынков с валидным token_id")
+            return
 
         total_points = total_new = 0
         conn = self.get_db_connection()
         c = conn.cursor()
-        sql = f"""INSERT IGNORE INTO `{self.table_name}`
-            (condition_id, token_id, question, price_timestamp, price,
-             volume, volume_24h, liquidity, end_date, slug, tags,
-             outcome_yes, outcome_no, spread, num_outcomes, active, raw_json)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"""
+
+        sql = f"""
+        INSERT IGNORE INTO `{self.table_name}`
+        (condition_id, token_id, question, price_timestamp, price,
+         volume, volume_24h, liquidity, end_date, slug, tags,
+         outcome_yes, outcome_no, spread, num_outcomes, active, raw_json)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """
+
+        BATCH_SIZE = 50
 
         for i, meta in enumerate(market_metas):
             cid = meta["condition_id"]
             tid = meta["token_id"]
+
             last_ts = self.get_last_timestamp(cid)
             start_ts = last_ts + 1 if last_ts else None
+
             history = self.fetch_price_history(tid, start_ts=start_ts)
 
             if not history:
-                if (i + 1) % 100 == 0:
-                    print(f" ...{i+1}/{len(market_metas)} рынков, {total_new} новых точек", end="\r")
-                time.sleep(random.uniform(0.3, 0.5))
+                if (i + 1) % 200 == 0:
+                    print(f" ...{i+1:,}/{len(market_metas):,}  (новых точек: {total_new:,})", end="\r")
+                time.sleep(random.uniform(0.6, 1.3))
                 continue
 
             rows = []
-            for point in history:
-                ts = point.get("t", 0)
-                price = point.get("p", 0)
+            for p in history:
+                ts = p.get("t", 0)
+                price = p.get("p", 0)
                 if ts > 0:
                     dt = datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
                     rows.append((
@@ -323,7 +389,7 @@ class PolymarketHistoryCollector:
                         meta["volume"], meta["volume_24h"], meta["liquidity"],
                         meta["end_date"], meta["slug"], meta["tags"],
                         meta["outcome_yes"], meta["outcome_no"], meta["spread"],
-                        meta["num_outcomes"], meta["active"], meta["raw_json"],
+                        meta["num_outcomes"], meta["active"], meta["raw_json"]
                     ))
 
             if rows:
@@ -331,38 +397,41 @@ class PolymarketHistoryCollector:
                 total_new += c.rowcount
                 total_points += len(rows)
 
-            if (i + 1) % 50 == 0:
+            if (i + 1) % BATCH_SIZE == 0:
                 conn.commit()
-                print(f" ...{i+1}/{len(market_metas)} рынков, {total_new} новых точек, {total_points} total", end="\r")
+                print(f" ...{i+1:,}/{len(market_metas):,}  новых точек: {total_new:,}  всего: {total_points:,}", end="\r")
 
-            time.sleep(random.uniform(0.8, 1.2))
+            time.sleep(random.uniform(0.8, 1.4))
 
         conn.commit()
         c.close()
         conn.close()
-        print(f"\n ✅ Загружено {total_points} ценовых точек, {total_new} новых")
+
+        print(f"\n\n ✅ Итог: загружено {total_points:,} ценовых точек, из них новых — {total_new:,}")
+
+# ────────────────────────────────────────────────
+# Запуск
+# ────────────────────────────────────────────────
 
 def main():
-    print(f"🚀 Polymarket Collector")
+    print(f"🚀 Polymarket History Collector")
     print(f"База: {args.host}:{args.port}/{args.database}")
-    print(f"🎯 Таблица: {args.table_name}")
+    print(f"Таблица: {args.table_name}")
     print("=" * 60)
 
-    if args.table_name == "vlad_polymarket_history":
-        PolymarketHistoryCollector(args.table_name).process()
+    collector = PolymarketHistoryCollector(args.table_name)
+    collector.process()
 
     print("=" * 60)
-    print("🏁 ЗАГРУЗКА ЗАВЕРШЕНА")
+    print("🏁 Завершено")
 
 if __name__ == "__main__":
     try:
         main()
-    except SystemExit:
-        raise
     except KeyboardInterrupt:
-        print("\n🛑 Прервано")
+        print("\n🛑 Прервано пользователем")
         sys.exit(1)
     except Exception as e:
-        print(f"\n❌ {e!r}")
+        print(f"\n❌ Критическая ошибка: {e}")
         send_error_trace(e)
         sys.exit(1)
