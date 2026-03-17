@@ -302,14 +302,17 @@ class PolymarketDirectCollector:
 class PolymarketHistoryCollector:
     """
     Backfill полной ценовой истории через /prices-history.
+    Таблица vlad_polymarket_history содержит ВСЕ поля из vlad_polymarket_direct
+    + price_timestamp для каждой часовой точки.
 
     Алгоритм:
       1. Загрузить список всех рынков (CLOB /markets с пагинацией)
-      2. Для каждого рынка с token_id:
+      2. Для каждого рынка:
+         - Сохранить текущие метаданные (volume, liquidity, tags, slug, end_date...)
          - Проверить последний timestamp в БД
          - Запросить /prices-history?market={token_id}&interval=max&fidelity=60
-         - Записать новые точки (INSERT IGNORE по token_id + timestamp)
-      3. Hourly fidelity (60 мин) — оптимальный баланс объём/точность
+         - Записать каждую ценовую точку с полными метаданными рынка
+      3. INSERT IGNORE по (condition_id, price_timestamp) — дедупликация
     """
     def __init__(self, table_name):
         self.table_name = table_name
@@ -322,26 +325,41 @@ class PolymarketHistoryCollector:
         c.execute(f"""
             CREATE TABLE IF NOT EXISTS `{self.table_name}` (
                 id INT AUTO_INCREMENT PRIMARY KEY,
-                token_id VARCHAR(100) NOT NULL COMMENT 'CLOB token ID (YES outcome)',
                 condition_id VARCHAR(100) NOT NULL COMMENT 'Market condition ID',
-                question VARCHAR(500) COMMENT 'Market question (для читаемости)',
-                price_timestamp DATETIME NOT NULL COMMENT 'UTC timestamp точки',
+                token_id VARCHAR(100) NOT NULL COMMENT 'CLOB token ID (YES outcome)',
+                question TEXT COMMENT 'Market question',
+                price_timestamp DATETIME NOT NULL COMMENT 'UTC timestamp ценовой точки',
                 price FLOAT NOT NULL COMMENT 'Цена YES токена (≈ probability)',
+                volume DECIMAL(20,2) COMMENT 'Общий объём торгов (USDC) на момент snapshot',
+                volume_24h DECIMAL(20,2) COMMENT 'Объём за 24ч',
+                liquidity DECIMAL(20,2) COMMENT 'Ликвидность в orderbook',
+                end_date VARCHAR(50) COMMENT 'Дата разрешения рынка',
+                slug VARCHAR(255) COMMENT 'URL slug рынка',
+                tags VARCHAR(500) COMMENT 'Теги рынка',
+                outcome_yes FLOAT COMMENT 'Текущая цена YES (на момент загрузки)',
+                outcome_no FLOAT COMMENT 'Текущая цена NO (на момент загрузки)',
+                spread FLOAT COMMENT 'Bid-ask spread',
+                num_outcomes INT COMMENT 'Кол-во исходов',
+                active TINYINT(1) COMMENT 'Рынок активен (1) или закрыт (0)',
+                raw_json TEXT COMMENT 'Полный JSON рынка с CLOB API',
                 loaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE KEY uq_token_ts (token_id, price_timestamp),
-                INDEX idx_condition (condition_id),
+                UNIQUE KEY uq_cond_ts (condition_id, price_timestamp),
+                INDEX idx_token (token_id),
                 INDEX idx_timestamp (price_timestamp),
-                INDEX idx_price (price)
+                INDEX idx_price (price),
+                INDEX idx_volume (volume DESC),
+                INDEX idx_slug (slug),
+                INDEX idx_active (active)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-            COMMENT='Polymarket: полная ценовая история всех рынков (hourly, backfill)';
+            COMMENT='Polymarket: полная ценовая история с метаданными (hourly, backfill)';
         """)
         conn.commit(); c.close(); conn.close()
 
-    def get_last_timestamp(self, token_id):
-        """Последний timestamp для этого token_id в БД."""
+    def get_last_timestamp(self, condition_id):
+        """Последний timestamp для этого condition_id в БД."""
         try:
             conn = self.get_db_connection(); c = conn.cursor()
-            c.execute(f"SELECT MAX(price_timestamp) FROM `{self.table_name}` WHERE token_id = %s", (token_id,))
+            c.execute(f"SELECT MAX(price_timestamp) FROM `{self.table_name}` WHERE condition_id = %s", (condition_id,))
             row = c.fetchone(); c.close(); conn.close()
             if row and row[0]:
                 return int(row[0].timestamp())
@@ -349,7 +367,7 @@ class PolymarketHistoryCollector:
         except: return None
 
     def fetch_all_markets(self):
-        """Загружает ВСЕ рынки с token_id через CLOB API с пагинацией."""
+        """Загружает ВСЕ рынки с полными метаданными через CLOB API."""
         all_markets = []
         next_cursor = None
         while True:
@@ -373,75 +391,110 @@ class PolymarketHistoryCollector:
         return all_markets
 
     def fetch_price_history(self, token_id, start_ts=None):
-        """
-        GET /prices-history?market={token_id}&interval=max&fidelity=60
-        Возвращает: [{"t": unix_ts, "p": price}, ...]
-        """
+        """GET /prices-history — возвращает [{"t": unix_ts, "p": price}, ...]"""
         params = {"market": token_id, "interval": "max", "fidelity": 60}
         if start_ts:
-            # Incremental: только новые точки
             params.pop("interval", None)
             params["startTs"] = start_ts
-            import math
             params["endTs"] = int(time.time())
-
         try:
             resp = self.session.get("https://clob.polymarket.com/prices-history", params=params, timeout=20)
             if resp.status_code == 200:
-                data = resp.json()
-                return data.get("history", [])
-            elif resp.status_code == 404:
-                return []  # Рынок без истории
+                return resp.json().get("history", [])
         except: pass
         return []
+
+    def extract_market_meta(self, m):
+        """Извлекает все метаданные рынка в dict (как в vlad_polymarket_direct)."""
+        cid = m.get("condition_id", m.get("conditionId", ""))
+        if not cid: return None
+
+        tokens = m.get("tokens", [])
+        tid = ""
+        yes_p = no_p = None
+        if isinstance(tokens, list) and tokens:
+            tid = tokens[0].get("token_id", "")
+            yes_p = _sf(tokens[0].get("price"))
+            if len(tokens) >= 2:
+                no_p = _sf(tokens[1].get("price"))
+
+        if not tid: return None
+
+        # Outcomes from outcomePrices
+        outcomes = m.get("outcomePrices", [])
+        if isinstance(outcomes, list):
+            if len(outcomes) >= 1 and yes_p is None: yes_p = _sf(outcomes[0])
+            if len(outcomes) >= 2 and no_p is None: no_p = _sf(outcomes[1])
+
+        # Spread
+        best_bid = _sf(m.get("bestBid"))
+        best_ask = _sf(m.get("bestAsk"))
+        spread = round(best_ask - best_bid, 4) if best_bid and best_ask else None
+
+        # Tags
+        tags_raw = m.get("tags", [])
+        tags_str = ",".join(str(t.get("label", t) if isinstance(t, dict) else t) for t in (tags_raw or [])[:15])
+
+        return {
+            "condition_id": cid[:100],
+            "token_id": tid[:100],
+            "question": m.get("question", "")[:2000],
+            "volume": _sf(m.get("volume", m.get("volumeNum"))),
+            "volume_24h": _sf(m.get("volume24hr", m.get("volume_24h"))),
+            "liquidity": _sf(m.get("liquidity", m.get("liquidityNum"))),
+            "end_date": str(m.get("endDate", m.get("end_date_iso", "")))[:50],
+            "slug": str(m.get("market_slug", m.get("slug", "")))[:255],
+            "tags": tags_str[:500] if tags_str else None,
+            "outcome_yes": yes_p,
+            "outcome_no": no_p,
+            "spread": spread,
+            "num_outcomes": len(tokens) if isinstance(tokens, list) else None,
+            "active": 1 if m.get("active", True) else 0,
+            "raw_json": json.dumps(m, ensure_ascii=False, default=str)[:5000],
+        }
 
     def process(self):
         self.ensure_table()
 
-        # 1. Загрузить все рынки
+        # 1. Загрузить все рынки с полными метаданными
         print("   📡 Загрузка списка рынков...")
         markets = self.fetch_all_markets()
         if not markets:
             print("   ⚠️ Нет рынков"); return
 
-        # 2. Извлечь token_id + condition_id + question
-        market_tokens = []
+        # 2. Извлечь метаданные каждого рынка
+        market_metas = []
         for m in markets:
-            cid = m.get("condition_id", m.get("conditionId", ""))
-            question = m.get("question", "")[:500]
-            tokens = m.get("tokens", [])
-            if isinstance(tokens, list) and tokens:
-                # Берём YES token (первый)
-                tok = tokens[0]
-                tid = tok.get("token_id", "")
-                if tid and cid:
-                    market_tokens.append({"token_id": tid, "condition_id": cid, "question": question})
+            meta = self.extract_market_meta(m)
+            if meta:
+                market_metas.append(meta)
 
-        print(f"   🎯 Рынков с token_id: {len(market_tokens)}")
+        print(f"   🎯 Рынков с token_id: {len(market_metas)}")
 
-        # 3. Для каждого рынка — скачать историю
+        # 3. Для каждого рынка — скачать историю цен + записать с метаданными
         total_points = 0
         total_new = 0
         conn = self.get_db_connection(); c = conn.cursor()
         sql = f"""INSERT IGNORE INTO `{self.table_name}`
-            (token_id, condition_id, question, price_timestamp, price)
-            VALUES (%s, %s, %s, %s, %s)"""
+            (condition_id, token_id, question, price_timestamp, price,
+             volume, volume_24h, liquidity, end_date, slug, tags,
+             outcome_yes, outcome_no, spread, num_outcomes, active, raw_json)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"""
 
-        for i, mt in enumerate(market_tokens):
-            tid = mt["token_id"]
-            cid = mt["condition_id"]
-            q = mt["question"]
+        for i, meta in enumerate(market_metas):
+            cid = meta["condition_id"]
+            tid = meta["token_id"]
 
-            # Incremental check
-            last_ts = self.get_last_timestamp(tid)
+            # Incremental: проверяем последний timestamp
+            last_ts = self.get_last_timestamp(cid)
             start_ts = last_ts + 1 if last_ts else None
 
             history = self.fetch_price_history(tid, start_ts=start_ts)
 
             if not history:
                 if (i + 1) % 100 == 0:
-                    print(f"   ...{i+1}/{len(market_tokens)} рынков обработано, {total_new} новых точек", end="\r")
-                time.sleep(random.uniform(0.1, 0.3))
+                    print(f"   ...{i+1}/{len(market_metas)} рынков, {total_new} новых точек", end="\r")
+                time.sleep(random.uniform(0.3, 0.5))
                 continue
 
             rows = []
@@ -450,7 +503,13 @@ class PolymarketHistoryCollector:
                 price = point.get("p", 0)
                 if ts > 0:
                     dt = datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
-                    rows.append((tid[:100], cid[:100], q, dt, price))
+                    rows.append((
+                        cid, tid, meta["question"], dt, price,
+                        meta["volume"], meta["volume_24h"], meta["liquidity"],
+                        meta["end_date"], meta["slug"], meta["tags"],
+                        meta["outcome_yes"], meta["outcome_no"], meta["spread"],
+                        meta["num_outcomes"], meta["active"], meta["raw_json"],
+                    ))
 
             if rows:
                 c.executemany(sql, rows)
@@ -460,7 +519,7 @@ class PolymarketHistoryCollector:
             # Commit каждые 50 рынков
             if (i + 1) % 50 == 0:
                 conn.commit()
-                print(f"   ...{i+1}/{len(market_tokens)} рынков, {total_new} новых точек, {total_points} total", end="\r")
+                print(f"   ...{i+1}/{len(market_metas)} рынков, {total_new} новых точек, {total_points} total", end="\r")
 
             # Rate limit: 60 req/min (Polymarket CLOB). 1 req/sec = безопасно
             time.sleep(random.uniform(0.8, 1.2))
