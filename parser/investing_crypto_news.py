@@ -34,8 +34,8 @@ ALERT_EMAIL = os.getenv("ALERT_EMAIL", "vladyurjevitch@yandex.ru")
 
 BASE_URL = "https://ru.investing.com/news/cryptocurrency-news"
 MAX_PAGES = 999
-MAX_CONSECUTIVE_FAILURES = 5  # Было 100 — слишком много, 5 достаточно
-CONTEXT_REFRESH_EVERY = 10  # Создаём новый browser context каждые N страниц
+MAX_CONSECUTIVE_FAILURES = 15  # Больше попыток — Cloudflare иногда пропускает
+CONTEXT_REFRESH_EVERY = 5  # Чаще обновляем context
 
 # Разные User-Agent для ротации
 USER_AGENTS = [
@@ -196,10 +196,25 @@ async def parse_and_save_incrementally(table_name, max_pages=None):
                 # Проверяем что не 403/429/503
                 if response and response.status >= 400:
                     consecutive_failures += 1
-                    print(f"   ⚠️ HTTP {response.status} (неудача {consecutive_failures}/{MAX_CONSECUTIVE_FAILURES})")
-                    await asyncio.sleep(random.uniform(10, 20))
-                    page_num += 1
-                    continue
+                    status = response.status
+                    print(f"   ⚠️ HTTP {status} (неудача {consecutive_failures}/{MAX_CONSECUTIVE_FAILURES})")
+
+                    # При 403 — это Cloudflare блокировка. Новый context + retry ту же страницу
+                    if status == 403 or status == 429 or status == 503:
+                        try:
+                            await context.close()
+                        except:
+                            pass
+                        wait = random.uniform(15, 30) if status == 403 else random.uniform(30, 60)
+                        print(f"   🔄 Cloudflare блок — новый context, пауза {wait:.0f}с...")
+                        await asyncio.sleep(wait)
+                        context, page = await create_context(browser)
+                        # НЕ увеличиваем page_num — retry ту же страницу
+                        continue
+                    else:
+                        page_num += 1
+                        await asyncio.sleep(random.uniform(5, 10))
+                        continue
 
                 # ── FIX #2: ждём появления статей, не networkidle ──
                 try:
@@ -236,15 +251,24 @@ async def parse_and_save_incrementally(table_name, max_pages=None):
                     consecutive_failures += 1
                     print(f"   ⚠️ Новости не найдены (неудача {consecutive_failures}/{MAX_CONSECUTIVE_FAILURES})")
 
-                    # ── FIX #4: при блокировке — долгая пауза + новый context ──
-                    if consecutive_failures >= 2:
-                        await context.close()
-                        wait = random.uniform(15, 30)
-                        print(f"   🔄 Возможная блокировка — пауза {wait:.0f}с + новый context")
+                    # Проверяем: может это Cloudflare challenge page?
+                    page_content = await page.content()
+                    is_cf_block = "Cloudflare" in page_content or "cf-browser-verification" in page_content or "challenge-platform" in page_content
+
+                    if is_cf_block or consecutive_failures >= 3:
+                        try:
+                            await context.close()
+                        except:
+                            pass
+                        wait = random.uniform(20, 40)
+                        print(f"   🔄 {'Cloudflare challenge' if is_cf_block else 'Серия неудач'} — пауза {wait:.0f}с + новый context")
                         await asyncio.sleep(wait)
                         context, page = await create_context(browser)
+                        # Retry ту же страницу
+                        continue
 
                     page_num += 1
+                    await asyncio.sleep(random.uniform(5, 10))
                     continue
 
                 # Успех — сбрасываем failures
