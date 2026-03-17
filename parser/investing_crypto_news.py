@@ -152,10 +152,17 @@ async def parse_and_save_incrementally(table_name, max_pages=None):
         existing_links = set()
 
     async with async_playwright() as p:
-        # Firefox менее детектируемый чем Chromium в headless
-        browser = await p.firefox.launch(
+        # Chromium (уже установлен на сервере)
+        browser = await p.chromium.launch(
             headless=True,
-            args=['--disable-blink-features=AutomationControlled'],
+            args=[
+                '--disable-blink-features=AutomationControlled',
+                '--disable-dev-shm-usage',
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-infobars',
+                '--disable-background-timer-throttling',
+            ],
         )
 
         context, page = await create_context(browser)
