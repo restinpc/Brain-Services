@@ -488,35 +488,39 @@ class PolymarketHistoryCollector:
         except: pass
         return []
 
-def extract_market_meta(self, m):
-    """Извлекает все метаданные рынка в dict (как в vlad_polymarket_direct)."""
-    cid = m.get("condition_id", m.get("conditionId", ""))
-    if not cid: return None
+    def extract_market_meta(self, m):
+        """Извлекает все метаданные рынка в dict (как в vlad_polymarket_direct)."""
+        cid = m.get("condition_id", m.get("conditionId", ""))
+        if not cid:
+            return None
 
-    # Сначала пробуем CLOB-формат (tokens array)
-    tokens = m.get("tokens", [])
-    tid = ""
-    yes_p = no_p = None
+        # Сначала пробуем CLOB-формат (tokens array)
+        tokens = m.get("tokens", [])
+        tid = ""
+        yes_p = no_p = None
 
-    if isinstance(tokens, list) and tokens:
-        tid = tokens[0].get("token_id", "")
-        yes_p = _sf(tokens[0].get("price"))
-        if len(tokens) >= 2:
-            no_p = _sf(tokens[1].get("price"))
+        if isinstance(tokens, list) and tokens:
+            tid = tokens[0].get("token_id", "")
+            yes_p = _sf(tokens[0].get("price"))
+            if len(tokens) >= 2:
+                no_p = _sf(tokens[1].get("price"))
 
-    # Fallback: Gamma API формат (clobTokenIds)
-    if not tid:
-        clob_ids = m.get("clobTokenIds", [])
-        if isinstance(clob_ids, list) and clob_ids:
-            tid = str(clob_ids[0])
+        # Fallback: Gamma API формат (clobTokenIds)
+        if not tid:
+            clob_ids = m.get("clobTokenIds", [])
+            if isinstance(clob_ids, list) and clob_ids:
+                tid = str(clob_ids[0])
 
-    if not tid: return None
+        if not tid:
+            return None
 
         # Outcomes from outcomePrices
         outcomes = m.get("outcomePrices", [])
         if isinstance(outcomes, list):
-            if len(outcomes) >= 1 and yes_p is None: yes_p = _sf(outcomes[0])
-            if len(outcomes) >= 2 and no_p is None: no_p = _sf(outcomes[1])
+            if len(outcomes) >= 1 and yes_p is None:
+                yes_p = _sf(outcomes[0])
+            if len(outcomes) >= 2 and no_p is None:
+                no_p = _sf(outcomes[1])
 
         # Spread
         best_bid = _sf(m.get("bestBid"))
