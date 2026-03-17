@@ -170,7 +170,7 @@ async def parse_and_save_incrementally(table_name, max_pages=None):
 
                 print(f"\n📄 Страница {page_num}: {url}")
 
-                await page.goto(url, timeout=30000)
+                await page.goto(url, timeout=100000)
                 await page.wait_for_load_state('networkidle')
                 await asyncio.sleep(2)
 
