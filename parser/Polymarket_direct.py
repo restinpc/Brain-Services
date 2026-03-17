@@ -1,6 +1,6 @@
 """
 WorldMonitor фильтрует рынки по тегам: politics, geopolitics, elections, ukraine, china, middle-east, iran
-Таблица: vlad_polymarket_direct
+Таблица: vlad_polymarket_history
 Запуск:
   python Polymarket_direct.py vlad_polymarket_history [host] [port] [user] [password] [database]
 """
@@ -46,28 +46,6 @@ DB_CONFIG = {
     'database': args.database
 }
 
-DATASETS = {
-    "vlad_polymarket_direct": {"description": "Polymarket — текущие snapshots всех рынков"},
-    "vlad_polymarket_history": {"description": "Polymarket — полная история цен (backfill через /prices-history)"},
-}
-
-# === WorldMonitor фильтры ===
-GEO_TAGS = {"politics", "geopolitics", "elections", "world", "ukraine", "china", "middle-east",
-            "europe", "economy", "fed", "inflation", "iran", "taiwan", "russia", "israel",
-            "ai", "crypto", "trade", "tariffs", "recession", "war", "nato", "nuclear",
-            "sanctions", "oil", "opec", "military"}
-
-EXCLUDE_KEYWORDS = {
-    "nba", "nfl", "mlb", "nhl", "fifa", "world cup", "super bowl", "championship",
-    "playoffs", "oscar", "grammy", "emmy", "box office", "movie", "album", "song",
-    "streamer", "influencer", "celebrity", "kardashian", "bachelor", "reality tv",
-    "mvp", "touchdown", "home run", "goal scorer", "academy award", "bafta",
-    "golden globe", "cannes", "sundance", "documentary", "feature film", "tv series",
-    "season finale", "ufc", "boxing", "tennis", "golf", "formula 1", "cricket",
-    "premier league", "champions league", "la liga", "bundesliga", "serie a",
-    "ligue 1", "olympics", "paralympics", "wrestling", "nascar"
-}
-
 def _sf(v):
     if v is None or v == "":
         return None
@@ -97,6 +75,8 @@ class PolymarketHistoryCollector:
     def ensure_table(self):
         conn = self.get_db_connection()
         c = conn.cursor()
+
+        # Создаём таблицу, если её нет
         c.execute(f"""
             CREATE TABLE IF NOT EXISTS `{self.table_name}` (
                 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -128,6 +108,27 @@ class PolymarketHistoryCollector:
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             COMMENT='Polymarket: полная ценовая история (hourly backfill)';
         """)
+
+        # === Миграция колонок (на случай старой таблицы) ===
+        columns_to_add = [
+            ("volume", "DECIMAL(20,2)"),
+            ("volume_24h", "DECIMAL(20,2)"),
+            ("liquidity", "DECIMAL(20,2)"),
+            ("outcome_yes", "FLOAT"),
+            ("outcome_no", "FLOAT"),
+            ("spread", "FLOAT"),
+            ("num_outcomes", "INT"),
+            ("active", "TINYINT(1)"),
+            ("raw_json", "TEXT"),
+            ("tags", "VARCHAR(500)"),
+        ]
+
+        for col, typ in columns_to_add:
+            try:
+                c.execute(f"ALTER TABLE `{self.table_name}` ADD COLUMN IF NOT EXISTS `{col}` {typ}")
+            except:
+                pass  # колонка уже есть или ошибка MySQL < 8.0
+
         conn.commit()
         c.close()
         conn.close()
@@ -140,15 +141,13 @@ class PolymarketHistoryCollector:
             row = c.fetchone()
             c.close()
             conn.close()
-            if row and row[0]:
-                return int(row[0].timestamp())
-            return None
+            return int(row[0].timestamp()) if row and row[0] else None
         except:
             return None
 
     def fetch_all_markets(self):
         all_markets = []
-        # === Tier 1: активные ===
+        # Активные
         print(" 📡 Gamma API: активные рынки...")
         offset = 0
         while True:
@@ -158,23 +157,20 @@ class PolymarketHistoryCollector:
                     params={"active": "true", "closed": "false", "limit": "100", "offset": str(offset), "order": "volume24hr", "ascending": "false"},
                     timeout=20
                 )
-                if resp.status_code != 200:
-                    break
+                if resp.status_code != 200: break
                 data = resp.json()
                 markets = data if isinstance(data, list) else data.get("data", data.get("markets", []))
-                if not markets:
-                    break
+                if not markets: break
                 all_markets.extend(markets)
                 print(f" ...активных: {len(all_markets)}", end="\r")
                 offset += len(markets)
-                if len(markets) < 100:
-                    break
+                if len(markets) < 100: break
                 time.sleep(random.uniform(0.3, 0.6))
             except Exception as e:
                 print(f" ⚠️ Gamma error: {e}")
                 break
 
-        # === Tier 2: топ-5000 закрытых ===
+        # ТОП-5000 закрытых
         print(f"\n 📡 Gamma API: недавно закрытые рынки...")
         offset = 0
         closed_count = 0
@@ -185,12 +181,10 @@ class PolymarketHistoryCollector:
                     params={"active": "false", "closed": "true", "limit": "100", "offset": str(offset), "order": "volume", "ascending": "false"},
                     timeout=20
                 )
-                if resp.status_code != 200:
-                    break
+                if resp.status_code != 200: break
                 data = resp.json()
                 markets = data if isinstance(data, list) else data.get("data", data.get("markets", []))
-                if not markets:
-                    break
+                if not markets: break
                 all_markets.extend(markets)
                 closed_count += len(markets)
                 print(f" ...закрытых: {closed_count}", end="\r")
@@ -220,7 +214,6 @@ class PolymarketHistoryCollector:
         return []
 
     def extract_market_meta(self, m):
-        """Поддержка CLOB + Gamma (clobTokenIds может быть list ИЛИ JSON-строкой)"""
         cid = m.get("condition_id", m.get("conditionId", ""))
         if not cid:
             return None
@@ -230,14 +223,12 @@ class PolymarketHistoryCollector:
         tid = ""
         yes_p = no_p = None
 
-        # 1. CLOB-формат
         if isinstance(tokens, list) and tokens:
             tid = tokens[0].get("token_id", "")
             yes_p = _sf(tokens[0].get("price"))
             if len(tokens) >= 2:
                 no_p = _sf(tokens[1].get("price"))
 
-        # 2. Gamma API — robust парсинг (list или строка)
         if not tid:
             clob_ids = clob_raw
             if isinstance(clob_raw, str):
@@ -251,7 +242,6 @@ class PolymarketHistoryCollector:
         if not tid:
             return None
 
-        # 3. Цены из outcomePrices
         outcomes = m.get("outcomePrices", [])
         if isinstance(outcomes, list):
             if len(outcomes) >= 1 and yes_p is None:
@@ -259,22 +249,14 @@ class PolymarketHistoryCollector:
             if len(outcomes) >= 2 and no_p is None:
                 no_p = _sf(outcomes[1])
 
-        # Spread
         best_bid = _sf(m.get("bestBid"))
         best_ask = _sf(m.get("bestAsk"))
         spread = round(best_ask - best_bid, 4) if best_bid and best_ask else None
 
-        # Tags
         tags_raw = m.get("tags", [])
-        tags_str = ",".join(
-            str(t.get("label", t) if isinstance(t, dict) else t)
-            for t in (tags_raw or [])[:15]
-        )
+        tags_str = ",".join(str(t.get("label", t) if isinstance(t, dict) else t) for t in (tags_raw or [])[:15])
 
-        num_outcomes = (
-            len(tokens) if isinstance(tokens, list) and tokens else
-            (len(clob_ids) if isinstance(clob_ids, list) and clob_ids else None)
-        )
+        num_outcomes = len(tokens) if isinstance(tokens, list) and tokens else (len(clob_ids) if isinstance(clob_ids, list) and clob_ids else None)
 
         return {
             "condition_id": cid[:100],
@@ -302,11 +284,7 @@ class PolymarketHistoryCollector:
             print(" ⚠️ Нет рынков")
             return
 
-        market_metas = []
-        for m in markets:
-            meta = self.extract_market_meta(m)
-            if meta:
-                market_metas.append(meta)
+        market_metas = [meta for m in markets if (meta := self.extract_market_meta(m))]
         print(f" 🎯 Рынков с token_id: {len(market_metas)}")
 
         total_points = total_new = 0
@@ -362,12 +340,6 @@ class PolymarketHistoryCollector:
         print(f"\n ✅ Загружено {total_points} ценовых точек, {total_new} новых")
 
 def main():
-    if args.table_name not in DATASETS:
-        print("❌ Неизвестная таблица. Допустимые:")
-        for n in DATASETS:
-            print(f" - {n}")
-        sys.exit(1)
-
     print(f"🚀 Polymarket Collector")
     print(f"База: {args.host}:{args.port}/{args.database}")
     print(f"🎯 Таблица: {args.table_name}")
