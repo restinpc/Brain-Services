@@ -72,11 +72,11 @@ class PolymarketHistoryCollector:
     def get_db_connection(self):
         return mysql.connector.connect(**DB_CONFIG)
 
-    def ensure_table(self):
+        def ensure_table(self):
         conn = self.get_db_connection()
         c = conn.cursor()
 
-        # Создаём таблицу, если её нет
+        # 1. Создаём таблицу, если её вообще нет
         c.execute(f"""
             CREATE TABLE IF NOT EXISTS `{self.table_name}` (
                 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -85,53 +85,56 @@ class PolymarketHistoryCollector:
                 question TEXT,
                 price_timestamp DATETIME NOT NULL,
                 price FLOAT NOT NULL,
-                volume DECIMAL(20,2),
-                volume_24h DECIMAL(20,2),
-                liquidity DECIMAL(20,2),
-                end_date VARCHAR(50),
-                slug VARCHAR(255),
-                tags VARCHAR(500),
-                outcome_yes FLOAT,
-                outcome_no FLOAT,
-                spread FLOAT,
-                num_outcomes INT,
-                active TINYINT(1),
-                raw_json TEXT,
                 loaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE KEY uq_cond_ts (condition_id, price_timestamp),
-                INDEX idx_token (token_id),
-                INDEX idx_timestamp (price_timestamp),
-                INDEX idx_price (price),
-                INDEX idx_volume (volume DESC),
-                INDEX idx_slug (slug),
-                INDEX idx_active (active)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-            COMMENT='Polymarket: полная ценовая история (hourly backfill)';
+                UNIQUE KEY uq_cond_ts (condition_id, price_timestamp)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         """)
 
-        # === Миграция колонок (на случай старой таблицы) ===
-        columns_to_add = [
-            ("volume", "DECIMAL(20,2)"),
-            ("volume_24h", "DECIMAL(20,2)"),
-            ("liquidity", "DECIMAL(20,2)"),
-            ("outcome_yes", "FLOAT"),
-            ("outcome_no", "FLOAT"),
-            ("spread", "FLOAT"),
-            ("num_outcomes", "INT"),
-            ("active", "TINYINT(1)"),
-            ("raw_json", "TEXT"),
-            ("tags", "VARCHAR(500)"),
-        ]
+        # 2. Список всех нужных колонок и их типов
+        required_columns = {
+            "volume": "DECIMAL(20,2) COMMENT 'Общий объём торгов (USDC)'",
+            "volume_24h": "DECIMAL(20,2) COMMENT 'Объём за 24ч'",
+            "liquidity": "DECIMAL(20,2) COMMENT 'Ликвидность в orderbook'",
+            "end_date": "VARCHAR(50) COMMENT 'Дата разрешения рынка'",
+            "slug": "VARCHAR(255) COMMENT 'URL slug рынка'",
+            "tags": "VARCHAR(500) COMMENT 'Теги рынка'",
+            "outcome_yes": "FLOAT COMMENT 'Текущая цена YES'",
+            "outcome_no": "FLOAT COMMENT 'Текущая цена NO'",
+            "spread": "FLOAT COMMENT 'Bid-ask spread'",
+            "num_outcomes": "INT COMMENT 'Кол-во исходов'",
+            "active": "TINYINT(1) COMMENT 'Рынок активен (1) или закрыт (0)'",
+            "raw_json": "TEXT COMMENT 'Полный JSON рынка'"
+        }
 
-        for col, typ in columns_to_add:
-            try:
-                c.execute(f"ALTER TABLE `{self.table_name}` ADD COLUMN IF NOT EXISTS `{col}` {typ}")
-            except:
-                pass  # колонка уже есть или ошибка MySQL < 8.0
+        # 3. Проверяем, какие колонки уже есть
+        c.execute(f"SHOW COLUMNS FROM `{self.table_name}`")
+        existing = {row[0] for row in c.fetchall()}
+
+        # 4. Добавляем отсутствующие
+        for col, definition in required_columns.items():
+            if col not in existing:
+                try:
+                    print(f"   Добавляю колонку: {col}")
+                    c.execute(f"ALTER TABLE `{self.table_name}` ADD COLUMN `{col}` {definition}")
+                except mysql.connector.Error as err:
+                    print(f"   Ошибка при добавлении {col}: {err}")
+                    # продолжаем, чтобы не прерывать
+
+        # 5. Добавляем индексы, если их нет
+        try:
+            c.execute(f"ALTER TABLE `{self.table_name}` ADD INDEX idx_token (token_id)")
+            c.execute(f"ALTER TABLE `{self.table_name}` ADD INDEX idx_timestamp (price_timestamp)")
+            c.execute(f"ALTER TABLE `{self.table_name}` ADD INDEX idx_price (price)")
+            c.execute(f"ALTER TABLE `{self.table_name}` ADD INDEX idx_volume (volume DESC)")
+            c.execute(f"ALTER TABLE `{self.table_name}` ADD INDEX idx_slug (slug)")
+            c.execute(f"ALTER TABLE `{self.table_name}` ADD INDEX idx_active (active)")
+        except:
+            pass  # индексы уже есть или ошибка
 
         conn.commit()
         c.close()
         conn.close()
+        print("   Таблица проверена и обновлена")
 
     def get_last_timestamp(self, condition_id):
         try:
