@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 import os
 import sys
 import argparse
@@ -138,8 +136,8 @@ class TreasuryCollector:
             print(f"   ⚠️ Ошибка при получении последней даты из {self.table_name}: {e}")
             return None, None
 
-    def detect_date_column(self, endpoint: str) -> str:
-        """Определяет имя колонки с датой, запросив 1 строку из API."""
+    def detect_date_column(self, endpoint: str) -> str | None:
+        """Определяет имя колонки с датой, запросив 1 строку из API. Возвращает None если не найдено."""
         full_url = urljoin(BASE_API_URL, endpoint)
         try:
             resp = self.session.get(full_url, params={'page[size]': 1}, timeout=30)
@@ -152,39 +150,33 @@ class TreasuryCollector:
                         return col
         except Exception:
             pass
-        return 'record_date'
+        return None  # Колонка даты не найдена — sort/filter не будут добавлены
 
     def fetch_all_pages(self, endpoint: str, last_date: str = None) -> list:
         """
         Загружает данные с СЕРВЕРНОЙ фильтрацией.
 
-        FIX: ранее парсер загружал ВСЕ страницы с 2005 года и фильтровал в Python.
-        API возвращает данные по умолчанию ASC → страница 1 = данные 2005 →
-        все отбрасываются фильтром (row_date <= last_date) →
-        len(filtered) == 0 < PAGE_SIZE → break →
-        парсер останавливался на 1й странице, никогда не дойдя до новых данных.
-
-        Теперь: параметр filter=record_date:gt:YYYY-MM-DD передаётся серверу.
-        API сам возвращает только строки новее last_date. Парсер получает
-        ТОЛЬКО новые данные, пагинация работает корректно.
+        FIX v2: detect_date_column вызывается всегда. Если колонка не найдена
+        (некоторые эндпоинты не имеют record_date), sort и filter не добавляются.
         """
         full_url = urljoin(BASE_API_URL, endpoint)
         all_data = []
         page = 1
 
-        # Определяем колонку с датой для серверного фильтра
-        date_col = self.detect_date_column(endpoint) if last_date else 'record_date'
+        # Определяем колонку с датой — ВСЕГДА, независимо от last_date
+        date_col = self.detect_date_column(endpoint)
 
         while True:
             params = {
                 'page[number]': page,
                 'page[size]': PAGE_SIZE,
-                'sort': date_col,
             }
 
-            # Серверная фильтрация — API отдаёт только строки новее last_date
-            if last_date:
-                params['filter'] = f'{date_col}:gt:{last_date}'
+            # sort и filter добавляем ТОЛЬКО если колонка даты подтверждена
+            if date_col:
+                params['sort'] = date_col
+                if last_date:
+                    params['filter'] = f'{date_col}:gt:{last_date}'
 
             attempts = 0
             while attempts < MAX_RETRIES:
@@ -277,7 +269,7 @@ class TreasuryCollector:
             print(f"   📅 Последняя запись: {last_date} (колонка: {date_col}) → загружаем только новее")
             print(f"   🔍 Серверный фильтр: filter={date_col}:gt:{last_date}")
         else:
-            print(f"   📦 Таблица пуста — полная загрузка")
+            print(f"   📦 Таблица пуста или нет колонки даты — полная загрузка")
         try:
             all_data = self.fetch_all_pages(endpoint, last_date)
         except Exception as e:
