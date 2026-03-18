@@ -147,22 +147,26 @@ class FearGreedCollector:
 
 class BTCHashrateCollector:
     """mempool.space/api — BTC mining hashrate + difficulty"""
+
     def __init__(self, table_name):
         self.table_name = table_name
         self.session = build_session()
 
-    def get_db_connection(self): return mysql.connector.connect(**DB_CONFIG)
+    def get_db_connection(self):
+        return mysql.connector.connect(**DB_CONFIG)
 
     def ensure_table(self):
-        conn = self.get_db_connection(); c = conn.cursor()
+        # ... (твой CREATE TABLE без изменений)
+        conn = self.get_db_connection();
+        c = conn.cursor()
         c.execute(f"""
             CREATE TABLE IF NOT EXISTS `{self.table_name}` (
                 id INT AUTO_INCREMENT PRIMARY KEY,
-                current_hashrate DECIMAL(30,2) COMMENT 'Текущий hashrate (H/s)',
-                current_hashrate_eh DECIMAL(20,4) COMMENT 'Hashrate в EH/s',
-                current_difficulty DECIMAL(30,2) COMMENT 'Текущая difficulty',
-                hashrate_data_json LONGTEXT COMMENT 'Массив [{timestamp, avgHashrate}]',
-                difficulty_data_json LONGTEXT COMMENT 'Массив [{timestamp, difficulty, height}]',
+                current_hashrate DECIMAL(30,2),
+                current_hashrate_eh DECIMAL(20,4),
+                current_difficulty DECIMAL(30,2),
+                hashrate_data_json LONGTEXT,
+                difficulty_data_json LONGTEXT,
                 period VARCHAR(10) DEFAULT '3m',
                 snapshot_hour DATETIME NOT NULL,
                 snapshot_at DATETIME NOT NULL,
@@ -172,44 +176,56 @@ class BTCHashrateCollector:
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             COMMENT='BTC hashrate + difficulty (mempool.space)';
         """)
-        conn.commit(); c.close(); conn.close()
+        conn.commit();
+        c.close();
+        conn.close()
 
     def process(self):
         self.ensure_table()
         now = datetime.utcnow()
         snapshot_at = now.strftime("%Y-%m-%d %H:%M:%S")
-        snapshot_hour = now.replace(minute=0, second=0, microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
+        snapshot_hour = now.replace(minute=0, second=0, microsecond=0)
 
-        # mempool.space API: hashrate за 3 месяца
-        resp = self.session.get("https://mempool.space/api/v1/mining/hashrate/3m", timeout=20)
-        resp.raise_for_status()
-        data = resp.json()
+        try:
+            # 1. Hashrate 3m
+            resp = self.session.get("https://mempool.space/api/v1/mining/hashrate/3m", timeout=20)
+            resp.raise_for_status()
+            data = resp.json()
 
-        current_hr = data.get("currentHashrate", 0)
-        current_diff = data.get("currentDifficulty", 0)
-        hr_eh = current_hr / 1e18 if current_hr else 0
+            current_hr = data.get("currentHashrate", 0)
+            current_diff = data.get("currentDifficulty", 0)
+            hr_eh = round(current_hr / 1e18, 4) if current_hr else 0.0
 
-        # Difficulty adjustment history
-        diff_resp = self.session.get("https://mempool.space/api/v1/mining/difficulty-adjustments/6", timeout=15)
-        diff_data = diff_resp.json() if diff_resp.status_code == 200 else []
+            # 2. Difficulty adjustments
+            diff_resp = self.session.get("https://mempool.space/api/v1/mining/difficulty-adjustments/6", timeout=15)
+            diff_resp.raise_for_status()
+            diff_data = diff_resp.json()
 
-        conn = self.get_db_connection(); c = conn.cursor()
-        sql = f"""INSERT IGNORE INTO `{self.table_name}`
-            (current_hashrate, current_hashrate_eh, current_difficulty,
-             hashrate_data_json, difficulty_data_json, period, snapshot_hour, snapshot_at)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)"""
+            # Сохраняем только последние 30 точек hashrate и 10 корректировок
+            hr_json = json.dumps(data.get("hashrates", [])[-30:], default=str)[:50000]
+            diff_json = json.dumps(diff_data[:10] if isinstance(diff_data, list) else diff_data, default=str)[:10000]
 
-        c.execute(sql, (
-            current_hr, round(hr_eh, 4), current_diff,
-            json.dumps(data.get("hashrates", [])[-30:], default=str)[:50000],  # Last 30 points
-            json.dumps(diff_data[:10], default=str)[:10000],
-            "3m", snapshot_hour, snapshot_at,
-        ))
-        conn.commit(); inserted = c.rowcount; c.close(); conn.close()
+            conn = self.get_db_connection()
+            c = conn.cursor()
+            sql = f"""INSERT IGNORE INTO `{self.table_name}`
+                (current_hashrate, current_hashrate_eh, current_difficulty,
+                 hashrate_data_json, difficulty_data_json, period, snapshot_hour, snapshot_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s)"""
 
-        print(f"   ✅ BTC Hashrate: {hr_eh:.2f} EH/s")
-        print(f"      Difficulty: {current_diff:.0f}")
-        print(f"      Записано: {inserted}")
+            c.execute(sql, (current_hr, hr_eh, current_diff, hr_json, diff_json, "3m", snapshot_hour, snapshot_at))
+            conn.commit()
+            inserted = c.rowcount
+            c.close();
+            conn.close()
+
+            print(f"   ✅ BTC Hashrate: {hr_eh:.2f} EH/s | Difficulty: {current_diff:,.0f} | Записано: {inserted}")
+
+        except requests.exceptions.RequestException as e:
+            print(f"   ❌ Ошибка API mempool.space: {e}")
+            raise
+        except Exception as e:
+            print(f"   ❌ Неизвестная ошибка в hashrate: {e}")
+            raise
 
 
 def main():
