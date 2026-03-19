@@ -24,10 +24,6 @@ def send_error_trace(exc: Exception, node: str, script: str = "server.py") -> No
     """
     Отправляет трассировку ошибки АСИНХРОННО в отдельном потоке,
     чтобы НЕ блокировать asyncio event loop.
-
-    ВАЖНО: раньше здесь был синхронный requests.post(timeout=10), который
-    полностью блокировал event loop на 10 секунд → каскадное исчерпание
-    пула соединений. Теперь отправка идёт в daemon-потоке.
     """
     logs = (
         f"Node: {node}\nScript: {script}\n"
@@ -157,10 +153,16 @@ def build_engines():
 # ── Workers ───────────────────────────────────────────────────────────────────
 async def resolve_workers(engine_super, service_id: int, default: int = 1) -> int:
     """
-    DEV  → всегда 1.
-    PROD → читает brain_service.workers из engine_super;
-           если =0, использует brain_models.priority.
+    Приоритет:
+      1. WORKERS > 0 в .env  → берём это значение напрямую (хардкод на ноде).
+      2. WORKERS = 0 (или не задан) + DEV → всегда 1.
+      3. WORKERS = 0 (или не задан) + PROD → читает brain_service.workers из engine_super;
+                                              если =0, использует brain_models.priority.
     """
+    env_workers = int(os.getenv("WORKERS", "0"))
+    if env_workers > 0:
+        return env_workers
+
     if IS_DEV:
         return 1
     try:
