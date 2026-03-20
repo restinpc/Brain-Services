@@ -29,7 +29,6 @@ ASSETS = {
     'US10Y':  '^TNX',
 }
 
-# Колонки которые качаем — добавили High, Low, Open
 OHLCV_COLS = {
     'Close':  'Close',
     'High':   'High',
@@ -41,21 +40,15 @@ OHLCV_COLS = {
 engine = create_engine(SQLALCHEMY_URL, pool_recycle=3600)
 
 
-# ── Миграция: добавляем недостающие колонки в существующую таблицу ────────────
+# ── Миграция: добавляем недостающие колонки ───────────────────────────────────
 
 def migrate_add_columns():
-    """
-    Проверяет существующие колонки таблицы.
-    Если High/Low/Open отсутствуют — добавляет их через ALTER TABLE.
-    Запускается один раз при старте, безопасно при повторном запуске.
-    """
-    new_cols = []
-    for name in ASSETS:
-        for suffix in ('High', 'Low', 'Open'):
-            new_cols.append(f'{name}_{suffix}')
-
+    new_cols = [
+        f'{name}_{suffix}'
+        for name in ASSETS
+        for suffix in ('High', 'Low', 'Open')
+    ]
     with engine.connect() as conn:
-        # Получаем список существующих колонок
         result = conn.execute(text(
             f"SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
             f"WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '{TABLE_NAME}'"
@@ -64,20 +57,20 @@ def migrate_add_columns():
 
     missing = [c for c in new_cols if c not in existing]
     if not missing:
-        print(f"  ✅ Все колонки уже существуют ({len(new_cols)} штук)")
+        print(f"  ✅ Все колонки уже существуют")
         return
 
-    print(f"  ⚙️  Добавляем {len(missing)} колонок: {missing[:6]}{'...' if len(missing) > 6 else ''}")
+    print(f"  ⚙️  Добавляем {len(missing)} колонок: "
+          f"{missing[:6]}{'...' if len(missing) > 6 else ''}...")
     alter_parts = ", ".join(f"ADD COLUMN `{col}` DOUBLE NULL" for col in missing)
     with engine.begin() as conn:
         conn.execute(text(f"ALTER TABLE `{TABLE_NAME}` {alter_parts}"))
     print(f"  ✅ ALTER TABLE выполнен")
 
 
-# ── Получение крайних дат ─────────────────────────────────────────────────────
+# ── Даты ─────────────────────────────────────────────────────────────────────
 
 def get_last_datetime():
-    """Последняя datetime в таблице — для инкрементального обновления."""
     try:
         with engine.connect() as conn:
             result = conn.execute(text(f"SELECT MAX(`datetime`) FROM `{TABLE_NAME}`"))
@@ -89,7 +82,6 @@ def get_last_datetime():
 
 
 def get_first_datetime():
-    """Первая datetime в таблице — для бэкфилла исторических колонок."""
     try:
         with engine.connect() as conn:
             result = conn.execute(text(f"SELECT MIN(`datetime`) FROM `{TABLE_NAME}`"))
@@ -104,8 +96,9 @@ def get_first_datetime():
 
 def download_ohlcv(start_date=None, period="2y") -> pd.DataFrame:
     """
-    Качает OHLCV для всех тикеров из ASSETS.
-    Возвращает wide DataFrame с колонками: {Name}_{Close/High/Low/Open/Volume}
+    Качает OHLCV для всех тикеров.
+    start_date — datetime, качаем с этой даты.
+    period     — строка "2y"/"1y", используется если start_date=None.
     """
     tickers = list(ASSETS.values())
     try:
@@ -126,7 +119,10 @@ def download_ohlcv(start_date=None, period="2y") -> pd.DataFrame:
                 progress=False,
             )
     except Exception as e:
-        print(f"❌ Ошибка Yahoo Finance: {e}")
+        print(f"  ❌ Ошибка Yahoo Finance: {e}")
+        return pd.DataFrame()
+
+    if data is None or data.empty:
         return pd.DataFrame()
 
     dfs = {}
@@ -181,15 +177,14 @@ def get_crypto_metrics() -> pd.DataFrame:
         return pd.DataFrame()
 
 
-# ── Бэкфилл: заполнение исторических High/Low/Open ───────────────────────────
+# ── Бэкфилл через temp table + UPDATE JOIN ────────────────────────────────────
 
 def backfill_missing_columns():
     """
-    Проверяет, есть ли строки где High/Low/Open = NULL.
-    Если есть — качает историю с самого начала таблицы и обновляет через UPDATE.
-    Вызывается один раз после migrate_add_columns().
+    Заполняет NULL в High/Low/Open для уже существующих строк.
+    Использует временную таблицу + UPDATE JOIN — намного быстрее
+    построчного UPDATE на 25k+ строк.
     """
-    # Проверяем нужен ли бэкфилл (есть ли NULL в первой попавшейся High-колонке)
     check_col = 'EURUSD_High'
     with engine.connect() as conn:
         result = conn.execute(text(
@@ -203,60 +198,87 @@ def backfill_missing_columns():
 
     print(f"  ⚙️  Нужно заполнить {null_count} строк историческими High/Low/Open...")
 
+    # ── Скачиваем: сначала по дате, fallback на period="2y" ──────────────────
+    hist_df = pd.DataFrame()
+
     first_dt = get_first_datetime()
-    if not first_dt:
-        print("  ⚠️  Не удалось получить начальную дату, пропускаем бэкфилл")
-        return
+    if first_dt:
+        start = first_dt - datetime.timedelta(days=1)
+        print(f"  [*] Пробуем скачать с {start.date()}...")
+        hist_df = download_ohlcv(start_date=start)
 
-    start = first_dt - datetime.timedelta(days=1)
-    print(f"  [*] Скачиваем историю с {start.date()} для бэкфилла...")
-
-    hist_df = download_ohlcv(start_date=start)
     if hist_df.empty:
-        print("  ⚠️  Не удалось скачать историю для бэкфилла")
+        # yfinance не всегда отдаёт данные по start= для дат старше 730 дней
+        print(f"  [*] start= не сработал → пробуем period='2y'...")
+        hist_df = download_ohlcv(period="2y")
+
+    if hist_df.empty:
+        print("  ⚠️  Не удалось скачать данные для бэкфилла, пропускаем")
         return
 
-    # Строим список колонок для UPDATE
-    update_cols = []
-    for name in ASSETS:
-        for suffix in ('High', 'Low', 'Open'):
-            col = f'{name}_{suffix}'
-            if col in hist_df.columns:
-                update_cols.append(col)
+    # ── Нормализуем индекс ────────────────────────────────────────────────────
+    hist_df = hist_df.copy()
+    hist_df.index.name = 'datetime'
+    hist_df = hist_df.reset_index()
+
+    # Страховка от разных названий индекса в разных версиях yfinance
+    for alias in ('Datetime', 'Date', 'index'):
+        if alias in hist_df.columns and 'datetime' not in hist_df.columns:
+            hist_df.rename(columns={alias: 'datetime'}, inplace=True)
+
+    hist_df['datetime'] = pd.to_datetime(hist_df['datetime']).dt.tz_localize(None)
+
+    # ── Оставляем только High/Low/Open колонки ────────────────────────────────
+    update_cols = [
+        f'{name}_{suffix}'
+        for name in ASSETS
+        for suffix in ('High', 'Low', 'Open')
+        if f'{name}_{suffix}' in hist_df.columns
+    ]
 
     if not update_cols:
-        print("  ⚠️  Нет колонок для обновления")
+        print("  ⚠️  High/Low/Open колонок нет в скачанных данных")
         return
 
-    print(f"  [*] Обновляем {len(update_cols)} колонок по {len(hist_df)} строкам...")
+    keep = ['datetime'] + update_cols
+    hist_df = hist_df[keep].dropna(how='all', subset=update_cols)
+    print(f"  [*] Скачано {len(hist_df)} строк, "
+          f"обновляем {len(update_cols)} колонок через UPDATE JOIN...")
 
-    # Обновляем батчами по 500 строк
-    hist_df = hist_df.reset_index()  # datetime становится колонкой
-    hist_df = hist_df.rename(columns={'index': 'datetime', 'Datetime': 'datetime'})
+    # ── Временная таблица + UPDATE JOIN ──────────────────────────────────────
+    TMP = "_backfill_tmp"
+    try:
+        # 1. Пишем в temp-таблицу (быстро через to_sql)
+        hist_df.to_sql(
+            name=TMP, con=engine,
+            if_exists='replace', index=False,
+            chunksize=2000, method='multi',
+        )
 
-    batch_size = 500
-    updated = 0
-    with engine.begin() as conn:
-        for i in range(0, len(hist_df), batch_size):
-            batch = hist_df.iloc[i:i + batch_size]
-            for _, row in batch.iterrows():
-                dt = row.get('datetime')
-                if dt is None:
-                    continue
-                set_parts = []
-                values = {'dt': dt}
-                for col in update_cols:
-                    val = row.get(col)
-                    if val is not None and not pd.isna(val):
-                        set_parts.append(f"`{col}` = :{col.replace(' ', '_')}")
-                        values[col.replace(' ', '_')] = float(val)
-                if not set_parts:
-                    continue
-                sql = f"UPDATE `{TABLE_NAME}` SET {', '.join(set_parts)} WHERE `datetime` = :dt"
-                conn.execute(text(sql), values)
-                updated += 1
+        # 2. Один UPDATE JOIN — обновляет все совпадающие строки за один запрос
+        set_clause = ",\n    ".join(
+            f"t.`{col}` = s.`{col}`" for col in update_cols
+        )
+        sql = f"""
+            UPDATE `{TABLE_NAME}` t
+            JOIN   `{TMP}` s ON s.`datetime` = t.`datetime`
+            SET    {set_clause}
+            WHERE  t.`{check_col}` IS NULL
+        """
+        with engine.begin() as conn:
+            result  = conn.execute(text(sql))
+            updated = result.rowcount
 
-    print(f"  ✅ Бэкфилл завершён: обновлено {updated} строк")
+        print(f"  ✅ Бэкфилл завершён: обновлено {updated} строк")
+
+    except Exception as e:
+        print(f"  ❌ Ошибка при бэкфилле: {e}")
+    finally:
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(f"DROP TABLE IF EXISTS `{TMP}`"))
+        except Exception:
+            pass
 
 
 # ── Сохранение новых данных ───────────────────────────────────────────────────
@@ -286,17 +308,17 @@ def save_data(df: pd.DataFrame):
 if __name__ == "__main__":
     print(f"🚀 Загрузка рыночных данных → {TABLE_NAME}\n")
 
-    # 1. Миграция: добавляем новые колонки если их нет
+    # 1. Миграция структуры таблицы
     print("[1] Проверка структуры таблицы...")
     migrate_add_columns()
 
-    # 2. Бэкфилл: заполняем историческими High/Low/Open уже существующие строки
+    # 2. Бэкфилл исторических High/Low/Open
     print("\n[2] Бэкфилл исторических данных...")
     backfill_missing_columns()
 
-    # 3. Инкрементальное обновление — как раньше
+    # 3. Инкрементальное обновление — только новые строки
     print("\n[3] Обновление свежих данных...")
-    last_dt = get_last_datetime()
+    last_dt    = get_last_datetime()
     start_date = (last_dt - datetime.timedelta(days=1)) if last_dt else None
 
     df_market = download_ohlcv(start_date=start_date)
@@ -304,7 +326,6 @@ if __name__ == "__main__":
         print("  ⚠️  Нет новых рыночных данных")
         sys.exit(0)
 
-    # Отрезаем только новые строки
     if last_dt is not None:
         df_market = df_market[df_market.index > last_dt]
 
