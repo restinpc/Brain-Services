@@ -1,8 +1,4 @@
 """
-Polymarket History Collector — только история цен
-Активные рынки + топ-5000 закрытых по volume
-Incremental backfill через /prices-history
-
 Запуск:
   python Polymarket_direct.py vlad_polymarket [host] [port] [user] [password] [database]
 """
@@ -39,7 +35,7 @@ def send_error_trace(exc, script_name="Polymarket_direct.py"):
 # ────────────────────────────────────────────────
 
 parser = argparse.ArgumentParser(description="Polymarket History → MySQL")
-parser.add_argument("table_name", help="Имя таблицы (например: vlad_polymarket_history)")
+parser.add_argument("table_name", help="Имя таблицы (например: vlad_polymarket)")
 parser.add_argument("host", nargs="?", default=os.getenv("DB_HOST"))
 parser.add_argument("port", nargs="?", default=os.getenv("DB_PORT", "3306"))
 parser.add_argument("user", nargs="?", default=os.getenv("DB_USER"))
@@ -72,7 +68,18 @@ def _sf(v):
     except:
         return None
 
-def build_session():
+def _parse_end_date(s):
+    """Возвращает date-объект для колонки DATE, или None если не распарсить."""
+    if not s:
+        return None
+    try:
+        from datetime import date
+        dt = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+        return dt.date()
+    except:
+        return None
+
+
     s = requests.Session()
     retry = Retry(total=4, backoff_factor=1.8, status_forcelist=[429, 500, 502, 503, 504], allowed_methods=["GET"])
     s.mount("https://", HTTPAdapter(max_retries=retry))
@@ -94,41 +101,38 @@ class PolymarketHistoryCollector:
     def get_db_connection(self):
         conn = mysql.connector.connect(**DB_CONFIG)
         c = conn.cursor()
-        # Защита от долгого ожидания блокировки
         c.execute("SET SESSION innodb_lock_wait_timeout = 600;")
         return conn, c
 
     def ensure_table(self):
         conn, c = self.get_db_connection()
 
-        # Базовая структура
         c.execute(f"""
         CREATE TABLE IF NOT EXISTS `{self.table_name}` (
             id                  INT AUTO_INCREMENT PRIMARY KEY,
             condition_id        VARCHAR(100) NOT NULL,
-            token_id            VARCHAR(100) NOT NULL,
-            question            TEXT,
+            question            VARCHAR(500),
             price_timestamp     DATETIME NOT NULL,
-            price               FLOAT NOT NULL,
+            price               DECIMAL(5,4) NOT NULL,
             loaded_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE KEY uq_cond_ts (condition_id, price_timestamp)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Polymarket — история цен';
         """)
 
-        # Полный набор колонок
         columns = {
-            "volume":       "DECIMAL(20,2)      COMMENT 'Общий объём торгов (USDC)'",
-            "volume_24h":   "DECIMAL(20,2)      COMMENT 'Объём за 24 часа'",
-            "liquidity":    "DECIMAL(20,2)      COMMENT 'Текущая ликвидность'",
-            "end_date":     "VARCHAR(50)        COMMENT 'Дата разрешения/экспирации'",
-            "slug":         "VARCHAR(255)       COMMENT 'Slug рынка'",
-            "tags":         "VARCHAR(500)       COMMENT 'Теги через запятую'",
-            "outcome_yes":  "FLOAT              COMMENT 'Текущая цена YES'",
-            "outcome_no":   "FLOAT              COMMENT 'Текущая цена NO'",
-            "spread":       "FLOAT              COMMENT 'Спред bid-ask'",
-            "num_outcomes": "INT                COMMENT 'Количество исходов'",
-            "active":       "TINYINT(1)         COMMENT '1 = активен, 0 = закрыт'",
-            "raw_json":     "TEXT               COMMENT 'Полный JSON рынка'"
+            # DECIMAL(14,2): до $99T — более чем достаточно, 7 байт вместо 9
+            "volume":        "DECIMAL(14,2)  COMMENT 'Общий объём торгов (USDC)'",
+            "volume_24h":    "DECIMAL(14,2)  COMMENT 'Объём за 24 часа'",
+            "liquidity":     "DECIMAL(14,2)  COMMENT 'Текущая ликвидность'",
+            # DATE (3 байта) вместо VARCHAR(50) (~25 байт) + нормальные date-операции
+            "end_date":      "DATE           COMMENT 'Дата разрешения/экспирации'",
+            "tags":          "VARCHAR(500)   COMMENT 'Теги через запятую'",
+            # DECIMAL(5,4): цена 0.0000–0.9999, 3 байта вместо 4 у FLOAT
+            "outcome_yes":   "DECIMAL(5,4)   COMMENT 'Текущая цена YES'",
+            "outcome_no":    "DECIMAL(5,4)   COMMENT 'Текущая цена NO'",
+            "spread":        "DECIMAL(5,4)   COMMENT 'Спред bid-ask'",
+            "num_outcomes":  "INT            COMMENT 'Количество исходов'",
+            "active":        "TINYINT(1)     COMMENT '1 = активен, 0 = закрыт'",
         }
 
         c.execute(f"SHOW COLUMNS FROM `{self.table_name}`")
@@ -144,13 +148,10 @@ class PolymarketHistoryCollector:
                 except Exception as e:
                     print(f"   Ошибка при добавлении {col}: {e}")
 
-        # Индексы
         indexes = [
-            "idx_token (token_id)",
             "idx_timestamp (price_timestamp)",
             "idx_price (price)",
             "idx_volume (volume DESC)",
-            "idx_slug (slug)",
             "idx_active (active)"
         ]
         for idx_def in indexes:
@@ -213,10 +214,25 @@ class PolymarketHistoryCollector:
                 print(f"\n ⚠️ Ошибка активных: {e}")
                 break
 
-        # Топ-5000 закрытых
-        print(f"\n 📡 Gamma API → топ-5000 закрытых...")
+        # Закрытые рынки — только качественные для бэктестинга
+        # Критерии: volume >= $50K, ликвидность >= $500, срок жизни >= 7 дней
+        # API отдаёт по volume DESC → как только max volume страницы < $50K — стоп
+        print(f"\n 📡 Gamma API → закрытые рынки (volume ≥ $50K, liquidity ≥ $500, срок ≥ 7 дней)...")
         offset = 0
-        closed_count = 0
+        closed_fetched = 0
+        closed_passed  = 0
+        CLOSED_MIN_VOLUME    = 50_000   # минимальный total volume в USDC
+        CLOSED_MIN_LIQUIDITY = 500      # минимальная ликвидность — ниже = цена шумит от одной сделки
+        CLOSED_MIN_DAYS      = 7        # минимальная длина жизни рынка (168 часовых точек)
+
+        def _parse_dt_safe(s):
+            if not s:
+                return None
+            try:
+                return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+            except:
+                return None
+
         while True:
             try:
                 r = self.session.get(
@@ -235,11 +251,50 @@ class PolymarketHistoryCollector:
                 data = r.json()
                 markets = data if isinstance(data, list) else data.get("data", data.get("markets", []))
                 if not markets: break
-                all_markets.extend(markets)
-                closed_count += len(markets)
-                print(f" ...закрытых: {closed_count:,}", end="\r")
+
+                page_passed = 0
+                max_vol_on_page = 0
+                for m in markets:
+                    vol = _sf(m.get("volume") or m.get("volumeNum"))
+                    if vol is not None:
+                        max_vol_on_page = max(max_vol_on_page, vol)
+
+                    # Фильтр 1: volume
+                    if vol is None or vol < CLOSED_MIN_VOLUME:
+                        continue
+
+                    # Фильтр 2: ликвидность — защита от шумных малоликвидных рынков
+                    liq = _sf(m.get("liquidity") or m.get("liquidityNum"))
+                    if liq is not None and liq < CLOSED_MIN_LIQUIDITY:
+                        continue
+
+                    # Фильтр 3: длина жизни — надёжный парсинг через несколько полей
+                    start_dt = (_parse_dt_safe(m.get("startDate"))
+                                or _parse_dt_safe(m.get("createdAt"))
+                                or _parse_dt_safe(m.get("created_at")))
+                    end_dt   = (_parse_dt_safe(m.get("endDate"))
+                                or _parse_dt_safe(m.get("resolutionDate")))
+                    if start_dt and end_dt:
+                        if (end_dt - start_dt).days < CLOSED_MIN_DAYS:
+                            continue
+                    else:
+                        # Даты не распарсились — пропускаем, не берём сомнительные рынки
+                        continue
+
+                    all_markets.append(m)
+                    page_passed += 1
+
+                closed_fetched += len(markets)
+                closed_passed  += page_passed
+                print(f" ...закрытых проверено: {closed_fetched:,}  прошло фильтр: {closed_passed:,}", end="\r")
+
+                # API DESC по volume — если максимум страницы уже ниже порога, дальше нет смысла
+                if max_vol_on_page < CLOSED_MIN_VOLUME:
+                    print(f"\n   → макс. volume страницы ${max_vol_on_page:,.0f} < порога, стоп")
+                    break
+
                 offset += len(markets)
-                if len(markets) < 100 or closed_count >= 5000: break
+                if len(markets) < 100: break
                 time.sleep(random.uniform(1.2, 2.2))
             except Exception as e:
                 print(f"\n ⚠️ Ошибка закрытых: {e}")
@@ -272,14 +327,12 @@ class PolymarketHistoryCollector:
 
         tid = yes_p = no_p = None
 
-        # CLOB
         if isinstance(tokens, list) and tokens:
             tid = tokens[0].get("token_id", "")
             yes_p = _sf(tokens[0].get("price"))
             if len(tokens) >= 2:
                 no_p = _sf(tokens[1].get("price"))
 
-        # Gamma (list или строка)
         if not tid and clob_raw:
             clob_ids = clob_raw
             if isinstance(clob_raw, str):
@@ -311,20 +364,18 @@ class PolymarketHistoryCollector:
 
         return {
             "condition_id": cid[:100],
-            "token_id": tid[:100],
-            "question": (m.get("question") or m.get("title") or "").strip()[:2000],
-            "volume": _sf(m.get("volume") or m.get("volumeNum")),
-            "volume_24h": _sf(m.get("volume24hr") or m.get("volume_24h")),
-            "liquidity": _sf(m.get("liquidity") or m.get("liquidityNum")),
-            "end_date": str(m.get("endDate") or m.get("end_date_iso") or m.get("resolutionDate") or "")[:50],
-            "slug": str(m.get("slug") or m.get("market_slug") or "")[:255],
-            "tags": tags_str[:500] or None,
-            "outcome_yes": yes_p,
-            "outcome_no": no_p,
-            "spread": spread,
+            "_token_id":    tid,          # только для API-запроса, в БД не пишем
+            "question":     (m.get("question") or m.get("title") or "").strip()[:2000],
+            "volume":       _sf(m.get("volume") or m.get("volumeNum")),
+            "volume_24h":   _sf(m.get("volume24hr") or m.get("volume_24h")),
+            "liquidity":    _sf(m.get("liquidity") or m.get("liquidityNum")),
+            "end_date":     _parse_end_date(m.get("endDate") or m.get("end_date_iso") or m.get("resolutionDate")),
+            "tags":         tags_str[:500] or None,
+            "outcome_yes":  yes_p,
+            "outcome_no":   no_p,
+            "spread":       spread,
             "num_outcomes": num_outcomes,
-            "active": 1 if m.get("active", True) else 0,
-            "raw_json": json.dumps(m, ensure_ascii=False, default=str)[:8000]
+            "active":       1 if m.get("active", True) else 0,
         }
 
     def process(self):
@@ -349,20 +400,20 @@ class PolymarketHistoryCollector:
 
         sql = f"""
         INSERT IGNORE INTO `{self.table_name}`
-        (condition_id, token_id, question, price_timestamp, price,
-         volume, volume_24h, liquidity, end_date, slug, tags,
-         outcome_yes, outcome_no, spread, num_outcomes, active, raw_json)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        (condition_id, question, price_timestamp, price,
+         volume, volume_24h, liquidity, end_date, tags,
+         outcome_yes, outcome_no, spread, num_outcomes, active)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """
 
-        SUBBATCH_SIZE = 500               # максимум строк за один INSERT
-        COMMIT_EVERY_MARKETS = 5          # коммит после каждого N рынка
-        FORCE_COMMIT_IF_ROWS_GT = 1000    # принудительный коммит при большом рынке
+        SUBBATCH_SIZE = 500
+        COMMIT_EVERY_MARKETS = 5
+        FORCE_COMMIT_IF_ROWS_GT = 1000
 
         try:
             for i, meta in enumerate(market_metas):
                 cid = meta["condition_id"]
-                tid = meta["token_id"]
+                tid = meta["_token_id"]  # используем только для запроса к API
 
                 last_ts = self.get_last_timestamp(cid)
                 start_ts = last_ts + 1 if last_ts else None
@@ -381,17 +432,17 @@ class PolymarketHistoryCollector:
                     ts = p.get("t", 0)
                     price = p.get("p", 0)
                     if ts > 0:
-                        dt = datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+                        # Округляем до минуты — API возвращает случайные секунды
+                        dt = datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d %H:%M:00")
                         rows.append((
-                            cid, tid, meta["question"], dt, price,
+                            cid, meta["question"], dt, price,
                             meta["volume"], meta["volume_24h"], meta["liquidity"],
-                            meta["end_date"], meta["slug"], meta["tags"],
+                            meta["end_date"], meta["tags"],
                             meta["outcome_yes"], meta["outcome_no"], meta["spread"],
-                            meta["num_outcomes"], meta["active"], meta["raw_json"]
+                            meta["num_outcomes"], meta["active"]
                         ))
 
                 if rows:
-                    # Разбиваем на подбатчи
                     for start in range(0, len(rows), SUBBATCH_SIZE):
                         sub_rows = rows[start:start + SUBBATCH_SIZE]
                         try:
@@ -402,9 +453,8 @@ class PolymarketHistoryCollector:
                         except mysql.connector.Error as err:
                             print(f"   Ошибка вставки подбатча рынка {i+1} (строки {start}-{start+len(sub_rows)}): {err}")
                             conn.rollback()
-                            break  # прерываем этот рынок, идём дальше
+                            break
 
-                # Коммит
                 if (i + 1) % COMMIT_EVERY_MARKETS == 0 or len(rows) > FORCE_COMMIT_IF_ROWS_GT:
                     conn.commit()
                     pct = round((i + 1) / len(market_metas) * 100, 1)
