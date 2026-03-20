@@ -79,7 +79,7 @@ def _parse_end_date(s):
     except:
         return None
 
-
+def build_session():
     s = requests.Session()
     retry = Retry(total=4, backoff_factor=1.8, status_forcelist=[429, 500, 502, 503, 504], allowed_methods=["GET"])
     s.mount("https://", HTTPAdapter(max_retries=retry))
