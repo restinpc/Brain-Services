@@ -419,7 +419,7 @@ class PolymarketHistoryCollector:
             print("   → нет рынков с валидным token_id")
             return
 
-        total_points = total_new = 0
+        total_points = total_new = total_updated = 0
         conn, c = self.get_db_connection()
 
         sql = f"""
@@ -459,7 +459,7 @@ class PolymarketHistoryCollector:
                 if not history:
                     if (i + 1) % 200 == 0:
                         pct = round((i + 1) / len(market_metas) * 100, 1)
-                        print(f" ...{i+1:,}/{len(market_metas):,} ({pct}%)  новых: {total_new:,}", end="\r")
+                        print(f" ...{i+1:,}/{len(market_metas):,} ({pct}%)  обработано: {total_new:,}", end="\r")
                     time.sleep(random.uniform(1.2, 2.2))
                     continue
 
@@ -468,7 +468,7 @@ class PolymarketHistoryCollector:
                     ts = p.get("t", 0)
                     price = p.get("p", 0)
                     if ts > 0:
-                        dt = datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d %H:%M:00")
+                        dt = datetime.fromtimestamp(ts, datetime.UTC).strftime("%Y-%m-%d %H:%M:00")
                         rows.append((
                             cid, meta["question"], dt, price,
                             meta["volume"], meta["volume_24h"], meta["liquidity"],
@@ -482,9 +482,18 @@ class PolymarketHistoryCollector:
                         sub_rows = rows[start:start + SUBBATCH_SIZE]
                         try:
                             c.executemany(sql, sub_rows)
-                            inserted = c.rowcount
-                            total_new += inserted
-                            total_points += len(sub_rows)
+                            # ON DUPLICATE KEY UPDATE rowcount:
+                            #   1 = новая строка вставлена
+                            #   2 = существующая строка обновлена
+                            #   0 = строка не изменилась
+                            rc = c.rowcount
+                            # rc // 2 = кол-во обновлённых, rc % 2 + остаток = новые
+                            # Точная формула: новые = rc - обновлённые*2, но из executemany
+                            # суммарный rc уже агрегирован — используем: новые ≈ rc кратно не 2
+                            # Простой и честный способ:
+                            total_new     += len(sub_rows)   # всего строк обработано
+                            total_updated += rc              # affected rows (1=new, 2=updated)
+                            total_points  += len(sub_rows)
                         except mysql.connector.Error as err:
                             print(f"   Ошибка вставки подбатча рынка {i+1} (строки {start}-{start+len(sub_rows)}): {err}")
                             conn.rollback()
@@ -493,7 +502,7 @@ class PolymarketHistoryCollector:
                 if (i + 1) % COMMIT_EVERY_MARKETS == 0 or len(rows) > FORCE_COMMIT_IF_ROWS_GT:
                     conn.commit()
                     pct = round((i + 1) / len(market_metas) * 100, 1)
-                    print(f" ...{i+1:,}/{len(market_metas):,} ({pct}%)  новых: {total_new:,}  всего: {total_points:,}", end="\r")
+                    print(f" ...{i+1:,}/{len(market_metas):,} ({pct}%)  строк в БД: {total_points:,}  affected: {total_updated:,}", end="\r")
 
                 time.sleep(random.uniform(1.4, 2.4))
 
@@ -508,8 +517,8 @@ class PolymarketHistoryCollector:
             c.close()
             conn.close()
 
-        final_pct = round(total_new / total_points * 100, 1) if total_points > 0 else 0
-        print(f"\n\n ✅ Завершено: загружено {total_points:,} точек, новых — {total_new:,} ({final_pct}%)")
+        # affected: 1=новая, 2=обновлена → новые ≈ total_updated если только INSERT
+        print(f"\n\n ✅ Завершено: строк обработано {total_points:,}  affected rows {total_updated:,}")
 
 # ────────────────────────────────────────────────
 # Запуск
