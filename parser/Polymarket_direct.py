@@ -480,24 +480,23 @@ class PolymarketHistoryCollector:
                 if rows:
                     for start in range(0, len(rows), SUBBATCH_SIZE):
                         sub_rows = rows[start:start + SUBBATCH_SIZE]
-                        try:
-                            c.executemany(sql, sub_rows)
-                            # ON DUPLICATE KEY UPDATE rowcount:
-                            #   1 = новая строка вставлена
-                            #   2 = существующая строка обновлена
-                            #   0 = строка не изменилась
-                            rc = c.rowcount
-                            # rc // 2 = кол-во обновлённых, rc % 2 + остаток = новые
-                            # Точная формула: новые = rc - обновлённые*2, но из executemany
-                            # суммарный rc уже агрегирован — используем: новые ≈ rc кратно не 2
-                            # Простой и честный способ:
-                            total_new     += len(sub_rows)   # всего строк обработано
-                            total_updated += rc              # affected rows (1=new, 2=updated)
-                            total_points  += len(sub_rows)
-                        except mysql.connector.Error as err:
-                            print(f"   Ошибка вставки подбатча рынка {i+1} (строки {start}-{start+len(sub_rows)}): {err}")
-                            conn.rollback()
-                            break
+                        # Retry при дедлоке — до 5 попыток с паузой
+                        for attempt in range(5):
+                            try:
+                                c.executemany(sql, sub_rows)
+                                rc = c.rowcount
+                                total_new     += len(sub_rows)
+                                total_updated += rc
+                                total_points  += len(sub_rows)
+                                break  # успех — выходим из retry
+                            except mysql.connector.Error as err:
+                                if err.errno == 1213 and attempt < 4:  # Deadlock
+                                    conn.rollback()
+                                    time.sleep(random.uniform(0.5, 1.5) * (attempt + 1))
+                                    continue
+                                print(f"   Ошибка рынка {i+1} (попытка {attempt+1}): {err}")
+                                conn.rollback()
+                                break
 
                 if (i + 1) % COMMIT_EVERY_MARKETS == 0 or len(rows) > FORCE_COMMIT_IF_ROWS_GT:
                     conn.commit()
