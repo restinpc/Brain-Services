@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 Полная история 1989–2024 (300k+ событий) + monthly candidate updates.
 
