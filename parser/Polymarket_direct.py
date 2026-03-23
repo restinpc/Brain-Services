@@ -9,7 +9,7 @@ import json
 import time
 import random
 import traceback
-from datetime import datetime
+from datetime import datetime, date
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -56,6 +56,8 @@ DB_CONFIG = {
     'database': args.database
 }
 
+TODAY = date.today()
+
 # ────────────────────────────────────────────────
 # Утилиты
 # ────────────────────────────────────────────────
@@ -73,9 +75,16 @@ def _parse_end_date(s):
     if not s:
         return None
     try:
-        from datetime import date
         dt = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
         return dt.date()
+    except:
+        return None
+
+def _parse_dt_safe(s):
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
     except:
         return None
 
@@ -120,14 +129,11 @@ class PolymarketHistoryCollector:
         """)
 
         columns = {
-            # DECIMAL(14,2): до $99T — более чем достаточно, 7 байт вместо 9
             "volume":        "DECIMAL(14,2)  COMMENT 'Общий объём торгов (USDC)'",
             "volume_24h":    "DECIMAL(14,2)  COMMENT 'Объём за 24 часа'",
             "liquidity":     "DECIMAL(14,2)  COMMENT 'Текущая ликвидность'",
-            # DATE (3 байта) вместо VARCHAR(50) (~25 байт) + нормальные date-операции
             "end_date":      "DATE           COMMENT 'Дата разрешения/экспирации'",
             "tags":          "VARCHAR(500)   COMMENT 'Теги через запятую'",
-            # DECIMAL(5,4): цена 0.0000–0.9999, 3 байта вместо 4 у FLOAT
             "outcome_yes":   "DECIMAL(5,4)   COMMENT 'Текущая цена YES'",
             "outcome_no":    "DECIMAL(5,4)   COMMENT 'Текущая цена NO'",
             "spread":        "DECIMAL(5,4)   COMMENT 'Спред bid-ask'",
@@ -214,24 +220,13 @@ class PolymarketHistoryCollector:
                 print(f"\n ⚠️ Ошибка активных: {e}")
                 break
 
-        # Закрытые рынки — только качественные для бэктестинга
-        # Критерии: volume >= $50K, ликвидность >= $500, срок жизни >= 7 дней
-        # API отдаёт по volume DESC → как только max volume страницы < $50K — стоп
         print(f"\n 📡 Gamma API → закрытые рынки (volume ≥ $50K, liquidity ≥ $500, срок ≥ 7 дней)...")
         offset = 0
         closed_fetched = 0
         closed_passed  = 0
-        CLOSED_MIN_VOLUME    = 50_000   # минимальный total volume в USDC
-        CLOSED_MIN_LIQUIDITY = 500      # минимальная ликвидность — ниже = цена шумит от одной сделки
-        CLOSED_MIN_DAYS      = 7        # минимальная длина жизни рынка (168 часовых точек)
-
-        def _parse_dt_safe(s):
-            if not s:
-                return None
-            try:
-                return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
-            except:
-                return None
+        CLOSED_MIN_VOLUME    = 50_000
+        CLOSED_MIN_LIQUIDITY = 500
+        CLOSED_MIN_DAYS      = 7
 
         while True:
             try:
@@ -259,16 +254,13 @@ class PolymarketHistoryCollector:
                     if vol is not None:
                         max_vol_on_page = max(max_vol_on_page, vol)
 
-                    # Фильтр 1: volume
                     if vol is None or vol < CLOSED_MIN_VOLUME:
                         continue
 
-                    # Фильтр 2: ликвидность — защита от шумных малоликвидных рынков
                     liq = _sf(m.get("liquidity") or m.get("liquidityNum"))
                     if liq is not None and liq < CLOSED_MIN_LIQUIDITY:
                         continue
 
-                    # Фильтр 3: длина жизни — надёжный парсинг через несколько полей
                     start_dt = (_parse_dt_safe(m.get("startDate"))
                                 or _parse_dt_safe(m.get("createdAt"))
                                 or _parse_dt_safe(m.get("created_at")))
@@ -278,7 +270,6 @@ class PolymarketHistoryCollector:
                         if (end_dt - start_dt).days < CLOSED_MIN_DAYS:
                             continue
                     else:
-                        # Даты не распарсились — пропускаем, не берём сомнительные рынки
                         continue
 
                     all_markets.append(m)
@@ -288,7 +279,6 @@ class PolymarketHistoryCollector:
                 closed_passed  += page_passed
                 print(f" ...закрытых проверено: {closed_fetched:,}  прошло фильтр: {closed_passed:,}", end="\r")
 
-                # API DESC по volume — если максимум страницы уже ниже порога, дальше нет смысла
                 if max_vol_on_page < CLOSED_MIN_VOLUME:
                     print(f"\n   → макс. volume страницы ${max_vol_on_page:,.0f} < порога, стоп")
                     break
@@ -322,30 +312,35 @@ class PolymarketHistoryCollector:
         if not cid:
             return None
 
-        tokens = m.get("tokens", [])
+        tokens   = m.get("tokens", [])
         clob_raw = m.get("clobTokenIds")
+        clob_ids = []
 
         tid = yes_p = no_p = None
 
+        # ── token_id + outcome_yes/no из tokens[] ──────────────────────────
         if isinstance(tokens, list) and tokens:
-            tid = tokens[0].get("token_id", "")
+            tid   = tokens[0].get("token_id", "")
             yes_p = _sf(tokens[0].get("price"))
             if len(tokens) >= 2:
                 no_p = _sf(tokens[1].get("price"))
 
+        # ── fallback token_id из clobTokenIds ─────────────────────────────
         if not tid and clob_raw:
-            clob_ids = clob_raw
             if isinstance(clob_raw, str):
                 try:
                     clob_ids = json.loads(clob_raw)
                 except:
                     clob_ids = []
+            elif isinstance(clob_raw, list):
+                clob_ids = clob_raw
             if isinstance(clob_ids, list) and clob_ids:
                 tid = str(clob_ids[0])
 
         if not tid:
             return None
 
+        # ── outcome_yes/no: fallback через outcomePrices ───────────────────
         outcomes = m.get("outcomePrices", [])
         if isinstance(outcomes, list):
             if len(outcomes) >= 1 and yes_p is None:
@@ -353,29 +348,58 @@ class PolymarketHistoryCollector:
             if len(outcomes) >= 2 and no_p is None:
                 no_p = _sf(outcomes[1])
 
+        # ── spread ─────────────────────────────────────────────────────────
         best_bid = _sf(m.get("bestBid"))
         best_ask = _sf(m.get("bestAsk"))
         spread = round(best_ask - best_bid, 4) if best_bid is not None and best_ask is not None else None
 
+        # ── tags ───────────────────────────────────────────────────────────
         tags_raw = m.get("tags", [])
-        tags_str = ",".join(str(t.get("label", t) if isinstance(t, dict) else t) for t in tags_raw[:15])
+        if isinstance(tags_raw, list):
+            parts = []
+            for t in tags_raw[:15]:
+                label = t.get("label") or t.get("name") or t.get("slug") if isinstance(t, dict) else str(t)
+                if label:
+                    parts.append(str(label))
+            tags_str = ",".join(parts)
+        else:
+            tags_str = str(tags_raw) if tags_raw else ""
 
-        num_outcomes = len(tokens) if isinstance(tokens, list) else (len(clob_ids) if 'clob_ids' in locals() and isinstance(clob_ids, list) else None)
+        # ── num_outcomes: ИСПРАВЛЕНО ───────────────────────────────────────
+        # Было: len(tokens) когда tokens=[] давало 0
+        # Теперь: tokens → clob_ids → дефолт 2 (все рынки в таблице бинарные)
+        if isinstance(tokens, list) and len(tokens) > 0:
+            num_outcomes = len(tokens)
+        elif isinstance(clob_ids, list) and len(clob_ids) > 0:
+            num_outcomes = len(clob_ids)
+        else:
+            num_outcomes = 2
+
+        # ── active: ИСПРАВЛЕНО ─────────────────────────────────────────────
+        # Было: берётся из API-флага, который "замерзает" на момент загрузки
+        # Теперь: пересчитывается по end_date — закрытый = end_date < сегодня
+        end_date = _parse_end_date(
+            m.get("endDate") or m.get("end_date_iso") or m.get("resolutionDate")
+        )
+        if end_date is not None:
+            active = 0 if end_date < TODAY else 1
+        else:
+            active = 1 if m.get("active", True) else 0
 
         return {
             "condition_id": cid[:100],
-            "_token_id":    tid,          # только для API-запроса, в БД не пишем
+            "_token_id":    tid,
             "question":     (m.get("question") or m.get("title") or "").strip()[:2000],
             "volume":       _sf(m.get("volume") or m.get("volumeNum")),
             "volume_24h":   _sf(m.get("volume24hr") or m.get("volume_24h")),
             "liquidity":    _sf(m.get("liquidity") or m.get("liquidityNum")),
-            "end_date":     _parse_end_date(m.get("endDate") or m.get("end_date_iso") or m.get("resolutionDate")),
-            "tags":         tags_str[:500] or None,
+            "end_date":     end_date,
+            "tags":         tags_str[:500] if tags_str else None,
             "outcome_yes":  yes_p,
             "outcome_no":   no_p,
             "spread":       spread,
             "num_outcomes": num_outcomes,
-            "active":       1 if m.get("active", True) else 0,
+            "active":       active,
         }
 
     def process(self):
@@ -399,11 +423,23 @@ class PolymarketHistoryCollector:
         conn, c = self.get_db_connection()
 
         sql = f"""
-        INSERT IGNORE INTO `{self.table_name}`
+        INSERT INTO `{self.table_name}`
         (condition_id, question, price_timestamp, price,
          volume, volume_24h, liquidity, end_date, tags,
          outcome_yes, outcome_no, spread, num_outcomes, active)
         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        ON DUPLICATE KEY UPDATE
+            question     = VALUES(question),
+            volume       = VALUES(volume),
+            volume_24h   = VALUES(volume_24h),
+            liquidity    = VALUES(liquidity),
+            end_date     = VALUES(end_date),
+            tags         = VALUES(tags),
+            outcome_yes  = VALUES(outcome_yes),
+            outcome_no   = VALUES(outcome_no),
+            spread       = VALUES(spread),
+            num_outcomes = VALUES(num_outcomes),
+            active       = VALUES(active)
         """
 
         SUBBATCH_SIZE = 500
@@ -413,7 +449,7 @@ class PolymarketHistoryCollector:
         try:
             for i, meta in enumerate(market_metas):
                 cid = meta["condition_id"]
-                tid = meta["_token_id"]  # используем только для запроса к API
+                tid = meta["_token_id"]
 
                 last_ts = self.get_last_timestamp(cid)
                 start_ts = last_ts + 1 if last_ts else None
@@ -432,7 +468,6 @@ class PolymarketHistoryCollector:
                     ts = p.get("t", 0)
                     price = p.get("p", 0)
                     if ts > 0:
-                        # Округляем до минуты — API возвращает случайные секунды
                         dt = datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d %H:%M:00")
                         rows.append((
                             cid, meta["question"], dt, price,
