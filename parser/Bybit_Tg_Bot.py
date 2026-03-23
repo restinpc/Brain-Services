@@ -19,9 +19,9 @@ API_ID   = int(os.getenv("API_ID",   32475085))
 API_HASH = os.getenv("API_HASH",     "2152018f5ca2fa91b67c5dbf589f89e7")
 
 SESSIONS = [
-    os.getenv("SESSION_FILE_1", r"C:\PyProject\Brain-Services\parser\session_1"),
-    os.getenv("SESSION_FILE_2", r"C:\PyProject\Brain-Services\parser\session_2"),
-    os.getenv("SESSION_FILE_3", r"C:\PyProject\Brain-Services\parser\session_3"),
+    os.getenv("SESSION_FILE_1", "/brain/Brain-Services/parser/session_1"),
+    os.getenv("SESSION_FILE_2", "/brain/Brain-Services/parser/session_2"),
+    os.getenv("SESSION_FILE_3", "/brain/Brain-Services/parser/session_3"),
 ]
 
 # Квоты по активу: сколько запросов каждый аккаунт отправляет за цикл (24 запуска)
