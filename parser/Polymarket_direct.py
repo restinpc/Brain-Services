@@ -9,7 +9,7 @@ import json
 import time
 import random
 import traceback
-from datetime import datetime, date
+from datetime import datetime, timezone, date
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -468,7 +468,7 @@ class PolymarketHistoryCollector:
                     ts = p.get("t", 0)
                     price = p.get("p", 0)
                     if ts > 0:
-                        dt = datetime.fromtimestamp(ts, datetime.UTC).strftime("%Y-%m-%d %H:%M:00")
+                        dt = datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%M:00")
                         rows.append((
                             cid, meta["question"], dt, price,
                             meta["volume"], meta["volume_24h"], meta["liquidity"],
