@@ -12,6 +12,7 @@ from datetime import datetime, date
 
 import requests
 from requests.adapters import HTTPAdapter
+from requests.exceptions import ChunkedEncodingError, ConnectionError as RequestsConnectionError
 from urllib3.util.retry import Retry
 import mysql.connector
 from dotenv import load_dotenv
@@ -24,19 +25,27 @@ EMAIL = os.getenv("ALERT_EMAIL", "vladyurjevitch@yandex.ru")
 
 UCDP_TOKEN = os.getenv("UCDP_TOKEN", "")
 UCDP_API_BASE = "https://ucdpapi.pcr.uu.se/api"
-UCDP_GED_VERSION = "25.1"  # Latest annual version
-UCDP_CANDIDATE_VERSION = "26.0.1"  # Latest monthly candidate
+UCDP_GED_VERSION = "25.1"
+UCDP_CANDIDATE_VERSION = "26.0.1"
+
+# Параметры retry для сетевых ошибок
+MAX_PAGE_RETRIES = 5
+RETRY_BACKOFF_BASE = 10  # секунд
+
 
 def send_error_trace(exc, script_name="UCDP_history.py"):
     logs = f"Node: {NODE_NAME}\nScript: {script_name}\nException: {repr(exc)}\n\nTraceback:\n{traceback.format_exc()}"
-    try: requests.post(TRACE_URL, data={"url": "cli_script", "node": NODE_NAME, "email": EMAIL, "logs": logs}, timeout=10)
-    except: pass
+    try:
+        requests.post(TRACE_URL, data={"url": "cli_script", "node": NODE_NAME, "email": EMAIL, "logs": logs}, timeout=10)
+    except:
+        pass
+
 
 parser = argparse.ArgumentParser(description="UCDP GED Events (full history + incremental) → MySQL")
 parser.add_argument("table_name", help="Имя целевой таблицы")
-parser.add_argument("host", nargs="?", default=os.getenv("DB_HOST"))
-parser.add_argument("port", nargs="?", default=os.getenv("DB_PORT", "3306"))
-parser.add_argument("user", nargs="?", default=os.getenv("DB_USER"))
+parser.add_argument("host",     nargs="?", default=os.getenv("DB_HOST"))
+parser.add_argument("port",     nargs="?", default=os.getenv("DB_PORT", "3306"))
+parser.add_argument("user",     nargs="?", default=os.getenv("DB_USER"))
 parser.add_argument("password", nargs="?", default=os.getenv("DB_PASSWORD"))
 parser.add_argument("database", nargs="?", default=os.getenv("DB_NAME"))
 args = parser.parse_args()
@@ -47,46 +56,77 @@ if not UCDP_TOKEN:
     print("❌ Ошибка: не указан UCDP_TOKEN в .env")
     print("   Получить: https://ucdp.uu.se/apidocs/"); sys.exit(1)
 
-DB_CONFIG = {'host': args.host, 'port': int(args.port), 'user': args.user, 'password': args.password, 'database': args.database}
+DB_CONFIG = {
+    'host': args.host, 'port': int(args.port),
+    'user': args.user, 'password': args.password, 'database': args.database
+}
 DATASETS = {"vlad_ucdp_events": {"description": "UCDP GED conflict events (1989–present)"}}
 
 
 class UCDPCollector:
     def __init__(self, table_name):
         self.table_name = table_name
-        self.session = requests.Session()
-        retry = Retry(total=3, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504], allowed_methods=["GET"])
-        self.session.mount("https://", HTTPAdapter(max_retries=retry))
-        self.session.headers.update({"x-ucdp-access-token": UCDP_TOKEN})
+        self.session = self._make_session()
 
-    def get_db_connection(self): return mysql.connector.connect(**DB_CONFIG)
+    def _make_session(self):
+        """Создаёт сессию с retry-политикой. Пересоздаётся после обрыва."""
+        s = requests.Session()
+        retry = Retry(
+            total=5,
+            backoff_factor=3,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET"],
+            raise_on_status=False,
+        )
+        s.mount("https://", HTTPAdapter(max_retries=retry))
+        s.headers.update({"x-ucdp-access-token": UCDP_TOKEN})
+        return s
+
+    def get_db_connection(self):
+        return mysql.connector.connect(**DB_CONFIG)
 
     # ── Загрузка данных с пагинацией ──────────────────────────
     def fetch_page(self, version, page=0, pagesize=1000, year_filter=None):
-        """
-        GET /api/gedevents/{version}?pagesize=N&page=P
-        Или /api/gedevents/{version}?year=YYYY для фильтрации по году.
-        """
         url = f"{UCDP_API_BASE}/gedevents/{version}"
         params = {"pagesize": pagesize, "page": page}
         if year_filter:
             params["year"] = year_filter
 
-        resp = self.session.get(url, params=params, timeout=60)
+        resp = self.session.get(url, params=params, timeout=90)
         if resp.status_code == 429:
-            time.sleep(30 + random.uniform(5, 15))
+            wait = 30 + random.uniform(5, 15)
+            print(f"\n   ⏳ Rate limit (429), ждём {wait:.0f}с...")
+            time.sleep(wait)
             return self.fetch_page(version, page, pagesize, year_filter)
         resp.raise_for_status()
         return resp.json()
 
     def fetch_all_events(self, version, year_filter=None):
-        """Загружает все события с пагинацией."""
+        """
+        Загружает все события с пагинацией.
+        При ChunkedEncodingError / ConnectionError пересоздаёт сессию
+        и повторяет именно упавшую страницу (до MAX_PAGE_RETRIES раз).
+        Уже загруженные страницы не теряются.
+        """
         all_events = []
         page = 0
         total_pages = None
 
         while True:
-            data = self.fetch_page(version, page=page, year_filter=year_filter)
+            # ── retry конкретной страницы при сетевых обрывах ──
+            for attempt in range(1, MAX_PAGE_RETRIES + 1):
+                try:
+                    data = self.fetch_page(version, page=page, year_filter=year_filter)
+                    break  # успех
+                except (ChunkedEncodingError, RequestsConnectionError, OSError) as e:
+                    if attempt == MAX_PAGE_RETRIES:
+                        raise
+                    wait = RETRY_BACKOFF_BASE * (2 ** (attempt - 1)) + random.uniform(2, 8)
+                    print(f"\n   ⚠️  Сетевой сбой на стр.{page+1} (попытка {attempt}/{MAX_PAGE_RETRIES}): {e!r}")
+                    print(f"   🔄 Пересоздаём сессию, ждём {wait:.0f}с...")
+                    self.session = self._make_session()
+                    time.sleep(wait)
+
             results = data.get("Result", [])
             total_pages = data.get("TotalPages", 0)
             total_count = data.get("TotalCount", 0)
@@ -96,7 +136,11 @@ class UCDPCollector:
 
             all_events.extend(results)
             current_page = data.get("CurrentPage", page)
-            print(f"   📥 Стр. {current_page+1}/{total_pages}: +{len(results)}, всего {len(all_events)}/{total_count}", end="\r")
+            print(
+                f"   📥 Стр. {current_page+1}/{total_pages}: "
+                f"+{len(results)}, всего {len(all_events)}/{total_count}",
+                end="\r"
+            )
 
             if current_page + 1 >= total_pages:
                 break
@@ -163,14 +207,16 @@ class UCDPCollector:
             c.execute(f"SELECT MAX(year) FROM `{self.table_name}`")
             row = c.fetchone(); c.close(); conn.close()
             return row[0] if row and row[0] else None
-        except: return None
+        except:
+            return None
 
     def get_row_count(self):
         try:
             conn = self.get_db_connection(); c = conn.cursor()
             c.execute(f"SELECT COUNT(*) FROM `{self.table_name}`")
             cnt = c.fetchone()[0]; c.close(); conn.close(); return cnt
-        except: return 0
+        except:
+            return 0
 
     def insert_events(self, events):
         if not events: return 0
@@ -193,12 +239,12 @@ class UCDPCollector:
             if v is None or v == "": return None
             try: return float(v)
             except: return None
+
         def si(v):
             if v is None or v == "": return None
             try: return int(v)
             except: return None
 
-        # UCDP field names (camelCase from API)
         TYPE_MAP = {1: "State-based", 2: "Non-state", 3: "One-sided violence"}
 
         total = 0
@@ -258,7 +304,6 @@ class UCDPCollector:
             print(f"   Таблица пуста, начинаем полную загрузку\n")
 
             total_inserted = 0
-            # Качаем по годам чтобы не превышать лимиты
             for year in range(1989, 2025):
                 print(f"\n📅 Год {year}:")
                 events = self.fetch_all_events(UCDP_GED_VERSION, year_filter=year)
@@ -272,7 +317,7 @@ class UCDPCollector:
 
             print(f"\n🏁 BACKFILL GED завершён: {total_inserted} записей")
 
-            # Теперь candidate events за 2025+
+            # Candidate events за 2025+
             print(f"\n📦 Загрузка UCDP Candidate v{UCDP_CANDIDATE_VERSION} (2025+)")
             events = self.fetch_all_events(UCDP_CANDIDATE_VERSION)
             if events:
@@ -280,12 +325,11 @@ class UCDPCollector:
                 print(f"   ✅ Candidate: {n} новых из {len(events)}")
 
         else:
-            # ═══ INCREMENTAL: candidate events за последние годы ═══
+            # ═══ INCREMENTAL ═══
             print(f"\n🔄 INCREMENTAL MODE")
             print(f"   Последний год в БД: {last_year}")
             print(f"   Текущих записей: {current_count}\n")
 
-            # Перекачиваем последний год GED (мог обновиться)
             current_year = date.today().year
             for year in range(max(last_year - 1, 1989), current_year):
                 print(f"   📥 GED v{UCDP_GED_VERSION}, год {year}...")
@@ -295,7 +339,6 @@ class UCDPCollector:
                     if n > 0: print(f"      +{n} новых")
                 time.sleep(random.uniform(0.5, 1.5))
 
-            # Candidate за текущий год
             print(f"   📥 Candidate v{UCDP_CANDIDATE_VERSION}...")
             events = self.fetch_all_events(UCDP_CANDIDATE_VERSION)
             if events:
@@ -316,10 +359,18 @@ def main():
     print(f"🎯 Таблица: {args.table_name}")
     print("=" * 60)
     UCDPCollector(args.table_name).process()
-    print("=" * 60); print("🏁 ЗАГРУЗКА ЗАВЕРШЕНА")
+    print("=" * 60)
+    print("🏁 ЗАГРУЗКА ЗАВЕРШЕНА")
+
 
 if __name__ == "__main__":
-    try: main()
-    except SystemExit: raise
-    except KeyboardInterrupt: print("\n🛑 Прервано"); sys.exit(1)
-    except Exception as e: print(f"\n❌ Критическая ошибка: {e!r}"); send_error_trace(e); sys.exit(1)
+    try:
+        main()
+    except SystemExit:
+        raise
+    except KeyboardInterrupt:
+        print("\n🛑 Прервано"); sys.exit(1)
+    except Exception as e:
+        print(f"\n❌ Критическая ошибка: {e!r}")
+        send_error_trace(e)
+        sys.exit(1)
