@@ -16,6 +16,7 @@ from datetime import datetime, timedelta
 
 from fastapi import FastAPI, HTTPException, Query
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from dotenv import load_dotenv
 
 from common import (
@@ -184,34 +185,90 @@ async def preload_all_data():
         except Exception as e:
             log(f"❌ ctx_index error: {e}", NODE_NAME, level="error")
 
-        try:
+    
+    url_to_event_id = {}
+    try:
+        async with engine_vlad.connect() as conn:
             res = await conn.execute(text("""
-                SELECT EventId, CurrencyCode, Importance,
-                       ForecastValue, PreviousValue, OldPreviousValue,
-                       ActualValue, FullDate, EventType
+                SELECT Url, EventId
                 FROM brain_calendar
-                WHERE ActualValue IS NOT NULL AND Processed = 1
-                ORDER BY FullDate
+                WHERE Url IS NOT NULL AND Url != '' AND EventId IS NOT NULL
+                GROUP BY Url, EventId
             """))
+            for r in res.fetchall():
+                url_to_event_id[r[0]] = r[1]
+        log(f"  url→event_id map: {len(url_to_event_id)} entries", NODE_NAME)
+    except Exception as e:
+        log(f"❌ url→event_id map error: {e}", NODE_NAME, level="error")
+
+    # читаем актуальные данные из engine_brain
+    try:
+        async with engine_brain.connect() as conn:
+            query = """
+                SELECT
+                    Url,
+                    CurrencyCode,
+                    Importance,
+                    ForecastValue,
+                    PreviousValue,
+                    OldPreviousValue,
+                    ActualValue,
+                    FullDate,
+                    EventType
+                FROM brain_calendar
+                WHERE ActualValue IS NOT NULL
+                  AND Processed = 1
+                ORDER BY FullDate
+            """
+            res = await conn.execute(text(query))
             rows = res.fetchall()
-            log(f"  brain_calendar: {len(rows)} rows", NODE_NAME)
-            for (event_id, currency, importance, forecast, previous, old_prev,
-                 actual, full_date, event_type) in rows:
-                if event_type in SKIP_EVENT_TYPES or event_id is None or currency is None:
+            log(f"  brain_calendar (from engine_brain): {len(rows)} rows", NODE_NAME)
+
+            skipped_no_event_id = 0
+            skipped_no_index = 0
+            for row in rows:
+                url        = row[0]
+                currency   = row[1]
+                importance = row[2]
+                forecast   = row[3]
+                previous   = row[4]
+                old_prev   = row[5]
+                actual     = row[6]
+                full_date  = row[7]
+                event_type = row[8]
+
+                if event_type in SKIP_EVENT_TYPES or currency is None:
                     continue
+
+                event_id = url_to_event_id.get(url) if url else None
+                if event_id is None:
+                    skipped_no_event_id += 1
+                    continue
+
                 fcd, scd, rcd = classify_event(forecast, previous, old_prev,
                                                actual, DIRECTION_THRESHOLD)
                 imp = (importance or "none").lower()
                 key = (event_id, currency, imp, fcd, scd, rcd)
+
+                if key not in GLOBAL_CAL_CTX_INDEX:
+                    skipped_no_index += 1
+                    continue
+
                 GLOBAL_CAL_CTX_HIST.setdefault(key, []).append(full_date)
                 GLOBAL_CAL_BY_DT.setdefault(full_date, []).append(key)
+
             for key in GLOBAL_CAL_CTX_HIST:
                 GLOBAL_CAL_CTX_HIST[key].sort()
+
             total_obs = sum(len(v) for v in GLOBAL_CAL_CTX_HIST.values())
             log(f"  contexts: {len(GLOBAL_CAL_CTX_HIST)}, observations: {total_obs}", NODE_NAME)
-        except Exception as e:
-            log(f"❌ brain_calendar error: {e}", NODE_NAME, level="error")
+            log(f"  skipped (no event_id via url): {skipped_no_event_id}", NODE_NAME)
+            log(f"  skipped (not in ctx_index): {skipped_no_index}", NODE_NAME)
 
+    except Exception as e:
+        log(f"❌ brain_calendar (from engine_brain) error: {e}", NODE_NAME, level="error")
+
+    # Загрузка рыночных данных из engine_brain
     for table in ["brain_rates_eur_usd", "brain_rates_eur_usd_day",
                   "brain_rates_btc_usd", "brain_rates_btc_usd_day",
                   "brain_rates_eth_usd", "brain_rates_eth_usd_day"]:
@@ -247,8 +304,22 @@ async def preload_all_data():
         except Exception as e:
             log(f"❌ {table}: {e}", NODE_NAME, level="error")
 
-    SERVICE_URL      = await load_service_url(engine_super, SERVICE_ID)
-    await ensure_cache_table(engine_vlad)
+    # Загрузка SERVICE_URL с обработкой ошибок
+    try:
+        SERVICE_URL = await load_service_url(engine_super, SERVICE_ID)
+        log(f"  SERVICE_URL loaded: {SERVICE_URL}", NODE_NAME)
+    except OperationalError as e:
+        log(f"❌ Failed to load service URL (OperationalError): {e}", NODE_NAME, level="error", force=True)
+        SERVICE_URL = ""
+    except Exception as e:
+        log(f"❌ Failed to load service URL: {e}", NODE_NAME, level="error", force=True)
+        SERVICE_URL = ""
+
+    try:
+        await ensure_cache_table(engine_vlad)
+    except Exception as e:
+        log(f"❌ Failed to ensure cache table: {e}", NODE_NAME, level="error")
+
     LAST_RELOAD_TIME = datetime.now()
     log("✅ CALENDAR FULL DATA RELOAD COMPLETED", NODE_NAME, force=True)
 
@@ -265,13 +336,21 @@ async def background_reload_data():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await preload_all_data()
+    try:
+        await preload_all_data()
+    except Exception as e:
+        log(f"❌ Initial data load failed, but server will continue: {e}",
+            NODE_NAME, level="error", force=True)
+
     task = asyncio.create_task(background_reload_data())
     yield
     task.cancel()
-    await engine_vlad.dispose()
-    await engine_brain.dispose()
-    await engine_super.dispose()
+
+    for name, engine in [("vlad", engine_vlad), ("brain", engine_brain), ("super", engine_super)]:
+        try:
+            await engine.dispose()
+        except Exception as e:
+            log(f"Error disposing engine_{name}: {e}", NODE_NAME, level="error")
 
 
 app = FastAPI(lifespan=lifespan)
@@ -347,25 +426,26 @@ async def calculate_pure_memory(pair: int, day: int, date_str: str,
 
 @app.get("/")
 async def get_metadata():
-    for t in ["brain_calendar_weights", "brain_calendar_context_idx",
-              "brain_calendar", "version_microservice"]:
+    db_status = {}
+
+    for db_name, engine in [("vlad", engine_vlad), ("brain", engine_brain), ("super", engine_super)]:
         try:
-            async with engine_vlad.connect() as conn:
-                await conn.execute(text(f"SELECT 1 FROM `{t}` LIMIT 1"))
+            async with engine.connect() as conn:
+                await conn.execute(text("SELECT 1"))
+            db_status[db_name] = "ok"
         except Exception as e:
-            return {"status": "error", "error": f"vlad.{t} inaccessible: {e}"}
-    for t in ["brain_rates_eur_usd", "brain_rates_btc_usd", "brain_rates_eth_usd"]:
-        try:
-            async with engine_brain.connect() as conn:
-                await conn.execute(text(f"SELECT 1 FROM `{t}` LIMIT 1"))
-        except Exception as e:
-            return {"status": "error", "error": f"brain.{t} inaccessible: {e}"}
+            db_status[db_name] = f"error: {str(e)[:100]}"
+
     async with engine_vlad.connect() as conn:
-        res     = await conn.execute(text(
-            "SELECT version FROM version_microservice WHERE microservice_id = :id"),
-            {"id": SERVICE_ID})
-        row     = res.fetchone()
-        version = row[0] if row else 0
+        try:
+            res = await conn.execute(text(
+                "SELECT version FROM version_microservice WHERE microservice_id = :id"),
+                {"id": SERVICE_ID})
+            row = res.fetchone()
+            version = row[0] if row else 0
+        except Exception:
+            version = 0
+
     return {
         "status": "ok", "version": f"1.{version}.0", "mode": MODE,
         "name":   NODE_NAME,
@@ -376,6 +456,8 @@ async def get_metadata():
             "weight_codes":      len(GLOBAL_WEIGHT_CODES),
             "calendar_contexts": len(GLOBAL_CAL_CTX_HIST),
             "last_reload":       LAST_RELOAD_TIME.isoformat() if LAST_RELOAD_TIME else None,
+            "db_status":         db_status,
+            "brain_calendar_source": "engine_brain",
         },
     }
 
@@ -448,6 +530,9 @@ async def get_new_weights(
                 "limit":        limit,
             })
         return ok_response([r["weight_code"] for r in res.mappings().all()])
+    except OperationalError as e:
+        log(f"Database connection error in get_new_weights: {e}", NODE_NAME, level="error")
+        return err_response(f"Database connection error: {str(e)}")
     except Exception as e:
         send_error_trace(e, node=NODE_NAME, script="get_new_weights")
         return err_response(str(e))
@@ -470,6 +555,9 @@ async def get_values(
                                                           calc_type=type, calc_var=var),
             node         = NODE_NAME,
         )
+    except OperationalError as e:
+        log(f"Database connection error in get_values: {e}", NODE_NAME, level="error")
+        return err_response(f"Database connection error: {str(e)}")
     except Exception as e:
         send_error_trace(e, node=NODE_NAME, script="get_values")
         return err_response(str(e))
@@ -478,25 +566,39 @@ async def get_values(
 @app.post("/patch")
 async def patch_service():
     async with engine_vlad.begin() as conn:
-        res = await conn.execute(
-            text("SELECT version FROM version_microservice WHERE microservice_id = :id"),
-            {"id": SERVICE_ID})
-        row = res.fetchone()
-        if not row:
-            raise HTTPException(status_code=500, detail=f"Service ID {SERVICE_ID} not found")
-        old = row[0]; new = max(old, 1)
-        if new != old:
-            await conn.execute(
-                text("UPDATE version_microservice SET version = :v WHERE microservice_id = :id"),
-                {"v": new, "id": SERVICE_ID})
+        try:
+            res = await conn.execute(
+                text("SELECT version FROM version_microservice WHERE microservice_id = :id"),
+                {"id": SERVICE_ID})
+            row = res.fetchone()
+            if not row:
+                raise HTTPException(status_code=500, detail=f"Service ID {SERVICE_ID} not found")
+            old = row[0]; new = max(old, 1)
+            if new != old:
+                await conn.execute(
+                    text("UPDATE version_microservice SET version = :v WHERE microservice_id = :id"),
+                    {"v": new, "id": SERVICE_ID})
+        except OperationalError as e:
+            log(f"Database connection error in patch_service: {e}", NODE_NAME, level="error")
+            raise HTTPException(status_code=503, detail=f"Database connection error: {str(e)}")
     return {"status": "ok", "from_version": old, "to_version": new}
 
 
 if __name__ == "__main__":
     import asyncio as _asyncio
     async def _get_workers():
-        return await resolve_workers(engine_super, SERVICE_ID, default=1)
-    _workers = _asyncio.run(_get_workers())
+        try:
+            return await resolve_workers(engine_super, SERVICE_ID, default=1)
+        except Exception as e:
+            log(f"Error resolving workers, using default 1: {e}", NODE_NAME, level="error")
+            return 1
+
+    try:
+        _workers = _asyncio.run(_get_workers())
+    except Exception as e:
+        log(f"Failed to get workers count, using default 1: {e}", NODE_NAME, level="error")
+        _workers = 1
+
     log(f"Starting with {_workers} worker(s) in {MODE} mode", NODE_NAME, force=True)
     try:
         uvicorn.run("server:app", host="0.0.0.0", port=PORT, reload=False, workers=_workers)
