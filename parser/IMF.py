@@ -33,7 +33,7 @@ NODE_NAME  = os.getenv("NODE_NAME", "IMF")
 EMAIL      = os.getenv("ALERT_EMAIL", "samuray150305@gmail.com")
 
 # ── 3. ТРАССИРОВКА ОШИБОК ─────────────────────────────────────────────────────
-def send_error_trace(exc: Exception, script_name: str = "imf_parser.py"):
+def send_error_trace(exc: Exception, script_name: str = "IMF.py"):
     import threading
     logs = f"Node: {NODE_NAME}\nScript: {script_name}\nException: {repr(exc)}\n\nTraceback:\n{traceback.format_exc()}"
 

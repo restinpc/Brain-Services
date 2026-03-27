@@ -31,7 +31,7 @@ NODE_NAME  = os.getenv("NODE_NAME", "FRED")
 EMAIL      = os.getenv("ALERT_EMAIL", "samuray150305@gmail.com")
 
 # ── 3. ТРАССИРОВКА ОШИБОК ─────────────────────────────────────────────────────
-def send_error_trace(exc: Exception, script_name: str = "fred_parser.py"):
+def send_error_trace(exc: Exception, script_name: str = "FRED.py"):
     """
     Отправляет трассировку в фоновом потоке — не блокирует основной процесс.
     """
