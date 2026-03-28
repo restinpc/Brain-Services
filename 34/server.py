@@ -19,6 +19,7 @@ from datetime import datetime, timedelta
 
 from fastapi import FastAPI, HTTPException, Query
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from dotenv import load_dotenv
 
 from common import (
@@ -79,6 +80,7 @@ BB_MAP          = {"UNKNOWN": 0, "UPPER": 1, "MID": 2, "LOWER": 3}
 GLOBAL_MKT_BY_INSTR  = {}
 GLOBAL_MKT_CONTEXT   = {}
 GLOBAL_MKT_OBS_DTS   = defaultdict(set)
+_MKT_SORTED_DATES = []
 GLOBAL_MKT_CTX_HIST  = {}
 GLOBAL_CTX_INDEX     = {}
 GLOBAL_WEIGHT_CODES  = []
@@ -341,6 +343,9 @@ async def preload_all_data():
         except Exception as e:
             log(f"❌ market_history: {e}", NODE_NAME, level="error")
 
+        # ── bisect: отсортированный список дат market ──
+        _MKT_SORTED_DATES[:] = sorted(GLOBAL_MKT_OBS_DTS.keys())
+
         # brain_rates_* → T1 / ranges / extremums
         for table in ["brain_rates_eur_usd", "brain_rates_eur_usd_day",
                       "brain_rates_btc_usd", "brain_rates_btc_usd_day",
@@ -365,12 +370,13 @@ async def preload_all_data():
                     ranges.append(rng)
                 GLOBAL_AVG_RANGE[table] = sum(ranges) / len(ranges) if ranges else 0.0
 
+                interval = "1 DAY" if table.endswith("_day") else "1 HOUR"
                 for typ in ("min", "max"):
                     op = ">" if typ == "max" else "<"
                     q  = f"""
                         SELECT t1.date FROM `{table}` t1
-                        JOIN `{table}` t_prev ON t_prev.date = t1.date - INTERVAL 1 DAY
-                        JOIN `{table}` t_next ON t_next.date = t1.date + INTERVAL 1 DAY
+                        JOIN `{table}` t_prev ON t_prev.date = t1.date - INTERVAL {interval}
+                        JOIN `{table}` t_next ON t_next.date = t1.date + INTERVAL {interval}
                         WHERE t1.`{typ}` {op} t_prev.`{typ}`
                           AND t1.`{typ}` {op} t_next.`{typ}`"""
                     res_ext = await conn.execute(text(q))
@@ -407,22 +413,63 @@ async def background_reload_data():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await preload_all_data()
+    try:
+        await preload_all_data()
+    except Exception as e:
+        log(f"❌ Initial data load failed, server continues: {e}",
+            NODE_NAME, level="error", force=True)
+
     task = asyncio.create_task(background_reload_data())
     yield
     task.cancel()
-    await engine_vlad.dispose()
-    await engine_brain.dispose()
-    try:
-        await engine_super.dispose()
-    except Exception:
-        pass
+
+    for _name, _eng in [("vlad", engine_vlad), ("brain", engine_brain), ("super", engine_super)]:
+        try:
+            await _eng.dispose()
+        except Exception as e:
+            log(f"Error disposing {_name}: {e}", NODE_NAME, level="error")
 
 
 app = FastAPI(lifespan=lifespan)
 
 
 # ── calculate_pure_memory ─────────────────────────────────────────────────────
+
+
+# ── Подгрузка свежих свечей из БД ─────────────────────────────────────────
+_LAST_RATES_REFRESH = {}
+
+async def _refresh_rates_if_needed(rates_table):
+    """Если в RAM нет свечи за последний час — подгрузить из БД. Не чаще раз в 30 сек."""
+    now = datetime.now()
+    last = _LAST_RATES_REFRESH.get(rates_table)
+    if last and (now - last).total_seconds() < 30:
+        return
+    _LAST_RATES_REFRESH[rates_table] = now
+
+    ram = GLOBAL_RATES.get(rates_table)
+    if not ram:
+        return
+    max_dt = max(ram.keys())
+    try:
+        async with engine_brain.connect() as conn:
+            res = await conn.execute(text(
+                f"SELECT date, open, close, t1 "
+                f"FROM `{rates_table}` WHERE date > :dt ORDER BY date"),
+                {"dt": max_dt})
+            n = 0
+            for r in res.mappings().all():
+                dt = r["date"]
+                if r["t1"] is not None:
+                    ram[dt] = float(r["t1"])
+                cl = GLOBAL_LAST_CANDLES.get(rates_table)
+                if cl is not None:
+                    cl.append((dt, (r["close"] or 0) > (r["open"] or 0)))
+                n += 1
+            if n > 0:
+                log(f"  📥 Refreshed {n} candle(s) for {rates_table}", NODE_NAME)
+    except Exception as e:
+        log(f"  ⚠️ Rates refresh error ({rates_table}): {e}", NODE_NAME, level="warning")
 
 async def calculate_pure_memory(pair: int, day: int, date_str: str,
                                  calc_type: int = 0, calc_var: int = 0) -> dict | None:
@@ -431,6 +478,7 @@ async def calculate_pure_memory(pair: int, day: int, date_str: str,
         return None
 
     rates_table  = get_rates_table_name(pair, day)
+    await _refresh_rates_if_needed(rates_table)
     modification = get_modification_factor(pair)
     delta_unit   = timedelta(days=1) if day == 1 else timedelta(hours=1)
     check_dts    = [target_date + delta_unit * s
@@ -440,11 +488,16 @@ async def calculate_pure_memory(pair: int, day: int, date_str: str,
     for dt in check_dts:
         if dt > target_date:
             continue
-        for instr in GLOBAL_MKT_OBS_DTS.get(dt, set()):
-            ctx = GLOBAL_MKT_CONTEXT.get((instr, dt))
-            if ctx:
-                shift = round((target_date - dt) / delta_unit)
-                observations.append((instr, dt, ctx, shift))
+        dt_end = dt + delta_unit
+        _l = bisect.bisect_left(_MKT_SORTED_DATES, dt)
+        _r = bisect.bisect_left(_MKT_SORTED_DATES, dt_end)
+        for _i in range(_l, _r):
+            obs_dt = _MKT_SORTED_DATES[_i]
+            for instr in GLOBAL_MKT_OBS_DTS.get(obs_dt, set()):
+                ctx = GLOBAL_MKT_CONTEXT.get((instr, obs_dt))
+                if ctx:
+                    shift = round((target_date - obs_dt) / delta_unit)
+                    observations.append((instr, obs_dt, ctx, shift))
 
     if not observations:
         return {}
