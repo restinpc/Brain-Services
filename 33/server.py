@@ -68,6 +68,10 @@ GLOBAL_LAST_CANDLES  = {}
 SERVICE_URL          = ""
 LAST_RELOAD_TIME     = None
 
+# Для эффективного поиска событий по временному интервалу
+_CAL_SORTED_DATES = []   # список datetime
+_CAL_SORTED_DATA  = []   # список списков ключей, соответствующих датам
+
 
 def get_rates_table_name(pair_id: int, day_flag: int) -> str:
     return {1: "brain_rates_eur_usd", 3: "brain_rates_btc_usd",
@@ -155,13 +159,21 @@ def compute_extremum_value(t_dates, calc_var, ext_set, candle_ranges, avg_range,
 
 
 async def preload_all_data():
-    global SERVICE_URL, LAST_RELOAD_TIME
+    global SERVICE_URL, LAST_RELOAD_TIME, _CAL_SORTED_DATES, _CAL_SORTED_DATA
     log("🔄 CALENDAR FULL DATA RELOAD STARTED", NODE_NAME, force=True)
 
-    GLOBAL_WEIGHT_CODES.clear(); GLOBAL_CAL_CTX_INDEX.clear()
-    GLOBAL_CAL_CTX_HIST.clear(); GLOBAL_CAL_BY_DT.clear()
-    GLOBAL_RATES.clear(); GLOBAL_EXTREMUMS.clear()
-    GLOBAL_CANDLE_RANGES.clear(); GLOBAL_AVG_RANGE.clear(); GLOBAL_LAST_CANDLES.clear()
+    # Очистка старых данных
+    GLOBAL_WEIGHT_CODES.clear()
+    GLOBAL_CAL_CTX_INDEX.clear()
+    GLOBAL_CAL_CTX_HIST.clear()
+    GLOBAL_CAL_BY_DT.clear()
+    GLOBAL_RATES.clear()
+    GLOBAL_EXTREMUMS.clear()
+    GLOBAL_CANDLE_RANGES.clear()
+    GLOBAL_AVG_RANGE.clear()
+    GLOBAL_LAST_CANDLES.clear()
+    _CAL_SORTED_DATES.clear()
+    _CAL_SORTED_DATA.clear()
 
     async with engine_vlad.connect() as conn:
         try:
@@ -185,7 +197,7 @@ async def preload_all_data():
         except Exception as e:
             log(f"❌ ctx_index error: {e}", NODE_NAME, level="error")
 
-    # Шаг 1: строим словарь url → event_id из engine_vlad
+    # Построение url -> event_id
     url_to_event_id = {}
     try:
         async with engine_vlad.connect() as conn:
@@ -201,7 +213,7 @@ async def preload_all_data():
     except Exception as e:
         log(f"❌ url→event_id map error: {e}", NODE_NAME, level="error")
 
-    # Шаг 2: читаем актуальные данные из engine_brain
+    # Загрузка календарных событий из engine_brain
     try:
         async with engine_brain.connect() as conn:
             query = """
@@ -226,13 +238,6 @@ async def preload_all_data():
 
             skipped_no_event_id = 0
             skipped_no_index = 0
-
-            # Логируем диапазон дат
-            if rows:
-                first_date = rows[0][7]  # FullDate
-                last_date = rows[-1][7]
-                log(f"  Диапазон дат в brain_calendar: {first_date} .. {last_date}", NODE_NAME)
-
             for row in rows:
                 url        = row[0]
                 currency   = row[1]
@@ -272,22 +277,27 @@ async def preload_all_data():
             log(f"  skipped (no event_id via url): {skipped_no_event_id}", NODE_NAME)
             log(f"  skipped (not in ctx_index): {skipped_no_index}", NODE_NAME)
 
-            # Логируем статистику по датам
-            if GLOBAL_CAL_BY_DT:
-                all_dates = sorted(GLOBAL_CAL_BY_DT.keys())
-                log(f"  Диапазон дат в GLOBAL_CAL_BY_DT: {all_dates[0]} .. {all_dates[-1]}", NODE_NAME)
-                log(f"  Всего уникальных дат: {len(all_dates)}", NODE_NAME)
-                log(f"  Последние 5 дат: {all_dates[-5:]}", NODE_NAME)
-
     except Exception as e:
         log(f"❌ brain_calendar (from engine_brain) error: {e}", NODE_NAME, level="error")
+
+    # Построение отсортированных структур для эффективного поиска по интервалу
+    if GLOBAL_CAL_BY_DT:
+        sorted_items = sorted(GLOBAL_CAL_BY_DT.items())
+        _sorted_dts, _sorted_vals = zip(*sorted_items) if sorted_items else ([], [])
+        _CAL_SORTED_DATES = list(_sorted_dts)
+        _CAL_SORTED_DATA = list(_sorted_vals)
+    else:
+        _CAL_SORTED_DATES = []
+        _CAL_SORTED_DATA = []
 
     # Загрузка рыночных данных из engine_brain
     for table in ["brain_rates_eur_usd", "brain_rates_eur_usd_day",
                   "brain_rates_btc_usd", "brain_rates_btc_usd_day",
                   "brain_rates_eth_usd", "brain_rates_eth_usd_day"]:
-        GLOBAL_RATES[table] = {}; GLOBAL_LAST_CANDLES[table] = []
-        GLOBAL_CANDLE_RANGES[table] = {}; GLOBAL_AVG_RANGE[table] = 0.0
+        GLOBAL_RATES[table] = {}
+        GLOBAL_LAST_CANDLES[table] = []
+        GLOBAL_CANDLE_RANGES[table] = {}
+        GLOBAL_AVG_RANGE[table] = 0.0
         GLOBAL_EXTREMUMS[table] = {"min": set(), "max": set()}
         try:
             async with engine_brain.connect() as conn:
@@ -304,17 +314,18 @@ async def preload_all_data():
                     GLOBAL_CANDLE_RANGES[table][dt] = rng
                     ranges.append(rng)
                 GLOBAL_AVG_RANGE[table] = sum(ranges) / len(ranges) if ranges else 0.0
+                interval = "1 DAY" if table.endswith("_day") else "1 HOUR"
                 for typ in ("min", "max"):
                     op = ">" if typ == "max" else "<"
                     q  = f"""
                         SELECT t1.date FROM `{table}` t1
-                        JOIN `{table}` t_prev ON t_prev.date = t1.date - INTERVAL 1 DAY
-                        JOIN `{table}` t_next ON t_next.date = t1.date + INTERVAL 1 DAY
+                        JOIN `{table}` t_prev ON t_prev.date = t1.date - INTERVAL {interval}
+                        JOIN `{table}` t_next ON t_next.date = t1.date + INTERVAL {interval}
                         WHERE t1.`{typ}` {op} t_prev.`{typ}` AND t1.`{typ}` {op} t_next.`{typ}`
                     """
                     res_ext = await conn.execute(text(q))
                     GLOBAL_EXTREMUMS[table][typ] = {r["date"] for r in res_ext.mappings().all()}
-            log(f"  {table}: {len(GLOBAL_RATES[table])} candles, диапазон дат: {min(GLOBAL_RATES[table].keys()) if GLOBAL_RATES[table] else 'нет'} .. {max(GLOBAL_RATES[table].keys()) if GLOBAL_RATES[table] else 'нет'}", NODE_NAME)
+            log(f"  {table}: {len(GLOBAL_RATES[table])} candles", NODE_NAME)
         except Exception as e:
             log(f"❌ {table}: {e}", NODE_NAME, level="error")
 
@@ -370,213 +381,117 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
-async def calculate_pure_memory(pair: int, day: int, date_str: str,
-                                calc_type: int = 0, calc_var: int = 0) -> dict | None:
-    log(f"\n{'=' * 60}", NODE_NAME)
-    log(f"📊 calculate_pure_memory START", NODE_NAME)
-    log(f"  Parameters: pair={pair}, day={day}, date_str='{date_str}', type={calc_type}, var={calc_var}", NODE_NAME)
 
+# ── Подгрузка свежих свечей из БД ─────────────────────────────────────────
+_LAST_RATES_REFRESH = {}
+
+async def _refresh_rates_if_needed(rates_table):
+    """Если в RAM нет свечи за последний час — подгрузить из БД. Не чаще раз в 30 сек."""
+    now = datetime.now()
+    last = _LAST_RATES_REFRESH.get(rates_table)
+    if last and (now - last).total_seconds() < 30:
+        return
+    _LAST_RATES_REFRESH[rates_table] = now
+
+    ram = GLOBAL_RATES.get(rates_table)
+    if not ram:
+        return
+    max_dt = max(ram.keys())
+    try:
+        async with engine_brain.connect() as conn:
+            res = await conn.execute(text(
+                f"SELECT date, open, close, t1 "
+                f"FROM `{rates_table}` WHERE date > :dt ORDER BY date"),
+                {"dt": max_dt})
+            n = 0
+            for r in res.mappings().all():
+                dt = r["date"]
+                if r["t1"] is not None:
+                    ram[dt] = float(r["t1"])
+                cl = GLOBAL_LAST_CANDLES.get(rates_table)
+                if cl is not None:
+                    cl.append((dt, (r["close"] or 0) > (r["open"] or 0)))
+                n += 1
+            if n > 0:
+                log(f"  📥 Refreshed {n} candle(s) for {rates_table}", NODE_NAME)
+    except Exception as e:
+        log(f"  ⚠️ Rates refresh error ({rates_table}): {e}", NODE_NAME, level="warning")
+
+async def calculate_pure_memory(pair: int, day: int, date_str: str,
+                                 calc_type: int = 0, calc_var: int = 0) -> dict | None:
     target_date = parse_date_string(date_str)
     if not target_date:
-        log(f"  ❌ Invalid date string: {date_str}", NODE_NAME)
         return None
 
-    log(f"  Parsed target_date: {target_date}", NODE_NAME)
-
-    rates_table = get_rates_table_name(pair, day)
+    rates_table  = get_rates_table_name(pair, day)
+    await _refresh_rates_if_needed(rates_table)
     modification = get_modification_factor(pair)
-    delta_unit = timedelta(days=1) if day == 1 else timedelta(hours=1)
+    delta_unit   = timedelta(days=1) if day == 1 else timedelta(hours=1)
+    check_dts    = [target_date + delta_unit * s
+                    for s in range(-SHIFT_WINDOW, SHIFT_WINDOW + 1)]
 
-    log(f"  rates_table='{rates_table}'", NODE_NAME)
-    log(f"  modification={modification}", NODE_NAME)
-    log(f"  delta_unit={delta_unit} (1 {'day' if day == 1 else 'hour'})", NODE_NAME)
-    log(f"  SHIFT_WINDOW={SHIFT_WINDOW}", NODE_NAME)
-
-    # Формируем окно поиска
-    check_dts = [target_date + delta_unit * s for s in range(-SHIFT_WINDOW, SHIFT_WINDOW + 1)]
-    log(f"  Окно поиска (check_dts):", NODE_NAME)
-    log(f"    Всего дат: {len(check_dts)}", NODE_NAME)
-    log(f"    Начало: {check_dts[0]}", NODE_NAME)
-    log(f"    Конец: {check_dts[-1]}", NODE_NAME)
-    log(f"    Дата target_date в окне: {target_date} (индекс {SHIFT_WINDOW})", NODE_NAME)
-
-    # Статистика по GLOBAL_CAL_BY_DT
-    if GLOBAL_CAL_BY_DT:
-        all_dates = sorted(GLOBAL_CAL_BY_DT.keys())
-        log(f"  GLOBAL_CAL_BY_DT статистика:", NODE_NAME)
-        log(f"    Всего уникальных дат: {len(all_dates)}", NODE_NAME)
-        log(f"    Диапазон: {all_dates[0]} .. {all_dates[-1]}", NODE_NAME)
-        log(f"    Последние 10 дат: {all_dates[-10:]}", NODE_NAME)
-
-        # Находим ближайшие даты к target_date
-        dates_before = [d for d in all_dates if d <= target_date]
-        dates_after = [d for d in all_dates if d > target_date]
-        log(f"    Дат <= target_date: {len(dates_before)}", NODE_NAME)
-        log(f"    Дат > target_date: {len(dates_after)}", NODE_NAME)
-        if dates_before:
-            log(f"    Последняя дата <= target_date: {dates_before[-1]}", NODE_NAME)
-        if dates_after:
-            log(f"    Первая дата > target_date: {dates_after[0]}", NODE_NAME)
-    else:
-        log(f"  ⚠️ GLOBAL_CAL_BY_DT ПУСТ!", NODE_NAME)
-
-    # Поиск событий в диапазонах, НО ТОЛЬКО ПРОШЛЫХ событий
     observations = []
-    dates_with_events = []
+    for dt in check_dts:
+        if dt > target_date:
+            continue
 
-    if day == 0:  # Часовые данные
-        for dt in check_dts:
-            if dt > target_date:
-                continue
+        # Определяем интервал поиска: [dt, dt + delta_unit)
+        dt_end = dt + delta_unit
+        left = bisect.bisect_left(_CAL_SORTED_DATES, dt)
+        right = bisect.bisect_left(_CAL_SORTED_DATES, dt_end)
 
-            # Определяем интервал: [dt, min(dt + 1 час, target_date)]
-            dt_end = min(dt + timedelta(hours=1), target_date + timedelta(microseconds=1))
-
-            # Находим все даты событий в этом интервале
-            matching_dates = []
-            for event_dt in GLOBAL_CAL_BY_DT.keys():
-                if dt <= event_dt < dt_end:
-                    matching_dates.append(event_dt)
-
-            if matching_dates:
-                log(f"    📅 Найдены события в интервале {dt} - {dt_end}: {len(matching_dates)} дат", NODE_NAME)
-                for event_dt in matching_dates:
-                    for ctx_key in GLOBAL_CAL_BY_DT[event_dt]:
-                        shift_steps = round((target_date - event_dt) / delta_unit)
-                        observations.append((ctx_key, event_dt, shift_steps))
-                        if event_dt not in dates_with_events:
-                            dates_with_events.append(event_dt)
-
-    else:  # Дневные данные (day == 1)
-        for dt in check_dts:
-            if dt > target_date:
-                continue
-
-            # Определяем интервал: [dt, min(dt + 1 день, target_date)]
-            dt_end = min(dt + timedelta(days=1), target_date + timedelta(microseconds=1))
-
-            # Находим все даты событий в этом интервале
-            matching_dates = []
-            for event_dt in GLOBAL_CAL_BY_DT.keys():
-                if dt <= event_dt < dt_end:
-                    matching_dates.append(event_dt)
-
-            if matching_dates:
-                log(f"    📅 Найдены события в интервале {dt} - {dt_end}: {len(matching_dates)} дат", NODE_NAME)
-                for event_dt in matching_dates:
-                    for ctx_key in GLOBAL_CAL_BY_DT[event_dt]:
-                        shift_steps = round((target_date - event_dt) / delta_unit)
-                        observations.append((ctx_key, event_dt, shift_steps))
-                        if event_dt not in dates_with_events:
-                            dates_with_events.append(event_dt)
-
-    log(f"\n  Результаты поиска событий:", NODE_NAME)
-    log(f"    Дат с событиями в окне: {len(dates_with_events)}", NODE_NAME)
-    if dates_with_events:
-        log(f"    Даты с событиями: {dates_with_events}", NODE_NAME)
-    log(f"    Всего observations: {len(observations)}", NODE_NAME)
+        for i in range(left, right):
+            obs_dt = _CAL_SORTED_DATES[i]
+            for ctx_key in _CAL_SORTED_DATA[i]:
+                # Вычисляем shift как округлённое количество единиц delta_unit
+                # между target_date и датой события
+                shift_steps = round((target_date - obs_dt) / delta_unit)
+                observations.append((ctx_key, obs_dt, shift_steps))
 
     if not observations:
-        log(f"  ❌ Нет observations! Возвращаем пустой результат", NODE_NAME)
-        log(f"{'=' * 60}\n", NODE_NAME)
         return {}
 
-    # Рыночные данные
-    ram_rates = GLOBAL_RATES.get(rates_table, {})
-    ram_ranges = GLOBAL_CANDLE_RANGES.get(rates_table, {})
-    avg_range = GLOBAL_AVG_RANGE.get(rates_table, 0.0)
-    ram_ext = GLOBAL_EXTREMUMS.get(rates_table, {"min": set(), "max": set()})
+    ram_rates   = GLOBAL_RATES.get(rates_table, {})
+    ram_ranges  = GLOBAL_CANDLE_RANGES.get(rates_table, {})
+    avg_range   = GLOBAL_AVG_RANGE.get(rates_table, 0.0)
+    ram_ext     = GLOBAL_EXTREMUMS.get(rates_table, {"min": set(), "max": set()})
     prev_candle = find_prev_candle_trend(rates_table, target_date)
 
-    log(f"\n  Рыночные данные для {rates_table}:", NODE_NAME)
-    log(f"    ram_rates размер: {len(ram_rates)}", NODE_NAME)
-    if ram_rates:
-        log(f"    ram_rates диапазон: {min(ram_rates.keys())} .. {max(ram_rates.keys())}", NODE_NAME)
-    log(f"    ram_ranges размер: {len(ram_ranges)}", NODE_NAME)
-    log(f"    avg_range: {avg_range}", NODE_NAME)
-    log(f"    extremums min: {len(ram_ext['min'])}, max: {len(ram_ext['max'])}", NODE_NAME)
-    log(f"    prev_candle: {prev_candle}", NODE_NAME)
-
-    # Обработка наблюдений
     result = {}
-    processed_keys = 0
-    skipped_not_recurring = 0
-    skipped_shift_out_of_range = 0
-    skipped_no_history = 0
-    skipped_no_ctx_info = 0
-
     for ctx_key, obs_dt, shift in observations:
-        # Дополнительная проверка: убеждаемся, что obs_dt НЕ в будущем
-        if obs_dt > target_date:
-            log(f"    ⚠️ Пропускаем будущее событие: {obs_dt} > {target_date}", NODE_NAME)
-            continue
-
-        processed_keys += 1
         event_id, currency, importance, fcd, scd, rcd = ctx_key
-
         ctx_info = GLOBAL_CAL_CTX_INDEX.get(ctx_key)
         if ctx_info is None:
-            if processed_keys <= 10:
-                log(f"    ⚠️ ctx_key {ctx_key} not in GLOBAL_CAL_CTX_INDEX", NODE_NAME)
-            skipped_no_ctx_info += 1
             continue
-
         is_recurring = ctx_info["occurrence_count"] >= RECURRING_MIN_COUNT
-
         if not is_recurring and shift != 0:
-            skipped_not_recurring += 1
             continue
         if is_recurring and abs(shift) > SHIFT_WINDOW:
-            skipped_shift_out_of_range += 1
             continue
 
         all_ctx_dts = GLOBAL_CAL_CTX_HIST.get(ctx_key, [])
-        idx = bisect.bisect_left(all_ctx_dts, target_date)
-        valid_dts = all_ctx_dts[:idx]
-
+        idx         = bisect.bisect_left(all_ctx_dts, target_date)
+        valid_dts   = all_ctx_dts[:idx]
         if not valid_dts:
-            skipped_no_history += 1
             continue
 
-        t_dates = [d + delta_unit * shift for d in valid_dts if d + delta_unit * shift < target_date]
+        t_dates   = [d + delta_unit * shift for d in valid_dts
+                     if d + delta_unit * shift < target_date]
         shift_arg = shift if is_recurring else None
 
         if calc_type in (0, 1):
             t1_sum = compute_t1_value(t_dates, calc_var, ram_rates, ram_ranges, avg_range)
-            wc = make_weight_code(event_id, currency, importance, fcd, scd, rcd, 0, shift_arg)
+            wc     = make_weight_code(event_id, currency, importance, fcd, scd, rcd, 0, shift_arg)
             result[wc] = result.get(wc, 0.0) + t1_sum
-            if t1_sum != 0 and processed_keys <= 10:
-                log(f"    ✓ {wc}: t1_sum={t1_sum:.6f}, total={result[wc]:.6f}", NODE_NAME)
 
         if calc_type in (0, 2) and prev_candle:
             _, is_bull = prev_candle
-            ext_set = ram_ext["max" if is_bull else "min"]
-            ext_val = compute_extremum_value(t_dates, calc_var, ext_set, ram_ranges,
-                                             avg_range, modification, len(valid_dts))
+            ext_set    = ram_ext["max" if is_bull else "min"]
+            ext_val    = compute_extremum_value(t_dates, calc_var, ext_set, ram_ranges,
+                                                avg_range, modification, len(valid_dts))
             if ext_val is not None:
                 wc = make_weight_code(event_id, currency, importance, fcd, scd, rcd, 1, shift_arg)
                 result[wc] = result.get(wc, 0.0) + ext_val
-                if ext_val != 0 and processed_keys <= 10:
-                    log(f"    ✓ {wc}: ext_val={ext_val:.6f}, total={result[wc]:.6f}", NODE_NAME)
-
-    log(f"\n  ИТОГОВАЯ СТАТИСТИКА:", NODE_NAME)
-    log(f"    Всего observations: {len(observations)}", NODE_NAME)
-    log(f"    Обработано keys: {processed_keys}", NODE_NAME)
-    log(f"    Пропущено (нет ctx_info): {skipped_no_ctx_info}", NODE_NAME)
-    log(f"    Пропущено (not recurring + shift !=0): {skipped_not_recurring}", NODE_NAME)
-    log(f"    Пропущено (shift out of range): {skipped_shift_out_of_range}", NODE_NAME)
-    log(f"    Пропущено (нет истории до target_date): {skipped_no_history}", NODE_NAME)
-    log(f"    Результат: {len(result)} weight_code(s)", NODE_NAME)
-    if result:
-        if len(result) <= 20:
-            log(f"    Ключи результата: {list(result.keys())}", NODE_NAME)
-            log(f"    Значения: {list(result.values())}", NODE_NAME)
-        else:
-            log(f"    Ключей результата слишком много ({len(result)}), не вывожу все", NODE_NAME)
-    else:
-        log(f"    ⚠️ РЕЗУЛЬТАТ ПУСТОЙ!", NODE_NAME)
-
-    log(f"{'=' * 60}\n", NODE_NAME)
 
     return {k: round(v, 6) for k, v in result.items() if v != 0}
 
@@ -603,17 +518,6 @@ async def get_metadata():
         except Exception:
             version = 0
 
-    # Собираем статистику по датам
-    date_stats = {}
-    if GLOBAL_CAL_BY_DT:
-        all_dates = sorted(GLOBAL_CAL_BY_DT.keys())
-        date_stats = {
-            "total_dates": len(all_dates),
-            "first_date": str(all_dates[0]),
-            "last_date": str(all_dates[-1]),
-            "last_5_dates": [str(d) for d in all_dates[-5:]]
-        }
-
     return {
         "status": "ok", "version": f"1.{version}.0", "mode": MODE,
         "name":   NODE_NAME,
@@ -626,8 +530,6 @@ async def get_metadata():
             "last_reload":       LAST_RELOAD_TIME.isoformat() if LAST_RELOAD_TIME else None,
             "db_status":         db_status,
             "brain_calendar_source": "engine_brain",
-            "date_stats":        date_stats,
-            "shift_window":      SHIFT_WINDOW,
         },
     }
 
