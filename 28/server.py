@@ -1,5 +1,6 @@
-﻿import sys
+import sys
 import os
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared"))
 
 import uvicorn
@@ -10,6 +11,7 @@ from datetime import datetime, timedelta
 
 from fastapi import FastAPI, HTTPException, Query
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from dotenv import load_dotenv
 
 from common import (
@@ -22,8 +24,8 @@ from common import (
 from cache_helper import ensure_cache_table, load_service_url, cached_values
 
 SERVICE_ID = 28
-NODE_NAME  = os.getenv("NODE_NAME", "brain-investing-context-weights-microservice")
-PORT       = 8892
+NODE_NAME = os.getenv("NODE_NAME", "brain-investing-context-weights-microservice")
+PORT = 8892
 
 load_dotenv()
 
@@ -32,21 +34,23 @@ engine_vlad, engine_brain, engine_super = build_engines()
 log(f"MODE={MODE}", NODE_NAME, force=True)
 log(f"engines built via build_engines()", NODE_NAME)
 
-THRESHOLD           = 0.0001
+THRESHOLD = 0.0001
 RECURRING_MIN_COUNT = 2
 
 # ── Глобальные данные ─────────────────────────────────────────────────────────
-GLOBAL_EXTREMUMS     = {}
-GLOBAL_RATES         = {}
+GLOBAL_EXTREMUMS = {}
+GLOBAL_RATES = {}
 GLOBAL_CANDLE_RANGES = {}
-GLOBAL_AVG_RANGE     = {}
-GLOBAL_CALENDAR      = {}
-GLOBAL_HISTORY       = {}
-GLOBAL_LAST_CANDLES  = {}
-GLOBAL_CTX_INDEX     = {}
-GLOBAL_WEIGHT_CODES  = []
-SERVICE_URL          = ""
-LAST_RELOAD_TIME     = None
+GLOBAL_AVG_RANGE = {}
+GLOBAL_CALENDAR = {}
+_CAL_SORTED_DATES = []
+_CAL_SORTED_DATA = []
+GLOBAL_HISTORY = {}
+GLOBAL_LAST_CANDLES = {}
+GLOBAL_CTX_INDEX = {}
+GLOBAL_WEIGHT_CODES = []
+SERVICE_URL = ""
+LAST_RELOAD_TIME = None
 
 
 def get_rates_table_name(pair_id, day_flag):
@@ -54,20 +58,22 @@ def get_rates_table_name(pair_id, day_flag):
             4: "brain_rates_eth_usd"}.get(pair_id, "brain_rates_eur_usd") + (
         "_day" if day_flag == 1 else "")
 
+
 def get_modification_factor(pair_id):
     return {1: 0.001, 3: 1000.0, 4: 100.0}.get(pair_id, 1.0)
 
+
 _DATE_FORMATS_28 = (
     "%Y-%m-%d %H:%M:%S",
-    "%Y-%m-%d %H:%M:%S.%f",    # ← NEW
+    "%Y-%m-%d %H:%M:%S.%f",  # ← NEW
     "%Y-%m-%dT%H:%M:%S",
-    "%Y-%m-%dT%H:%M:%S.%f",    # ← NEW
+    "%Y-%m-%dT%H:%M:%S.%f",  # ← NEW
     "%Y-%m-%d",
     "%Y-%d-%m %H:%M:%S",
-    "%Y-%d-%m %H:%M:%S.%f",    # ← NEW
+    "%Y-%d-%m %H:%M:%S.%f",  # ← NEW
 )
- 
- 
+
+
 def parse_date_string(date_str):
     for fmt in _DATE_FORMATS_28:
         try:
@@ -77,12 +83,14 @@ def parse_date_string(date_str):
     log(f"⚠️  parse_date_string failed: repr={date_str!r}", NODE_NAME, level="error", force=True)
     return None
 
+
 def find_prev_candle_trend(table, target_date):
     candles = GLOBAL_LAST_CANDLES.get(table, [])
     if not candles:
         return None
     idx = bisect.bisect_left(candles, (target_date, False))
     return candles[idx - 1] if idx > 0 else None
+
 
 def _direction(a, b, beat_label="UP", miss_label="DOWN", inline_label="FLAT"):
     if a is None or b is None:
@@ -91,11 +99,13 @@ def _direction(a, b, beat_label="UP", miss_label="DOWN", inline_label="FLAT"):
     if a < b - THRESHOLD: return miss_label
     return inline_label
 
+
 def resolve_event_context(actual, forecast, previous):
-    fdir = _direction(forecast, previous, "UP",   "DOWN",   "FLAT")
-    sdir = _direction(actual,   forecast,  "BEAT", "MISS",   "INLINE")
-    adir = _direction(actual,   previous,  "UP",   "DOWN",   "FLAT")
+    fdir = _direction(forecast, previous, "UP", "DOWN", "FLAT")
+    sdir = _direction(actual, forecast, "BEAT", "MISS", "INLINE")
+    adir = _direction(actual, previous, "UP", "DOWN", "FLAT")
     return fdir, sdir, adir
+
 
 def try_float(val):
     try:
@@ -103,9 +113,11 @@ def try_float(val):
     except (ValueError, TypeError):
         return None
 
+
 def build_weight_code(event_id, fdir, sdir, adir, mode, hour=None):
     base = f"{event_id}__{fdir}__{sdir}__{adir}__{mode}"
     return base if hour is None else f"{base}__{hour}"
+
 
 def get_last_known_context(event_id, before_date):
     history = GLOBAL_HISTORY.get(event_id, [])
@@ -119,10 +131,11 @@ def get_last_known_context(event_id, before_date):
                 return resolve_event_context(ev["actual"], ev["forecast"], ev["previous"])
     return "UNKNOWN", "UNKNOWN", "UNKNOWN"
 
+
 def compute_t1_value(t_dates, calc_var, ram_rates, candle_ranges, avg_range):
     need_filter = calc_var in (1, 3, 4)
-    use_square  = calc_var in (2, 3)
-    use_range   = calc_var == 4
+    use_square = calc_var in (2, 3)
+    use_range = calc_var == 4
     total = 0.0
     for d in t_dates:
         rng = candle_ranges.get(d, 0.0)
@@ -135,10 +148,11 @@ def compute_t1_value(t_dates, calc_var, ram_rates, candle_ranges, avg_range):
             total += t1 * abs(t1) if use_square else t1
     return total
 
+
 def compute_extremum_value(t_dates, calc_var, ext_set, candle_ranges, avg_range,
-                            modification, total_hist):
+                           modification, total_hist):
     need_filter = calc_var in (1, 3, 4)
-    use_range   = calc_var == 4
+    use_range = calc_var == 4
     pool = [d for d in t_dates if candle_ranges.get(d, 0.0) > avg_range] if need_filter else t_dates
     if not pool:
         return None
@@ -175,33 +189,47 @@ async def preload_all_data():
             }
         log(f"  ctx_index: {len(GLOBAL_CTX_INDEX)}", NODE_NAME)
 
+    async with engine_brain.connect() as conn:
         res = await conn.execute(text("""
             SELECT event_id, occurrence_time_utc, importance, actual, forecast, previous
             FROM vlad_investing_calendar WHERE event_id IS NOT NULL
         """))
-        GLOBAL_CALENDAR.clear(); GLOBAL_HISTORY.clear()
+        GLOBAL_CALENDAR.clear();
+        GLOBAL_HISTORY.clear()
         for r in res.mappings().all():
             dt, eid = r["occurrence_time_utc"], r["event_id"]
             GLOBAL_HISTORY.setdefault(eid, []).append(dt)
             GLOBAL_CALENDAR.setdefault(dt, []).append({
                 "EventId": eid, "Importance": r["importance"], "event_date": dt,
-                "actual":   try_float(r["actual"]),
+                "actual": try_float(r["actual"]),
                 "forecast": try_float(r["forecast"]),
                 "previous": try_float(r["previous"]),
             })
         for eid in GLOBAL_HISTORY:
             GLOBAL_HISTORY[eid].sort()
+        log(f"  calendar: {sum(len(v) for v in GLOBAL_CALENDAR.values())} events", NODE_NAME)
+
+    # ── bisect: перестройка отсортированных списков ──
+    if GLOBAL_CALENDAR:
+        _si = sorted(GLOBAL_CALENDAR.items())
+        _CAL_SORTED_DATES[:] = [x[0] for x in _si]
+        _CAL_SORTED_DATA[:] = [x[1] for x in _si]
+    else:
+        _CAL_SORTED_DATES.clear()
+        _CAL_SORTED_DATA.clear()
 
     for table in ["brain_rates_eur_usd", "brain_rates_eur_usd_day",
                   "brain_rates_btc_usd", "brain_rates_btc_usd_day",
                   "brain_rates_eth_usd", "brain_rates_eth_usd_day"]:
-        GLOBAL_RATES[table] = {}; GLOBAL_LAST_CANDLES[table] = []
-        GLOBAL_CANDLE_RANGES[table] = {}; GLOBAL_AVG_RANGE[table] = 0.0
+        GLOBAL_RATES[table] = {};
+        GLOBAL_LAST_CANDLES[table] = []
+        GLOBAL_CANDLE_RANGES[table] = {};
+        GLOBAL_AVG_RANGE[table] = 0.0
         GLOBAL_EXTREMUMS[table] = {"min": set(), "max": set()}
         async with engine_brain.connect() as conn:
-            res    = await conn.execute(text(
+            res = await conn.execute(text(
                 f"SELECT date, open, close, `max`, `min`, t1 FROM {table}"))
-            rows   = sorted(res.mappings().all(), key=lambda x: x["date"])
+            rows = sorted(res.mappings().all(), key=lambda x: x["date"])
             ranges = []
             for r in rows:
                 dt = r["date"]
@@ -212,19 +240,28 @@ async def preload_all_data():
                 GLOBAL_CANDLE_RANGES[table][dt] = rng
                 ranges.append(rng)
             GLOBAL_AVG_RANGE[table] = sum(ranges) / len(ranges) if ranges else 0.0
+            interval = "1 DAY" if table.endswith("_day") else "1 HOUR"
             for typ in ("min", "max"):
-                op  = ">" if typ == "max" else "<"
+                op = ">" if typ == "max" else "<"
                 col = "max" if typ == "max" else "min"
-                q   = f"""SELECT t1.date FROM {table} t1
-                    JOIN {table} t_prev ON t_prev.date = t1.date - INTERVAL 1 HOUR
-                    JOIN {table} t_next ON t_next.date = t1.date + INTERVAL 1 HOUR
+                q = f"""SELECT t1.date FROM {table} t1
+                    JOIN {table} t_prev ON t_prev.date = t1.date - INTERVAL {interval}
+                    JOIN {table} t_next ON t_next.date = t1.date + INTERVAL {interval}
                     WHERE t1.{col} {op} t_prev.{col} AND t1.{col} {op} t_next.{col}"""
                 res_ext = await conn.execute(text(q))
                 GLOBAL_EXTREMUMS[table][typ] = {r["date"] for r in res_ext.mappings().all()}
         log(f"  {table}: {len(GLOBAL_RATES[table])} candles", NODE_NAME)
 
-    SERVICE_URL      = await load_service_url(engine_super, SERVICE_ID)
-    await ensure_cache_table(engine_vlad)
+    try:
+        SERVICE_URL = await load_service_url(engine_super, SERVICE_ID)
+        log(f"  SERVICE_URL loaded", NODE_NAME)
+    except (OperationalError, Exception) as e:
+        log(f"❌ load_service_url failed: {e}", NODE_NAME, level="error", force=True)
+        SERVICE_URL = ""
+    try:
+        await ensure_cache_table(engine_vlad)
+    except Exception as e:
+        log(f"❌ ensure_cache_table failed: {e}", NODE_NAME, level="error")
     LAST_RELOAD_TIME = datetime.now()
     log("✅ FULL DATA RELOAD COMPLETED", NODE_NAME, force=True)
 
@@ -241,16 +278,60 @@ async def background_reload_data():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await preload_all_data()
+    try:
+        await preload_all_data()
+    except Exception as e:
+        log(f"❌ Initial data load failed, server continues: {e}",
+            NODE_NAME, level="error", force=True)
+
     task = asyncio.create_task(background_reload_data())
     yield
     task.cancel()
-    await engine_vlad.dispose()
-    await engine_brain.dispose()
-    await engine_super.dispose()
+
+    for _name, _eng in [("vlad", engine_vlad), ("brain", engine_brain), ("super", engine_super)]:
+        try:
+            await _eng.dispose()
+        except Exception as e:
+            log(f"Error disposing {_name}: {e}", NODE_NAME, level="error")
 
 
 app = FastAPI(lifespan=lifespan)
+
+# ── Подгрузка свежих свечей из БД ─────────────────────────────────────────
+_LAST_RATES_REFRESH = {}
+
+
+async def _refresh_rates_if_needed(rates_table):
+    """Если в RAM нет свечи за последний час — подгрузить из БД. Не чаще раз в 30 сек."""
+    now = datetime.now()
+    last = _LAST_RATES_REFRESH.get(rates_table)
+    if last and (now - last).total_seconds() < 30:
+        return
+    _LAST_RATES_REFRESH[rates_table] = now
+
+    ram = GLOBAL_RATES.get(rates_table)
+    if not ram:
+        return
+    max_dt = max(ram.keys())
+    try:
+        async with engine_brain.connect() as conn:
+            res = await conn.execute(text(
+                f"SELECT date, open, close, t1 "
+                f"FROM `{rates_table}` WHERE date > :dt ORDER BY date"),
+                {"dt": max_dt})
+            n = 0
+            for r in res.mappings().all():
+                dt = r["date"]
+                if r["t1"] is not None:
+                    ram[dt] = float(r["t1"])
+                cl = GLOBAL_LAST_CANDLES.get(rates_table)
+                if cl is not None:
+                    cl.append((dt, (r["close"] or 0) > (r["open"] or 0)))
+                n += 1
+            if n > 0:
+                log(f"  📥 Refreshed {n} candle(s) for {rates_table}", NODE_NAME)
+    except Exception as e:
+        log(f"  ⚠️ Rates refresh error ({rates_table}): {e}", NODE_NAME, level="warning")
 
 
 async def calculate_pure_memory(pair, day, date_str, calc_type=0, calc_var=0):
@@ -260,92 +341,102 @@ async def calculate_pure_memory(pair, day, date_str, calc_type=0, calc_var=0):
             f"date_str={date_str!r} pair={pair} day={day} calc_type={calc_type} calc_var={calc_var}",
             NODE_NAME, level="error", force=True)
         return None
- 
-    rates_table  = get_rates_table_name(pair, day)
+
+    rates_table = get_rates_table_name(pair, day)
+    await _refresh_rates_if_needed(rates_table)
     modification = get_modification_factor(pair)
-    window       = 12
-    check_dates  = (
+    window = 12
+    check_dates = (
         [target_date + timedelta(hours=h) for h in range(-window, window + 1)]
         if day == 0 else
-        [target_date + timedelta(days=d)  for d in range(-window, window + 1)]
+        [target_date + timedelta(days=d) for d in range(-window, window + 1)]
     )
- 
-    events_in_window = [
-        e for dt in check_dates for e in GLOBAL_CALENDAR.get(dt, [])
-        if e["Importance"] != 1 or dt == target_date
-    ]
+
+    delta_unit = timedelta(hours=1) if day == 0 else timedelta(days=1)
+    events_in_window = []
+    for dt in check_dates:
+        if dt > target_date:
+            continue
+        dt_end = dt + delta_unit
+        _l = bisect.bisect_left(_CAL_SORTED_DATES, dt)
+        _r = bisect.bisect_left(_CAL_SORTED_DATES, dt_end)
+        for _i in range(_l, _r):
+            for e in _CAL_SORTED_DATA[_i]:
+                if e["Importance"] != 1 or dt == target_date:
+                    events_in_window.append(e)
     if not events_in_window:
         log(f"ℹ️  calculate_pure_memory: no events in window | "
             f"date={date_str!r} pair={pair} day={day}",
             NODE_NAME, force=False)
         return {}
- 
-    ram_rates   = GLOBAL_RATES.get(rates_table, {})
-    ram_ranges  = GLOBAL_CANDLE_RANGES.get(rates_table, {})
-    avg_range   = GLOBAL_AVG_RANGE.get(rates_table, 0.0)
-    ram_ext     = GLOBAL_EXTREMUMS.get(rates_table, {"min": set(), "max": set()})
+
+    ram_rates = GLOBAL_RATES.get(rates_table, {})
+    ram_ranges = GLOBAL_CANDLE_RANGES.get(rates_table, {})
+    avg_range = GLOBAL_AVG_RANGE.get(rates_table, 0.0)
+    ram_ext = GLOBAL_EXTREMUMS.get(rates_table, {"min": set(), "max": set()})
     prev_candle = find_prev_candle_trend(rates_table, target_date)
- 
+
     result = {}
     for e in events_in_window:
-        diff  = target_date - e["event_date"]
+        diff = target_date - e["event_date"]
         shift = int(diff.total_seconds() / 3600) if day == 0 else diff.days
-        eid   = e["EventId"]
- 
+        eid = e["EventId"]
+
         fdir, sdir, adir = get_last_known_context(eid, target_date)
-        ctx_key  = (eid, fdir, sdir, adir)
+        ctx_key = (eid, fdir, sdir, adir)
         ctx_info = GLOBAL_CTX_INDEX.get(ctx_key)
         if ctx_info is None:
             continue
- 
+
         is_recurring = ctx_info["occurrence_count"] >= RECURRING_MIN_COUNT
         if not is_recurring and shift != 0:
             continue
         if is_recurring and abs(shift) > window:
             continue
- 
+
         valid_dates = [d for d in GLOBAL_HISTORY.get(eid, []) if d < target_date]
         if not valid_dates:
             continue
- 
-        delta  = timedelta(hours=shift) if day == 0 else timedelta(days=shift)
+
+        delta = timedelta(hours=shift) if day == 0 else timedelta(days=shift)
         t_dates = [d + delta for d in valid_dates if (d + delta) < target_date]
         hour_arg = shift if is_recurring else None
- 
+
         if calc_type in (0, 1):
             t1_sum = compute_t1_value(t_dates, calc_var, ram_rates, ram_ranges, avg_range)
-            wc     = build_weight_code(eid, fdir, sdir, adir, 0, hour_arg)
+            wc = build_weight_code(eid, fdir, sdir, adir, 0, hour_arg)
             result[wc] = result.get(wc, 0.0) + t1_sum
- 
+
         if calc_type in (0, 2) and prev_candle:
             _, is_bull = prev_candle
-            ext_set    = ram_ext["max" if is_bull else "min"]
-            ext_val    = compute_extremum_value(t_dates, calc_var, ext_set, ram_ranges,
-                                                avg_range, modification, len(valid_dates))
+            ext_set = ram_ext["max" if is_bull else "min"]
+            ext_val = compute_extremum_value(t_dates, calc_var, ext_set, ram_ranges,
+                                             avg_range, modification, len(valid_dates))
             if ext_val is not None:
                 wc = build_weight_code(eid, fdir, sdir, adir, 1, hour_arg)
                 result[wc] = result.get(wc, 0.0) + ext_val
- 
+
     return {k: round(v, 6) for k, v in result.items() if v != 0}
 
 
 @app.get("/")
 async def get_metadata():
     for t in ["vlad_investing_weights", "vlad_investing_event_context_idx",
-              "vlad_investing_calendar", "version_microservice"]:
+              "version_microservice"]:
         try:
             async with engine_vlad.connect() as conn:
                 await conn.execute(text(f"SELECT 1 FROM `{t}` LIMIT 1"))
         except Exception as e:
             return {"status": "error", "error": f"vlad.{t} inaccessible: {e}"}
-    for t in ["brain_rates_eur_usd", "brain_rates_btc_usd", "brain_rates_eth_usd"]:
+    for t in ["brain_rates_eur_usd", "brain_rates_btc_usd", "brain_rates_eth_usd",
+              "vlad_investing_calendar"]:
         try:
             async with engine_brain.connect() as conn:
                 await conn.execute(text(f"SELECT 1 FROM `{t}` LIMIT 1"))
         except Exception as e:
             return {"status": "error", "error": f"brain.{t} inaccessible: {e}"}
     async with engine_vlad.connect() as conn:
-        res     = await conn.execute(text(
+        res = await conn.execute(text(
             "SELECT version FROM version_microservice WHERE microservice_id = :id"),
             {"id": SERVICE_ID})
         version = (res.fetchone() or [0])[0]
@@ -355,8 +446,8 @@ async def get_metadata():
         "weight_code_format": "{event_id}__{fdir}__{sdir}__{adir}__{mode}[__{hour}]",
         "metadata": {
             "ctx_index_rows": len(GLOBAL_CTX_INDEX),
-            "weight_codes":   len(GLOBAL_WEIGHT_CODES),
-            "last_reload":    LAST_RELOAD_TIME.isoformat() if LAST_RELOAD_TIME else None,
+            "weight_codes": len(GLOBAL_WEIGHT_CODES),
+            "last_reload": LAST_RELOAD_TIME.isoformat() if LAST_RELOAD_TIME else None,
         },
     }
 
@@ -372,8 +463,8 @@ async def get_weights():
 
 @app.get("/new_weights")
 async def get_new_weights(
-    code: str = Query(...),
-    limit: int = Query(500, ge=1, le=5000),
+        code: str = Query(...),
+        limit: int = Query(500, ge=1, le=5000),
 ):
     try:
         parts = code.split("__")
@@ -415,20 +506,20 @@ async def get_new_weights(
 
 @app.get("/values")
 async def get_values(
-    pair: int = Query(1), day: int = Query(0), date: str = Query(...),
-    type: int = Query(0, ge=0, le=2), var: int = Query(0, ge=0, le=4),
+        pair: int = Query(1), day: int = Query(0), date: str = Query(...),
+        type: int = Query(0, ge=0, le=2), var: int = Query(0, ge=0, le=4),
 ):
     try:
         return await cached_values(
             engine_vlad=engine_vlad,
-            service_url  = SERVICE_URL,
-            pair         = pair,
-            day          = day,
-            date         = date,
-            extra_params = {"type": type, "var": var},
-            compute_fn   = lambda: calculate_pure_memory(pair, day, date,
-                                                          calc_type=type, calc_var=var),
-            node         = NODE_NAME,
+            service_url=SERVICE_URL,
+            pair=pair,
+            day=day,
+            date=date,
+            extra_params={"type": type, "var": var},
+            compute_fn=lambda: calculate_pure_memory(pair, day, date,
+                                                     calc_type=type, calc_var=var),
+            node=NODE_NAME,
         )
     except Exception as e:
         send_error_trace(e, node=NODE_NAME, script="get_values")
@@ -444,7 +535,8 @@ async def patch_service():
         row = res.fetchone()
         if not row:
             raise HTTPException(status_code=500, detail=f"Service ID {SERVICE_ID} not found")
-        old = row[0]; new = max(old, 3)
+        old = row[0];
+        new = max(old, 3)
         if new != old:
             await conn.execute(
                 text("UPDATE version_microservice SET version = :v WHERE microservice_id = :id"),
@@ -454,9 +546,21 @@ async def patch_service():
 
 if __name__ == "__main__":
     import asyncio as _asyncio
+
+
     async def _get_workers():
-        return await resolve_workers(engine_super, SERVICE_ID, default=1)
-    _workers = _asyncio.run(_get_workers())
+        try:
+            return await resolve_workers(engine_super, SERVICE_ID, default=1)
+        except Exception as e:
+            log(f"resolve_workers failed, default=1: {e}", NODE_NAME, level="error")
+            return 1
+
+
+    try:
+        _workers = _asyncio.run(_get_workers())
+    except Exception as e:
+        log(f"Failed to get workers: {e}", NODE_NAME, level="error")
+        _workers = 1
     log(f"Starting with {_workers} worker(s) in {MODE} mode", NODE_NAME, force=True)
     try:
         uvicorn.run("server:app", host="0.0.0.0", port=PORT, reload=False, workers=_workers)
