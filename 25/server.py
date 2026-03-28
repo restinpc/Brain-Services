@@ -1,4 +1,4 @@
-﻿import sys
+import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared"))
 
@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 
 from fastapi import FastAPI, HTTPException, Query
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from dotenv import load_dotenv
 
 from common import (
@@ -53,6 +54,8 @@ CONFIDENCE_FUNCS = {"bayes": confidence_bayes, "none": confidence_none}
 GLOBAL_EXTREMUMS        = {}
 GLOBAL_RATES            = {}
 GLOBAL_CALENDAR         = {}
+_CAL_SORTED_DATES = []
+_CAL_SORTED_DATA  = []
 GLOBAL_HISTORY          = {}
 GLOBAL_LAST_CANDLES     = {}
 GLOBAL_WEIGHT_CODES     = []
@@ -101,6 +104,8 @@ async def preload_all_data():
         for r in res.mappings().all():
             GLOBAL_EVENT_TYPES[r["event_id"]] = 1 if (r["occurrence_count"] or 0) > 1 else 0
 
+    # ── Календарь событий — читается из Brain ──
+    async with engine_brain.connect() as conn:
         res = await conn.execute(text("""
             SELECT c.event_id, c.occurrence_time_utc, c.importance
             FROM vlad_investing_calendar c WHERE c.event_id IS NOT NULL
@@ -110,6 +115,16 @@ async def preload_all_data():
             dt, eid, imp = r["occurrence_time_utc"], r["event_id"], r["importance"]
             GLOBAL_HISTORY.setdefault(eid, []).append(dt)
             GLOBAL_CALENDAR.setdefault(dt, []).append({"EventId": eid, "Importance": imp, "event_date": dt})
+        log(f"  calendar: {sum(len(v) for v in GLOBAL_CALENDAR.values())} events", NODE_NAME)
+
+    # ── bisect: перестройка отсортированных списков ──
+    if GLOBAL_CALENDAR:
+        _si = sorted(GLOBAL_CALENDAR.items())
+        _CAL_SORTED_DATES[:] = [x[0] for x in _si]
+        _CAL_SORTED_DATA[:]  = [x[1] for x in _si]
+    else:
+        _CAL_SORTED_DATES.clear()
+        _CAL_SORTED_DATA.clear()
 
     tables = [
         "brain_rates_eur_usd", "brain_rates_eur_usd_day",
@@ -136,12 +151,13 @@ async def preload_all_data():
             if n > 0:
                 for pct in (25, 50, 75, 90):
                     GLOBAL_CANDLE_THRESHOLD[table][pct] = sizes_list[min(int(n * pct / 100), n - 1)]
+            interval = "1 DAY" if table.endswith("_day") else "1 HOUR"
             for typ in ("min", "max"):
                 op = ">" if typ == "max" else "<"
                 q  = f"""
                     SELECT t1.date FROM {table} t1
-                    JOIN {table} t_prev ON t_prev.date = t1.date - INTERVAL 1 HOUR
-                    JOIN {table} t_next ON t_next.date = t1.date + INTERVAL 1 HOUR
+                    JOIN {table} t_prev ON t_prev.date = t1.date - INTERVAL {interval}
+                    JOIN {table} t_next ON t_next.date = t1.date + INTERVAL {interval}
                     WHERE t1.{typ if typ=='min' else 'max'} {op} t_prev.{typ if typ=='min' else 'max'}
                       AND t1.{typ if typ=='min' else 'max'} {op} t_next.{typ if typ=='min' else 'max'}
                 """
@@ -149,8 +165,16 @@ async def preload_all_data():
                 GLOBAL_EXTREMUMS[table][typ] = {r["date"] for r in res_ext.mappings().all()}
         log(f"  {table}: {len(GLOBAL_RATES[table])} candles", NODE_NAME)
 
-    SERVICE_URL      = await load_service_url(engine_super, SERVICE_ID)
-    await ensure_cache_table(engine_vlad)
+    try:
+        SERVICE_URL = await load_service_url(engine_super, SERVICE_ID)
+        log(f"  SERVICE_URL loaded", NODE_NAME)
+    except (OperationalError, Exception) as e:
+        log(f"❌ load_service_url failed: {e}", NODE_NAME, level="error", force=True)
+        SERVICE_URL = ""
+    try:
+        await ensure_cache_table(engine_vlad)
+    except Exception as e:
+        log(f"❌ ensure_cache_table failed: {e}", NODE_NAME, level="error")
     LAST_RELOAD_TIME = datetime.now()
     log("✅ FULL DATA RELOAD COMPLETED", NODE_NAME, force=True)
 
@@ -167,17 +191,61 @@ async def background_reload_data():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await preload_all_data()
+    try:
+        await preload_all_data()
+    except Exception as e:
+        log(f"❌ Initial data load failed, server continues: {e}",
+            NODE_NAME, level="error", force=True)
+
     task = asyncio.create_task(background_reload_data())
     yield
     task.cancel()
-    await engine_vlad.dispose()
-    await engine_brain.dispose()
-    await engine_super.dispose()
+
+    for _name, _eng in [("vlad", engine_vlad), ("brain", engine_brain), ("super", engine_super)]:
+        try:
+            await _eng.dispose()
+        except Exception as e:
+            log(f"Error disposing {_name}: {e}", NODE_NAME, level="error")
 
 
 app = FastAPI(lifespan=lifespan)
 
+
+
+# ── Подгрузка свежих свечей из БД ─────────────────────────────────────────
+_LAST_RATES_REFRESH = {}
+
+async def _refresh_rates_if_needed(rates_table):
+    """Если в RAM нет свечи за последний час — подгрузить из БД. Не чаще раз в 30 сек."""
+    now = datetime.now()
+    last = _LAST_RATES_REFRESH.get(rates_table)
+    if last and (now - last).total_seconds() < 30:
+        return
+    _LAST_RATES_REFRESH[rates_table] = now
+
+    ram = GLOBAL_RATES.get(rates_table)
+    if not ram:
+        return
+    max_dt = max(ram.keys())
+    try:
+        async with engine_brain.connect() as conn:
+            res = await conn.execute(text(
+                f"SELECT date, open, close, t1 "
+                f"FROM `{rates_table}` WHERE date > :dt ORDER BY date"),
+                {"dt": max_dt})
+            n = 0
+            for r in res.mappings().all():
+                dt = r["date"]
+                if r["t1"] is not None:
+                    ram[dt] = float(r["t1"])
+                cl = GLOBAL_LAST_CANDLES.get(rates_table)
+                if cl is not None:
+                    cl.append((dt, (r["close"] or 0) > (r["open"] or 0)))
+                n += 1
+            if n > 0:
+                log(f"  📥 Refreshed {n} candle(s) for {rates_table}", NODE_NAME)
+    except Exception as e:
+        log(f"  ⚠️ Rates refresh error ({rates_table}): {e}", NODE_NAME, level="warning")
 
 async def calculate_pure_memory(pair, day, date_str, type_=0, var=0) -> dict | None:
     target_date = parse_date_string(date_str)
@@ -191,16 +259,25 @@ async def calculate_pure_memory(pair, day, date_str, type_=0, var=0) -> dict | N
     wl, wr, candle_pct, conf_name, conf_param = var_cfg
     conf_fn      = CONFIDENCE_FUNCS[conf_name]
     rates_table  = get_rates_table_name(pair, day)
+    await _refresh_rates_if_needed(rates_table)
     modification = get_modification_factor(pair)
 
     check_dates = [
         target_date + (timedelta(hours=h) if day == 0 else timedelta(days=h))
         for h in range(wl, wr + 1)
     ]
-    events_in_window = [
-        e for dt in check_dates for e in GLOBAL_CALENDAR.get(dt, [])
-        if e["Importance"] != 1 or dt == target_date
-    ]
+    delta_unit = timedelta(hours=1) if day == 0 else timedelta(days=1)
+    events_in_window = []
+    for dt in check_dates:
+        if dt > target_date:
+            continue
+        dt_end = dt + delta_unit
+        _l = bisect.bisect_left(_CAL_SORTED_DATES, dt)
+        _r = bisect.bisect_left(_CAL_SORTED_DATES, dt_end)
+        for _i in range(_l, _r):
+            for e in _CAL_SORTED_DATA[_i]:
+                if e["Importance"] != 1 or dt == target_date:
+                    events_in_window.append(e)
 
     needed_events = []
     for e in events_in_window:
@@ -254,13 +331,14 @@ async def calculate_pure_memory(pair, day, date_str, type_=0, var=0) -> dict | N
 @app.get("/")
 async def get_metadata():
     for t in ["vlad_investing_weights_table", "vlad_investing_event_index",
-              "vlad_investing_calendar", "version_microservice"]:
+              "version_microservice"]:
         try:
             async with engine_vlad.connect() as conn:
                 await conn.execute(text(f"SELECT 1 FROM `{t}` LIMIT 1"))
         except Exception as e:
             return {"status": "error", "error": f"vlad.{t} inaccessible: {e}"}
-    for t in ["brain_rates_eur_usd", "brain_rates_btc_usd", "brain_rates_eth_usd"]:
+    for t in ["brain_rates_eur_usd", "brain_rates_btc_usd", "brain_rates_eth_usd",
+              "vlad_investing_calendar"]:
         try:
             async with engine_brain.connect() as conn:
                 await conn.execute(text(f"SELECT 1 FROM `{t}` LIMIT 1"))
@@ -356,8 +434,16 @@ async def patch_service():
 if __name__ == "__main__":
     import asyncio as _asyncio
     async def _get_workers():
-        return await resolve_workers(engine_super, SERVICE_ID, default=1)
-    _workers = _asyncio.run(_get_workers())
+        try:
+            return await resolve_workers(engine_super, SERVICE_ID, default=1)
+        except Exception as e:
+            log(f"resolve_workers failed, default=1: {e}", NODE_NAME, level="error")
+            return 1
+    try:
+        _workers = _asyncio.run(_get_workers())
+    except Exception as e:
+        log(f"Failed to get workers: {e}", NODE_NAME, level="error")
+        _workers = 1
     log(f"Starting with {_workers} worker(s) in {MODE} mode", NODE_NAME, force=True)
     try:
         uvicorn.run("server:app", host="0.0.0.0", port=PORT, reload=False, workers=_workers)
