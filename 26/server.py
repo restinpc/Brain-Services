@@ -353,8 +353,6 @@ async def calculate_pure_memory(pair: int, day: int, date_str: str,
     delta_unit = timedelta(hours=1) if day == 0 else timedelta(days=1)
     events_in_window = []
     for dt in check_dates:
-        if dt > target_date:
-            continue
         dt_end = dt + delta_unit
         _l = bisect.bisect_left(_CAL_SORTED_DATES, dt)
         _r = bisect.bisect_left(_CAL_SORTED_DATES, dt_end)
