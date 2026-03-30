@@ -287,10 +287,7 @@ async def preload_all_data():
         except Exception as e:
             log(f"❌ ctx_index: {e}", NODE_NAME, level="error")
 
-    # ── brain DB: vlad_market_history + brain_rates_* ─────────────────────────
-    async with engine_brain.connect() as conn:
-
-        # vlad_market_history → классификация в RAM
+        # ── vlad_market_history из базы vlad (исправлено) ────────────────────────
         try:
             col_parts  = []
             instruments = list(INSTRUMENT_COLUMNS.keys())
@@ -303,7 +300,7 @@ async def preload_all_data():
                 f"SELECT `datetime`, {', '.join(col_parts)} "
                 f"FROM vlad_market_history ORDER BY `datetime`"))
             rows = res.fetchall()
-            log(f"  vlad_market_history: {len(rows)} rows", NODE_NAME)
+            log(f"  vlad_market_history (from vlad DB): {len(rows)} rows", NODE_NAME)
 
             by_instr_close  = {instr: [] for instr in instruments}
             by_instr_volume = {instr: [] for instr in instruments}
@@ -341,12 +338,13 @@ async def preload_all_data():
             log(f"  instruments: {len(GLOBAL_MKT_BY_INSTR)}, "
                 f"contexts: {len(GLOBAL_MKT_CONTEXT)}, obs: {total_obs}", NODE_NAME)
         except Exception as e:
-            log(f"❌ market_history: {e}", NODE_NAME, level="error")
+            log(f"❌ vlad_market_history: {e}", NODE_NAME, level="error")
 
         # ── bisect: отсортированный список дат market ──
         _MKT_SORTED_DATES[:] = sorted(GLOBAL_MKT_OBS_DTS.keys())
 
-        # brain_rates_* → T1 / ranges / extremums
+    # ── brain DB: brain_rates_* (остается без изменений) ────────────────────────
+    async with engine_brain.connect() as conn:
         for table in ["brain_rates_eur_usd", "brain_rates_eur_usd_day",
                       "brain_rates_btc_usd", "brain_rates_btc_usd_day",
                       "brain_rates_eth_usd", "brain_rates_eth_usd_day"]:
@@ -431,9 +429,6 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
-
-
-# ── calculate_pure_memory ─────────────────────────────────────────────────────
 
 
 # ── Подгрузка свежих свечей из БД ─────────────────────────────────────────
@@ -548,7 +543,7 @@ async def calculate_pure_memory(pair: int, day: int, date_str: str,
     return {k: round(v, 6) for k, v in result.items() if v != 0}
 
 
-# ── Endpoints ─────────────────────────────────────────────────────────────────
+# ── Endpoints (без изменений) ─────────────────────────────────────────────────
 
 @app.get("/")
 async def get_metadata():
@@ -562,10 +557,15 @@ async def get_metadata():
     for t in ["vlad_market_history", "brain_rates_eur_usd",
               "brain_rates_btc_usd", "brain_rates_eth_usd"]:
         try:
-            async with engine_brain.connect() as conn:
-                await conn.execute(text(f"SELECT 1 FROM `{t}` LIMIT 1"))
+            # Проверяем vlad_market_history в базе vlad
+            if t == "vlad_market_history":
+                async with engine_vlad.connect() as conn:
+                    await conn.execute(text(f"SELECT 1 FROM `{t}` LIMIT 1"))
+            else:
+                async with engine_brain.connect() as conn:
+                    await conn.execute(text(f"SELECT 1 FROM `{t}` LIMIT 1"))
         except Exception as e:
-            return {"status": "error", "error": f"brain.{t} inaccessible: {e}"}
+            return {"status": "error", "error": f"{'vlad' if t=='vlad_market_history' else 'brain'}.{t} inaccessible: {e}"}
     async with engine_vlad.connect() as conn:
         res     = await conn.execute(text(
             "SELECT version FROM version_microservice WHERE microservice_id = :id"),
