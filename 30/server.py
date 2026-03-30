@@ -56,6 +56,7 @@ GLOBAL_EXTREMUMS = {}
 GLOBAL_CANDLE_RANGES = {}
 GLOBAL_AVG_RANGE = {}
 GLOBAL_LAST_CANDLES = {}
+_RATES_DATE_INDEX = {}   # table → {date → [datetime, ...]} для поиска hourly свечей по дате
 SERVICE_URL = ""
 LAST_RELOAD_TIME = None
 
@@ -168,6 +169,7 @@ async def preload_all_data():
     GLOBAL_CANDLE_RANGES.clear();
     GLOBAL_AVG_RANGE.clear();
     GLOBAL_LAST_CANDLES.clear()
+    _RATES_DATE_INDEX.clear()
 
     # Загрузка данных из vlad базы (веса, контекст)
     async with engine_vlad.connect() as conn:
@@ -220,6 +222,7 @@ async def preload_all_data():
         GLOBAL_CANDLE_RANGES[table] = {};
         GLOBAL_AVG_RANGE[table] = 0.0
         GLOBAL_EXTREMUMS[table] = {"min": set(), "max": set()}
+        _RATES_DATE_INDEX[table] = defaultdict(list)
         try:
             async with engine_brain.connect() as conn:
                 res = await conn.execute(text(
@@ -234,6 +237,9 @@ async def preload_all_data():
                     rng = float(r["max"] or 0) - float(r["min"] or 0)
                     GLOBAL_CANDLE_RANGES[table][dt] = rng
                     ranges.append(rng)
+                    # Индекс date→[datetime] для поиска hourly свечей по дате ECB-события
+                    if isinstance(dt, datetime):
+                        _RATES_DATE_INDEX[table][dt.date()].append(dt)
                 GLOBAL_AVG_RANGE[table] = sum(ranges) / len(ranges) if ranges else 0.0
                 interval = "1 DAY" if table.endswith("_day") else "1 HOUR"
                 for typ in ("min", "max"):
@@ -378,11 +384,21 @@ async def calculate_pure_memory(pair, day, date_str, calc_type=0, calc_var=0):
         if not valid_dates:
             continue
 
-        t_dates = [
-            datetime.combine(d + timedelta(days=shift), time_type(0, 0))
-            for d in valid_dates
-            if datetime.combine(d + timedelta(days=shift), time_type(0, 0)) < target_date
-        ]
+        t_dates = []
+        date_index = _RATES_DATE_INDEX.get(rates_table, {})
+        for d in valid_dates:
+            shifted_date = d + timedelta(days=shift)
+            if date_index:
+                # hourly: находим все свечи за эту дату
+                hourly_dts = date_index.get(shifted_date, [])
+                for hdt in hourly_dts:
+                    if hdt < target_date:
+                        t_dates.append(hdt)
+            else:
+                # daily: одна свеча на дату (полночь)
+                dt_val = datetime.combine(shifted_date, time_type(0, 0))
+                if dt_val < target_date:
+                    t_dates.append(dt_val)
         shift_arg = shift if is_recurring else None
 
         if calc_type in (0, 1):
