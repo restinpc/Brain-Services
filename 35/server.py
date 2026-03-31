@@ -13,8 +13,8 @@ from common import log
 # КОНФИГУРАЦИЯ
 # ─────────────────────────────────────────────────────────────────────────────
 
-SERVICE_ID = 36
-PORT       = 8899
+SERVICE_ID = 35
+PORT       = 8898
 NODE_NAME  = "brain-news-weights"
 
 CTX_TABLE     = "vlad_news_context_idx"
