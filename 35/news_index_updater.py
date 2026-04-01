@@ -6,28 +6,7 @@ news_index_updater.py
       динамическими — они должны обновляться по мере поступления новых новостей,
       а не только при полной пересборке (context_idx.py + weights.py).
 
-Когда вызывается:
-  1. Из фонового reload сервера (каждые 3600 сек) — через run_incremental_update()
-  2. Как самостоятельный cron-скрипт: python news_index_updater.py
-
-Что делает:
-  Шаг 1 — Найти новые news_id, которых ещё нет в vlad_news_ctx_map
-  Шаг 2 — Прочитать их NER-данные из brain_*_ner таблиц
-  Шаг 3 — Построить fingerprints (консенсус >= 2/3 моделей)
-  Шаг 4 — Upsert в vlad_news_context_idx:
-           - Новый fingerprint → INSERT (occurrence_count = 1)
-           - Существующий     → UPDATE occurrence_count += N, last_dt
-  Шаг 5 — Добавить строки в vlad_news_ctx_map для новых news_id
-  Шаг 6 — Добавить weight_codes для:
-           - Новых ctx_id (shift=0 только, пока count=1)
-           - ctx_id, которые перешли через порог recurring (count стал >= 2)
-             → дописать все shift 1..SHIFT_MAX для обоих mode
-
-Важно:
-  - Не делает TRUNCATE — только дополняет существующее
-  - Идемпотентен: повторный запуск не создаёт дублей (INSERT IGNORE / ON DUPLICATE KEY)
-  - Потокобезопасен для одного процесса (без race condition с сервером, т.к.
-    сервер только читает эти таблицы)
+Вызывается из фонового reload сервера (каждые 3600 сек) — через run_incremental_update()
 """
 
 import os
@@ -42,7 +21,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# КОНФИГУРАЦИЯ — идентична context_idx.py и weights.py
+# КОНФИГУРАЦИЯ
 # ─────────────────────────────────────────────────────────────────────────────
 
 CTX_TABLE   = os.getenv("CTX_TABLE",  "vlad_news_context_idx")
@@ -121,15 +100,12 @@ def get_vlad_conn():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# УТИЛИТЫ — ИДЕНТИЧНЫ context_idx.py (дублирование намеренно для автономности)
+# УТИЛИТЫ 
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_feed_cat(feed: str) -> str:
     """
     Определяет категорию источника по полю feed.
-
-    @param feed  str   Значение поля feed из news-таблицы
-    @return str        Однобуквенный код: F/P/T/W/G
     """
     feed_lower = (feed or "").lower()
     for key, cat in FEED_CAT_MAP.items():
@@ -141,9 +117,6 @@ def get_feed_cat(feed: str) -> str:
 def normalize_token(raw: str) -> str:
     """
     Нормализует строку NER-сущности: первые 2 слова, lowercase, до 64 символов.
-
-    @param raw   str   Сырая строка (например "Wall Street Journal")
-    @return str        Нормализованная строка ("wall street")
     """
     if not raw:
         return ""
@@ -155,9 +128,6 @@ def consensus_entities(ner_rows: list) -> dict:
     """
     Строит NER-консенсус из записей нескольких моделей для одной новости.
     Сущность включается если встречается в >= MIN_MODELS строках.
-
-    @param ner_rows  list   Список dict с ключами person/location/misc (от разных моделей)
-    @return dict            {"person": str, "location": str, "misc": str}
     """
     persons = Counter()
     locations = Counter()
@@ -189,11 +159,6 @@ def make_fingerprint(feed_cat: str, person: str, location: str, misc: str) -> st
     """
     Создаёт 16-символьный MD5-хэш контекста (уникальный ключ fingerprint).
 
-    @param feed_cat   str   Категория источника (F/P/T/W/G)
-    @param person     str   Нормализованный person-токен
-    @param location   str   Нормализованный location-токен
-    @param misc       str   Нормализованный misc-токен
-    @return str             16-символьный hex-хэш
     """
     raw = f"{feed_cat}|{person}|{location}|{misc}"
     return hashlib.md5(raw.encode()).hexdigest()[:16]
@@ -202,11 +167,6 @@ def make_fingerprint(feed_cat: str, person: str, location: str, misc: str) -> st
 def make_weight_code(ctx_id: int, mode: int, shift: int) -> str:
     """
     Формирует строковый код веса в формате NW{ctx_id}_{mode}_{shift}.
-
-    @param ctx_id  int   ID из vlad_news_context_idx
-    @param mode    int   0=T1 sum, 1=Extremum probability
-    @param shift   int   Сдвиг в часах (0..SHIFT_MAX)
-    @return str          Например "NW42_0_3"
     """
     return f"NW{ctx_id}_{mode}_{shift}"
 
@@ -221,10 +181,6 @@ def find_new_news_ids(brain_conn, vlad_conn) -> set:
     но ещё отсутствуют в vlad_news_ctx_map (то есть ещё не обработаны).
 
     Логика: LEFT JOIN ctx_map → WHERE ctx_map.news_id IS NULL
-
-    @param brain_conn  connection   Соединение с brain БД
-    @param vlad_conn   connection   Соединение с vlad БД
-    @return set                     Множество необработанных news_id (int)
     """
     # Читаем уже обработанные news_id из ctx_map
     vcur = vlad_conn.cursor()
@@ -259,10 +215,6 @@ def load_ner_for_new_ids(brain_conn, new_ids: set) -> dict:
     """
     Загружает NER-данные из всех источников только для заданных news_id.
     Возвращает словарь news_id → [ner_row, ...] для построения fingerprints.
-
-    @param brain_conn  connection   Соединение с brain БД
-    @param new_ids     set          Множество news_id для загрузки
-    @return dict                    {news_id: [{"person": .., "location": .., "misc": .., "date": .., "feed": ..}, ...]}
     """
     if not new_ids:
         return {}
@@ -343,10 +295,6 @@ def upsert_context_idx(vlad_conn, fp_records: list) -> dict:
       - Если существующий → UPDATE occurrence_count += N, last_dt
 
     Возвращает актуальный маппинг {fp_hash: ctx_id} для дальнейшего использования.
-
-    @param vlad_conn   connection   Соединение с vlad БД
-    @param fp_records  list         Список fingerprint-записей из build_fp_records()
-    @return dict                    {fingerprint_hash: ctx_id}
     """
     if not fp_records:
         return {}
@@ -420,11 +368,6 @@ def insert_ctx_map(vlad_conn, fp_records: list, fp_to_id: dict):
     """
     Добавляет новые строки в vlad_news_ctx_map (news_id → ctx_id).
     Использует INSERT IGNORE — не затрагивает уже существующие записи.
-
-    @param vlad_conn   connection   Соединение с vlad БД
-    @param fp_records  list         Fingerprint-записи (news_id, date, fp)
-    @param fp_to_id    dict         {fp_hash: ctx_id} после upsert
-    @return None
     """
     vcur = vlad_conn.cursor()
     sql  = f"INSERT IGNORE INTO `{MAP_TABLE}` (news_id, ctx_id, news_date) VALUES (%s, %s, %s)"
@@ -467,9 +410,6 @@ def update_weight_codes(vlad_conn):
       Уже есть shift=0, надо дописать shift 1..SHIFT_MAX для обоих mode.
 
     Использует INSERT IGNORE — безопасен для повторного запуска.
-
-    @param vlad_conn  connection   Соединение с vlad БД
-    @return None
     """
     vcur = vlad_conn.cursor()
 
@@ -533,23 +473,6 @@ def run_incremental_update(
 ) -> dict:
     """
     Запускает полный инкрементальный цикл обновления индекса.
-
-    Может принимать уже открытые соединения (для вызова из сервера)
-    или открыть их самостоятельно (для cron-режима).
-
-    @param brain_conn   connection | None   Соединение с brain БД (или None → открыть)
-    @param vlad_conn    connection | None   Соединение с vlad БД (или None → открыть)
-    @param close_after  bool                Закрывать соединения после завершения
-    @return dict        {"new_news": int, "new_ctx": int, "new_codes": int}
-
-    @usage
-        # Из cron-скрипта:
-        result = run_incremental_update()
-
-        # Из сервера (передаём существующие соединения):
-        # Внимание: mysql.connector не asyncio-совместим, поэтому
-        # вызывать через asyncio.to_thread() или отдельным sync-методом.
-        result = run_incremental_update(brain_conn, vlad_conn, close_after=False)
     """
     _own_connections = brain_conn is None
 
@@ -603,37 +526,8 @@ def run_incremental_update(
             except Exception:
                 pass
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-# ИНТЕГРАЦИЯ С СЕРВЕРОМ (добавить в server_35/36)
-# ─────────────────────────────────────────────────────────────────────────────
-#
-# В BaseBrainService (brain_framework.py) метод preload_all_data()
-# вызывается каждые 3600 секунд. Добавить вызов updater'а ДО load_my_data().
-#
-# Пример интеграции в server.py (service 35/36):
-#
-#   import asyncio
-#   from news_index_updater import run_incremental_update
-#
-#   class NewsWeightsService(BaseBrainService):
-#
-#       async def load_my_data(self, conn_vlad, conn_brain):
-#           # Шаг 0: обновить индекс перед загрузкой
-#           # mysql.connector — синхронный, поэтому запускаем в thread
-#           await asyncio.to_thread(run_incremental_update)
-#
-#           # Шаг 1-3: загрузить обновлённые данные как обычно
-#           res = await conn_vlad.execute(...)
-#           ...
-#
-# Это гарантирует: каждый раз когда сервер перезагружает данные из БД,
-# он сначала актуализирует сами таблицы контекстов и весов.
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ТОЧКА ВХОДА (cron-режим)
+# ТОЧКА ВХОДА
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
