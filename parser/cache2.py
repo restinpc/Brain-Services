@@ -46,8 +46,8 @@ SLOT_BATCH_SIZE = 50
 # Retry для упавших дат.
 RETRY_PASSES      = 3
 RETRY_PASS_DELAYS = [30, 60, 120]  # сервису нужно время восстановиться
-HTTP_TIMEOUT      = 20             # таймаут одного запроса (секунды)
-RETRY_TIMEOUT     = 30             # таймаут при retry
+HTTP_TIMEOUT      = 30             # таймаут одного запроса (секунды)
+RETRY_TIMEOUT     = 90             # таймаут при retry
 
 # Circuit breaker: если подряд столько батчей = 100% ошибок → сервис лежит.
 # Пауза CB_PAUSE секунд, потом пробуем снова.
