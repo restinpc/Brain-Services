@@ -38,7 +38,7 @@ ALERT_EMAIL = os.getenv("ALERT_EMAIL", "vladyurjevitch@yandex.ru")
 # Параметры парсинга
 # ----------------------------------------------------------------------
 BASE_URL = "https://www.coindesk.com/latest-crypto-news"
-MAX_CLICKS = 999  # лимит кликов "More Stories"
+MAX_CLICKS = 20  # лимит кликов "More Stories"
 
 # ----------------------------------------------------------------------
 # Селекторы для элементов на странице (можно легко обновить)
