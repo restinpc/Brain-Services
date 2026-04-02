@@ -25,7 +25,7 @@ load_dotenv()
 MODEL_IDS = [30]
 
 SERVICE_FOLDER_MAP: dict[int, str] = {
-    30: "/Brain-Services/30",
+    30: "/brain/Brain-Services/30",
     # 31: "/brain/Brain-Server/31",
 }
 
