@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import hashlib
 import importlib.util
+import inspect
 import json
 import logging
 import math
@@ -274,13 +275,21 @@ class ServiceRunner:
         # Определяем стиль сервиса по наличию функций
         if hasattr(module, "calculate"):
             self._style = "dummy"
-            log.info(f"  [model{self.model_id}] стиль: dummy (calculate)")
+            fn = module.calculate
         elif hasattr(module, "calculate_pure_memory"):
             self._style = "legacy"
-            log.info(f"  [model{self.model_id}] стиль: legacy (calculate_pure_memory)")
+            fn = module.calculate_pure_memory
         else:
             self._style = "unknown"
+            fn = None
             log.warning(f"  [model{self.model_id}] ⚠️  не найдена ни calculate(), ни calculate_pure_memory()")
+
+        # Определяем синхронная или асинхронная функция расчёта
+        self._calc_is_async = inspect.iscoroutinefunction(fn) if fn else False
+
+        style_label = self._style
+        async_label = "async" if self._calc_is_async else "sync"
+        log.info(f"  [model{self.model_id}] стиль: {style_label} ({async_label})")
 
         log.info(f"  [model{self.model_id}] server.py загружен из {server_path}")
 
@@ -336,7 +345,31 @@ class ServiceRunner:
                 f"все расчёты вернут пустой результат"
             )
 
-    def calculate(
+    def _call_fn(self, pair: int, day: int, date_str: str, extra_params: dict):
+        """
+        Вызывает вычислительную функцию модуля с правильными аргументами.
+        Для async-функций возвращает корутину — вызывающий код должен await её.
+        Для sync-функций возвращает результат напрямую.
+        """
+        if self._style == "legacy":
+            return self.module.calculate_pure_memory(
+                pair,
+                day,
+                date_str,
+                calc_type = extra_params.get("type", 0),
+                calc_var  = extra_params.get("var",  0),
+            )
+        else:
+            return self.module.calculate(
+                pair     = pair,
+                day      = day,
+                date_str = date_str,
+                type_    = extra_params.get("type", 0),
+                var      = extra_params.get("var",  0),
+                param    = extra_params.get("param", ""),
+            )
+
+    async def calculate_async(
         self,
         pair: int,
         day: int,
@@ -344,10 +377,12 @@ class ServiceRunner:
         extra_params: dict,
     ) -> tuple[dict | None, str | None]:
         """
-        Вызывает вычислительную функцию из server.py напрямую.
-        Автоматически определяет стиль:
-          dummy  → calculate(pair, day, date_str, type_=, var=, param=)
-          legacy → calculate_pure_memory(pair, day, date_str, calc_type=, calc_var=)
+        Универсальный вызов вычислительной функции сервиса.
+        Обрабатывает оба случая:
+          - async функция (legacy calculate_pure_memory, новые async calculate)
+            → await напрямую в event loop
+          - sync функция (новый dummy calculate)
+            → запускает через asyncio.to_thread чтобы не блокировать event loop
         Возвращает (result | None, error_reason | None).
         """
         if self.module is None:
@@ -356,34 +391,24 @@ class ServiceRunner:
         if self._style == "unknown":
             return None, (
                 f"server.py (model={self.model_id}) не содержит ни calculate(), "
-                f"ни calculate_pure_memory()\n"
+                f"ни calculate_pure_memory()
+"
                 f"Проверь что это правильный файл сервиса"
             )
 
         try:
-            if self._style == "legacy":
-                # Старые сервисы: calculate_pure_memory(pair, day, date_str, calc_type, calc_var)
-                result = self.module.calculate_pure_memory(
-                    pair,
-                    day,
-                    date_str,
-                    calc_type = extra_params.get("type", 0),
-                    calc_var  = extra_params.get("var",  0),
-                )
+            if self._calc_is_async:
+                # async функция — await напрямую в текущем event loop
+                result = await self._call_fn(pair, day, date_str, extra_params)
             else:
-                # Новый dummy-фреймворк: calculate(pair, day, date_str, type_, var, param)
-                result = self.module.calculate(
-                    pair     = pair,
-                    day      = day,
-                    date_str = date_str,
-                    type_    = extra_params.get("type", 0),
-                    var      = extra_params.get("var",  0),
-                    param    = extra_params.get("param", ""),
+                # sync функция — в отдельном потоке чтобы не блокировать event loop
+                result = await asyncio.to_thread(
+                    self._call_fn, pair, day, date_str, extra_params
                 )
         except ImportError as e:
             # model.py не найден или не импортируется
             return None, (
-                f"ImportError при вызове calculate(): {e}\n"
+                f"ImportError при вызове вычислительной функции: {e}\n"
                 f"Скорее всего model.py отсутствует или содержит ошибку импорта\n"
                 f"Путь: {self.folder / 'model.py'}"
             )
@@ -551,10 +576,8 @@ async def _fetch_and_store_one(
     date_str = date_val.strftime("%Y-%m-%d %H:%M:%S")
 
     async with sem:
-        # Запускаем синхронный calculate() в потоке — не блокируем event loop
-        result, err = await asyncio.to_thread(
-            runner.calculate, pair, day, date_str, extra_params
-        )
+        # calculate_async сам решает: await (async) или to_thread (sync)
+        result, err = await runner.calculate_async(pair, day, date_str, extra_params)
 
     if err is not None:
         return "error", date_str, err
