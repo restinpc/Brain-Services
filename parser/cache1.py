@@ -329,6 +329,12 @@ class ServiceRunner:
         try:
             await self.module.preload_all_data()
             self._initialized = True
+        except Exception as e:
+            raise RuntimeError(
+                f"Ошибка при preload_all_data (model={self.model_id}):\n"
+                f"  {type(e).__name__}: {e}\n\n"
+                f"{traceback.format_exc()}"
+            )
 
         # Для legacy async сервисов ограничиваем конкурентность на уровне модуля.
         # Sync-функции (новый dummy) запускаются в потоках — там нет общего event loop,
@@ -342,12 +348,6 @@ class ServiceRunner:
         else:
             self._module_sem = None
             log.info(f"  [model{self.model_id}] _module_sem=None (sync dummy — не нужен)")
-        except Exception as e:
-            raise RuntimeError(
-                f"Ошибка при preload_all_data (model={self.model_id}):\n"
-                f"  {type(e).__name__}: {e}\n\n"
-                f"{traceback.format_exc()}"
-            )
 
         # Проверяем что данные загружены
         rates = getattr(self.module, "GLOBAL_RATES", {})
