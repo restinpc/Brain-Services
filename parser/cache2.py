@@ -305,8 +305,11 @@ async def _call_one(
     """
     async with global_sem:
         try:
+            # Используем /compute — чистое вычисление без кеша на стороне сервиса.
+            # Это исключает конкуренцию за vlad_values_cache между кешером и сервисом,
+            # что было причиной "Packet sequence number wrong" при concurrent запросах.
             async with session.get(
-                f"{url}/values",
+                f"{url}/compute",
                 params=params,
                 timeout=aiohttp.ClientTimeout(total=timeout_sec),
             ) as r:
@@ -325,11 +328,18 @@ async def _call_one(
                 except Exception as e:
                     return None, f"JSON parse error: {e}"
 
+                # /compute возвращает результат напрямую (dict без обёртки payLoad)
+                # /values возвращает {"status":"ok","payLoad":{...}}
+                # Обрабатываем оба формата для совместимости
                 if "payLoad" in data:
                     payload = data["payLoad"]
                 elif "payload" in data:
                     payload = data["payload"]
+                elif "error" in data and "status" not in data:
+                    # /compute вернул {"error": "..."}
+                    return None, f"Сервис вернул error: {data['error'][:200]}"
                 elif "status" not in data:
+                    # /compute вернул dict с результатом напрямую
                     payload = data
                 else:
                     return None, f"Нет payLoad в ответе: {str(data)[:200]}"
@@ -893,7 +903,7 @@ async def run_slot(
     # Проверяем что сервис доступен перед началом работы
     alive = await _check_service_alive(session, service_url, label)
     if not alive:
-        log.error(f"{label} ❌ Сервис недоступен. Пропускаем слот.")
+        log.error(f"{label} ❌ Сервис {service_url} недоступен. Проверь что он запущен и порт доступен.")
         return {"slot": slot, "cache": stats_cache, "backtest": stats_backtest, "timed_out": False}
 
     log.info(f"{label} ▶  Кеш: {len(candles)} свечей, {len(param_combos)} комбинаций")
