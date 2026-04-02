@@ -396,8 +396,7 @@ class ServiceRunner:
         if self._style == "unknown":
             return None, (
                 f"server.py (model={self.model_id}) не содержит ни calculate(), "
-                f"ни calculate_pure_memory()
-"
+                f"ни calculate_pure_memory()\n"
                 f"Проверь что это правильный файл сервиса"
             )
 
