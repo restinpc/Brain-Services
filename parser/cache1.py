@@ -346,7 +346,7 @@ class ServiceRunner:
             # 4 одновременных вызова — AsyncEngine в модуле имеет пул соединений
             # и корректно обрабатывает concurrent access. Значение 1 слишком медленно.
             # Увеличивай если нет ошибок, уменьшай если снова появятся.
-            module_concurrency = 4
+            module_concurrency = 16
             self._module_sem = asyncio.Semaphore(module_concurrency)
             log.info(
                 f"  [model{self.model_id}] _module_sem={module_concurrency} "
