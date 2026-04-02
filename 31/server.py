@@ -5,6 +5,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared"))
 import uvicorn
 import asyncio
 import bisect
+import functools
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
@@ -338,6 +339,97 @@ async def _refresh_rates_if_needed(rates_table):
     except Exception as e:
         log(f"  ⚠️ Rates refresh error ({rates_table}): {e}", NODE_NAME, level="warning")
 
+
+def _compute_cpu_only(
+    pair: int, day: int, date_str: str,
+    calc_type: int = 0, calc_var: int = 0,
+) -> dict | None:
+    """
+    Синхронная CPU-часть вычисления весов.
+    Вызывается через asyncio.to_thread() из /compute чтобы не блокировать event loop.
+    Не делает никаких async операций — только работа с данными в RAM.
+    _refresh_rates_if_needed должна быть вызвана ДО этой функции.
+    """
+    target_date = parse_date_string(date_str)
+    if not target_date:
+        return None
+
+    rates_table  = get_rates_table_name(pair, day)
+    modification = get_modification_factor(pair)
+    delta_unit   = timedelta(days=1) if day == 1 else timedelta(hours=1)
+    check_dts    = [target_date + delta_unit * s
+                    for s in range(-SHIFT_WINDOW, SHIFT_WINDOW + 1)]
+
+    observations = []
+    for dt in check_dts:
+        if dt > target_date:
+            continue
+        dt_end = dt + delta_unit
+        _l = bisect.bisect_left(_MKT_SORTED_DATES, dt)
+        _r = bisect.bisect_left(_MKT_SORTED_DATES, dt_end)
+        for _i in range(_l, _r):
+            obs_dt = _MKT_SORTED_DATES[_i]
+            for instr in GLOBAL_MKT_OBS_DTS.get(obs_dt, set()):
+                ctx = GLOBAL_MKT_CONTEXT.get((instr, obs_dt))
+                if ctx:
+                    observations.append(
+                        (instr, obs_dt, ctx, round((target_date - obs_dt) / delta_unit))
+                    )
+
+    if not observations:
+        return {}
+
+    ram_rates   = GLOBAL_RATES.get(rates_table, {})
+    ram_ranges  = GLOBAL_CANDLE_RANGES.get(rates_table, {})
+    avg_range   = GLOBAL_AVG_RANGE.get(rates_table, 0.0)
+    ram_ext     = GLOBAL_EXTREMUMS.get(rates_table, {"min": set(), "max": set()})
+    prev_candle = find_prev_candle_trend(rates_table, target_date)
+
+    result = {}
+    for instr, obs_dt, (rcd, td, md), shift in observations:
+        ctx_key = (instr, rcd, td, md)
+
+        ctx_info = GLOBAL_CTX_INDEX.get(ctx_key)
+        if ctx_info is None:
+            continue
+        is_recurring = ctx_info["occurrence_count"] >= RECURRING_MIN_COUNT
+        if not is_recurring and shift != 0:
+            continue
+        if is_recurring and abs(shift) > SHIFT_WINDOW:
+            continue
+
+        all_ctx_dts = GLOBAL_MKT_CTX_HIST.get(ctx_key, [])
+        idx         = bisect.bisect_left(all_ctx_dts, target_date)
+        valid_dts   = all_ctx_dts[:idx]
+        if not valid_dts:
+            continue
+
+        t_dates = [d + delta_unit * shift for d in valid_dts
+                   if (d + delta_unit * shift) < target_date]
+        if not t_dates:
+            continue
+
+        shift_arg = shift if is_recurring else None
+
+        if calc_type in (0, 1):
+            t1_sum = compute_t1_value(t_dates, calc_var, ram_rates, ram_ranges, avg_range)
+            wc     = make_weight_code(instr, rcd, td, md, 0, shift_arg)
+            result[wc] = result.get(wc, 0.0) + t1_sum
+
+        if calc_type in (0, 2) and prev_candle:
+            _, is_bull = prev_candle
+            ext_set    = ram_ext["max" if is_bull else "min"]
+            ext_val    = compute_extremum_value(
+                t_dates, calc_var, ext_set, ram_ranges,
+                avg_range, modification, len(valid_dts)
+            )
+            if ext_val is not None:
+                wc = make_weight_code(instr, rcd, td, md, 1, shift_arg)
+                result[wc] = result.get(wc, 0.0) + ext_val
+
+    return {k: round(v, 6) for k, v in result.items() if v != 0}
+
+
 async def calculate_pure_memory(pair, day, date_str, calc_type=0, calc_var=0):
     target_date = parse_date_string(date_str)
     if not target_date:
@@ -530,18 +622,24 @@ async def compute_values(
     type: int = Query(0, ge=0, le=2), var: int = Query(0, ge=0, le=4),
 ):
     """
-    Чистое вычисление без кеширования.
-    Используется cache.py при построении кеша — чтобы не создавать
-    конкуренцию за vlad_values_cache между кешером и сервисом.
+    Чистое вычисление без кеширования. Используется cache.py при построении кеша.
 
-    Возвращает результат напрямую:
-      {"key1": float, "key2": float, ...}  — непустой результат
-      {}                                   — нет сигнала на эту дату
-      {"error": "..."}                     — ошибка вычисления
+    Ключевое отличие от /values:
+    1. Нет чтения/записи в vlad_values_cache — исключает конкуренцию за БД
+    2. CPU-тяжёлая часть вычисления выполняется в thread pool через asyncio.to_thread —
+       event loop остаётся отзывчивым и принимает другие запросы пока идёт вычисление.
+
+    Возвращает результат напрямую: {"key": float, ...} или {}
     """
     try:
-        result = await calculate_pure_memory(pair, day, date,
-                                             calc_type=type, calc_var=var)
+        rates_table = get_rates_table_name(pair, day)
+        # Async часть: обновить свечи если нужно (с 30-сек кешем — редко бьёт в БД)
+        await _refresh_rates_if_needed(rates_table)
+        # CPU часть: в thread pool чтобы не блокировать event loop
+        result = await asyncio.to_thread(
+            functools.partial(_compute_cpu_only, pair, day, date,
+                              calc_type=type, calc_var=var)
+        )
         return result if result is not None else {}
     except Exception as e:
         send_error_trace(e, node=NODE_NAME, script="compute_values")
