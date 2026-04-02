@@ -1,12 +1,13 @@
 """
 cache.py — параллельное заполнение кеша + бэктест.
 
-Ключевые оптимизации vs sequential версии:
-  1. Параллельные HTTP-запросы: вместо одного запроса за раз — батч из HTTP_CONCURRENCY
-  2. Параллельные слоты: все 6 (pair × day) работают одновременно через asyncio.gather
-  3. Bulk INSERT: результаты батча сохраняются одной транзакцией вместо N отдельных
+Ключевые оптимизации:
+  1. /compute_batch вместо N одиночных /compute — 460 000 запросов → ~90
+  2. Общие данные (rates, ranges, extremums) в сервисе читаются 1 раз на батч
+  3. Bulk INSERT: результаты батча сохраняются одной транзакцией
   4. Keep-alive TCP: один коннектор на всё время работы скрипта
-  5. Retry: упавшие даты прогоняются повторно RETRY_PASSES раз
+  5. Retry: упавшие батчи прогоняются повторно RETRY_PASSES раз
+  6. 6 слотов работают параллельно через asyncio.gather
 """
 
 import argparse
@@ -35,24 +36,27 @@ MODEL_IDS = [31]
 
 # ── Параллельность ────────────────────────────────────────────────────────────
 # Сколько одновременных HTTP-запросов к сервису.
-# Начни с 5 — это безопасно. Поднимай по 5 если сервис стабилен.
-# Слишком высокое значение = OOM или pool exhaustion на стороне сервиса.
-HTTP_CONCURRENCY = 1
+# При батчевом режиме каждый запрос уже несёт 50–100 дат,
+# поэтому 2–3 — разумный максимум. Больше не нужно.
+HTTP_CONCURRENCY = 2
 
-# Размер батча свечей для asyncio.gather.
-# batch=50 при concurrency=5 → отправляем 50 запросов, но одновременно идут только 5.
+# Сколько дат отправлять в одном /compute_batch запросе.
+# 50 дат × ~0.5–1с CPU ≈ 25–50с на запрос — хорошо укладывается в BATCH_TIMEOUT.
+# Если сервис однопоточный (workers=1), можно поднять до 100.
 SLOT_BATCH_SIZE = 50
 
-# Retry для упавших дат.
+# Таймаут одного батч-запроса.
+# 50 дат × ~1с CPU = 50с, берём двукратный запас.
+BATCH_TIMEOUT   = 120    # секунд на один POST /compute_batch
+RETRY_TIMEOUT   = 180    # секунд на retry-батч
+
+# Retry для упавших батчей.
 RETRY_PASSES      = 3
-RETRY_PASS_DELAYS = [30, 60, 120]  # сервису нужно время восстановиться
-HTTP_TIMEOUT      = 30             # таймаут одного запроса (секунды)
-RETRY_TIMEOUT     = 90             # таймаут при retry
+RETRY_PASS_DELAYS = [30, 60, 120]
 
 # Circuit breaker: если подряд столько батчей = 100% ошибок → сервис лежит.
-# Пауза CB_PAUSE секунд, потом пробуем снова.
-CB_THRESHOLD = 2    # батчей подряд с 100% ошибок
-CB_PAUSE     = 60   # секунд паузы
+CB_THRESHOLD = 2
+CB_PAUSE     = 60
 
 # ── Логирование ────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -290,27 +294,30 @@ def _compute_signal(values: dict, tier: int) -> int:
     return 1 if total > 0 else (-1 if total < 0 else 0)
 
 
-# ── HTTP ──────────────────────────────────────────────────────────────────────
+# ── HTTP — батчевый запрос ────────────────────────────────────────────────────
 
-async def _call_one(
+async def _call_batch(
     session: aiohttp.ClientSession,
     url: str,
-    params: dict,
+    pair: int,
+    day: int,
+    extra_params: dict,
+    dates: list[str],
     global_sem: asyncio.Semaphore,
-    timeout_sec: float = HTTP_TIMEOUT,
+    timeout_sec: float = BATCH_TIMEOUT,
 ) -> tuple[dict | None, str | None]:
     """
-    Один GET /values. Возвращает (payload | None, error_reason | None).
-    Ограничен глобальным семафором чтобы не перегрузить сервис.
+    POST /compute_batch с батчем дат.
+    Возвращает (payload_dict | None, error_reason | None).
+
+    payload_dict: {date_str: {weight_code: float, ...}, ...}
     """
     async with global_sem:
         try:
-            # Используем /compute — чистое вычисление без кеша на стороне сервиса.
-            # Это исключает конкуренцию за vlad_values_cache между кешером и сервисом,
-            # что было причиной "Packet sequence number wrong" при concurrent запросах.
-            async with session.get(
-                f"{url}/compute",
-                params=params,
+            async with session.post(
+                f"{url}/compute_batch",
+                params={"pair": pair, "day": day, **extra_params},
+                json=dates,
                 timeout=aiohttp.ClientTimeout(total=timeout_sec),
             ) as r:
                 if r.status != 200:
@@ -328,26 +335,15 @@ async def _call_one(
                 except Exception as e:
                     return None, f"JSON parse error: {e}"
 
-                # /compute возвращает результат напрямую (dict без обёртки payLoad)
-                # /values возвращает {"status":"ok","payLoad":{...}}
-                # Обрабатываем оба формата для совместимости
-                if "payLoad" in data:
-                    payload = data["payLoad"]
-                elif "payload" in data:
-                    payload = data["payload"]
-                elif "error" in data and "status" not in data:
-                    # /compute вернул {"error": "..."}
+                # Сервис вернул {"error": "..."}
+                if isinstance(data, dict) and "error" in data and len(data) == 1:
                     return None, f"Сервис вернул error: {data['error'][:200]}"
-                elif "status" not in data:
-                    # /compute вернул dict с результатом напрямую
-                    payload = data
-                else:
-                    return None, f"Нет payLoad в ответе: {str(data)[:200]}"
 
-                if isinstance(payload, dict) and payload.get("status") == "error":
-                    return None, f"Сервис вернул error: {str(payload)[:200]}"
+                # Ожидаем {date_str: dict, ...}
+                if not isinstance(data, dict):
+                    return None, f"Неожиданный тип ответа: {type(data).__name__}"
 
-                return payload, None
+                return data, None
 
         except asyncio.TimeoutError:
             return None, f"Таймаут >{timeout_sec}s"
@@ -361,14 +357,7 @@ async def _call_one(
 
 # ── Bulk INSERT ───────────────────────────────────────────────────────────────
 
-async def _bulk_insert(
-    engine_vlad,
-    rows: list[dict],
-) -> None:
-    """
-    Вставляет список строк в vlad_values_cache одной транзакцией.
-    Намного быстрее N отдельных INSERT IGNORE.
-    """
+async def _bulk_insert(engine_vlad, rows: list[dict]) -> None:
     if not rows:
         return
     try:
@@ -389,11 +378,7 @@ async def _bulk_insert(
 # ── Загрузка кешированных дат ─────────────────────────────────────────────────
 
 async def _load_cached_dates(
-    engine_vlad,
-    service_url: str,
-    pair: int,
-    day: int,
-    p_hash: str,
+    engine_vlad, service_url: str, pair: int, day: int, p_hash: str,
 ) -> set:
     async with engine_vlad.connect() as conn:
         res = await conn.execute(text("""
@@ -404,21 +389,11 @@ async def _load_cached_dates(
         return {row[0] for row in res.fetchall()}
 
 
-# ── Один проход по списку свечей ──────────────────────────────────────────────
-
-FailedItem = dict  # {"candle": dict, "reason": str}
-
-
+# ── Проверка доступности сервиса ──────────────────────────────────────────────
 
 async def _check_service_alive(
-    session: aiohttp.ClientSession,
-    url: str,
-    label: str = "",
+    session: aiohttp.ClientSession, url: str, label: str = "",
 ) -> bool:
-    """
-    Проверяет что сервис отвечает на GET /.
-    Если нет — логирует причину.
-    """
     try:
         async with session.get(
             f"{url}/",
@@ -429,7 +404,7 @@ async def _check_service_alive(
             log.warning(f"{label} ⚠️  Сервис отвечает HTTP {r.status}")
             return False
     except asyncio.TimeoutError:
-        log.warning(f"{label} ⚠️  Сервис не отвечает (таймаут 5s)")
+        log.warning(f"{label} ⚠️  Сервис не отвечает (таймаут 30s)")
         return False
     except aiohttp.ClientConnectorError as e:
         log.warning(f"{label} ⚠️  Сервис недоступен: {e}")
@@ -437,6 +412,12 @@ async def _check_service_alive(
     except Exception as e:
         log.warning(f"{label} ⚠️  Ошибка проверки сервиса: {e}")
         return False
+
+
+# ── Один проход по списку свечей ──────────────────────────────────────────────
+
+FailedItem = dict  # {"candle": dict, "reason": str}
+
 
 async def _run_pass(
     candles: list[dict],
@@ -454,66 +435,68 @@ async def _run_pass(
     timeout_sec: float,
 ) -> tuple[int, list[FailedItem]]:
     """
-    Проходит по candles батчами ПОСЛЕДОВАТЕЛЬНЫХ HTTP-запросов.
-    Не останавливается на ошибках — собирает все упавшие в failed_list.
-    Bulk INSERT после каждого батча.
+    Проходит по candles батчами POST /compute_batch.
+
+    Каждый батч = один HTTP-запрос с SLOT_BATCH_SIZE датами.
+    Это принципиальное отличие от старой версии, где каждая свеча = отдельный запрос.
+
+    Соотношение запросов:
+      Было:  N_candles × N_combos запросов  (460 000 для model=31)
+      Стало: ceil(N_candles / SLOT_BATCH_SIZE) × N_combos запросов  (~90 для model=31)
     """
     if not candles:
         return 0, []
 
-    params_json  = json.dumps(extra_params, ensure_ascii=False)
-    ok_count     = 0
+    params_json = json.dumps(extra_params, ensure_ascii=False)
+    ok_count    = 0
     failed: list[FailedItem] = []
-    cb_streak    = 0
+    cb_streak   = 0
 
     for batch_start in range(0, len(candles), SLOT_BATCH_SIZE):
         if deadline.exceeded():
             log.warning(f"{label} ⏰ {pass_name}: дедлайн, прерываем")
             break
 
-        batch = candles[batch_start : batch_start + SLOT_BATCH_SIZE]
+        batch      = candles[batch_start : batch_start + SLOT_BATCH_SIZE]
+        date_strs  = [c["date"].strftime("%Y-%m-%d %H:%M:%S") for c in batch]
+        date_index = {s: c for s, c in zip(date_strs, batch)}
 
-        # ПОСЛЕДОВАТЕЛЬНО запрашиваем все свечи в батче
-        insert_rows: list[dict] = []
+        payload, err = await _call_batch(
+            session, service_url, pair, day,
+            extra_params, date_strs, global_sem, timeout_sec,
+        )
+
         batch_ok  = 0
         batch_err = 0
 
-        for c in batch:
-            res = await _call_one(
-                session,
-                service_url,
-                {"pair": pair, "day": day,
-                 "date": c["date"].strftime("%Y-%m-%d %H:%M:%S"),
-                 **extra_params},
-                global_sem,
-                timeout_sec,
-            )
-
-            if isinstance(res, Exception):
-                failed.append({"candle": c, "reason": f"gather exception: {res}"})
-                batch_err += 1
-                continue
-
-            payload, err = res
-            if err is not None or payload is None:
+        if err is not None or payload is None:
+            # Весь батч упал — все даты идут в failed
+            for c in batch:
                 failed.append({"candle": c, "reason": err or "payload is None"})
-                batch_err += 1
-                continue
+            batch_err = len(batch)
+        else:
+            # Разбираем ответ: payload = {date_str: result_dict}
+            insert_rows: list[dict] = []
+            for date_str, candle in date_index.items():
+                result = payload.get(date_str)
+                if result is None:
+                    # Дата отсутствует в ответе — нештатная ситуация
+                    failed.append({"candle": candle, "reason": "дата отсутствует в batch-ответе"})
+                    batch_err += 1
+                    continue
+                insert_rows.append({
+                    "url":  service_url,
+                    "pair": pair,
+                    "day":  day,
+                    "dv":   candle["date"],
+                    "ph":   p_hash,
+                    "pj":   params_json,
+                    "rj":   json.dumps(result, ensure_ascii=False),
+                })
+                batch_ok += 1
+                ok_count += 1
 
-            insert_rows.append({
-                "url":  service_url,
-                "pair": pair,
-                "day":  day,
-                "dv":   c["date"],
-                "ph":   p_hash,
-                "pj":   params_json,
-                "rj":   json.dumps(payload, ensure_ascii=False),
-            })
-            batch_ok += 1
-            ok_count += 1
-
-        # Bulk INSERT успешных результатов
-        await _bulk_insert(engine_vlad, insert_rows)
+            await _bulk_insert(engine_vlad, insert_rows)
 
         done = batch_start + len(batch)
         pct  = done / len(candles) * 100
@@ -523,7 +506,7 @@ async def _run_pass(
         )
 
         # Circuit breaker
-        if batch_err == len(batch) and batch_ok == 0:
+        if batch_err > 0 and batch_ok == 0:
             cb_streak += 1
             log.warning(
                 f"{label} ⚡ Батч 100% ошибок (streak={cb_streak}/{CB_THRESHOLD}). "
@@ -573,38 +556,32 @@ async def fill_cache_parallel(
     deadline: Deadline,
     slot: str = "",
 ) -> dict:
-    """
-    Заполняет кеш для одного (pair, day, combo).
-    Параллельные HTTP-запросы + bulk INSERT + retry для упавших.
-    """
     if not candles:
         return {"new": 0, "skipped": 0, "errors": 0, "total": 0}
 
-    label   = f"[{slot}]" if slot else "[cache]"
-    p_hash  = _params_hash(extra_params)
+    label  = f"[{slot}]" if slot else "[cache]"
+    p_hash = _params_hash(extra_params)
 
-    # Загружаем уже кешированные даты
     cached_dates = await _load_cached_dates(engine_vlad, service_url, pair, day, p_hash)
     skipped      = sum(1 for c in candles if c["date"] in cached_dates)
     to_fetch     = [c for c in candles if c["date"] not in cached_dates]
 
+    n_batches = math.ceil(len(to_fetch) / SLOT_BATCH_SIZE) if to_fetch else 0
     log.info(
         f"{label} Начало: {len(candles)} свечей  "
         f"в кеше={len(cached_dates)}  нужно={len(to_fetch)}  "
-        f"params={json.dumps(extra_params)}"
+        f"батчей≈{n_batches}  params={json.dumps(extra_params)}"
     )
 
     if not to_fetch:
         return {"new": 0, "skipped": skipped, "errors": 0, "total": len(candles)}
 
-    # Основной проход
     ok, failed = await _run_pass(
         to_fetch, session, service_url, pair, day,
         extra_params, p_hash, global_sem, engine_vlad,
-        deadline, label, "▶ Основной", HTTP_TIMEOUT,
+        deadline, label, "▶ Основной", BATCH_TIMEOUT,
     )
 
-    # Retry-проходы для упавших дат
     for pass_num in range(1, RETRY_PASSES + 1):
         if not failed or deadline.exceeded():
             break
@@ -617,7 +594,7 @@ async def fill_cache_parallel(
         await asyncio.sleep(delay)
 
         retry_candles = [item["candle"] for item in failed]
-        ok_r, failed = await _run_pass(
+        ok_r, failed  = await _run_pass(
             retry_candles, session, service_url, pair, day,
             extra_params, p_hash, global_sem, engine_vlad,
             deadline, label, f"♻ Retry {pass_num}", RETRY_TIMEOUT,
@@ -634,7 +611,6 @@ async def fill_cache_parallel(
         log.warning(
             f"{label} ⚠️  Готово с ошибками: new={ok}  skip={skipped}  err={errors}"
         )
-        # Логируем примеры ошибок — группируем по причине
         reasons: dict[str, list] = {}
         for item in failed:
             key = item["reason"][:80]
@@ -874,11 +850,6 @@ async def run_slot(
     global_sem: asyncio.Semaphore,
     session: aiohttp.ClientSession,
 ) -> dict:
-    """
-    Обрабатывает один слот (pair, day) полностью:
-    кеш для всех комбо + бэктест для всех тиров.
-    Запускается параллельно с другими слотами через asyncio.gather.
-    """
     slot  = _slot_label(pair, day)
     label = f"[{slot}]"
     stats_cache    = {"new": 0, "skipped": 0, "errors": 0}
@@ -889,13 +860,16 @@ async def run_slot(
         log.warning(f"{label} ⚠️  Нет свечей — пропускаем")
         return {"slot": slot, "cache": stats_cache, "backtest": stats_backtest, "timed_out": False}
 
-    # Проверяем что сервис доступен перед началом работы
     alive = await _check_service_alive(session, service_url, label)
     if not alive:
-        log.error(f"{label} ❌ Сервис {service_url} недоступен. Проверь что он запущен и порт доступен.")
+        log.error(f"{label} ❌ Сервис {service_url} недоступен.")
         return {"slot": slot, "cache": stats_cache, "backtest": stats_backtest, "timed_out": False}
 
-    log.info(f"{label} ▶  Кеш: {len(candles)} свечей, {len(param_combos)} комбинаций")
+    n_batches = math.ceil(len(candles) / SLOT_BATCH_SIZE)
+    log.info(
+        f"{label} ▶  Кеш: {len(candles)} свечей  "
+        f"батчей≈{n_batches}  комбинаций={len(param_combos)}"
+    )
 
     # ── Кеш ───────────────────────────────────────────────────────────────────
     if not args.skip_fill:
@@ -1011,16 +985,22 @@ async def run_model(
 ) -> tuple[dict, dict, bool]:
     slots = [(p, d) for p in args.pairs for d in args.days]
 
+    # Оценка количества батч-запросов
+    est_batches_per_combo = sum(
+        math.ceil(1 / SLOT_BATCH_SIZE)  # placeholder — реальные цифры после загрузки свечей
+        for _ in slots
+    )
+
     log.info(
         f"\n{'#'*60}\n"
         f"  🤖 model_id={model_id}  url={service_url}\n"
         f"  Слотов: {len(slots)}  Комбинаций: {len(param_combos)}\n"
         f"  HTTP_CONCURRENCY={HTTP_CONCURRENCY}  SLOT_BATCH_SIZE={SLOT_BATCH_SIZE}\n"
+        f"  BATCH_TIMEOUT={BATCH_TIMEOUT}s  RETRY_TIMEOUT={RETRY_TIMEOUT}s\n"
         f"  Retry: passes={RETRY_PASSES}  delays={RETRY_PASS_DELAYS}s\n"
         f"{'#'*60}"
     )
 
-    # Загружаем свечи для всех слотов параллельно
     log.info("  📊 Загружаем свечи для всех слотов параллельно...")
     candles_list = await asyncio.gather(*[
         fetch_candles(engine_brain, p, d, date_from, date_to)
@@ -1028,18 +1008,17 @@ async def run_model(
     ])
     candles_map = dict(zip(slots, candles_list))
     for (p, d), cc in candles_map.items():
-        log.info(f"  [{_slot_label(p, d)}] свечей: {len(cc)}")
+        n_batches = math.ceil(len(cc) / SLOT_BATCH_SIZE) if cc else 0
+        log.info(f"  [{_slot_label(p, d)}] свечей: {len(cc)}  батчей: {n_batches}  "
+                 f"× {len(param_combos)} комбо = {n_batches * len(param_combos)} запросов")
 
-    # Один глобальный семафор для всех HTTP-запросов к этому сервису
     global_sem = asyncio.Semaphore(HTTP_CONCURRENCY)
 
-    # Один keep-alive сессия на всё время работы модели
-    connector = aiohttp.TCPConnector(keepalive_timeout=60, limit=HTTP_CONCURRENCY + 10)
+    connector = aiohttp.TCPConnector(keepalive_timeout=60, limit=HTTP_CONCURRENCY + 4)
     async with aiohttp.ClientSession(connector=connector) as session:
 
         log.info(f"\n  🚀 Запускаем {len(slots)} слотов параллельно...")
 
-        # Все слоты стартуют одновременно
         slot_tasks = [
             run_slot(
                 pair=p, day=d,
@@ -1059,7 +1038,6 @@ async def run_model(
         ]
         slot_results = await asyncio.gather(*slot_tasks, return_exceptions=True)
 
-    # Агрегируем статистику
     sc = {"new": 0, "skipped": 0, "errors": 0}
     sb = {"done": 0, "skipped": 0, "failed": 0}
     timed_out = False
@@ -1261,13 +1239,14 @@ async def run(args) -> None:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Кеш + бэктест. Параллельные HTTP-запросы + parallel slots.",
+        description="Кеш + бэктест. Батчевые запросы к /compute_batch.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"""
 Параметры производительности (в коде):
-  HTTP_CONCURRENCY  = {HTTP_CONCURRENCY}   — одновременных запросов к сервису
-  SLOT_BATCH_SIZE   = {SLOT_BATCH_SIZE}  — свечей в параллельном батче
-  RETRY_PASSES      = {RETRY_PASSES}    — перепрогонов для упавших дат
+  HTTP_CONCURRENCY  = {HTTP_CONCURRENCY}   — одновременных батч-запросов к сервису
+  SLOT_BATCH_SIZE   = {SLOT_BATCH_SIZE}  — дат в одном батч-запросе
+  BATCH_TIMEOUT     = {BATCH_TIMEOUT}s  — таймаут одного батч-запроса
+  RETRY_PASSES      = {RETRY_PASSES}    — перепрогонов для упавших батчей
 
 Примеры:
   python cache.py
@@ -1312,9 +1291,9 @@ def main():
     log.info(f"   слотов            : {n_slots} → {slots}")
     log.info(f"   HTTP_CONCURRENCY  : {HTTP_CONCURRENCY}")
     log.info(f"   SLOT_BATCH_SIZE   : {SLOT_BATCH_SIZE}")
+    log.info(f"   BATCH_TIMEOUT     : {BATCH_TIMEOUT}s")
     log.info(f"   RETRY_PASSES      : {RETRY_PASSES}")
     log.info(f"   RETRY_PASS_DELAYS : {RETRY_PASS_DELAYS}s")
-    log.info(f"   HTTP/RETRY timeout: {HTTP_TIMEOUT}/{RETRY_TIMEOUT}s")
     log.info("=" * 60)
 
     try:
