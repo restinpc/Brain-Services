@@ -190,7 +190,9 @@ async def preload_all_data():
             res  = await conn.execute(text(
                 f"SELECT `datetime`, {col_list} FROM vlad_market_history ORDER BY `datetime`"))
             rows = res.fetchall()
-            log(f"  vlad_market_history: {len(rows)} rows", NODE_NAME)
+            log(f"  vlad_market_history (from engine_vlad): {len(rows)} rows", NODE_NAME)
+            if rows:
+                log(f"    date range: {rows[0][0]} → {rows[-1][0]}", NODE_NAME)
             by_instr    = {instr: [] for instr in INSTRUMENT_COLUMNS}
             instruments = list(INSTRUMENT_COLUMNS.keys())
             for row in rows:
@@ -200,6 +202,8 @@ async def preload_all_data():
                     if val is not None:
                         by_instr[instr].append((dt, float(val)))
             for instr, series in by_instr.items():
+                log(f"    {instr}: {len(series)} observations" +
+                    (f", last={series[-1][0]}" if series else ""), NODE_NAME)
                 if not series:
                     continue
                 threshold = THRESHOLD_BY_INSTRUMENT.get(instr, DEFAULT_THRESHOLD)
@@ -337,6 +341,7 @@ async def _refresh_rates_if_needed(rates_table):
 async def calculate_pure_memory(pair, day, date_str, calc_type=0, calc_var=0):
     target_date = parse_date_string(date_str)
     if not target_date:
+        log(f"  🔍 DIAG: parse_date_string failed for '{date_str}'", NODE_NAME)
         return None
 
     rates_table  = get_rates_table_name(pair, day)
@@ -346,21 +351,41 @@ async def calculate_pure_memory(pair, day, date_str, calc_type=0, calc_var=0):
     check_dts    = [target_date + delta_unit * s
                     for s in range(-SHIFT_WINDOW, SHIFT_WINDOW + 1)]
 
+    log(f"  🔍 DIAG: target={target_date} pair={pair} day={day} type={calc_type} var={calc_var}", NODE_NAME)
+    log(f"  🔍 DIAG: rates_table={rates_table} rates_keys={len(GLOBAL_RATES.get(rates_table, {}))}", NODE_NAME)
+    log(f"  🔍 DIAG: _MKT_SORTED_DATES len={len(_MKT_SORTED_DATES)}"
+        + (f" range={_MKT_SORTED_DATES[0]}→{_MKT_SORTED_DATES[-1]}" if _MKT_SORTED_DATES else " EMPTY"),
+        NODE_NAME)
+    log(f"  🔍 DIAG: check_dts range={check_dts[0]}→{check_dts[-1]} (after filter: ≤{target_date})", NODE_NAME)
+
     observations = []
+    _diag_checked = 0
+    _diag_found_in_sorted = 0
+    _diag_found_instr = 0
+    _diag_found_ctx = 0
     for dt in check_dts:
         if dt > target_date:
             continue
+        _diag_checked += 1
         dt_end = dt + delta_unit
         _l = bisect.bisect_left(_MKT_SORTED_DATES, dt)
         _r = bisect.bisect_left(_MKT_SORTED_DATES, dt_end)
+        _diag_found_in_sorted += (_r - _l)
         for _i in range(_l, _r):
             obs_dt = _MKT_SORTED_DATES[_i]
             for instr in GLOBAL_MKT_OBS_DTS.get(obs_dt, set()):
+                _diag_found_instr += 1
                 ctx = GLOBAL_MKT_CONTEXT.get((instr, obs_dt))
                 if ctx:
+                    _diag_found_ctx += 1
                     observations.append((instr, obs_dt, ctx, round((target_date - obs_dt) / delta_unit)))
 
+    log(f"  🔍 DIAG: checked={_diag_checked} bisect_hits={_diag_found_in_sorted} "
+        f"instr_hits={_diag_found_instr} ctx_hits={_diag_found_ctx} observations={len(observations)}",
+        NODE_NAME)
+
     if not observations:
+        log(f"  🔍 DIAG: EMPTY — no observations found → return {{}}", NODE_NAME)
         return {}
 
     ram_rates   = GLOBAL_RATES.get(rates_table, {})
@@ -369,27 +394,46 @@ async def calculate_pure_memory(pair, day, date_str, calc_type=0, calc_var=0):
     ram_ext     = GLOBAL_EXTREMUMS.get(rates_table, {"min": set(), "max": set()})
     prev_candle = find_prev_candle_trend(rates_table, target_date)
 
+    log(f"  🔍 DIAG: ram_rates={len(ram_rates)} ram_ranges={len(ram_ranges)} "
+        f"avg_range={avg_range:.6f} ext_min={len(ram_ext.get('min',set()))} "
+        f"ext_max={len(ram_ext.get('max',set()))} prev_candle={'YES' if prev_candle else 'NO'}",
+        NODE_NAME)
+
     result = {}
+    _diag_no_ctx = 0
+    _diag_not_recurring = 0
+    _diag_shift_out = 0
+    _diag_no_valid = 0
+    _diag_no_tdates = 0
+    _diag_computed = 0
     for instr, obs_dt, (rcd, td, md), shift in observations:
         ctx_key  = (instr, rcd, td, md)
         ctx_info = GLOBAL_CTX_INDEX.get(ctx_key)
         if ctx_info is None:
+            _diag_no_ctx += 1
             continue
         is_recurring = ctx_info["occurrence_count"] >= RECURRING_MIN_COUNT
         if not is_recurring and shift != 0:
+            _diag_not_recurring += 1
             continue
         if is_recurring and abs(shift) > SHIFT_WINDOW:
+            _diag_shift_out += 1
             continue
 
         all_ctx_dts = GLOBAL_MKT_CTX_HIST.get(ctx_key, [])
         idx         = bisect.bisect_left(all_ctx_dts, target_date)
         valid_dts   = all_ctx_dts[:idx]
         if not valid_dts:
+            _diag_no_valid += 1
             continue
 
         t_dates   = [d + delta_unit * shift for d in valid_dts
                      if (d + delta_unit * shift) < target_date]
+        if not t_dates:
+            _diag_no_tdates += 1
+            continue
         shift_arg = shift if is_recurring else None
+        _diag_computed += 1
 
         if calc_type in (0, 1):
             t1_sum = compute_t1_value(t_dates, calc_var, ram_rates, ram_ranges, avg_range)
@@ -405,7 +449,14 @@ async def calculate_pure_memory(pair, day, date_str, calc_type=0, calc_var=0):
                 wc = make_weight_code(instr, rcd, td, md, 1, shift_arg)
                 result[wc] = result.get(wc, 0.0) + ext_val
 
-    return {k: round(v, 6) for k, v in result.items() if v != 0}
+    log(f"  🔍 DIAG: no_ctx_idx={_diag_no_ctx} not_recurring={_diag_not_recurring} "
+        f"shift_out={_diag_shift_out} no_valid_history={_diag_no_valid} "
+        f"no_tdates={_diag_no_tdates} computed={_diag_computed}",
+        NODE_NAME)
+
+    final = {k: round(v, 6) for k, v in result.items() if v != 0}
+    log(f"  🔍 DIAG: result_keys_before_filter={len(result)} result_keys_final={len(final)}", NODE_NAME)
+    return final
 
 
 @app.get("/")
@@ -471,6 +522,30 @@ async def get_values(
         send_error_trace(e, node=NODE_NAME, script="get_values")
         return err_response(str(e))
 
+
+
+@app.get("/compute")
+async def compute_values(
+    pair: int = Query(1), day: int = Query(1), date: str = Query(...),
+    type: int = Query(0, ge=0, le=2), var: int = Query(0, ge=0, le=4),
+):
+    """
+    Чистое вычисление без кеширования.
+    Используется cache.py при построении кеша — чтобы не создавать
+    конкуренцию за vlad_values_cache между кешером и сервисом.
+
+    Возвращает результат напрямую:
+      {"key1": float, "key2": float, ...}  — непустой результат
+      {}                                   — нет сигнала на эту дату
+      {"error": "..."}                     — ошибка вычисления
+    """
+    try:
+        result = await calculate_pure_memory(pair, day, date,
+                                             calc_type=type, calc_var=var)
+        return result if result is not None else {}
+    except Exception as e:
+        send_error_trace(e, node=NODE_NAME, script="compute_values")
+        return {"error": str(e)}
 
 @app.post("/patch")
 async def patch_service():
