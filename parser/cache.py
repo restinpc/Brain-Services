@@ -31,8 +31,8 @@ SERVICE_FOLDER_MAP: dict[int, str] = {
 }
 
 # ── Параллельность ────────────────────────────────────────────────────────────
-SLOT_CONCURRENCY = 12    # параллельных вычислений на один слот
-SLOT_BATCH_SIZE  = 500   # свечей в батче (локальный вызов быстрее HTTP, можно больше)
+SLOT_CONCURRENCY = 6    # параллельных вычислений на один слот
+SLOT_BATCH_SIZE  = 250   # свечей в батче (локальный вызов быстрее HTTP, можно больше)
 
 # ── Стратегия retry: collect-then-retry ──────────────────────────────────────
 # Основной проход — не останавливается на ошибках, собирает все упавшие.
@@ -42,8 +42,13 @@ RETRY_PASSES      = 3
 RETRY_PASS_DELAYS = [10, 30, 60]   # сек; локальные вызовы восстанавливаются быстрее
 
 # ── Логирование ────────────────────────────────────────────────────────────────
+# ── Режим отладки — включить чтобы видеть [DEBUG] логи ───────────────────────
+# Переключи на True когда нужно диагностировать проблемы с кешем.
+# В обычном режиме держи False — DEBUG-логи очень многословны.
+DEBUG_MODE = True
+
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG if DEBUG_MODE else logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
@@ -391,7 +396,8 @@ class ServiceRunner:
         if self._style == "unknown":
             return None, (
                 f"server.py (model={self.model_id}) не содержит ни calculate(), "
-                f"ни calculate_pure_memory()\n"
+                f"ни calculate_pure_memory()
+"
                 f"Проверь что это правильный файл сервиса"
             )
 
@@ -576,10 +582,20 @@ async def _fetch_and_store_one(
 
     async with sem:
         # calculate_async сам решает: await (async) или to_thread (sync)
+        log.debug(f"[DEBUG] calculate_async → pair={pair} day={day} date={date_str} params={extra_params}")
         result, err = await runner.calculate_async(pair, day, date_str, extra_params)
+        log.debug(f"[DEBUG] calculate_async ← err={err!r} result_type={type(result).__name__} result={repr(result)[:120]}")
 
     if err is not None:
         return "error", date_str, err
+
+    # Лог перед INSERT — видно доходит ли до записи и что именно пишем
+    log.debug(
+        f"[DEBUG] INSERT date={date_str} "
+        f"result_empty={not result} "
+        f"result={repr(result)[:120]} "
+        f"service_url={runner.service_url}"
+    )
 
     try:
         async with engine_vlad.begin() as conn:
@@ -597,9 +613,10 @@ async def _fetch_and_store_one(
                 "pj":   json.dumps(extra_params, ensure_ascii=False),
                 "rj":   json.dumps(result,       ensure_ascii=False),
             })
+        log.debug(f"[DEBUG] INSERT OK date={date_str}")
     except Exception as e:
-        # Ошибка записи в кеш не является критической — логируем и продолжаем
-        log.debug(f"[CACHE] DB insert warn date={date_str}: {e}")
+        # Временно повышаем до WARNING чтобы было видно в обычных логах
+        log.warning(f"[DEBUG] INSERT FAILED date={date_str}: {type(e).__name__}: {e}")
 
     return "ok", date_str, None
 
