@@ -22,18 +22,27 @@ MODEL_IDS = [30]
 
 # ── Параллельность ────────────────────────────────────────────────────────────
 # Максимум одновременных HTTP-запросов ко всем слотам суммарно.
-HTTP_CONCURRENCY = 30   # глобальный лимит (был 6)
+# ВАЖНО: не превышать реальный лимит сервиса. Если сервис не тянет —
+# снижай HTTP_CONCURRENCY; признак — все запросы таймаутятся.
+HTTP_CONCURRENCY = 10   # глобальный лимит (6 слотов × 2 = 12, режется до 10)
 
 # Максимум одновременных запросов на один слот.
-# 6 слотов × 5 = 30 → ровно HTTP_CONCURRENCY.
-SLOT_CONCURRENCY = 5    # локальный лимит на слот (новый параметр)
+# 6 слотов × 2 = 12, global_sem режет до HTTP_CONCURRENCY.
+SLOT_CONCURRENCY = 2    # локальный лимит на слот
 
 # Сколько свечей одного слота обрабатывается параллельно.
-SLOT_BATCH_SIZE = 10    # был 1, теперь 10 → на порядок быстрее
+SLOT_BATCH_SIZE = 10    # батч; реальная параллельность = min(batch, slot_sem)
 
-# Ретраи при таймауте/ошибке сети
-HTTP_RETRIES    = 3     # число попыток
-HTTP_RETRY_DELAY = 2.0  # базовая задержка (секунды), удваивается при backoff
+# Ретраи при таймауте/ошибке сети.
+# При массовых таймаутах retry = 1 (fail-fast): лучше быстро пропустить дату
+# и дообработать при следующем запуске, чем тратить 3x времени впустую.
+HTTP_RETRIES    = 2     # 1 = fail-fast; 2-3 = при нестабильной сети
+HTTP_RETRY_DELAY = 0.5  # базовая задержка (секунды)
+
+# Circuit breaker: если подряд столько ошибок — пауза перед следующим батчем.
+# Защищает от лавины запросов к упавшему сервису.
+CB_FAIL_THRESHOLD = 20   # сколько ошибок подряд → пауза
+CB_PAUSE_SECONDS  = 30   # пауза в секундах
 
 # ── Логирование ────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -447,6 +456,8 @@ async def fill_cache(
         f"батч={SLOT_BATCH_SIZE}  slot_concur={SLOT_CONCURRENCY}"
     )
 
+    consecutive_errors = 0  # circuit breaker: счётчик подряд идущих ошибок
+
     async with aiohttp.ClientSession() as session:
         for batch_start in range(0, len(to_fetch), SLOT_BATCH_SIZE):
             if deadline.exceeded():
@@ -455,6 +466,15 @@ async def fill_cache(
                     f"Обработано {batch_start}/{len(to_fetch)}"
                 )
                 break
+
+            # ── Circuit breaker ───────────────────────────────────────────────
+            if consecutive_errors >= CB_FAIL_THRESHOLD:
+                log.warning(
+                    f"{prefix} ⚡ Circuit breaker: {consecutive_errors} ошибок подряд, "
+                    f"пауза {CB_PAUSE_SECONDS}s..."
+                )
+                await asyncio.sleep(CB_PAUSE_SECONDS)
+                consecutive_errors = 0
 
             batch = to_fetch[batch_start : batch_start + SLOT_BATCH_SIZE]
 
@@ -471,17 +491,20 @@ async def fill_cache(
             for r in batch_results:
                 if isinstance(r, Exception):
                     errors += 1
+                    consecutive_errors += 1
                 elif r[0] == "ok":
                     new_count += 1
+                    consecutive_errors = 0  # успех сбрасывает счётчик
                 else:
                     errors += 1
                     error_dates.append(r[1])
+                    consecutive_errors += 1
 
             done_so_far = batch_start + len(batch)
             pct = done_so_far / len(to_fetch) * 100 if to_fetch else 100
             log.info(
                 f"{prefix} [{done_so_far}/{len(to_fetch)}] {pct:.1f}%  "
-                f"new={new_count}  err={errors}"
+                f"new={new_count}  err={errors}  cb_streak={consecutive_errors}"
             )
 
     done = skipped + new_count + errors
