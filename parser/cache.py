@@ -22,12 +22,18 @@ MODEL_IDS = [30]
 
 # ── Параллельность ────────────────────────────────────────────────────────────
 # Максимум одновременных HTTP-запросов ко всем слотам суммарно.
-HTTP_CONCURRENCY = 6   # глобальный лимит (семафор в _call_values)
+HTTP_CONCURRENCY = 30   # глобальный лимит (был 6)
+
+# Максимум одновременных запросов на один слот.
+# 6 слотов × 5 = 30 → ровно HTTP_CONCURRENCY.
+SLOT_CONCURRENCY = 5    # локальный лимит на слот (новый параметр)
 
 # Сколько свечей одного слота обрабатывается параллельно.
-# 6 слотов × 20 батч = 120 попыток → семафор режет до HTTP_CONCURRENCY=30.
-# Даёт ~4–5x прирост скорости заполнения кеша по сравнению с sequential.
-SLOT_BATCH_SIZE = 1
+SLOT_BATCH_SIZE = 10    # был 1, теперь 10 → на порядок быстрее
+
+# Ретраи при таймауте/ошибке сети
+HTTP_RETRIES    = 3     # число попыток
+HTTP_RETRY_DELAY = 2.0  # базовая задержка (секунды), удваивается при backoff
 
 # ── Логирование ────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -91,7 +97,6 @@ DAY_NAMES  = {0: "hourly",  1: "daily"}
 
 
 def _slot_label(pair: int, day: int) -> str:
-    """Короткий читаемый идентификатор слота для логов."""
     return f"{PAIR_NAMES.get(pair, f'pair{pair}')}-{'day' if day else 'hour'}"
 
 
@@ -261,40 +266,79 @@ def _compute_signal(values: dict, tier: int) -> int:
     return 1 if total > 0 else (-1 if total < 0 else 0)
 
 
-async def _call_values(session: aiohttp.ClientSession,
-                       url: str, params: dict,
-                       http_sem: asyncio.Semaphore) -> dict | None:
-    """HTTP-запрос к /values с ограничением одновременных запросов через sem."""
-    async with http_sem:
-        try:
-            async with session.get(
-                f"{url}/values",
-                params=params,
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as r:
-                if r.status != 200:
-                    log.warning(f"[CACHE] HTTP {r.status} для date={params.get('date')} params={params}")
-                    return None
-                data = await r.json()
-                if "payLoad" in data:
-                    payload = data["payLoad"]
-                elif "payload" in data:
-                    payload = data["payload"]
-                elif "status" not in data:
-                    payload = data
-                else:
-                    log.warning(f"[CACHE] Нет payLoad в ответе для date={params.get('date')} params={params}: {data}")
-                    return None
-                if isinstance(payload, dict) and payload.get("status") == "error":
-                    log.warning(f"[CACHE] Сервис вернул error для date={params.get('date')}: {payload}")
-                    return None
-                return payload
-        except asyncio.TimeoutError:
-            log.warning(f"[CACHE] Таймаут для date={params.get('date')} url={url}")
-            return None
-        except Exception as e:
-            log.warning(f"[CACHE] Исключение для date={params.get('date')}: {e}")
-            return None
+# ── HTTP запрос с retry ────────────────────────────────────────────────────────
+
+async def _call_values(
+    session: aiohttp.ClientSession,
+    url: str,
+    params: dict,
+    global_sem: asyncio.Semaphore,
+    slot_sem: asyncio.Semaphore,
+) -> dict | None:
+    """
+    HTTP GET /values с двойным семафором (глобальный + слотовый) и retry.
+
+    - slot_sem:   не более SLOT_CONCURRENCY запросов от данного слота
+    - global_sem: не более HTTP_CONCURRENCY запросов суммарно
+    Retry: до HTTP_RETRIES попыток с экспоненциальным backoff.
+    """
+    date_str = params.get("date", "?")
+
+    for attempt in range(HTTP_RETRIES):
+        async with slot_sem:
+            async with global_sem:
+                try:
+                    async with session.get(
+                        f"{url}/values",
+                        params=params,
+                        timeout=aiohttp.ClientTimeout(total=20),
+                    ) as r:
+                        if r.status != 200:
+                            log.warning(
+                                f"[CACHE] HTTP {r.status} date={date_str} "
+                                f"attempt={attempt+1}"
+                            )
+                            # 5xx — стоит ретраить, 4xx — нет
+                            if r.status < 500:
+                                return None
+                            # иначе — выйти из async with и сделать retry
+                        else:
+                            data = await r.json()
+                            if "payLoad" in data:
+                                payload = data["payLoad"]
+                            elif "payload" in data:
+                                payload = data["payload"]
+                            elif "status" not in data:
+                                payload = data
+                            else:
+                                log.warning(
+                                    f"[CACHE] Нет payLoad date={date_str}: {data}"
+                                )
+                                return None
+
+                            if isinstance(payload, dict) and payload.get("status") == "error":
+                                log.warning(
+                                    f"[CACHE] Сервис вернул error date={date_str}: {payload}"
+                                )
+                                return None
+
+                            return payload  # ← успех
+
+                except asyncio.TimeoutError:
+                    log.warning(
+                        f"[CACHE] Таймаут date={date_str} url={url} "
+                        f"attempt={attempt+1}/{HTTP_RETRIES}"
+                    )
+                except Exception as e:
+                    log.warning(
+                        f"[CACHE] Ошибка date={date_str} attempt={attempt+1}: {e}"
+                    )
+
+        # backoff перед следующей попыткой (вне обоих семафоров)
+        if attempt < HTTP_RETRIES - 1:
+            await asyncio.sleep(HTTP_RETRY_DELAY * (2 ** attempt))
+
+    return None  # все попытки исчерпаны
 
 
 async def fetch_candles(engine_brain, pair: int, day: int,
@@ -322,19 +366,19 @@ async def _fetch_and_store_one(
     day: int,
     extra_params: dict,
     p_hash: str,
-    http_sem: asyncio.Semaphore,
+    global_sem: asyncio.Semaphore,
+    slot_sem: asyncio.Semaphore,
     engine_vlad,
 ) -> tuple[str, str]:
     """
     Получает /values для одной свечи и сохраняет в кеш.
     Возвращает ('ok'|'error', date_str).
-    Семафор ограничивает одновременные HTTP-запросы глобально.
     """
     date_val    = candle["date"]
     date_str    = date_val.strftime("%Y-%m-%d %H:%M:%S")
     call_params = {"pair": pair, "day": day, "date": date_str, **extra_params}
 
-    result = await _call_values(session, service_url, call_params, http_sem)
+    result = await _call_values(session, service_url, call_params, global_sem, slot_sem)
     if result is None:
         return "error", date_str
 
@@ -357,20 +401,23 @@ async def _fetch_and_store_one(
     return "ok", date_str
 
 
-async def fill_cache(engine_vlad, candles: list[dict],
-                     service_url: str, pair: int, day: int,
-                     extra_params: dict,
-                     deadline: Deadline,
-                     http_sem: asyncio.Semaphore,
-                     slot: str = "") -> dict:
+async def fill_cache(
+    engine_vlad,
+    candles: list[dict],
+    service_url: str,
+    pair: int,
+    day: int,
+    extra_params: dict,
+    deadline: Deadline,
+    global_sem: asyncio.Semaphore,
+    slot_sem: asyncio.Semaphore,
+    slot: str = "",
+) -> dict:
     """
     Заполняет кеш для одного слота (pair, day, extra_params).
 
-    Внутри слота свечи обрабатываются батчами по SLOT_BATCH_SIZE параллельных
-    запросов. Глобальный семафор http_sem ограничивает суммарную нагрузку
-    на сервис со всех параллельных слотов.
-
-    slot — метка для логов, напр. 'EUR/USD-hour'.
+    Свечи обрабатываются батчами по SLOT_BATCH_SIZE параллельных запросов.
+    Семафоры ограничивают нагрузку: slot_sem — на слот, global_sem — суммарно.
     """
     if not candles:
         return {"done": 0, "total": 0, "errors": 0, "skipped": 0, "new": 0, "error_dates": []}
@@ -397,22 +444,26 @@ async def fill_cache(engine_vlad, candles: list[dict],
     log.info(
         f"{prefix} Начало: {total} свечей  "
         f"в кеше={len(cached_dates)}  нужно={len(to_fetch)}  "
-        f"батч={SLOT_BATCH_SIZE}"
+        f"батч={SLOT_BATCH_SIZE}  slot_concur={SLOT_CONCURRENCY}"
     )
 
     async with aiohttp.ClientSession() as session:
         for batch_start in range(0, len(to_fetch), SLOT_BATCH_SIZE):
             if deadline.exceeded():
-                log.warning(f"{prefix} ⏰ Таймаут! Обработано {batch_start}/{len(to_fetch)}")
+                log.warning(
+                    f"{prefix} ⏰ Таймаут! "
+                    f"Обработано {batch_start}/{len(to_fetch)}"
+                )
                 break
 
             batch = to_fetch[batch_start : batch_start + SLOT_BATCH_SIZE]
 
-            # Все запросы батча уходят параллельно; семафор дозирует их глобально
             batch_results = await asyncio.gather(*[
                 _fetch_and_store_one(
                     candle, session, service_url, pair, day,
-                    extra_params, p_hash, http_sem, engine_vlad,
+                    extra_params, p_hash,
+                    global_sem, slot_sem,
+                    engine_vlad,
                 )
                 for candle in batch
             ], return_exceptions=True)
@@ -422,7 +473,7 @@ async def fill_cache(engine_vlad, candles: list[dict],
                     errors += 1
                 elif r[0] == "ok":
                     new_count += 1
-                else:  # "error"
+                else:
                     errors += 1
                     error_dates.append(r[1])
 
@@ -434,7 +485,10 @@ async def fill_cache(engine_vlad, candles: list[dict],
             )
 
     done = skipped + new_count + errors
-    log.info(f"{prefix} ✓ Готово: total={total}  new={new_count}  skip={skipped}  err={errors}")
+    log.info(
+        f"{prefix} ✓ Готово: total={total}  "
+        f"new={new_count}  skip={skipped}  err={errors}"
+    )
     return {
         "done": done, "total": total, "errors": errors,
         "skipped": skipped, "new": new_count, "error_dates": error_dates,
@@ -634,6 +688,7 @@ async def upsert_summary(engine_vlad, service_url: str, model_id: int,
 
 # ─────────────────────────────────────────────────────────────────────────────
 # process_slot — единица параллелизма: один (pair, day)
+# Каждый слот работает в своём потоке asyncio, имеет собственный slot_sem.
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def process_slot(
@@ -648,16 +703,21 @@ async def process_slot(
     date_from: datetime,
     date_to: datetime,
     deadline: Deadline,
-    http_sem: asyncio.Semaphore,
+    global_sem: asyncio.Semaphore,
 ) -> dict:
     """
     Обрабатывает один слот (pair × day) полностью:
-      1. Заполняет кеш для всех param_combos
+      1. Заполняет кеш для всех param_combos (последовательно по combo)
       2. Запускает бэктест для всех param_combos × tiers
-    Возвращает агрегированную статистику слота.
+
+    Каждый слот создаёт собственный slot_sem (SLOT_CONCURRENCY),
+    что даёт гарантированную квоту запросов даже при конкуренции слотов.
     """
     slot  = _slot_label(pair, day)
     label = f"[{slot}]"
+
+    # ── Локальный семафор: не более SLOT_CONCURRENCY одновременных запросов ──
+    slot_sem = asyncio.Semaphore(SLOT_CONCURRENCY)
 
     stats_cache    = {"new": 0, "skipped": 0, "errors": 0, "error_dates": []}
     stats_backtest = {"done": 0, "skipped": 0, "failed": 0}
@@ -668,7 +728,11 @@ async def process_slot(
         return {"pair": pair, "day": day, "slot": slot,
                 "cache": stats_cache, "backtest": stats_backtest, "timed_out": False}
 
-    log.info(f"{label} ▶  Запуск: {len(candles)} свечей, {len(param_combos)} комбинаций")
+    log.info(
+        f"{label} ▶  Запуск: {len(candles)} свечей, "
+        f"{len(param_combos)} комбинаций  "
+        f"[slot_concur={SLOT_CONCURRENCY}, batch={SLOT_BATCH_SIZE}, retry={HTTP_RETRIES}]"
+    )
 
     # ── Фаза 1: Заполнение кеша ───────────────────────────────────────────────
     if not args.skip_fill:
@@ -682,7 +746,7 @@ async def process_slot(
 
             r = await fill_cache(
                 engine_vlad, candles, service_url, pair, day,
-                combo, deadline, http_sem, slot=slot,
+                combo, deadline, global_sem, slot_sem, slot=slot,
             )
             stats_cache["new"]     += r["new"]
             stats_cache["skipped"] += r["skipped"]
@@ -691,10 +755,14 @@ async def process_slot(
 
             if r["errors"] > 0:
                 sample = r["error_dates"][:50]
-                tail   = f"\n  ... и ещё {len(r['error_dates']) - 50}" if len(r["error_dates"]) > 50 else ""
+                tail   = (
+                    f"\n  ... и ещё {len(r['error_dates']) - 50}"
+                    if len(r["error_dates"]) > 50 else ""
+                )
                 send_trace(
                     f"⚠️ Ошибки кеша — {slot} params={combo_str}",
-                    f"model={model_id}  pair={PAIR_NAMES.get(pair)}  day={DAY_NAMES.get(day)}\n"
+                    f"model={model_id}  pair={PAIR_NAMES.get(pair)}  "
+                    f"day={DAY_NAMES.get(day)}\n"
                     f"params={combo_str}\nurl={service_url}\n\n"
                     f"Ошибок: {r['errors']} из {r['total']}\n"
                     f"Примеры дат:\n" + "\n".join(f"  {d}" for d in sample) + tail,
@@ -704,13 +772,18 @@ async def process_slot(
         if not timed_out:
             log.info(
                 f"{label} ✅ Кеш завершён: "
-                f"new={stats_cache['new']}  skip={stats_cache['skipped']}  err={stats_cache['errors']}"
+                f"new={stats_cache['new']}  "
+                f"skip={stats_cache['skipped']}  "
+                f"err={stats_cache['errors']}"
             )
             send_trace(
                 f"✅ Кеш завершён — {slot} model={model_id}",
                 f"pair={PAIR_NAMES.get(pair)}  day={DAY_NAMES.get(day)}\n"
-                f"new={stats_cache['new']}  skipped={stats_cache['skipped']}  errors={stats_cache['errors']}\n"
-                f"Прошло: {deadline.elapsed_str()}  Осталось: {deadline.remaining_str()}",
+                f"new={stats_cache['new']}  "
+                f"skipped={stats_cache['skipped']}  "
+                f"errors={stats_cache['errors']}\n"
+                f"Прошло: {deadline.elapsed_str()}  "
+                f"Осталось: {deadline.remaining_str()}",
             )
         else:
             log.warning(f"{label} ⏰ Кеш прерван по таймауту")
@@ -743,36 +816,49 @@ async def process_slot(
 
             if r.get("skipped"):
                 stats_backtest["skipped"] += 1
-                log.info(f"{label} [{idx}/{len(param_combos)}] tier={tier} ⏭  "
-                         f"уже посчитано: score={r['value_score']}  acc={r['accuracy']}")
+                log.info(
+                    f"{label} [{idx}/{len(param_combos)}] tier={tier} ⏭  "
+                    f"уже посчитано: score={r['value_score']}  acc={r['accuracy']}"
+                )
             elif "error" in r:
                 stats_backtest["failed"] += 1
-                log.info(f"{label} [{idx}/{len(param_combos)}] tier={tier} ✗ "
-                         f"{r['error']} (trades={r.get('trade_count', 0)})")
+                log.info(
+                    f"{label} [{idx}/{len(param_combos)}] tier={tier} ✗ "
+                    f"{r['error']} (trades={r.get('trade_count', 0)})"
+                )
             else:
                 stats_backtest["done"] += 1
                 results.append(r)
-                log.info(f"{label} [{idx}/{len(param_combos)}] tier={tier} ✓ "
-                         f"score={r['value_score']:>10.2f}  acc={r['accuracy']:.3f}  "
-                         f"trades={r['trade_count']}  params={combo_str}")
+                log.info(
+                    f"{label} [{idx}/{len(param_combos)}] tier={tier} ✓ "
+                    f"score={r['value_score']:>10.2f}  acc={r['accuracy']:.3f}  "
+                    f"trades={r['trade_count']}  params={combo_str}"
+                )
 
-        await upsert_summary(engine_vlad, service_url, model_id, pair, day, tier, date_from, date_to)
+        await upsert_summary(
+            engine_vlad, service_url, model_id, pair, day, tier, date_from, date_to
+        )
 
-        log.info(f"{label} 📊 tier={tier}: done={len(results)}  "
-                 f"skip={stats_backtest['skipped']}  fail={stats_backtest['failed']}")
+        log.info(
+            f"{label} 📊 tier={tier}: done={len(results)}  "
+            f"skip={stats_backtest['skipped']}  fail={stats_backtest['failed']}"
+        )
 
         if results:
             best = max(results, key=lambda x: x["value_score"])
-            log.info(f"{label} 🏆 tier={tier} лучший: "
-                     f"score={best['value_score']}  acc={best['accuracy']}  "
-                     f"trades={best['trade_count']}  params={best['params']}")
+            log.info(
+                f"{label} 🏆 tier={tier} лучший: "
+                f"score={best['value_score']}  acc={best['accuracy']}  "
+                f"trades={best['trade_count']}  params={best['params']}"
+            )
 
         if not timed_out:
             best_score = max((r["value_score"] for r in results), default=0)
             send_trace(
                 f"✅ Бэктест завершён — {slot} tier={tier} model={model_id}",
                 f"pair={PAIR_NAMES.get(pair)}  day={DAY_NAMES.get(day)}  tier={tier}\n"
-                f"done={len(results)}  skip={stats_backtest['skipped']}  fail={stats_backtest['failed']}\n"
+                f"done={len(results)}  skip={stats_backtest['skipped']}  "
+                f"fail={stats_backtest['failed']}\n"
                 f"best_score={best_score}\n"
                 f"Прошло: {deadline.elapsed_str()}  Осталось: {deadline.remaining_str()}",
             )
@@ -799,16 +885,21 @@ async def run_model(
 ) -> tuple[dict, dict, bool]:
 
     slots = [(p, d) for p in args.pairs for d in args.days]
+    n_slots = len(slots)
 
     log.info(
         f"\n{'#'*60}\n"
         f"  🤖 model_id={model_id}  url={service_url}\n"
-        f"  Слотов: {len(slots)}  Комбинаций: {len(param_combos)}\n"
+        f"  Слотов: {n_slots}  Комбинаций: {len(param_combos)}\n"
         f"  Слоты: {[_slot_label(p, d) for p, d in slots]}\n"
+        f"  Конфигурация: HTTP_CONCURRENCY={HTTP_CONCURRENCY}  "
+        f"SLOT_CONCURRENCY={SLOT_CONCURRENCY}  "
+        f"SLOT_BATCH_SIZE={SLOT_BATCH_SIZE}  "
+        f"HTTP_RETRIES={HTTP_RETRIES}\n"
         f"{'#'*60}"
     )
 
-    # ── Параллельная загрузка свечей для всех слотов ──────────────────────────
+    # ── Параллельная загрузка свечей ──────────────────────────────────────────
     log.info("  📊 Загружаем свечи для всех слотов параллельно...")
     candles_list = await asyncio.gather(*[
         fetch_candles(engine_brain, p, d, date_from, date_to)
@@ -819,12 +910,15 @@ async def run_model(
     for (p, d), candles in candles_map.items():
         log.info(f"  [{_slot_label(p, d)}] свечей: {len(candles)}")
 
-    # ── Общий HTTP-семафор для всех параллельных слотов ──────────────────────
-    http_sem = asyncio.Semaphore(HTTP_CONCURRENCY)
+    # ── Единый глобальный HTTP-семафор ────────────────────────────────────────
+    # Каждый слот создаёт свой slot_sem внутри process_slot.
+    global_sem = asyncio.Semaphore(HTTP_CONCURRENCY)
 
-    # ── Запускаем все слоты параллельно ──────────────────────────────────────
-    log.info(f"\n  🚀 Запускаем {len(slots)} слотов параллельно "
-             f"(HTTP_CONCURRENCY={HTTP_CONCURRENCY})...")
+    log.info(
+        f"\n  🚀 Запускаем {n_slots} слотов параллельно  "
+        f"(global={HTTP_CONCURRENCY}, per_slot={SLOT_CONCURRENCY}, "
+        f"batch={SLOT_BATCH_SIZE}, retry={HTTP_RETRIES})..."
+    )
 
     slot_results = await asyncio.gather(*[
         process_slot(
@@ -838,7 +932,7 @@ async def run_model(
             date_from=date_from,
             date_to=date_to,
             deadline=deadline,
-            http_sem=http_sem,
+            global_sem=global_sem,
         )
         for p, d in slots
     ], return_exceptions=True)
@@ -870,8 +964,10 @@ async def run_model(
 
         log.info(
             f"  [{slot_label}] итог: "
-            f"cache(new={c.get('new',0)} skip={c.get('skipped',0)} err={c.get('errors',0)})  "
-            f"backtest(done={b.get('done',0)} skip={b.get('skipped',0)} fail={b.get('failed',0)})"
+            f"cache(new={c.get('new',0)} skip={c.get('skipped',0)} "
+            f"err={c.get('errors',0)})  "
+            f"backtest(done={b.get('done',0)} skip={b.get('skipped',0)} "
+            f"fail={b.get('failed',0)})"
         )
 
     return stats_cache, stats_backtest, timed_out
@@ -883,7 +979,10 @@ async def run_model(
 
 async def run(args) -> None:
     deadline = Deadline(hours=args.timeout_hours)
-    log.info(f"⏰ Таймаут: {args.timeout_hours}h  (дедлайн: {deadline.deadline.strftime('%Y-%m-%d %H:%M:%S')})")
+    log.info(
+        f"⏰ Таймаут: {args.timeout_hours}h  "
+        f"(дедлайн: {deadline.deadline.strftime('%Y-%m-%d %H:%M:%S')})"
+    )
 
     vlad_host     = os.getenv("VLAD_HOST",     os.getenv("DB_HOST",     "localhost"))
     vlad_port     = os.getenv("VLAD_PORT",     os.getenv("DB_PORT",     "3306"))
@@ -903,15 +1002,27 @@ async def run(args) -> None:
     brain_password = os.getenv("MASTER_PASSWORD", vlad_password)
     brain_name     = os.getenv("MASTER_NAME",     "brain")
 
-    vlad_url  = f"mysql+aiomysql://{vlad_user}:{vlad_password}@{vlad_host}:{vlad_port}/{vlad_database}"
-    brain_url = f"mysql+aiomysql://{brain_user}:{brain_password}@{brain_host}:{brain_port}/{brain_name}"
+    vlad_url  = (
+        f"mysql+aiomysql://{vlad_user}:{vlad_password}"
+        f"@{vlad_host}:{vlad_port}/{vlad_database}"
+    )
+    brain_url = (
+        f"mysql+aiomysql://{brain_user}:{brain_password}"
+        f"@{brain_host}:{brain_port}/{brain_name}"
+    )
     super_sync_url = (
         f"mysql+mysqlconnector://{super_user}:{super_password}"
         f"@{super_host}:{super_port}/{super_name}"
     )
 
     log.info("=" * 60)
-    log.info(f"🚀 models={MODEL_IDS}  HTTP_CONCURRENCY={HTTP_CONCURRENCY}")
+    log.info(
+        f"🚀 models={MODEL_IDS}  "
+        f"HTTP_CONCURRENCY={HTTP_CONCURRENCY}  "
+        f"SLOT_CONCURRENCY={SLOT_CONCURRENCY}  "
+        f"SLOT_BATCH_SIZE={SLOT_BATCH_SIZE}  "
+        f"HTTP_RETRIES={HTTP_RETRIES}"
+    )
     log.info(f"   vlad  DB : {vlad_user}@{vlad_host}:{vlad_port}/{vlad_database}")
     log.info(f"   brain DB : {brain_user}@{brain_host}:{brain_port}/{brain_name}")
     log.info(f"   super DB : {super_user}@{super_host}:{super_port}/{super_name}")
@@ -941,18 +1052,23 @@ async def run(args) -> None:
         log.critical("❌ Ни одна модель не загружена. Выходим.")
         sys.exit(1)
 
-    # pool_size: пик соединений = слоты × батч (кеш), ограничиваем разумно.
-    # vlad: 6 слотов × SLOT_BATCH_SIZE=20 = 120 пиковых соединений → cap 60.
     n_slots    = len(args.pairs) * len(args.days)
-    vlad_pool  = min(n_slots * SLOT_BATCH_SIZE, 60)
+    # pool_size: n_slots × SLOT_CONCURRENCY параллельных запросов к БД
+    vlad_pool  = min(n_slots * SLOT_CONCURRENCY + 5, 80)
     brain_pool = max(n_slots, 6)
 
-    engine_vlad  = create_async_engine(vlad_url,  pool_size=vlad_pool,  max_overflow=10, echo=False)
-    engine_brain = create_async_engine(brain_url, pool_size=brain_pool, max_overflow=0,  echo=False)
+    engine_vlad  = create_async_engine(
+        vlad_url,  pool_size=vlad_pool,  max_overflow=10, echo=False
+    )
+    engine_brain = create_async_engine(
+        brain_url, pool_size=brain_pool, max_overflow=0,  echo=False
+    )
 
     log.info(
         f"  DB pool: vlad={vlad_pool}(+10 overflow)  brain={brain_pool}  "
-        f"слотов={n_slots}  батч={SLOT_BATCH_SIZE}  HTTP_CONCURRENCY={HTTP_CONCURRENCY}"
+        f"слотов={n_slots}  "
+        f"slot_concur={SLOT_CONCURRENCY}  batch={SLOT_BATCH_SIZE}  "
+        f"global_sem={HTTP_CONCURRENCY}"
     )
 
     try:
@@ -987,9 +1103,11 @@ async def run(args) -> None:
                 break
 
             stats_cache, stats_backtest, timed_out = await run_model(
-                model_id=model_id, service_url=service_url, param_combos=param_combos,
+                model_id=model_id, service_url=service_url,
+                param_combos=param_combos,
                 engine_vlad=engine_vlad, engine_brain=engine_brain,
-                args=args, date_from=date_from, date_to=date_to, deadline=deadline,
+                args=args, date_from=date_from, date_to=date_to,
+                deadline=deadline,
             )
 
             elapsed = deadline.elapsed_str()
@@ -997,10 +1115,15 @@ async def run(args) -> None:
             if timed_out:
                 all_timed_out = True
                 msg = (
-                    f"⏰ Модель {model_id} остановлена по таймауту ({args.timeout_hours}h).\n"
+                    f"⏰ Модель {model_id} остановлена по таймауту "
+                    f"({args.timeout_hours}h).\n"
                     f"Прошло: {elapsed}\n\n"
-                    f"Кеш  : new={stats_cache['new']}  skip={stats_cache['skipped']}  err={stats_cache['errors']}\n"
-                    f"Бэктест: done={stats_backtest['done']}  skip={stats_backtest['skipped']}  fail={stats_backtest['failed']}\n\n"
+                    f"Кеш  : new={stats_cache['new']}  "
+                    f"skip={stats_cache['skipped']}  "
+                    f"err={stats_cache['errors']}\n"
+                    f"Бэктест: done={stats_backtest['done']}  "
+                    f"skip={stats_backtest['skipped']}  "
+                    f"fail={stats_backtest['failed']}\n\n"
                     f"Запусти повторно — скрипт продолжит с места остановки."
                 )
                 log.warning(f"\n{msg}")
@@ -1010,8 +1133,12 @@ async def run(args) -> None:
                 msg = (
                     f"✅ Модель {model_id} завершена.\n"
                     f"Прошло: {elapsed}\n\n"
-                    f"Кеш  : new={stats_cache['new']}  skip={stats_cache['skipped']}  err={stats_cache['errors']}\n"
-                    f"Бэктест: done={stats_backtest['done']}  skip={stats_backtest['skipped']}  fail={stats_backtest['failed']}"
+                    f"Кеш  : new={stats_cache['new']}  "
+                    f"skip={stats_cache['skipped']}  "
+                    f"err={stats_cache['errors']}\n"
+                    f"Бэктест: done={stats_backtest['done']}  "
+                    f"skip={stats_backtest['skipped']}  "
+                    f"fail={stats_backtest['failed']}"
                 )
                 log.info(f"\n{'='*55}\n{msg}\n{'='*55}")
                 send_trace(f"✅ Готово — model={model_id}", msg)
@@ -1028,7 +1155,10 @@ async def run(args) -> None:
             log.warning(f"\n{final_msg}")
             send_trace(f"⏰ Таймаут — models={MODEL_IDS}", final_msg, is_error=False)
         else:
-            final_msg = f"✅ Все модели завершены.\nПрошло: {elapsed}\nМодели: {completed}"
+            final_msg = (
+                f"✅ Все модели завершены.\n"
+                f"Прошло: {elapsed}\nМодели: {completed}"
+            )
             log.info(f"\n{'='*55}\n{final_msg}\n{'='*55}")
             send_trace(f"✅ Все модели готовы — {MODEL_IDS}", final_msg)
 
@@ -1045,11 +1175,17 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description=(
             "Кеш + бэктест. "
-            "Подключение из env (VLAD_HOST/VLAD_PORT/VLAD_USER/VLAD_PASSWORD/VLAD_DATABASE).\n"
-            f"Параллельность: {len(['EUR/USD', 'BTC/USD', 'ETH/USD'])} пары × 2 таймфрейма = 6 слотов одновременно."
+            "Параллельность: 6 слотов × SLOT_CONCURRENCY={SLOT_CONCURRENCY} "
+            "запросов, глобальный лимит HTTP_CONCURRENCY={HTTP_CONCURRENCY}."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
+        epilog=f"""
+Параметры параллельности (в коде):
+  HTTP_CONCURRENCY  = {HTTP_CONCURRENCY}   # глобальный лимит запросов
+  SLOT_CONCURRENCY  = {SLOT_CONCURRENCY}    # лимит на один слот
+  SLOT_BATCH_SIZE   = {SLOT_BATCH_SIZE}   # свечей в батче
+  HTTP_RETRIES      = {HTTP_RETRIES}    # ретраи при таймауте
+
 Примеры:
   python cache.py
   python cache.py --date-from 2025-01-15 --date-to 2026-03-12
@@ -1061,9 +1197,18 @@ def parse_args():
     )
     parser.add_argument("--date-from", default=None)
     parser.add_argument("--date-to",   default=None)
-    parser.add_argument("--pair",  type=int, nargs="+", default=[1, 3, 4], choices=[1, 3, 4], dest="pairs")
-    parser.add_argument("--day",   type=int, nargs="+", default=[0, 1],    choices=[0, 1],    dest="days")
-    parser.add_argument("--tier",  type=int, nargs="+", default=[0, 1],    choices=[0, 1],    dest="tiers")
+    parser.add_argument(
+        "--pair",  type=int, nargs="+", default=[1, 3, 4],
+        choices=[1, 3, 4], dest="pairs"
+    )
+    parser.add_argument(
+        "--day",   type=int, nargs="+", default=[0, 1],
+        choices=[0, 1], dest="days"
+    )
+    parser.add_argument(
+        "--tier",  type=int, nargs="+", default=[0, 1],
+        choices=[0, 1], dest="tiers"
+    )
     parser.add_argument("--skip-fill",      action="store_true")
     parser.add_argument("--only-fill",      action="store_true")
     parser.add_argument("--timeout-hours",  type=float, default=24.0)
@@ -1082,17 +1227,20 @@ def main():
 
     log.info("=" * 60)
     log.info("⚙️  Параметры запуска")
-    log.info(f"   models        : {MODEL_IDS}")
-    log.info(f"   date_from     : {args.date_from or '2025-01-15 (default)'}")
-    log.info(f"   date_to       : {args.date_to   or 'today (default)'}")
-    log.info(f"   pairs         : {args.pairs}")
-    log.info(f"   days          : {args.days}")
-    log.info(f"   tiers         : {args.tiers}")
-    log.info(f"   skip_fill     : {args.skip_fill}")
-    log.info(f"   only_fill     : {args.only_fill}")
-    log.info(f"   timeout_hours : {args.timeout_hours}")
-    log.info(f"   слотов        : {n_slots} → {slots}")
-    log.info(f"   HTTP_CONCUR.  : {HTTP_CONCURRENCY}")
+    log.info(f"   models           : {MODEL_IDS}")
+    log.info(f"   date_from        : {args.date_from or '2025-01-15 (default)'}")
+    log.info(f"   date_to          : {args.date_to   or 'today (default)'}")
+    log.info(f"   pairs            : {args.pairs}")
+    log.info(f"   days             : {args.days}")
+    log.info(f"   tiers            : {args.tiers}")
+    log.info(f"   skip_fill        : {args.skip_fill}")
+    log.info(f"   only_fill        : {args.only_fill}")
+    log.info(f"   timeout_hours    : {args.timeout_hours}")
+    log.info(f"   слотов           : {n_slots} → {slots}")
+    log.info(f"   HTTP_CONCURRENCY : {HTTP_CONCURRENCY}")
+    log.info(f"   SLOT_CONCURRENCY : {SLOT_CONCURRENCY}")
+    log.info(f"   SLOT_BATCH_SIZE  : {SLOT_BATCH_SIZE}")
+    log.info(f"   HTTP_RETRIES     : {HTTP_RETRIES}")
     log.info("=" * 60)
 
     try:
