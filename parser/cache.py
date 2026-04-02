@@ -216,10 +216,16 @@ class ServiceRunner:
         self.service_url = f"local:{model_id}"  # псевдо-url для кеш-таблицы
         self._initialized = False
 
+    # Определяется автоматически при load_module():
+    #   "dummy"  — новый фреймворк: calculate(pair, day, date_str, type_, var, param)
+    #   "legacy" — старый сервис:   calculate_pure_memory(pair, day, date_str, calc_type, calc_var)
+    _style: str = "dummy"
+
     def load_module(self) -> None:
         """
         Динамически импортирует server.py из папки сервиса.
         Добавляет папку в sys.path чтобы server.py мог найти model.py и shared/.
+        Автоматически определяет стиль сервиса (dummy vs legacy).
         """
         server_path = self.folder / "server.py"
         if not server_path.exists():
@@ -264,6 +270,18 @@ class ServiceRunner:
             )
 
         self.module = module
+
+        # Определяем стиль сервиса по наличию функций
+        if hasattr(module, "calculate"):
+            self._style = "dummy"
+            log.info(f"  [model{self.model_id}] стиль: dummy (calculate)")
+        elif hasattr(module, "calculate_pure_memory"):
+            self._style = "legacy"
+            log.info(f"  [model{self.model_id}] стиль: legacy (calculate_pure_memory)")
+        else:
+            self._style = "unknown"
+            log.warning(f"  [model{self.model_id}] ⚠️  не найдена ни calculate(), ни calculate_pure_memory()")
+
         log.info(f"  [model{self.model_id}] server.py загружен из {server_path}")
 
     async def initialize(self) -> None:
@@ -296,12 +314,23 @@ class ServiceRunner:
 
         # Проверяем что данные загружены
         rates = getattr(self.module, "GLOBAL_RATES", {})
-        dataset_len = len(getattr(self.module, "GLOBAL_DATASET", []))
+        # Старые сервисы хранят GLOBAL_RATES как dict[table → dict[date→value]]
+        # Новые — как dict[table → list[dict]]
         for table, rows in rates.items():
-            log.info(f"    {table}: {len(rows)} строк")
-        log.info(f"    dataset: {dataset_len} строк")
+            n = len(rows) if isinstance(rows, (list, dict)) else 0
+            log.info(f"    {table}: {n} записей")
 
-        if not any(rates.values()):
+        dataset_len = len(getattr(self.module, "GLOBAL_DATASET", []))
+        if dataset_len:
+            log.info(f"    dataset: {dataset_len} строк")
+
+        # Для старых сервисов GLOBAL_RATES — dict[date→float], не пустой dict
+        has_data = any(
+            (len(v) > 0 if isinstance(v, (list, dict)) else bool(v))
+            for v in rates.values()
+        ) if rates else False
+
+        if not has_data:
             log.warning(
                 f"  ⚠️  [model{self.model_id}] GLOBAL_RATES пуст — "
                 f"все расчёты вернут пустой результат"
@@ -315,28 +344,42 @@ class ServiceRunner:
         extra_params: dict,
     ) -> tuple[dict | None, str | None]:
         """
-        Вызывает calculate() из server.py напрямую.
+        Вызывает вычислительную функцию из server.py напрямую.
+        Автоматически определяет стиль:
+          dummy  → calculate(pair, day, date_str, type_=, var=, param=)
+          legacy → calculate_pure_memory(pair, day, date_str, calc_type=, calc_var=)
         Возвращает (result | None, error_reason | None).
-        error_reason содержит подробное описание причины ошибки.
         """
         if self.module is None:
             return None, "Модуль не загружен (вызови load_module() сначала)"
 
-        if not hasattr(self.module, "calculate"):
+        if self._style == "unknown":
             return None, (
-                f"server.py (model={self.model_id}) не экспортирует calculate()\n"
-                f"Ожидается функция: calculate(pair, day, date_str, type_, var, param)"
+                f"server.py (model={self.model_id}) не содержит ни calculate(), "
+                f"ни calculate_pure_memory()\n"
+                f"Проверь что это правильный файл сервиса"
             )
 
         try:
-            result = self.module.calculate(
-                pair     = pair,
-                day      = day,
-                date_str = date_str,
-                type_    = extra_params.get("type", 0),
-                var      = extra_params.get("var",  0),
-                param    = extra_params.get("param", ""),
-            )
+            if self._style == "legacy":
+                # Старые сервисы: calculate_pure_memory(pair, day, date_str, calc_type, calc_var)
+                result = self.module.calculate_pure_memory(
+                    pair,
+                    day,
+                    date_str,
+                    calc_type = extra_params.get("type", 0),
+                    calc_var  = extra_params.get("var",  0),
+                )
+            else:
+                # Новый dummy-фреймворк: calculate(pair, day, date_str, type_, var, param)
+                result = self.module.calculate(
+                    pair     = pair,
+                    day      = day,
+                    date_str = date_str,
+                    type_    = extra_params.get("type", 0),
+                    var      = extra_params.get("var",  0),
+                    param    = extra_params.get("param", ""),
+                )
         except ImportError as e:
             # model.py не найден или не импортируется
             return None, (
