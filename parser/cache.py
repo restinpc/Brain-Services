@@ -20,6 +20,15 @@ load_dotenv()
 # ── ID моделей — перечисли нужные через запятую ───────────────────────────────
 MODEL_IDS = [30]
 
+# ── Параллельность ────────────────────────────────────────────────────────────
+# Максимум одновременных HTTP-запросов ко всем слотам суммарно.
+HTTP_CONCURRENCY = 30   # глобальный лимит (семафор в _call_values)
+
+# Сколько свечей одного слота обрабатывается параллельно.
+# 6 слотов × 20 батч = 120 попыток → семафор режет до HTTP_CONCURRENCY=30.
+# Даёт ~4–5x прирост скорости заполнения кеша по сравнению с sequential.
+SLOT_BATCH_SIZE = 20
+
 # ── Логирование ────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -79,6 +88,12 @@ RATES_TABLE = {
 
 PAIR_NAMES = {1: "EUR/USD", 3: "BTC/USD", 4: "ETH/USD"}
 DAY_NAMES  = {0: "hourly",  1: "daily"}
+
+
+def _slot_label(pair: int, day: int) -> str:
+    """Короткий читаемый идентификатор слота для логов."""
+    return f"{PAIR_NAMES.get(pair, f'pair{pair}')}-{'day' if day else 'hour'}"
+
 
 # ── DDL ────────────────────────────────────────────────────────────────────────
 DDL_CACHE = """
@@ -235,17 +250,6 @@ def _parse_dt(s: str) -> datetime:
     raise ValueError(f"Неверный формат даты: {s!r}")
 
 
-def _print_progress(done: int, total: int, label: str,
-                    errors: int = 0, skipped: int = 0) -> None:
-    pct   = done / total * 100 if total else 0
-    extra = ""
-    if skipped:
-        extra += f"  skip={skipped}"
-    if errors:
-        extra += f"  err={errors}"
-    print(f"\r    {label} [{done}/{total}] {pct:.1f}%{extra}", end="", flush=True)
-
-
 def _compute_signal(values: dict, tier: int) -> int:
     if not values:
         return 0
@@ -258,37 +262,39 @@ def _compute_signal(values: dict, tier: int) -> int:
 
 
 async def _call_values(session: aiohttp.ClientSession,
-                       url: str, params: dict) -> dict | None:
-    try:
-        async with session.get(
-            f"{url}/values",
-            params=params,
-            timeout=aiohttp.ClientTimeout(total=15),
-        ) as r:
-            if r.status != 200:
-                log.warning(f"[CACHE] HTTP {r.status} для date={params.get('date')} params={params}")
-                return None
-            data = await r.json()
-            if "payLoad" in data:
-                payload = data["payLoad"]
-            elif "payload" in data:
-                payload = data["payload"]
-            elif "status" not in data:
-                payload = data
-            else:
-                log.warning(f"[CACHE] Нет payLoad в ответе для date={params.get('date')} params={params}: {data}")
-                return None
-            # Если сервис вернул {"status":"error",...}
-            if isinstance(payload, dict) and payload.get("status") == "error":
-                log.warning(f"[CACHE] Сервис вернул error для date={params.get('date')}: {payload}")
-                return None
-            return payload
-    except asyncio.TimeoutError:
-        log.warning(f"[CACHE] Таймаут для date={params.get('date')} url={url}")
-        return None
-    except Exception as e:
-        log.warning(f"[CACHE] Исключение для date={params.get('date')}: {e}")
-        return None
+                       url: str, params: dict,
+                       http_sem: asyncio.Semaphore) -> dict | None:
+    """HTTP-запрос к /values с ограничением одновременных запросов через sem."""
+    async with http_sem:
+        try:
+            async with session.get(
+                f"{url}/values",
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as r:
+                if r.status != 200:
+                    log.warning(f"[CACHE] HTTP {r.status} для date={params.get('date')} params={params}")
+                    return None
+                data = await r.json()
+                if "payLoad" in data:
+                    payload = data["payLoad"]
+                elif "payload" in data:
+                    payload = data["payload"]
+                elif "status" not in data:
+                    payload = data
+                else:
+                    log.warning(f"[CACHE] Нет payLoad в ответе для date={params.get('date')} params={params}: {data}")
+                    return None
+                if isinstance(payload, dict) and payload.get("status") == "error":
+                    log.warning(f"[CACHE] Сервис вернул error для date={params.get('date')}: {payload}")
+                    return None
+                return payload
+        except asyncio.TimeoutError:
+            log.warning(f"[CACHE] Таймаут для date={params.get('date')} url={url}")
+            return None
+        except Exception as e:
+            log.warning(f"[CACHE] Исключение для date={params.get('date')}: {e}")
+            return None
 
 
 async def fetch_candles(engine_brain, pair: int, day: int,
@@ -308,18 +314,73 @@ async def fetch_candles(engine_brain, pair: int, day: int,
         ]
 
 
+async def _fetch_and_store_one(
+    candle: dict,
+    session: aiohttp.ClientSession,
+    service_url: str,
+    pair: int,
+    day: int,
+    extra_params: dict,
+    p_hash: str,
+    http_sem: asyncio.Semaphore,
+    engine_vlad,
+) -> tuple[str, str]:
+    """
+    Получает /values для одной свечи и сохраняет в кеш.
+    Возвращает ('ok'|'error', date_str).
+    Семафор ограничивает одновременные HTTP-запросы глобально.
+    """
+    date_val    = candle["date"]
+    date_str    = date_val.strftime("%Y-%m-%d %H:%M:%S")
+    call_params = {"pair": pair, "day": day, "date": date_str, **extra_params}
+
+    result = await _call_values(session, service_url, call_params, http_sem)
+    if result is None:
+        return "error", date_str
+
+    try:
+        async with engine_vlad.begin() as conn:
+            await conn.execute(text("""
+                INSERT IGNORE INTO vlad_values_cache
+                    (service_url, pair, day_flag, date_val,
+                     params_hash, params_json, result_json)
+                VALUES (:url, :pair, :day, :dv, :ph, :pj, :rj)
+            """), {
+                "url":  service_url, "pair": pair, "day":  day,
+                "dv":   date_val,    "ph":   p_hash,
+                "pj":   json.dumps(extra_params, ensure_ascii=False),
+                "rj":   json.dumps(result,       ensure_ascii=False),
+            })
+    except Exception:
+        pass  # INSERT IGNORE: дубликат — не ошибка
+
+    return "ok", date_str
+
+
 async def fill_cache(engine_vlad, candles: list[dict],
                      service_url: str, pair: int, day: int,
                      extra_params: dict,
-                     deadline: Deadline) -> dict:
+                     deadline: Deadline,
+                     http_sem: asyncio.Semaphore,
+                     slot: str = "") -> dict:
+    """
+    Заполняет кеш для одного слота (pair, day, extra_params).
+
+    Внутри слота свечи обрабатываются батчами по SLOT_BATCH_SIZE параллельных
+    запросов. Глобальный семафор http_sem ограничивает суммарную нагрузку
+    на сервис со всех параллельных слотов.
+
+    slot — метка для логов, напр. 'EUR/USD-hour'.
+    """
     if not candles:
         return {"done": 0, "total": 0, "errors": 0, "skipped": 0, "new": 0, "error_dates": []}
 
+    prefix = f"[{slot}]" if slot else "[cache]"
     p_hash = _params_hash(extra_params)
     total  = len(candles)
-    done   = errors = skipped = 0
-    error_dates = []   # накапливаем даты с ошибками
+    error_dates: list[str] = []
 
+    # ── Загружаем уже закешированные даты одним запросом ─────────────────────
     async with engine_vlad.connect() as conn:
         res = await conn.execute(text("""
             SELECT date_val FROM vlad_values_cache
@@ -328,65 +389,69 @@ async def fill_cache(engine_vlad, candles: list[dict],
         """), {"url": service_url, "pair": pair, "day": day, "ph": p_hash})
         cached_dates = {row[0] for row in res.fetchall()}
 
+    skipped   = sum(1 for c in candles if c["date"] in cached_dates)
+    to_fetch  = [c for c in candles if c["date"] not in cached_dates]
+    new_count = 0
+    errors    = 0
+
+    log.info(
+        f"{prefix} Начало: {total} свечей  "
+        f"в кеше={len(cached_dates)}  нужно={len(to_fetch)}  "
+        f"батч={SLOT_BATCH_SIZE}"
+    )
+
     async with aiohttp.ClientSession() as session:
-        for candle in candles:
+        for batch_start in range(0, len(to_fetch), SLOT_BATCH_SIZE):
             if deadline.exceeded():
-                log.warning(f"\n  ⏰ Таймаут! Осталось обработать {total - done} свечей")
+                log.warning(f"{prefix} ⏰ Таймаут! Обработано {batch_start}/{len(to_fetch)}")
                 break
 
-            date_val = candle["date"]
+            batch = to_fetch[batch_start : batch_start + SLOT_BATCH_SIZE]
 
-            if date_val in cached_dates:
-                skipped += 1
-                done    += 1
-                _print_progress(done, total, "cache", errors, skipped)
-                continue
+            # Все запросы батча уходят параллельно; семафор дозирует их глобально
+            batch_results = await asyncio.gather(*[
+                _fetch_and_store_one(
+                    candle, session, service_url, pair, day,
+                    extra_params, p_hash, http_sem, engine_vlad,
+                )
+                for candle in batch
+            ], return_exceptions=True)
 
-            date_str    = date_val.strftime("%Y-%m-%d %H:%M:%S")
-            call_params = {"pair": pair, "day": day, "date": date_str, **extra_params}
-            result = await _call_values(session, service_url, call_params)
+            for r in batch_results:
+                if isinstance(r, Exception):
+                    errors += 1
+                elif r[0] == "ok":
+                    new_count += 1
+                else:  # "error"
+                    errors += 1
+                    error_dates.append(r[1])
 
-            if result is None:
-                errors += 1
-                done   += 1
-                error_dates.append(date_str)
-                _print_progress(done, total, "cache", errors, skipped)
-                continue
+            done_so_far = batch_start + len(batch)
+            pct = done_so_far / len(to_fetch) * 100 if to_fetch else 100
+            log.info(
+                f"{prefix} [{done_so_far}/{len(to_fetch)}] {pct:.1f}%  "
+                f"new={new_count}  err={errors}"
+            )
 
-            try:
-                async with engine_vlad.begin() as conn:
-                    await conn.execute(text("""
-                        INSERT IGNORE INTO vlad_values_cache
-                            (service_url, pair, day_flag, date_val,
-                             params_hash, params_json, result_json)
-                        VALUES (:url, :pair, :day, :dv, :ph, :pj, :rj)
-                    """), {
-                        "url":  service_url, "pair": pair, "day":  day,
-                        "dv":   date_val,    "ph":   p_hash,
-                        "pj":   json.dumps(extra_params, ensure_ascii=False),
-                        "rj":   json.dumps(result,       ensure_ascii=False),
-                    })
-            except Exception:
-                pass
-
-            done += 1
-            _print_progress(done, total, "cache", errors, skipped)
-
-    print()
-    new = done - skipped - errors
-    return {"done": done, "total": total, "errors": errors, "skipped": skipped,
-            "new": new, "error_dates": error_dates}
+    done = skipped + new_count + errors
+    log.info(f"{prefix} ✓ Готово: total={total}  new={new_count}  skip={skipped}  err={errors}")
+    return {
+        "done": done, "total": total, "errors": errors,
+        "skipped": skipped, "new": new_count, "error_dates": error_dates,
+    }
 
 
 async def run_backtest(engine_vlad, candles: list[dict],
                        service_url: str, pair: int, day: int, tier: int,
                        extra_params: dict, date_from: datetime, date_to: datetime,
                        model_id: int,
-                       deadline: Deadline) -> dict:
+                       deadline: Deadline,
+                       slot: str = "") -> dict:
     if not candles:
         return {"error": "no candles"}
 
-    p_hash = _params_hash(extra_params)
+    prefix   = f"[{slot}]" if slot else "[backtest]"
+    p_hash   = _params_hash(extra_params)
 
     async with engine_vlad.connect() as conn:
         existing = (await conn.execute(text("""
@@ -425,11 +490,8 @@ async def run_backtest(engine_vlad, candles: list[dict],
     highest      = INITIAL_BALANCE
     summary_lost = 0.0
     trade_count  = win_count = 0
-    total        = len(candles)
 
-    for i, candle in enumerate(candles):
-        _print_progress(i + 1, total, f"backtest tier={tier}")
-
+    for candle in candles:
         values = cache_map.get(candle["date"])
         if not values:
             continue
@@ -452,8 +514,6 @@ async def run_backtest(engine_vlad, candles: list[dict],
         drawdown = highest - balance
         if drawdown > 0:
             summary_lost += drawdown / highest
-
-    print()
 
     if trade_count < 10:
         return {"error": "not enough trades", "trade_count": trade_count}
@@ -510,7 +570,7 @@ async def run_backtest(engine_vlad, candles: list[dict],
                 "acc":  result["accuracy"],
             })
     except Exception as e:
-        log.warning(f"  ⚠️  Не удалось сохранить результат бэктеста: {e}")
+        log.warning(f"{prefix} ⚠️  Не удалось сохранить результат бэктеста: {e}")
 
     return result
 
@@ -572,6 +632,160 @@ async def upsert_summary(engine_vlad, service_url: str, model_id: int,
         })
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# process_slot — единица параллелизма: один (pair, day)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def process_slot(
+    pair: int,
+    day: int,
+    candles: list[dict],
+    param_combos: list[dict],
+    engine_vlad,
+    service_url: str,
+    model_id: int,
+    args,
+    date_from: datetime,
+    date_to: datetime,
+    deadline: Deadline,
+    http_sem: asyncio.Semaphore,
+) -> dict:
+    """
+    Обрабатывает один слот (pair × day) полностью:
+      1. Заполняет кеш для всех param_combos
+      2. Запускает бэктест для всех param_combos × tiers
+    Возвращает агрегированную статистику слота.
+    """
+    slot  = _slot_label(pair, day)
+    label = f"[{slot}]"
+
+    stats_cache    = {"new": 0, "skipped": 0, "errors": 0, "error_dates": []}
+    stats_backtest = {"done": 0, "skipped": 0, "failed": 0}
+    timed_out      = False
+
+    if not candles:
+        log.warning(f"{label} ⚠️  Нет свечей — пропускаем слот")
+        return {"pair": pair, "day": day, "slot": slot,
+                "cache": stats_cache, "backtest": stats_backtest, "timed_out": False}
+
+    log.info(f"{label} ▶  Запуск: {len(candles)} свечей, {len(param_combos)} комбинаций")
+
+    # ── Фаза 1: Заполнение кеша ───────────────────────────────────────────────
+    if not args.skip_fill:
+        for idx, combo in enumerate(param_combos, 1):
+            if deadline.exceeded():
+                timed_out = True
+                break
+
+            combo_str = json.dumps(combo) if combo else "{}"
+            log.info(f"{label} 📥 Кеш [{idx}/{len(param_combos)}] params={combo_str}")
+
+            r = await fill_cache(
+                engine_vlad, candles, service_url, pair, day,
+                combo, deadline, http_sem, slot=slot,
+            )
+            stats_cache["new"]     += r["new"]
+            stats_cache["skipped"] += r["skipped"]
+            stats_cache["errors"]  += r["errors"]
+            stats_cache["error_dates"].extend(r["error_dates"])
+
+            if r["errors"] > 0:
+                sample = r["error_dates"][:50]
+                tail   = f"\n  ... и ещё {len(r['error_dates']) - 50}" if len(r["error_dates"]) > 50 else ""
+                send_trace(
+                    f"⚠️ Ошибки кеша — {slot} params={combo_str}",
+                    f"model={model_id}  pair={PAIR_NAMES.get(pair)}  day={DAY_NAMES.get(day)}\n"
+                    f"params={combo_str}\nurl={service_url}\n\n"
+                    f"Ошибок: {r['errors']} из {r['total']}\n"
+                    f"Примеры дат:\n" + "\n".join(f"  {d}" for d in sample) + tail,
+                    is_error=True,
+                )
+
+        if not timed_out:
+            log.info(
+                f"{label} ✅ Кеш завершён: "
+                f"new={stats_cache['new']}  skip={stats_cache['skipped']}  err={stats_cache['errors']}"
+            )
+            send_trace(
+                f"✅ Кеш завершён — {slot} model={model_id}",
+                f"pair={PAIR_NAMES.get(pair)}  day={DAY_NAMES.get(day)}\n"
+                f"new={stats_cache['new']}  skipped={stats_cache['skipped']}  errors={stats_cache['errors']}\n"
+                f"Прошло: {deadline.elapsed_str()}  Осталось: {deadline.remaining_str()}",
+            )
+        else:
+            log.warning(f"{label} ⏰ Кеш прерван по таймауту")
+    else:
+        log.info(f"{label} ⏭️  Кеш пропущен (--skip-fill)")
+
+    if args.only_fill or timed_out:
+        return {"pair": pair, "day": day, "slot": slot,
+                "cache": stats_cache, "backtest": stats_backtest, "timed_out": timed_out}
+
+    # ── Фаза 2: Бэктест ───────────────────────────────────────────────────────
+    for tier in args.tiers:
+        if deadline.exceeded():
+            timed_out = True
+            break
+
+        log.info(f"{label} 🧪 Бэктест tier={tier} ({len(param_combos)} комбинаций)")
+        results = []
+
+        for idx, combo in enumerate(param_combos, 1):
+            if deadline.exceeded():
+                timed_out = True
+                break
+
+            combo_str = json.dumps(combo) if combo else "{}"
+            r = await run_backtest(
+                engine_vlad, candles, service_url, pair, day, tier,
+                combo, date_from, date_to, model_id, deadline, slot=slot,
+            )
+
+            if r.get("skipped"):
+                stats_backtest["skipped"] += 1
+                log.info(f"{label} [{idx}/{len(param_combos)}] tier={tier} ⏭  "
+                         f"уже посчитано: score={r['value_score']}  acc={r['accuracy']}")
+            elif "error" in r:
+                stats_backtest["failed"] += 1
+                log.info(f"{label} [{idx}/{len(param_combos)}] tier={tier} ✗ "
+                         f"{r['error']} (trades={r.get('trade_count', 0)})")
+            else:
+                stats_backtest["done"] += 1
+                results.append(r)
+                log.info(f"{label} [{idx}/{len(param_combos)}] tier={tier} ✓ "
+                         f"score={r['value_score']:>10.2f}  acc={r['accuracy']:.3f}  "
+                         f"trades={r['trade_count']}  params={combo_str}")
+
+        await upsert_summary(engine_vlad, service_url, model_id, pair, day, tier, date_from, date_to)
+
+        log.info(f"{label} 📊 tier={tier}: done={len(results)}  "
+                 f"skip={stats_backtest['skipped']}  fail={stats_backtest['failed']}")
+
+        if results:
+            best = max(results, key=lambda x: x["value_score"])
+            log.info(f"{label} 🏆 tier={tier} лучший: "
+                     f"score={best['value_score']}  acc={best['accuracy']}  "
+                     f"trades={best['trade_count']}  params={best['params']}")
+
+        if not timed_out:
+            best_score = max((r["value_score"] for r in results), default=0)
+            send_trace(
+                f"✅ Бэктест завершён — {slot} tier={tier} model={model_id}",
+                f"pair={PAIR_NAMES.get(pair)}  day={DAY_NAMES.get(day)}  tier={tier}\n"
+                f"done={len(results)}  skip={stats_backtest['skipped']}  fail={stats_backtest['failed']}\n"
+                f"best_score={best_score}\n"
+                f"Прошло: {deadline.elapsed_str()}  Осталось: {deadline.remaining_str()}",
+            )
+
+    log.info(f"{label} ■  Слот завершён (timed_out={timed_out})")
+    return {"pair": pair, "day": day, "slot": slot,
+            "cache": stats_cache, "backtest": stats_backtest, "timed_out": timed_out}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# run_model — запускает все слоты параллельно
+# ─────────────────────────────────────────────────────────────────────────────
+
 async def run_model(
     model_id: int,
     service_url: str,
@@ -583,127 +797,94 @@ async def run_model(
     date_to: datetime,
     deadline: Deadline,
 ) -> tuple[dict, dict, bool]:
+
+    slots = [(p, d) for p in args.pairs for d in args.days]
+
+    log.info(
+        f"\n{'#'*60}\n"
+        f"  🤖 model_id={model_id}  url={service_url}\n"
+        f"  Слотов: {len(slots)}  Комбинаций: {len(param_combos)}\n"
+        f"  Слоты: {[_slot_label(p, d) for p, d in slots]}\n"
+        f"{'#'*60}"
+    )
+
+    # ── Параллельная загрузка свечей для всех слотов ──────────────────────────
+    log.info("  📊 Загружаем свечи для всех слотов параллельно...")
+    candles_list = await asyncio.gather(*[
+        fetch_candles(engine_brain, p, d, date_from, date_to)
+        for p, d in slots
+    ])
+    candles_map: dict[tuple, list] = dict(zip(slots, candles_list))
+
+    for (p, d), candles in candles_map.items():
+        log.info(f"  [{_slot_label(p, d)}] свечей: {len(candles)}")
+
+    # ── Общий HTTP-семафор для всех параллельных слотов ──────────────────────
+    http_sem = asyncio.Semaphore(HTTP_CONCURRENCY)
+
+    # ── Запускаем все слоты параллельно ──────────────────────────────────────
+    log.info(f"\n  🚀 Запускаем {len(slots)} слотов параллельно "
+             f"(HTTP_CONCURRENCY={HTTP_CONCURRENCY})...")
+
+    slot_results = await asyncio.gather(*[
+        process_slot(
+            pair=p, day=d,
+            candles=candles_map[(p, d)],
+            param_combos=param_combos,
+            engine_vlad=engine_vlad,
+            service_url=service_url,
+            model_id=model_id,
+            args=args,
+            date_from=date_from,
+            date_to=date_to,
+            deadline=deadline,
+            http_sem=http_sem,
+        )
+        for p, d in slots
+    ], return_exceptions=True)
+
+    # ── Агрегация статистики ──────────────────────────────────────────────────
     stats_cache    = {"new": 0, "skipped": 0, "errors": 0}
     stats_backtest = {"done": 0, "skipped": 0, "failed": 0}
     timed_out      = False
 
-    log.info(f"\n{'#'*60}\n  🤖 model_id={model_id}  url={service_url}\n  Комбинации: {len(param_combos)}\n{'#'*60}")
+    for res in slot_results:
+        if isinstance(res, Exception):
+            log.error(f"  ❌ Исключение в слоте: {res!r}")
+            send_error_trace(res, f"process_slot model={model_id}")
+            continue
 
-    for pair in args.pairs:
-        for day in args.days:
-            if deadline.exceeded():
-                timed_out = True
-                break
+        slot_label = res.get("slot", "?")
+        c = res.get("cache",    {})
+        b = res.get("backtest", {})
 
-            log.info(
-                f"\n{'='*55}\n"
-                f"  model={model_id}  pair={pair} ({PAIR_NAMES.get(pair)})  "
-                f"day={day} ({DAY_NAMES.get(day)})  "
-                f"[осталось: {deadline.remaining_str()}]"
-            )
+        stats_cache["new"]     += c.get("new",     0)
+        stats_cache["skipped"] += c.get("skipped", 0)
+        stats_cache["errors"]  += c.get("errors",  0)
+        stats_backtest["done"]    += b.get("done",    0)
+        stats_backtest["skipped"] += b.get("skipped", 0)
+        stats_backtest["failed"]  += b.get("failed",  0)
 
-            candles = await fetch_candles(engine_brain, pair, day, date_from, date_to)
-            if not candles:
-                log.warning("  ⚠️  Нет свечей — пропускаем")
-                continue
-            log.info(f"  Свечей: {len(candles)}")
+        if res.get("timed_out"):
+            timed_out = True
 
-            if not args.skip_fill:
-                log.info(f"\n  📥 Кеш ({len(param_combos)} комбинаций)...")
-                for idx, combo in enumerate(param_combos, 1):
-                    if deadline.exceeded():
-                        timed_out = True
-                        break
-                    combo_str = json.dumps(combo) if combo else "{}"
-                    log.info(f"  [{idx}/{len(param_combos)}] params={combo_str}")
-                    r = await fill_cache(engine_vlad, candles, service_url, pair, day, combo, deadline)
-                    stats_cache["new"]     += r["new"]
-                    stats_cache["skipped"] += r["skipped"]
-                    stats_cache["errors"]  += r["errors"]
-                    log.info(f"  ✓ total={r['total']}  new={r['new']}  skip={r['skipped']}  err={r['errors']}")
-
-                    if r["errors"] > 0:
-                        sample = r["error_dates"][:50]
-                        tail   = f"\n  ... и ещё {len(r["error_dates"]) - 50}" if len(r["error_dates"]) > 50 else ""
-                        send_trace(
-                            f"⚠️ Ошибки кеша — model={model_id} pair={pair} day={day} params={combo_str}",
-                            f"model={model_id}  pair={PAIR_NAMES.get(pair)}  day={DAY_NAMES.get(day)}\n"
-                            f"params={combo_str}\nurl={service_url}\n\n"
-                            f"Ошибок: {r["errors"]} из {r["total"]}\n"
-                            f"Примеры дат:\n" + "\n".join(f"  {d}" for d in sample) + tail,
-                            is_error=True,
-                        )
-
-                if not timed_out:
-                    send_trace(
-                        f"✅ Кеш завершён — pair={pair} day={day} model={model_id}",
-                        f"pair={PAIR_NAMES.get(pair)}  day={DAY_NAMES.get(day)}\n"
-                        f"new={stats_cache['new']}  skipped={stats_cache['skipped']}  errors={stats_cache['errors']}\n"
-                        f"Прошло: {deadline.elapsed_str()}  Осталось: {deadline.remaining_str()}",
-                    )
-            else:
-                log.info("  ⏭️  Кеш пропущен (--skip-fill)")
-
-            if args.only_fill or timed_out:
-                continue
-
-            for tier in args.tiers:
-                if deadline.exceeded():
-                    timed_out = True
-                    break
-
-                log.info(f"\n  🧪 Бэктест tier={tier} ({len(param_combos)} комбинаций)...")
-                results = []
-                for idx, combo in enumerate(param_combos, 1):
-                    if deadline.exceeded():
-                        timed_out = True
-                        break
-                    combo_str = json.dumps(combo) if combo else "{}"
-                    log.info(f"  [{idx}/{len(param_combos)}] params={combo_str}")
-                    r = await run_backtest(
-                        engine_vlad, candles, service_url, pair, day, tier,
-                        combo, date_from, date_to, model_id, deadline,
-                    )
-                    if r.get("skipped"):
-                        stats_backtest["skipped"] += 1
-                        log.info(f"  ⏭  уже посчитано: score={r['value_score']}  acc={r['accuracy']}")
-                    elif "error" in r:
-                        stats_backtest["failed"] += 1
-                        log.info(f"  ✗ {r['error']} (trades={r.get('trade_count', 0)})")
-                    else:
-                        stats_backtest["done"] += 1
-                        results.append(r)
-                        log.info(f"  ✓ score={r['value_score']:>10.2f}  acc={r['accuracy']:.3f}  trades={r['trade_count']}")
-
-                await upsert_summary(engine_vlad, service_url, model_id, pair, day, tier, date_from, date_to)
-
-                log.info(f"\n  📊 tier={tier}: done={len(results)}  skip={stats_backtest['skipped']}  fail={stats_backtest['failed']}")
-
-                if results:
-                    best = max(results, key=lambda x: x["value_score"])
-                    log.info(f"  🏆 Лучший: score={best['value_score']}  acc={best['accuracy']}  trades={best['trade_count']}  params={best['params']}")
-
-                if not timed_out:
-                    best_score = max((r["value_score"] for r in results), default=0)
-                    send_trace(
-                        f"✅ Бэктест завершён — pair={pair} day={day} tier={tier} model={model_id}",
-                        f"pair={PAIR_NAMES.get(pair)}  day={DAY_NAMES.get(day)}  tier={tier}\n"
-                        f"done={len(results)}  skip={stats_backtest['skipped']}  fail={stats_backtest['failed']}\n"
-                        f"best_score={best_score}\n"
-                        f"Прошло: {deadline.elapsed_str()}  Осталось: {deadline.remaining_str()}",
-                    )
-
-        if timed_out:
-            break
+        log.info(
+            f"  [{slot_label}] итог: "
+            f"cache(new={c.get('new',0)} skip={c.get('skipped',0)} err={c.get('errors',0)})  "
+            f"backtest(done={b.get('done',0)} skip={b.get('skipped',0)} fail={b.get('failed',0)})"
+        )
 
     return stats_cache, stats_backtest, timed_out
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# run — точка входа
+# ─────────────────────────────────────────────────────────────────────────────
 
 async def run(args) -> None:
     deadline = Deadline(hours=args.timeout_hours)
     log.info(f"⏰ Таймаут: {args.timeout_hours}h  (дедлайн: {deadline.deadline.strftime('%Y-%m-%d %H:%M:%S')})")
 
-    # ── Все параметры подключения ТОЛЬКО из env ───────────────────────────────
     vlad_host     = os.getenv("VLAD_HOST",     os.getenv("DB_HOST",     "localhost"))
     vlad_port     = os.getenv("VLAD_PORT",     os.getenv("DB_PORT",     "3306"))
     vlad_user     = os.getenv("VLAD_USER",     os.getenv("DB_USER",     "root"))
@@ -730,7 +911,7 @@ async def run(args) -> None:
     )
 
     log.info("=" * 60)
-    log.info(f"🚀 models={MODEL_IDS}")
+    log.info(f"🚀 models={MODEL_IDS}  HTTP_CONCURRENCY={HTTP_CONCURRENCY}")
     log.info(f"   vlad  DB : {vlad_user}@{vlad_host}:{vlad_port}/{vlad_database}")
     log.info(f"   brain DB : {brain_user}@{brain_host}:{brain_port}/{brain_name}")
     log.info(f"   super DB : {super_user}@{super_host}:{super_port}/{super_name}")
@@ -760,8 +941,19 @@ async def run(args) -> None:
         log.critical("❌ Ни одна модель не загружена. Выходим.")
         sys.exit(1)
 
-    engine_vlad  = create_async_engine(vlad_url,  pool_size=10, echo=False)
-    engine_brain = create_async_engine(brain_url, pool_size=6,  echo=False)
+    # pool_size: пик соединений = слоты × батч (кеш), ограничиваем разумно.
+    # vlad: 6 слотов × SLOT_BATCH_SIZE=20 = 120 пиковых соединений → cap 60.
+    n_slots    = len(args.pairs) * len(args.days)
+    vlad_pool  = min(n_slots * SLOT_BATCH_SIZE, 60)
+    brain_pool = max(n_slots, 6)
+
+    engine_vlad  = create_async_engine(vlad_url,  pool_size=vlad_pool,  max_overflow=10, echo=False)
+    engine_brain = create_async_engine(brain_url, pool_size=brain_pool, max_overflow=0,  echo=False)
+
+    log.info(
+        f"  DB pool: vlad={vlad_pool}(+10 overflow)  brain={brain_pool}  "
+        f"слотов={n_slots}  батч={SLOT_BATCH_SIZE}  HTTP_CONCURRENCY={HTTP_CONCURRENCY}"
+    )
 
     try:
         async with engine_vlad.begin() as conn:
@@ -784,6 +976,7 @@ async def run(args) -> None:
     log.info(f"  Пары   : {args.pairs}")
     log.info(f"  Дни    : {args.days}")
     log.info(f"  Тиры   : {args.tiers}")
+    log.info(f"  Слотов : {n_slots} (параллельно)")
 
     all_timed_out = False
 
@@ -850,7 +1043,11 @@ async def run(args) -> None:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Кеш + бэктест. Подключение из env (VLAD_HOST/VLAD_PORT/VLAD_USER/VLAD_PASSWORD/VLAD_DATABASE).",
+        description=(
+            "Кеш + бэктест. "
+            "Подключение из env (VLAD_HOST/VLAD_PORT/VLAD_USER/VLAD_PASSWORD/VLAD_DATABASE).\n"
+            f"Параллельность: {len(['EUR/USD', 'BTC/USD', 'ETH/USD'])} пары × 2 таймфрейма = 6 слотов одновременно."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Примеры:
@@ -871,9 +1068,6 @@ def parse_args():
     parser.add_argument("--only-fill",      action="store_true")
     parser.add_argument("--timeout-hours",  type=float, default=24.0)
 
-    # ── Игнорируем любые неизвестные позиционные/именованные аргументы ────────
-    # Это нужно если скрипт запускается через враппер, который передаёт
-    # лишние аргументы (например: vlad_values_cache 127.0.0.1 3306 root pass db)
     args, unknown = parser.parse_known_args()
     if unknown:
         log.warning(f"⚠️  Игнорируем неизвестные аргументы: {unknown}")
@@ -882,6 +1076,9 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    n_slots = len(args.pairs) * len(args.days)
+    slots   = [_slot_label(p, d) for p in args.pairs for d in args.days]
 
     log.info("=" * 60)
     log.info("⚙️  Параметры запуска")
@@ -894,6 +1091,8 @@ def main():
     log.info(f"   skip_fill     : {args.skip_fill}")
     log.info(f"   only_fill     : {args.only_fill}")
     log.info(f"   timeout_hours : {args.timeout_hours}")
+    log.info(f"   слотов        : {n_slots} → {slots}")
+    log.info(f"   HTTP_CONCUR.  : {HTTP_CONCURRENCY}")
     log.info("=" * 60)
 
     try:
