@@ -35,19 +35,24 @@ MODEL_IDS = [31]
 
 # ── Параллельность ────────────────────────────────────────────────────────────
 # Сколько одновременных HTTP-запросов к сервису.
-# Сервис на FastAPI/asyncio держит много concurrent запросов.
+# Начни с 5 — это безопасно. Поднимай по 5 если сервис стабилен.
+# Слишком высокое значение = OOM или pool exhaustion на стороне сервиса.
+HTTP_CONCURRENCY = 5
 
-HTTP_CONCURRENCY = 20
+# Размер батча свечей для asyncio.gather.
+# batch=50 при concurrency=5 → отправляем 50 запросов, но одновременно идут только 5.
+SLOT_BATCH_SIZE = 50
 
-# Размер батча свечей для asyncio.gather внутри одного слота.
-# При 20 concurrent и batch=100 — отправляем 100 запросов, ждём все, идём дальше.
-SLOT_BATCH_SIZE = 100
-
-# Retry для упавших дат: сколько раз повторяем после основного прохода.
+# Retry для упавших дат.
 RETRY_PASSES      = 3
-RETRY_PASS_DELAYS = [10, 30, 60]   # пауза перед каждым retry (секунды)
-HTTP_TIMEOUT      = 15             # таймаут одного запроса (секунды)
-RETRY_TIMEOUT     = 20             # таймаут при retry (чуть мягче)
+RETRY_PASS_DELAYS = [30, 60, 120]  # сервису нужно время восстановиться
+HTTP_TIMEOUT      = 20             # таймаут одного запроса (секунды)
+RETRY_TIMEOUT     = 30             # таймаут при retry
+
+# Circuit breaker: если подряд столько батчей = 100% ошибок → сервис лежит.
+# Пауза CB_PAUSE секунд, потом пробуем снова.
+CB_THRESHOLD = 2    # батчей подряд с 100% ошибок
+CB_PAUSE     = 60   # секунд паузы
 
 # ── Логирование ────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -394,6 +399,35 @@ async def _load_cached_dates(
 FailedItem = dict  # {"candle": dict, "reason": str}
 
 
+
+async def _check_service_alive(
+    session: aiohttp.ClientSession,
+    url: str,
+    label: str = "",
+) -> bool:
+    """
+    Проверяет что сервис отвечает на GET /.
+    Если нет — логирует причину.
+    """
+    try:
+        async with session.get(
+            f"{url}/",
+            timeout=aiohttp.ClientTimeout(total=5),
+        ) as r:
+            if r.status == 200:
+                return True
+            log.warning(f"{label} ⚠️  Сервис отвечает HTTP {r.status}")
+            return False
+    except asyncio.TimeoutError:
+        log.warning(f"{label} ⚠️  Сервис не отвечает (таймаут 5s)")
+        return False
+    except aiohttp.ClientConnectorError as e:
+        log.warning(f"{label} ⚠️  Сервис недоступен: {e}")
+        return False
+    except Exception as e:
+        log.warning(f"{label} ⚠️  Ошибка проверки сервиса: {e}")
+        return False
+
 async def _run_pass(
     candles: list[dict],
     session: aiohttp.ClientSession,
@@ -413,14 +447,17 @@ async def _run_pass(
     Проходит по candles батчами параллельных HTTP-запросов.
     Не останавливается на ошибках — собирает все упавшие в failed_list.
     Bulk INSERT после каждого батча.
+    Circuit breaker: если CB_THRESHOLD батчей подряд дают 100% ошибок →
+    сервис скорее всего упал → пауза CB_PAUSE секунд → проверка alive.
     Возвращает (ok_count, failed_list).
     """
     if not candles:
         return 0, []
 
-    params_json = json.dumps(extra_params, ensure_ascii=False)
-    ok_count    = 0
+    params_json  = json.dumps(extra_params, ensure_ascii=False)
+    ok_count     = 0
     failed: list[FailedItem] = []
+    cb_streak    = 0   # батчей подряд с 100% ошибками
 
     for batch_start in range(0, len(candles), SLOT_BATCH_SIZE):
         if deadline.exceeded():
@@ -446,15 +483,20 @@ async def _run_pass(
 
         # Разбираем результаты и готовим bulk INSERT
         insert_rows: list[dict] = []
+        batch_ok  = 0
+        batch_err = 0
+
         for i, res in enumerate(results):
             candle = batch[i]
             if isinstance(res, Exception):
                 failed.append({"candle": candle, "reason": f"gather exception: {res}"})
+                batch_err += 1
                 continue
 
             payload, err = res
             if err is not None or payload is None:
                 failed.append({"candle": candle, "reason": err or "payload is None"})
+                batch_err += 1
                 continue
 
             insert_rows.append({
@@ -466,17 +508,54 @@ async def _run_pass(
                 "pj":   params_json,
                 "rj":   json.dumps(payload, ensure_ascii=False),
             })
+            batch_ok += 1
             ok_count += 1
 
-        # Один bulk INSERT на весь батч
+        # Bulk INSERT успешных результатов
         await _bulk_insert(engine_vlad, insert_rows)
 
         done = batch_start + len(batch)
         pct  = done / len(candles) * 100
         log.info(
             f"{label} {pass_name} [{done}/{len(candles)}] {pct:.1f}%  "
-            f"ok={ok_count}  err={len(failed)}"
+            f"ok={ok_count}  err={len(failed)}  cb_streak={cb_streak}"
         )
+
+        # ── Circuit breaker ────────────────────────────────────────────────────
+        if batch_err == len(batch) and batch_ok == 0:
+            # Весь батч упал — возможно сервис лежит
+            cb_streak += 1
+            log.warning(
+                f"{label} ⚡ Батч 100% ошибок (streak={cb_streak}/{CB_THRESHOLD}). "
+                f"Ошибка: {failed[-1]['reason'][:120] if failed else 'unknown'}"
+            )
+
+            if cb_streak >= CB_THRESHOLD:
+                log.warning(
+                    f"{label} 🔴 Circuit breaker: {cb_streak} батчей подряд с ошибками. "
+                    f"Пауза {CB_PAUSE}s, потом проверяем сервис..."
+                )
+                await asyncio.sleep(CB_PAUSE)
+
+                alive = await _check_service_alive(session, service_url, label)
+                if not alive:
+                    log.error(
+                        f"{label} ❌ Сервис недоступен после паузы. "
+                        f"Прерываем проход — оставшиеся даты пойдут в retry."
+                    )
+                    # Добавляем оставшиеся необработанные свечи в failed
+                    next_start = batch_start + len(batch)
+                    for c in candles[next_start:]:
+                        failed.append({
+                            "candle": c,
+                            "reason": "сервис недоступен (circuit breaker)",
+                        })
+                    break
+                else:
+                    log.info(f"{label} ✅ Сервис снова доступен, продолжаем")
+                    cb_streak = 0   # сбрасываем счётчик
+        else:
+            cb_streak = 0   # был хоть один успех — сбрасываем
 
     return ok_count, failed
 
@@ -809,6 +888,12 @@ async def run_slot(
 
     if not candles:
         log.warning(f"{label} ⚠️  Нет свечей — пропускаем")
+        return {"slot": slot, "cache": stats_cache, "backtest": stats_backtest, "timed_out": False}
+
+    # Проверяем что сервис доступен перед началом работы
+    alive = await _check_service_alive(session, service_url, label)
+    if not alive:
+        log.error(f"{label} ❌ Сервис недоступен. Пропускаем слот.")
         return {"slot": slot, "cache": stats_cache, "backtest": stats_backtest, "timed_out": False}
 
     log.info(f"{label} ▶  Кеш: {len(candles)} свечей, {len(param_combos)} комбинаций")
