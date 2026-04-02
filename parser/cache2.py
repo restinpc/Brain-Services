@@ -454,12 +454,9 @@ async def _run_pass(
     timeout_sec: float,
 ) -> tuple[int, list[FailedItem]]:
     """
-    Проходит по candles батчами параллельных HTTP-запросов.
+    Проходит по candles батчами ПОСЛЕДОВАТЕЛЬНЫХ HTTP-запросов.
     Не останавливается на ошибках — собирает все упавшие в failed_list.
     Bulk INSERT после каждого батча.
-    Circuit breaker: если CB_THRESHOLD батчей подряд дают 100% ошибок →
-    сервис скорее всего упал → пауза CB_PAUSE секунд → проверка alive.
-    Возвращает (ok_count, failed_list).
     """
     if not candles:
         return 0, []
@@ -467,7 +464,7 @@ async def _run_pass(
     params_json  = json.dumps(extra_params, ensure_ascii=False)
     ok_count     = 0
     failed: list[FailedItem] = []
-    cb_streak    = 0   # батчей подряд с 100% ошибками
+    cb_streak    = 0
 
     for batch_start in range(0, len(candles), SLOT_BATCH_SIZE):
         if deadline.exceeded():
@@ -476,9 +473,13 @@ async def _run_pass(
 
         batch = candles[batch_start : batch_start + SLOT_BATCH_SIZE]
 
-        # Параллельно запрашиваем все свечи в батче
-        tasks = [
-            _call_one(
+        # ПОСЛЕДОВАТЕЛЬНО запрашиваем все свечи в батче
+        insert_rows: list[dict] = []
+        batch_ok  = 0
+        batch_err = 0
+
+        for c in batch:
+            res = await _call_one(
                 session,
                 service_url,
                 {"pair": pair, "day": day,
@@ -487,25 +488,15 @@ async def _run_pass(
                 global_sem,
                 timeout_sec,
             )
-            for c in batch
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Разбираем результаты и готовим bulk INSERT
-        insert_rows: list[dict] = []
-        batch_ok  = 0
-        batch_err = 0
-
-        for i, res in enumerate(results):
-            candle = batch[i]
             if isinstance(res, Exception):
-                failed.append({"candle": candle, "reason": f"gather exception: {res}"})
+                failed.append({"candle": c, "reason": f"gather exception: {res}"})
                 batch_err += 1
                 continue
 
             payload, err = res
             if err is not None or payload is None:
-                failed.append({"candle": candle, "reason": err or "payload is None"})
+                failed.append({"candle": c, "reason": err or "payload is None"})
                 batch_err += 1
                 continue
 
@@ -513,7 +504,7 @@ async def _run_pass(
                 "url":  service_url,
                 "pair": pair,
                 "day":  day,
-                "dv":   candle["date"],
+                "dv":   c["date"],
                 "ph":   p_hash,
                 "pj":   params_json,
                 "rj":   json.dumps(payload, ensure_ascii=False),
@@ -531,9 +522,8 @@ async def _run_pass(
             f"ok={ok_count}  err={len(failed)}  cb_streak={cb_streak}"
         )
 
-        # ── Circuit breaker ────────────────────────────────────────────────────
+        # Circuit breaker
         if batch_err == len(batch) and batch_ok == 0:
-            # Весь батч упал — возможно сервис лежит
             cb_streak += 1
             log.warning(
                 f"{label} ⚡ Батч 100% ошибок (streak={cb_streak}/{CB_THRESHOLD}). "
@@ -553,7 +543,6 @@ async def _run_pass(
                         f"{label} ❌ Сервис недоступен после паузы. "
                         f"Прерываем проход — оставшиеся даты пойдут в retry."
                     )
-                    # Добавляем оставшиеся необработанные свечи в failed
                     next_start = batch_start + len(batch)
                     for c in candles[next_start:]:
                         failed.append({
@@ -563,9 +552,9 @@ async def _run_pass(
                     break
                 else:
                     log.info(f"{label} ✅ Сервис снова доступен, продолжаем")
-                    cb_streak = 0   # сбрасываем счётчик
+                    cb_streak = 0
         else:
-            cb_streak = 0   # был хоть один успех — сбрасываем
+            cb_streak = 0
 
     return ok_count, failed
 
