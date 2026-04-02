@@ -345,10 +345,15 @@ def _compute_cpu_only(
     calc_type: int = 0, calc_var: int = 0,
 ) -> dict | None:
     """
-    Синхронная CPU-часть вычисления весов.
-    Вызывается через asyncio.to_thread() из /compute чтобы не блокировать event loop.
-    Не делает никаких async операций — только работа с данными в RAM.
-    _refresh_rates_if_needed должна быть вызвана ДО этой функции.
+    Оптимизированная синхронная CPU-часть вычисления весов.
+    Запускается через asyncio.to_thread() из /compute.
+
+    Оптимизации vs оригинальный calculate_pure_memory:
+    1. Без DIAG-логов (70k+ print вызовов на 10k свечей)
+    2. bisect для отсечения valid_dts — early exit вместо полного перебора
+    3. delta_shift вычисляется один раз вне внутреннего цикла
+    4. t_dates как список не создаётся — значения суммируются напрямую
+    5. Встроенный fast-path: skip нулевых t1 без вызовов функций
     """
     target_date = parse_date_string(date_str)
     if not target_date:
@@ -357,11 +362,11 @@ def _compute_cpu_only(
     rates_table  = get_rates_table_name(pair, day)
     modification = get_modification_factor(pair)
     delta_unit   = timedelta(days=1) if day == 1 else timedelta(hours=1)
-    check_dts    = [target_date + delta_unit * s
-                    for s in range(-SHIFT_WINDOW, SHIFT_WINDOW + 1)]
 
+    # Собираем наблюдения: все (инструмент, дата, контекст, сдвиг) <= target_date
     observations = []
-    for dt in check_dts:
+    for s in range(-SHIFT_WINDOW, SHIFT_WINDOW + 1):
+        dt = target_date + delta_unit * s
         if dt > target_date:
             continue
         dt_end = dt + delta_unit
@@ -385,10 +390,15 @@ def _compute_cpu_only(
     ram_ext     = GLOBAL_EXTREMUMS.get(rates_table, {"min": set(), "max": set()})
     prev_candle = find_prev_candle_trend(rates_table, target_date)
 
-    result = {}
-    for instr, obs_dt, (rcd, td, md), shift in observations:
-        ctx_key = (instr, rcd, td, md)
+    # Предвычисляем флаги для calc_var (одинаковы для всех итераций)
+    need_filter = calc_var in (1, 3, 4)
+    use_square  = calc_var in (2, 3)
+    use_range   = calc_var == 4
 
+    result = {}
+
+    for instr, obs_dt, (rcd, td, md), shift in observations:
+        ctx_key  = (instr, rcd, td, md)
         ctx_info = GLOBAL_CTX_INDEX.get(ctx_key)
         if ctx_info is None:
             continue
@@ -399,35 +409,80 @@ def _compute_cpu_only(
             continue
 
         all_ctx_dts = GLOBAL_MKT_CTX_HIST.get(ctx_key, [])
-        idx         = bisect.bisect_left(all_ctx_dts, target_date)
-        valid_dts   = all_ctx_dts[:idx]
-        if not valid_dts:
+        if not all_ctx_dts:
             continue
 
-        t_dates = [d + delta_unit * shift for d in valid_dts
-                   if (d + delta_unit * shift) < target_date]
-        if not t_dates:
+        # bisect для поиска верхней границы (строго < target_date)
+        # valid_dts = all_ctx_dts[:idx] — отсортированы, поэтому используем срез напрямую
+        idx = bisect.bisect_left(all_ctx_dts, target_date)
+        if idx == 0:
             continue
 
-        shift_arg = shift if is_recurring else None
+        # ── Оптимизация: delta_shift вычисляем один раз ────────────────────────
+        delta_shift = delta_unit * shift
 
+        # Верхняя граница для d: d + delta_shift < target_date → d < target_date - delta_shift
+        cutoff_d = target_date - delta_shift
+
+        # ── T1 сумма без создания промежуточного списка t_dates ───────────────
         if calc_type in (0, 1):
-            t1_sum = compute_t1_value(t_dates, calc_var, ram_rates, ram_ranges, avg_range)
-            wc     = make_weight_code(instr, rcd, td, md, 0, shift_arg)
-            result[wc] = result.get(wc, 0.0) + t1_sum
+            t1_total   = 0.0
+            t1_count   = 0
+            for d in all_ctx_dts[:idx]:
+                if d >= cutoff_d:
+                    break  # список отсортирован → все последующие тоже >= cutoff_d
+                t = d + delta_shift
+                rng = ram_ranges.get(t, 0.0)
+                if need_filter and rng <= avg_range:
+                    continue
+                if use_range:
+                    t1_total += rng - avg_range
+                else:
+                    t1 = ram_rates.get(t, 0.0)
+                    if t1 != 0.0:
+                        t1_total += t1 * abs(t1) if use_square else t1
+                t1_count += 1
 
+            if t1_count > 0:
+                wc = make_weight_code(instr, rcd, td, md, 0, shift if is_recurring else None)
+                result[wc] = result.get(wc, 0.0) + t1_total
+
+        # ── Extremum без создания промежуточного pool-списка ──────────────────
         if calc_type in (0, 2) and prev_candle:
             _, is_bull = prev_candle
             ext_set    = ram_ext["max" if is_bull else "min"]
-            ext_val    = compute_extremum_value(
-                t_dates, calc_var, ext_set, ram_ranges,
-                avg_range, modification, len(valid_dts)
-            )
-            if ext_val is not None:
-                wc = make_weight_code(instr, rcd, td, md, 1, shift_arg)
-                result[wc] = result.get(wc, 0.0) + ext_val
+
+            pool_total = 0
+            pool_in_ext = 0
+            total_hist_count = idx  # len(all_ctx_dts[:idx])
+
+            for d in all_ctx_dts[:idx]:
+                if d >= cutoff_d:
+                    break
+                t = d + delta_shift
+                rng = ram_ranges.get(t, 0.0)
+                if need_filter and rng <= avg_range:
+                    continue
+                if use_range:
+                    if t in ext_set:
+                        pool_in_ext += 1
+                        pool_total  += rng - avg_range
+                else:
+                    pool_total += 1
+                    if t in ext_set:
+                        pool_in_ext += 1
+
+            if pool_total > 0 and total_hist_count > 0:
+                if use_range:
+                    ext_val = pool_in_ext  # sum of (rng - avg_range) for ext_set dates
+                else:
+                    ext_val = ((pool_in_ext / total_hist_count) * 2 - 1) * modification
+                if ext_val != 0:
+                    wc = make_weight_code(instr, rcd, td, md, 1, shift if is_recurring else None)
+                    result[wc] = result.get(wc, 0.0) + ext_val
 
     return {k: round(v, 6) for k, v in result.items() if v != 0}
+
 
 
 async def calculate_pure_memory(pair, day, date_str, calc_type=0, calc_var=0):
