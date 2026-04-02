@@ -31,8 +31,8 @@ SERVICE_FOLDER_MAP: dict[int, str] = {
 }
 
 # ── Параллельность ────────────────────────────────────────────────────────────
-SLOT_CONCURRENCY = 1    # параллельных вычислений на один слот
-SLOT_BATCH_SIZE  = 100   # свечей в батче (локальный вызов быстрее HTTP, можно больше)
+SLOT_CONCURRENCY = 4    # параллельных вычислений на один слот
+SLOT_BATCH_SIZE  = 50   # свечей в батче (локальный вызов быстрее HTTP, можно больше)
 
 # ── Стратегия retry: collect-then-retry ──────────────────────────────────────
 # Основной проход — не останавливается на ошибках, собирает все упавшие.
@@ -222,6 +222,16 @@ class ServiceRunner:
         self.service_url = f"local:{model_id}"  # псевдо-url для кеш-таблицы
         self._initialized = False
 
+        # Глобальный семафор модуля — лимитирует суммарную конкурентность
+        # ко всем функциям расчёта этого модуля, независимо от числа слотов.
+        # Нужен потому что legacy-сервисы используют общий engine (engine_brain,
+        # engine_vlad) внутри calculate_pure_memory → _refresh_rates_if_needed.
+        # Если 6 слотов одновременно дёргают эту функцию — соединения ломаются
+        # с ошибкой "Packet sequence number wrong".
+        # Значение = максимум одновременных вызовов calculate ко всему модулю.
+        # Для legacy async сервисов рекомендуется 1-2.
+        self._module_sem: asyncio.Semaphore | None = None  # инициализируется в initialize()
+
     # Определяется автоматически при load_module():
     #   "dummy"  — новый фреймворк: calculate(pair, day, date_str, type_, var, param)
     #   "legacy" — старый сервис:   calculate_pure_memory(pair, day, date_str, calc_type, calc_var)
@@ -319,6 +329,19 @@ class ServiceRunner:
         try:
             await self.module.preload_all_data()
             self._initialized = True
+
+        # Для legacy async сервисов ограничиваем конкурентность на уровне модуля.
+        # Sync-функции (новый dummy) запускаются в потоках — там нет общего event loop,
+        # поэтому ограничение не нужно (asyncio.to_thread изолирует их).
+        if self._calc_is_async:
+            self._module_sem = asyncio.Semaphore(1)
+            log.info(
+                f"  [model{self.model_id}] _module_sem=1 "
+                f"(async legacy — защита от concurrent DB access)"
+            )
+        else:
+            self._module_sem = None
+            log.info(f"  [model{self.model_id}] _module_sem=None (sync dummy — не нужен)")
         except Exception as e:
             raise RuntimeError(
                 f"Ошибка при preload_all_data (model={self.model_id}):\n"
@@ -402,10 +425,14 @@ class ServiceRunner:
 
         try:
             if self._calc_is_async:
-                # async функция — await напрямую в текущем event loop
-                result = await self._call_fn(pair, day, date_str, extra_params)
+                # async функция — await напрямую в event loop.
+                # Оборачиваем в _module_sem чтобы предотвратить concurrent доступ
+                # к shared engine внутри модуля (защита от "Packet sequence number wrong").
+                async with self._module_sem:
+                    result = await self._call_fn(pair, day, date_str, extra_params)
             else:
-                # sync функция — в отдельном потоке чтобы не блокировать event loop
+                # sync функция — в отдельном потоке чтобы не блокировать event loop.
+                # asyncio.to_thread изолирует вызов, _module_sem не нужен.
                 result = await asyncio.to_thread(
                     self._call_fn, pair, day, date_str, extra_params
                 )
