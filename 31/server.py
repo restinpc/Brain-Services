@@ -9,8 +9,9 @@ import functools
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
+from typing import List
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Body
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from dotenv import load_dotenv
@@ -220,7 +221,6 @@ async def preload_all_data():
         except Exception as e:
             log(f"❌ market_history: {e}", NODE_NAME, level="error")
 
-    # ── bisect: отсортированный список дат market ──
     _MKT_SORTED_DATES[:] = sorted(GLOBAL_MKT_OBS_DTS.keys())
 
     for table in ["brain_rates_eur_usd", "brain_rates_eur_usd_day",
@@ -303,7 +303,6 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
-
 # ── Подгрузка свежих свечей из БД ─────────────────────────────────────────
 _LAST_RATES_REFRESH = {}
 
@@ -340,30 +339,28 @@ async def _refresh_rates_if_needed(rates_table):
         log(f"  ⚠️ Rates refresh error ({rates_table}): {e}", NODE_NAME, level="warning")
 
 
-def _compute_cpu_only(
-    pair: int, day: int, date_str: str,
-    calc_type: int = 0, calc_var: int = 0,
-) -> dict | None:
+# ── Внутренняя CPU-функция для одной даты ────────────────────────────────────
+
+def _compute_inner(
+    target_date: datetime,
+    delta_unit: timedelta,
+    rates_table: str,
+    modification: float,
+    calc_type: int,
+    calc_var: int,
+    ram_rates: dict,
+    ram_ranges: dict,
+    avg_range: float,
+    ram_ext: dict,
+    need_filter: bool,
+    use_square: bool,
+    use_range: bool,
+) -> dict:
     """
-    Оптимизированная синхронная CPU-часть вычисления весов.
-    Запускается через asyncio.to_thread() из /compute.
-
-    Оптимизации vs оригинальный calculate_pure_memory:
-    1. Без DIAG-логов (70k+ print вызовов на 10k свечей)
-    2. bisect для отсечения valid_dts — early exit вместо полного перебора
-    3. delta_shift вычисляется один раз вне внутреннего цикла
-    4. t_dates как список не создаётся — значения суммируются напрямую
-    5. Встроенный fast-path: skip нулевых t1 без вызовов функций
+    Чистое вычисление весов для одной даты.
+    Все данные передаются снаружи — не читает глобальные переменные,
+    что позволяет переиспользовать одни и те же данные для батча дат.
     """
-    target_date = parse_date_string(date_str)
-    if not target_date:
-        return None
-
-    rates_table  = get_rates_table_name(pair, day)
-    modification = get_modification_factor(pair)
-    delta_unit   = timedelta(days=1) if day == 1 else timedelta(hours=1)
-
-    # Собираем наблюдения: все (инструмент, дата, контекст, сдвиг) <= target_date
     observations = []
     for s in range(-SHIFT_WINDOW, SHIFT_WINDOW + 1):
         dt = target_date + delta_unit * s
@@ -384,17 +381,7 @@ def _compute_cpu_only(
     if not observations:
         return {}
 
-    ram_rates   = GLOBAL_RATES.get(rates_table, {})
-    ram_ranges  = GLOBAL_CANDLE_RANGES.get(rates_table, {})
-    avg_range   = GLOBAL_AVG_RANGE.get(rates_table, 0.0)
-    ram_ext     = GLOBAL_EXTREMUMS.get(rates_table, {"min": set(), "max": set()})
     prev_candle = find_prev_candle_trend(rates_table, target_date)
-
-    # Предвычисляем флаги для calc_var (одинаковы для всех итераций)
-    need_filter = calc_var in (1, 3, 4)
-    use_square  = calc_var in (2, 3)
-    use_range   = calc_var == 4
-
     result = {}
 
     for instr, obs_dt, (rcd, td, md), shift in observations:
@@ -412,26 +399,20 @@ def _compute_cpu_only(
         if not all_ctx_dts:
             continue
 
-        # bisect для поиска верхней границы (строго < target_date)
-        # valid_dts = all_ctx_dts[:idx] — отсортированы, поэтому используем срез напрямую
         idx = bisect.bisect_left(all_ctx_dts, target_date)
         if idx == 0:
             continue
 
-        # ── Оптимизация: delta_shift вычисляем один раз ────────────────────────
         delta_shift = delta_unit * shift
+        cutoff_d    = target_date - delta_shift
 
-        # Верхняя граница для d: d + delta_shift < target_date → d < target_date - delta_shift
-        cutoff_d = target_date - delta_shift
-
-        # ── T1 сумма без создания промежуточного списка t_dates ───────────────
         if calc_type in (0, 1):
-            t1_total   = 0.0
-            t1_count   = 0
+            t1_total = 0.0
+            t1_count = 0
             for d in all_ctx_dts[:idx]:
                 if d >= cutoff_d:
-                    break  # список отсортирован → все последующие тоже >= cutoff_d
-                t = d + delta_shift
+                    break
+                t   = d + delta_shift
                 rng = ram_ranges.get(t, 0.0)
                 if need_filter and rng <= avg_range:
                     continue
@@ -447,19 +428,18 @@ def _compute_cpu_only(
                 wc = make_weight_code(instr, rcd, td, md, 0, shift if is_recurring else None)
                 result[wc] = result.get(wc, 0.0) + t1_total
 
-        # ── Extremum без создания промежуточного pool-списка ──────────────────
         if calc_type in (0, 2) and prev_candle:
             _, is_bull = prev_candle
             ext_set    = ram_ext["max" if is_bull else "min"]
 
-            pool_total = 0
-            pool_in_ext = 0
-            total_hist_count = idx  # len(all_ctx_dts[:idx])
+            pool_total     = 0
+            pool_in_ext    = 0
+            total_hist_cnt = idx
 
             for d in all_ctx_dts[:idx]:
                 if d >= cutoff_d:
                     break
-                t = d + delta_shift
+                t   = d + delta_shift
                 rng = ram_ranges.get(t, 0.0)
                 if need_filter and rng <= avg_range:
                     continue
@@ -472,17 +452,95 @@ def _compute_cpu_only(
                     if t in ext_set:
                         pool_in_ext += 1
 
-            if pool_total > 0 and total_hist_count > 0:
+            if pool_total > 0 and total_hist_cnt > 0:
                 if use_range:
-                    ext_val = pool_in_ext  # sum of (rng - avg_range) for ext_set dates
+                    ext_val = pool_in_ext
                 else:
-                    ext_val = ((pool_in_ext / total_hist_count) * 2 - 1) * modification
+                    ext_val = ((pool_in_ext / total_hist_cnt) * 2 - 1) * modification
                 if ext_val != 0:
                     wc = make_weight_code(instr, rcd, td, md, 1, shift if is_recurring else None)
                     result[wc] = result.get(wc, 0.0) + ext_val
 
     return {k: round(v, 6) for k, v in result.items() if v != 0}
 
+
+def _compute_cpu_only(
+    pair: int, day: int, date_str: str,
+    calc_type: int = 0, calc_var: int = 0,
+) -> dict | None:
+    """
+    Тонкая обёртка над _compute_inner для одиночного /compute вызова.
+    Сохранена для обратной совместимости.
+    """
+    target_date = parse_date_string(date_str)
+    if not target_date:
+        return None
+
+    rates_table  = get_rates_table_name(pair, day)
+    modification = get_modification_factor(pair)
+    delta_unit   = timedelta(days=1) if day == 1 else timedelta(hours=1)
+    need_filter  = calc_var in (1, 3, 4)
+    use_square   = calc_var in (2, 3)
+    use_range    = calc_var == 4
+
+    return _compute_inner(
+        target_date, delta_unit, rates_table, modification,
+        calc_type, calc_var,
+        GLOBAL_RATES.get(rates_table, {}),
+        GLOBAL_CANDLE_RANGES.get(rates_table, {}),
+        GLOBAL_AVG_RANGE.get(rates_table, 0.0),
+        GLOBAL_EXTREMUMS.get(rates_table, {"min": set(), "max": set()}),
+        need_filter, use_square, use_range,
+    )
+
+
+def _compute_batch_cpu_only(
+    pair: int, day: int, dates: list[str],
+    calc_type: int = 0, calc_var: int = 0,
+) -> dict[str, dict]:
+    """
+    Батчевое вычисление: принимает список дат, возвращает {date_str: result}.
+
+    Ключевая оптимизация vs N одиночных вызовов:
+    - Общие данные (ram_rates, ram_ranges, avg_range, ram_ext, флаги) читаются
+      из глобальных словарей ОДИН РАЗ для всего батча, а не N раз.
+    - Нет HTTP round-trip overhead на каждую дату.
+    - Всё выполняется в одном потоке (вызывается через asyncio.to_thread),
+      поэтому не создаёт конкуренцию за GIL с другими воркерами.
+    """
+    rates_table  = get_rates_table_name(pair, day)
+    modification = get_modification_factor(pair)
+    delta_unit   = timedelta(days=1) if day == 1 else timedelta(hours=1)
+
+    # Читаем shared-данные один раз для всего батча
+    ram_rates   = GLOBAL_RATES.get(rates_table, {})
+    ram_ranges  = GLOBAL_CANDLE_RANGES.get(rates_table, {})
+    avg_range   = GLOBAL_AVG_RANGE.get(rates_table, 0.0)
+    ram_ext     = GLOBAL_EXTREMUMS.get(rates_table, {"min": set(), "max": set()})
+    need_filter = calc_var in (1, 3, 4)
+    use_square  = calc_var in (2, 3)
+    use_range   = calc_var == 4
+
+    results: dict[str, dict] = {}
+    for date_str in dates:
+        target_date = parse_date_string(date_str)
+        if not target_date:
+            results[date_str] = {}
+            continue
+        try:
+            result = _compute_inner(
+                target_date, delta_unit, rates_table, modification,
+                calc_type, calc_var,
+                ram_rates, ram_ranges, avg_range, ram_ext,
+                need_filter, use_square, use_range,
+            )
+            results[date_str] = result or {}
+        except Exception as e:
+            log(f"  ⚠️ _compute_batch_cpu_only error for {date_str}: {e}",
+                NODE_NAME, level="warning")
+            results[date_str] = {}
+
+    return results
 
 
 async def calculate_pure_memory(pair, day, date_str, calc_type=0, calc_var=0):
@@ -670,27 +728,18 @@ async def get_values(
         return err_response(str(e))
 
 
-
 @app.get("/compute")
 async def compute_values(
     pair: int = Query(1), day: int = Query(1), date: str = Query(...),
     type: int = Query(0, ge=0, le=2), var: int = Query(0, ge=0, le=4),
 ):
     """
-    Чистое вычисление без кеширования. Используется cache.py при построении кеша.
-
-    Ключевое отличие от /values:
-    1. Нет чтения/записи в vlad_values_cache — исключает конкуренцию за БД
-    2. CPU-тяжёлая часть вычисления выполняется в thread pool через asyncio.to_thread —
-       event loop остаётся отзывчивым и принимает другие запросы пока идёт вычисление.
-
-    Возвращает результат напрямую: {"key": float, ...} или {}
+    Одиночное вычисление без кеширования (обратная совместимость).
+    Для построения кеша используйте /compute_batch — он значительно быстрее.
     """
     try:
         rates_table = get_rates_table_name(pair, day)
-        # Async часть: обновить свечи если нужно (с 30-сек кешем — редко бьёт в БД)
         await _refresh_rates_if_needed(rates_table)
-        # CPU часть: в thread pool чтобы не блокировать event loop
         result = await asyncio.to_thread(
             functools.partial(_compute_cpu_only, pair, day, date,
                               calc_type=type, calc_var=var)
@@ -699,6 +748,45 @@ async def compute_values(
     except Exception as e:
         send_error_trace(e, node=NODE_NAME, script="compute_values")
         return {"error": str(e)}
+
+
+@app.post("/compute_batch")
+async def compute_batch_values(
+    pair: int  = Query(1),
+    day:  int  = Query(1),
+    type: int  = Query(0, ge=0, le=2),
+    var:  int  = Query(0, ge=0, le=4),
+    dates: List[str] = Body(...),
+):
+    """
+    Батчевое вычисление без кеширования. Принимает список дат, возвращает
+    словарь {date_str: {weight_code: float, ...}}.
+
+    Используется cache.py для построения кеша — намного быстрее N одиночных /compute:
+    - Общие данные (rates, ranges, extremums) читаются один раз на весь батч
+    - Нет HTTP round-trip overhead на каждую дату
+    - Всё выполняется в одном to_thread вызове, event loop остаётся отзывчивым
+
+    Пример запроса:
+        POST /compute_batch?pair=1&day=0&type=0&var=0
+        Body: ["2025-01-15 00:00:00", "2025-01-15 01:00:00", ...]
+    """
+    if not dates:
+        return {}
+    try:
+        rates_table = get_rates_table_name(pair, day)
+        await _refresh_rates_if_needed(rates_table)
+        result = await asyncio.to_thread(
+            functools.partial(
+                _compute_batch_cpu_only, pair, day, dates,
+                calc_type=type, calc_var=var,
+            )
+        )
+        return result if result is not None else {}
+    except Exception as e:
+        send_error_trace(e, node=NODE_NAME, script="compute_batch_values")
+        return {"error": str(e)}
+
 
 @app.post("/patch")
 async def patch_service():
