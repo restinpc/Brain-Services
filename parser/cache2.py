@@ -422,7 +422,7 @@ async def _check_service_alive(
     try:
         async with session.get(
             f"{url}/",
-            timeout=aiohttp.ClientTimeout(total=5),
+            timeout=aiohttp.ClientTimeout(total=30),
         ) as r:
             if r.status == 200:
                 return True
