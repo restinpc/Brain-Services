@@ -246,39 +246,41 @@ async def preload_all_data():
         except Exception as e:
             log(f"❌ ctx_index: {e}", NODE_NAME, level="error")
 
-        try:
-            col_list = ", ".join(f"`{col}`" for col in INSTRUMENT_COLUMNS.values())
+    # ── market_history читается из engine_brain ───────────────────────────────
+    try:
+        col_list = ", ".join(f"`{col}`" for col in INSTRUMENT_COLUMNS.values())
+        async with engine_brain.connect() as conn:
             res  = await conn.execute(text(
                 f"SELECT `datetime`, {col_list} FROM vlad_market_history ORDER BY `datetime`"))
             rows = res.fetchall()
-            log(f"  vlad_market_history (from engine_vlad): {len(rows)} rows", NODE_NAME)
-            if rows:
-                log(f"    date range: {rows[0][0]} → {rows[-1][0]}", NODE_NAME)
-            by_instr    = {instr: [] for instr in INSTRUMENT_COLUMNS}
-            instruments = list(INSTRUMENT_COLUMNS.keys())
-            for row in rows:
-                dt = row[0]
-                for i, instr in enumerate(instruments):
-                    val = row[i + 1]
-                    if val is not None:
-                        by_instr[instr].append((dt, float(val)))
-            for instr, series in by_instr.items():
-                log(f"    {instr}: {len(series)} observations" +
-                    (f", last={series[-1][0]}" if series else ""), NODE_NAME)
-                if not series:
-                    continue
-                threshold = THRESHOLD_BY_INSTRUMENT.get(instr, DEFAULT_THRESHOLD)
-                GLOBAL_MKT_BY_INSTR[instr] = series
-                for dt, rcd, td, md in classify_market_observations(series, threshold):
-                    GLOBAL_MKT_CONTEXT[(instr, dt)] = (rcd, td, md)
-                    GLOBAL_MKT_OBS_DTS[dt].add(instr)
-                    GLOBAL_MKT_CTX_HIST.setdefault((instr, rcd, td, md), []).append(dt)
-            for key in GLOBAL_MKT_CTX_HIST:
-                GLOBAL_MKT_CTX_HIST[key].sort()
-            log(f"  instruments: {len(GLOBAL_MKT_BY_INSTR)}, contexts: {len(GLOBAL_MKT_CONTEXT)}",
-                NODE_NAME)
-        except Exception as e:
-            log(f"❌ market_history: {e}", NODE_NAME, level="error")
+        log(f"  vlad_market_history (from engine_brain): {len(rows)} rows", NODE_NAME)
+        if rows:
+            log(f"    date range: {rows[0][0]} → {rows[-1][0]}", NODE_NAME)
+        by_instr    = {instr: [] for instr in INSTRUMENT_COLUMNS}
+        instruments = list(INSTRUMENT_COLUMNS.keys())
+        for row in rows:
+            dt = row[0]
+            for i, instr in enumerate(instruments):
+                val = row[i + 1]
+                if val is not None:
+                    by_instr[instr].append((dt, float(val)))
+        for instr, series in by_instr.items():
+            log(f"    {instr}: {len(series)} observations" +
+                (f", last={series[-1][0]}" if series else ""), NODE_NAME)
+            if not series:
+                continue
+            threshold = THRESHOLD_BY_INSTRUMENT.get(instr, DEFAULT_THRESHOLD)
+            GLOBAL_MKT_BY_INSTR[instr] = series
+            for dt, rcd, td, md in classify_market_observations(series, threshold):
+                GLOBAL_MKT_CONTEXT[(instr, dt)] = (rcd, td, md)
+                GLOBAL_MKT_OBS_DTS[dt].add(instr)
+                GLOBAL_MKT_CTX_HIST.setdefault((instr, rcd, td, md), []).append(dt)
+        for key in GLOBAL_MKT_CTX_HIST:
+            GLOBAL_MKT_CTX_HIST[key].sort()
+        log(f"  instruments: {len(GLOBAL_MKT_BY_INSTR)}, contexts: {len(GLOBAL_MKT_CONTEXT)}",
+            NODE_NAME)
+    except Exception as e:
+        log(f"❌ market_history: {e}", NODE_NAME, level="error")
 
     # ── bisect: отсортированный список дат market ──
     _MKT_SORTED_DATES[:] = sorted(GLOBAL_MKT_OBS_DTS.keys())
@@ -786,14 +788,13 @@ async def calculate_pure_memory(pair, day, date_str, calc_type=0, calc_var=0):
 
 @app.get("/")
 async def get_metadata():
-    for t in ["vlad_market_weights", "vlad_market_context_idx",
-              "vlad_market_history", "version_microservice"]:
+    for t in ["vlad_market_weights", "vlad_market_context_idx", "version_microservice"]:
         try:
             async with engine_vlad.connect() as conn:
                 await conn.execute(text(f"SELECT 1 FROM `{t}` LIMIT 1"))
         except Exception as e:
             return {"status": "error", "error": f"vlad.{t} inaccessible: {e}"}
-    for t in ["brain_rates_eur_usd", "brain_rates_btc_usd", "brain_rates_eth_usd"]:
+    for t in ["vlad_market_history", "brain_rates_eur_usd", "brain_rates_btc_usd", "brain_rates_eth_usd"]:
         try:
             async with engine_brain.connect() as conn:
                 await conn.execute(text(f"SELECT 1 FROM `{t}` LIMIT 1"))
