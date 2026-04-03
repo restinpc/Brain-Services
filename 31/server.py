@@ -375,8 +375,29 @@ app = FastAPI(lifespan=lifespan)
 # ── Подгрузка свежих свечей из БД ─────────────────────────────────────────
 _LAST_RATES_REFRESH = {}
 
+_BRAIN_SEM: asyncio.Semaphore | None = None
+
+
+def get_brain_sem() -> asyncio.Semaphore:
+    global _BRAIN_SEM
+    if _BRAIN_SEM is None:
+        _BRAIN_SEM = asyncio.Semaphore(8)
+    return _BRAIN_SEM
+
+
+async def _safe_brain_invalidate(conn) -> None:
+    try:
+        await conn.invalidate()
+    except Exception:
+        pass
+
+
 async def _refresh_rates_if_needed(rates_table):
-    """Если в RAM нет свечи за последний час — подгрузить из БД. Не чаще раз в 30 сек."""
+    """
+    Если в RAM нет свечи за последний час — подгрузить из БД. Не чаще раз в 30 сек.
+    При InternalError ("Packet sequence number wrong") инвалидирует соединение и
+    делает retry — никогда не бросает исключение наверх.
+    """
     now = datetime.now()
     last = _LAST_RATES_REFRESH.get(rates_table)
     if last and (now - last).total_seconds() < 30:
@@ -387,25 +408,53 @@ async def _refresh_rates_if_needed(rates_table):
     if not ram:
         return
     max_dt = max(ram.keys())
+
+    query = text(
+        f"SELECT date, open, close, t1 "
+        f"FROM `{rates_table}` WHERE date > :dt ORDER BY date"
+    )
+
     try:
-        async with engine_brain.connect() as conn:
-            res = await conn.execute(text(
-                f"SELECT date, open, close, t1 "
-                f"FROM `{rates_table}` WHERE date > :dt ORDER BY date"),
-                {"dt": max_dt})
-            n = 0
-            for r in res.mappings().all():
-                dt = r["date"]
-                if r["t1"] is not None:
-                    ram[dt] = float(r["t1"])
-                cl = GLOBAL_LAST_CANDLES.get(rates_table)
-                if cl is not None:
-                    cl.append((dt, (r["close"] or 0) > (r["open"] or 0)))
-                n += 1
-            if n > 0:
-                log(f"  📥 Refreshed {n} candle(s) for {rates_table}", NODE_NAME)
+        from sqlalchemy.exc import InternalError as SAInternalError, DBAPIError
+        async with get_brain_sem():
+            for attempt in range(2):
+                conn = await engine_brain.connect()
+                try:
+                    res = await conn.execute(query, {"dt": max_dt})
+                    rows = res.mappings().all()
+                    await conn.close()
+                    n = 0
+                    for r in rows:
+                        dt = r["date"]
+                        if r["t1"] is not None:
+                            ram[dt] = float(r["t1"])
+                        cl = GLOBAL_LAST_CANDLES.get(rates_table)
+                        if cl is not None:
+                            cl.append((dt, (r["close"] or 0) > (r["open"] or 0)))
+                        n += 1
+                    if n > 0:
+                        log(f"  📥 Refreshed {n} candle(s) for {rates_table}", NODE_NAME)
+                    return
+
+                except (SAInternalError, DBAPIError) as e:
+                    await _safe_brain_invalidate(conn)
+                    if attempt == 0:
+                        log(f"  ⚠️ Rates refresh InternalError, retry ({rates_table}): {e}",
+                            NODE_NAME, level="warning")
+                        continue
+                    log(f"  ⚠️ Rates refresh retry failed, skipping ({rates_table}): {e}",
+                        NODE_NAME, level="warning")
+                    return
+
+                except Exception as e:
+                    try:
+                        await conn.close()
+                    except Exception:
+                        pass
+                    log(f"  ⚠️ Rates refresh error ({rates_table}): {e}", NODE_NAME, level="warning")
+                    return
     except Exception as e:
-        log(f"  ⚠️ Rates refresh error ({rates_table}): {e}", NODE_NAME, level="warning")
+        log(f"  ⚠️ Rates refresh outer error ({rates_table}): {e}", NODE_NAME, level="warning")
 
 
 def _compute_cpu_only(
@@ -668,51 +717,31 @@ def _compute_cpu_only_py(pair, day, date_str, calc_type=0, calc_var=0):
 async def calculate_pure_memory(pair, day, date_str, calc_type=0, calc_var=0):
     target_date = parse_date_string(date_str)
     if not target_date:
-        log(f"  🔍 DIAG: parse_date_string failed for '{date_str}'", NODE_NAME)
         return None
 
     rates_table  = get_rates_table_name(pair, day)
+    # _refresh_rates_if_needed никогда не бросает — при ошибке просто пропускает обновление
     await _refresh_rates_if_needed(rates_table)
     modification = get_modification_factor(pair)
     delta_unit   = timedelta(days=1) if day == 1 else timedelta(hours=1)
-    check_dts    = [target_date + delta_unit * s
-                    for s in range(-SHIFT_WINDOW, SHIFT_WINDOW + 1)]
-
-    log(f"  🔍 DIAG: target={target_date} pair={pair} day={day} type={calc_type} var={calc_var}", NODE_NAME)
-    log(f"  🔍 DIAG: rates_table={rates_table} rates_keys={len(GLOBAL_RATES.get(rates_table, {}))}", NODE_NAME)
-    log(f"  🔍 DIAG: _MKT_SORTED_DATES len={len(_MKT_SORTED_DATES)}"
-        + (f" range={_MKT_SORTED_DATES[0]}→{_MKT_SORTED_DATES[-1]}" if _MKT_SORTED_DATES else " EMPTY"),
-        NODE_NAME)
-    log(f"  🔍 DIAG: check_dts range={check_dts[0]}→{check_dts[-1]} (after filter: ≤{target_date})", NODE_NAME)
 
     observations = []
-    _diag_checked = 0
-    _diag_found_in_sorted = 0
-    _diag_found_instr = 0
-    _diag_found_ctx = 0
-    for dt in check_dts:
+    for s in range(-SHIFT_WINDOW, SHIFT_WINDOW + 1):
+        dt = target_date + delta_unit * s
         if dt > target_date:
             continue
-        _diag_checked += 1
         dt_end = dt + delta_unit
         _l = bisect.bisect_left(_MKT_SORTED_DATES, dt)
         _r = bisect.bisect_left(_MKT_SORTED_DATES, dt_end)
-        _diag_found_in_sorted += (_r - _l)
         for _i in range(_l, _r):
             obs_dt = _MKT_SORTED_DATES[_i]
             for instr in GLOBAL_MKT_OBS_DTS.get(obs_dt, set()):
-                _diag_found_instr += 1
                 ctx = GLOBAL_MKT_CONTEXT.get((instr, obs_dt))
                 if ctx:
-                    _diag_found_ctx += 1
-                    observations.append((instr, obs_dt, ctx, round((target_date - obs_dt) / delta_unit)))
-
-    log(f"  🔍 DIAG: checked={_diag_checked} bisect_hits={_diag_found_in_sorted} "
-        f"instr_hits={_diag_found_instr} ctx_hits={_diag_found_ctx} observations={len(observations)}",
-        NODE_NAME)
+                    observations.append((instr, obs_dt, ctx,
+                                         round((target_date - obs_dt) / delta_unit)))
 
     if not observations:
-        log(f"  🔍 DIAG: EMPTY — no observations found → return {{}}", NODE_NAME)
         return {}
 
     ram_rates   = GLOBAL_RATES.get(rates_table, {})
@@ -721,46 +750,29 @@ async def calculate_pure_memory(pair, day, date_str, calc_type=0, calc_var=0):
     ram_ext     = GLOBAL_EXTREMUMS.get(rates_table, {"min": set(), "max": set()})
     prev_candle = find_prev_candle_trend(rates_table, target_date)
 
-    log(f"  🔍 DIAG: ram_rates={len(ram_rates)} ram_ranges={len(ram_ranges)} "
-        f"avg_range={avg_range:.6f} ext_min={len(ram_ext.get('min',set()))} "
-        f"ext_max={len(ram_ext.get('max',set()))} prev_candle={'YES' if prev_candle else 'NO'}",
-        NODE_NAME)
-
     result = {}
-    _diag_no_ctx = 0
-    _diag_not_recurring = 0
-    _diag_shift_out = 0
-    _diag_no_valid = 0
-    _diag_no_tdates = 0
-    _diag_computed = 0
     for instr, obs_dt, (rcd, td, md), shift in observations:
         ctx_key  = (instr, rcd, td, md)
         ctx_info = GLOBAL_CTX_INDEX.get(ctx_key)
         if ctx_info is None:
-            _diag_no_ctx += 1
             continue
         is_recurring = ctx_info["occurrence_count"] >= RECURRING_MIN_COUNT
         if not is_recurring and shift != 0:
-            _diag_not_recurring += 1
             continue
         if is_recurring and abs(shift) > SHIFT_WINDOW:
-            _diag_shift_out += 1
             continue
 
         all_ctx_dts = GLOBAL_MKT_CTX_HIST.get(ctx_key, [])
         idx         = bisect.bisect_left(all_ctx_dts, target_date)
         valid_dts   = all_ctx_dts[:idx]
         if not valid_dts:
-            _diag_no_valid += 1
             continue
 
         t_dates   = [d + delta_unit * shift for d in valid_dts
                      if (d + delta_unit * shift) < target_date]
         if not t_dates:
-            _diag_no_tdates += 1
             continue
         shift_arg = shift if is_recurring else None
-        _diag_computed += 1
 
         if calc_type in (0, 1):
             t1_sum = compute_t1_value(t_dates, calc_var, ram_rates, ram_ranges, avg_range)
@@ -776,14 +788,7 @@ async def calculate_pure_memory(pair, day, date_str, calc_type=0, calc_var=0):
                 wc = make_weight_code(instr, rcd, td, md, 1, shift_arg)
                 result[wc] = result.get(wc, 0.0) + ext_val
 
-    log(f"  🔍 DIAG: no_ctx_idx={_diag_no_ctx} not_recurring={_diag_not_recurring} "
-        f"shift_out={_diag_shift_out} no_valid_history={_diag_no_valid} "
-        f"no_tdates={_diag_no_tdates} computed={_diag_computed}",
-        NODE_NAME)
-
-    final = {k: round(v, 6) for k, v in result.items() if v != 0}
-    log(f"  🔍 DIAG: result_keys_before_filter={len(result)} result_keys_final={len(final)}", NODE_NAME)
-    return final
+    return {k: round(v, 6) for k, v in result.items() if v != 0}
 
 
 @app.get("/")
