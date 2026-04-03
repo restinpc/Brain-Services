@@ -111,9 +111,14 @@ def build_engines():
             os.getenv("DB_NAME",     ""),
         ),
         pool_size=20,
-        max_overflow=20,    # было дефолтные 10 → увеличено, чтобы выдержать всплески
-        pool_pre_ping=True, # автопереподключение при stale-соединениях
-        pool_recycle=1800,  # переиспользовать соединения не дольше 30 мин
+        max_overflow=20,
+        # pool_pre_ping=False — ВАЖНО: pool_pre_ping=True вызывает
+        # "Packet sequence number wrong" в aiomysql при высокой нагрузке.
+        # Pre-ping шлёт запрос на соединение, которое может быть занято
+        # другой корутиной → ломает порядок пакетов протокола MySQL.
+        # Вместо этого используем pool_recycle + явную инвалидацию в cache_helper.
+        pool_pre_ping=False,
+        pool_recycle=900,   # пересоздавать соединения каждые 15 мин
         echo=False,
     )
 
@@ -127,8 +132,8 @@ def build_engines():
         ),
         pool_size=5,
         max_overflow=10,
-        pool_pre_ping=True,
-        pool_recycle=1800,
+        pool_pre_ping=False,
+        pool_recycle=900,
         echo=False,
     )
 
@@ -142,8 +147,8 @@ def build_engines():
         ),
         pool_size=3,
         max_overflow=5,
-        pool_pre_ping=True,
-        pool_recycle=1800,
+        pool_pre_ping=False,
+        pool_recycle=900,
         echo=False,
     )
 
