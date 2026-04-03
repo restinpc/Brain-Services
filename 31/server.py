@@ -407,13 +407,18 @@ async def _refresh_rates_if_needed(rates_table):
 
 
 def _compute_cpu_only(
-    pair: int, day: int, date_str: str,
-    calc_type: int = 0, calc_var: int = 0,
+        pair: int, day: int, date_str: str,
+        calc_type: int = 0, calc_var: int = 0,
 ) -> dict | None:
     """
-    NumPy-ускоренная версия. Оптимизация: observations группируются по ctx_key,
-    все сдвиги одного контекста обрабатываются ОДНИМ векторизованным вызовом.
-    Это устраняет 3600+ аллокаций numpy-массивов на одну свечу.
+    NumPy-матричная версия.
+
+    Для каждого ctx_key все сдвиги обрабатываются ОДНИМ searchsorted-вызовом
+    над матрицей (n_valid × n_shifts). Это устраняет ~50x лишних аллокаций
+    numpy-массивов на свечу по сравнению с предыдущей версией.
+
+    Дополнительно: сдвиги дедуплицируются — одинаковый shift из разных obs_dt
+    вычисляется ровно один раз.
     """
     target_date = parse_date_string(date_str)
     if not target_date:
@@ -422,20 +427,20 @@ def _compute_cpu_only(
     if not NP_CTX_HIST_BUILT:
         return _compute_cpu_only_py(pair, day, date_str, calc_type, calc_var)
 
-    rates_table  = get_rates_table_name(pair, day)
+    rates_table = get_rates_table_name(pair, day)
     modification = get_modification_factor(pair)
-    delta_unit   = timedelta(days=1) if day == 1 else timedelta(hours=1)
-    delta_sec    = int(delta_unit.total_seconds())
-    target_ts    = int(target_date.timestamp())
+    delta_unit = timedelta(days=1) if day == 1 else timedelta(hours=1)
+    delta_sec = int(delta_unit.total_seconds())
+    target_ts = int(target_date.timestamp())
 
     np_rates = NP_RATES.get(rates_table)
     if np_rates is None:
         return {}
 
-    dates_ns   = np_rates["dates_ns"]
-    t1_arr     = np_rates["t1"]
+    dates_ns = np_rates["dates_ns"]
+    t1_arr = np_rates["t1"]
     ranges_arr = np_rates["ranges"]
-    avg_range  = GLOBAL_AVG_RANGE.get(rates_table, 0.0)
+    avg_range = GLOBAL_AVG_RANGE.get(rates_table, 0.0)
 
     prev_candle = find_prev_candle_trend(rates_table, target_date)
     ext_arr = None
@@ -444,15 +449,13 @@ def _compute_cpu_only(
         ext_arr = np_rates["ext_max" if is_bull else "ext_min"]
 
     need_filter = calc_var in (1, 3, 4)
-    use_square  = calc_var in (2, 3)
-    use_range   = calc_var == 4
+    use_square = calc_var in (2, 3)
+    use_range = calc_var == 4
 
-    # ── Шаг 1: собираем observations и группируем по ctx_key ─────────────────
-    # Вместо list of (instr, obs_dt, ctx, shift) → dict ctx_key → list[shift]
-    # Это позволяет обработать каждый ctx_key ОДИН раз с массивом всех сдвигов
-
-    from collections import defaultdict as _dd
-    ctx_shifts: dict = _dd(list)  # ctx_key → [shift, shift, ...]
+    # ── Шаг 1: собираем уникальные сдвиги по ctx_key ─────────────────────────
+    # Используем dict вместо list — автоматически дедуплицирует сдвиги.
+    # Структура: ctx_key → {shift: is_recurring}
+    ctx_shifts: dict[tuple, dict[int, bool]] = {}
 
     for s in range(-SHIFT_WINDOW, SHIFT_WINDOW + 1):
         dt = target_date + delta_unit * s
@@ -463,7 +466,7 @@ def _compute_cpu_only(
         _r = bisect.bisect_left(_MKT_SORTED_DATES, dt_end)
         for _i in range(_l, _r):
             obs_dt = _MKT_SORTED_DATES[_i]
-            shift  = round((target_date - obs_dt) / delta_unit)
+            shift = round((target_date - obs_dt) / delta_unit)
             for instr in GLOBAL_MKT_OBS_DTS.get(obs_dt, set()):
                 ctx = GLOBAL_MKT_CONTEXT.get((instr, obs_dt))
                 if not ctx:
@@ -478,96 +481,119 @@ def _compute_cpu_only(
                     continue
                 if is_recurring and abs(shift) > SHIFT_WINDOW:
                     continue
-                ctx_shifts[ctx_key].append((shift, is_recurring))
+                # dict.setdefault + присвоение = дедупликация без if-проверки
+                ctx_shifts.setdefault(ctx_key, {})[shift] = is_recurring
 
     if not ctx_shifts:
         return {}
 
-    result = {}
+    result: dict[str, float] = {}
+    len_dates = len(dates_ns)
 
-    # ── Шаг 2: для каждого ctx_key — ОДИН раз достаём ctx_ts и обрабатываем все сдвиги ──
-    for ctx_key, shift_list in ctx_shifts.items():
+    # ── Шаг 2: матричный расчёт для каждого ctx_key ──────────────────────────
+    for ctx_key, shift_map in ctx_shifts.items():
         ctx_ts = NP_CTX_HIST.get(ctx_key)
         if ctx_ts is None or len(ctx_ts) == 0:
             continue
 
-        # Исторические даты контекста до target_date
-        idx = np.searchsorted(ctx_ts, target_ts, side='left')
+        # Исторические даты контекста ДО target_date
+        idx = np.searchsorted(ctx_ts, target_ts, side="left")
         if idx == 0:
             continue
-        valid_ts   = ctx_ts[:idx]      # int64[] — ОДИН срез для всех сдвигов
-        total_hist = len(valid_ts)
+        valid_ts = ctx_ts[:idx]  # (n_valid,) int64
+        total_hist = len(valid_ts)  # для расчёта extremum
+        n_valid = total_hist
 
         instr, rcd, td, md = ctx_key
 
-        for shift, is_recurring in shift_list:
-            shift_ns   = shift * delta_sec
-            t_ts       = valid_ts + shift_ns        # int64[] — векторное сложение
+        # Список уникальных сдвигов
+        shifts_items = list(shift_map.items())  # [(shift, is_recurring), ...]
+        shifts_sec = np.fromiter(
+            (s * delta_sec for s, _ in shifts_items),
+            dtype=np.int64, count=len(shifts_items),
+        )  # (n_shifts,)
+        n_shifts = len(shifts_sec)
 
-            t_mask     = t_ts < target_ts
-            t_ts_v     = t_ts[t_mask]
-            if len(t_ts_v) == 0:
+        # ── Матрица сдвинутых timestamps (n_valid, n_shifts) ─────────────────
+        # Каждая строка: один исторический момент + все сдвиги
+        t_ts_mat = valid_ts[:, np.newaxis] + shifts_sec[np.newaxis, :]
+        # (n_valid, n_shifts), int64
+
+        # Фильтр: timestamp должен быть < target
+        lt_mask = t_ts_mat < target_ts  # (n_valid, n_shifts), bool
+
+        # ── ОДИН вызов searchsorted на весь ctx_key ───────────────────────────
+        flat_ts = t_ts_mat.ravel()  # (n_valid*n_shifts,)
+        ri_flat = np.searchsorted(dates_ns, flat_ts, side="left")
+
+        # Exact match + bounds
+        in_bnd = ri_flat < len_dates
+        exact = np.zeros(n_valid * n_shifts, dtype=bool)
+        if np.any(in_bnd):
+            exact[in_bnd] = dates_ns[ri_flat[in_bnd]] == flat_ts[in_bnd]
+
+        # Итоговая маска совпадений (n_valid, n_shifts)
+        hit_mat = (exact & lt_mask.ravel()).reshape(n_valid, n_shifts)
+        ri_mat = ri_flat.reshape(n_valid, n_shifts)
+
+        # ── Обрабатываем каждый столбец (один сдвиг) ─────────────────────────
+        for col, (shift, is_recurring) in enumerate(shifts_items):
+            col_hit = hit_mat[:, col]
+            if not np.any(col_hit):
                 continue
 
-            rate_idx   = np.searchsorted(dates_ns, t_ts_v, side='left')
-            ib         = rate_idx < len(dates_ns)
-            rate_idx   = rate_idx[ib]
-            t_ts_v     = t_ts_v[ib]
-            mm         = dates_ns[rate_idx] == t_ts_v
-            rate_idx   = rate_idx[mm]
-            if len(rate_idx) == 0:
-                continue
-
-            shift_arg  = shift if is_recurring else None
-            rng_vals   = ranges_arr[rate_idx]
+            ri = ri_mat[:, col][col_hit]  # индексы в dates_ns/t1/ranges
+            rng_vals = ranges_arr[ri]
+            shift_arg = shift if is_recurring else None
 
             # ── T1 ────────────────────────────────────────────────────────────
             if calc_type in (0, 1):
                 if need_filter:
                     fm = rng_vals > avg_range
-                    ri_f = rate_idx[fm]
+                    ri_f = ri[fm];
                     rv_f = rng_vals[fm]
                 else:
-                    ri_f = rate_idx
+                    ri_f = ri;
                     rv_f = rng_vals
 
-                if len(ri_f) > 0:
+                if len(ri_f):
                     if use_range:
-                        t1_total = float(np.sum(rv_f - avg_range))
+                        t1_v = float(np.sum(rv_f - avg_range))
                     elif use_square:
                         v = t1_arr[ri_f]
-                        t1_total = float(np.sum(v * np.abs(v)))
+                        t1_v = float(np.sum(v * np.abs(v)))
                     else:
-                        t1_total = float(np.sum(t1_arr[ri_f]))
+                        t1_v = float(np.sum(t1_arr[ri_f]))
 
-                    if t1_total != 0.0:
+                    if t1_v:
                         wc = make_weight_code(instr, rcd, td, md, 0, shift_arg)
-                        result[wc] = result.get(wc, 0.0) + t1_total
+                        result[wc] = result.get(wc, 0.0) + t1_v
 
             # ── Extremum ──────────────────────────────────────────────────────
-            if calc_type in (0, 2) and ext_arr is not None and total_hist > 0:
+            if calc_type in (0, 2) and ext_arr is not None and total_hist:
                 if need_filter:
                     fm = rng_vals > avg_range
-                    ri_e = rate_idx[fm]
+                    ri_e = ri[fm];
                     rv_e = rng_vals[fm]
                 else:
-                    ri_e = rate_idx
+                    ri_e = ri;
                     rv_e = rng_vals
 
-                if len(ri_e) > 0:
+                if len(ri_e):
                     ext_hits = ext_arr[ri_e]
                     if use_range:
-                        ext_val = float(np.sum((rv_e - avg_range) * ext_hits))
+                        ev = float(np.sum((rv_e - avg_range) * ext_hits))
                     else:
-                        ext_val = (
-                            (float(np.count_nonzero(ext_hits)) / total_hist) * 2 - 1
-                        ) * modification
+                        ev = (
+                                     float(np.count_nonzero(ext_hits)) / total_hist
+                             ) * 2 - 1
+                        ev *= modification
 
-                    if ext_val != 0.0:
+                    if ev:
                         wc = make_weight_code(instr, rcd, td, md, 1, shift_arg)
-                        result[wc] = result.get(wc, 0.0) + ext_val
+                        result[wc] = result.get(wc, 0.0) + ev
 
-    return {k: round(v, 6) for k, v in result.items() if v != 0}
+    return {k: round(v, 6) for k, v in result.items() if v}
 
 
 
