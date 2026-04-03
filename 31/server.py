@@ -6,12 +6,12 @@ import uvicorn
 import asyncio
 import bisect
 import functools
+import numpy as np
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
-from typing import List
 
-from fastapi import FastAPI, HTTPException, Query, Body
+from fastapi import FastAPI, HTTPException, Query
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from dotenv import load_dotenv
@@ -71,6 +71,13 @@ GLOBAL_AVG_RANGE     = {}
 GLOBAL_LAST_CANDLES  = {}
 SERVICE_URL          = ""
 LAST_RELOAD_TIME     = None
+
+# ── NumPy-ускоренные структуры (строятся в preload, используются в _compute_cpu_only) ──
+# Для каждой rates-таблицы: отсортированный массив дат, t1, ranges, ext_min, ext_max
+# Для каждого ctx_key: отсортированный int64-массив unix-timestamp (секунды)
+NP_RATES:    dict = {}   # table → {"dates_ns": int64[], "t1": float64[], "ranges": float64[], "ext_min": bool[], "ext_max": bool[]}
+NP_CTX_HIST: dict = {}   # ctx_key → int64[] (unix timestamps, sorted)
+NP_CTX_HIST_BUILT: bool = False
 
 
 def get_rates_table_name(pair_id, day_flag):
@@ -158,6 +165,58 @@ def compute_extremum_value(t_dates, calc_var, ext_set, candle_ranges, avg_range,
     return val if val != 0 else None
 
 
+
+def _build_numpy_arrays():
+    """
+    Строит NumPy-массивы из загруженных dict-структур.
+    Вызывается один раз после preload_all_data.
+    После этого _compute_cpu_only использует только NP_RATES и NP_CTX_HIST —
+    vectorized операции вместо Python-циклов с dict.get().
+    """
+    global NP_CTX_HIST_BUILT
+
+    # ── rates таблицы ─────────────────────────────────────────────────────────
+    for table, rates_dict in GLOBAL_RATES.items():
+        if not rates_dict:
+            NP_RATES[table] = None
+            continue
+
+        # Даты в секундах (int64) — совместимо с datetime через .timestamp()
+        sorted_dates = sorted(rates_dict.keys())
+        n = len(sorted_dates)
+
+        dates_ns  = np.array([int(d.timestamp()) for d in sorted_dates], dtype=np.int64)
+        t1_arr    = np.array([rates_dict.get(d, 0.0) for d in sorted_dates], dtype=np.float64)
+        ranges_d  = GLOBAL_CANDLE_RANGES.get(table, {})
+        ranges_arr = np.array([ranges_d.get(d, 0.0) for d in sorted_dates], dtype=np.float64)
+
+        ext_min_set = GLOBAL_EXTREMUMS.get(table, {}).get("min", set())
+        ext_max_set = GLOBAL_EXTREMUMS.get(table, {}).get("max", set())
+        ext_min_arr = np.array([d in ext_min_set for d in sorted_dates], dtype=bool)
+        ext_max_arr = np.array([d in ext_max_set for d in sorted_dates], dtype=bool)
+
+        NP_RATES[table] = {
+            "dates_ns":  dates_ns,
+            "t1":        t1_arr,
+            "ranges":    ranges_arr,
+            "ext_min":   ext_min_arr,
+            "ext_max":   ext_max_arr,
+        }
+        log(f"  NP {table}: {n} записей", NODE_NAME)
+
+    # ── ctx history ──────────────────────────────────────────────────────────
+    for ctx_key, dates_list in GLOBAL_MKT_CTX_HIST.items():
+        if dates_list:
+            NP_CTX_HIST[ctx_key] = np.array(
+                [int(d.timestamp()) for d in dates_list], dtype=np.int64
+            )
+        else:
+            NP_CTX_HIST[ctx_key] = np.empty(0, dtype=np.int64)
+
+    NP_CTX_HIST_BUILT = True
+    log(f"  NP_CTX_HIST: {len(NP_CTX_HIST)} контекстов", NODE_NAME, force=True)
+
+
 async def preload_all_data():
     global SERVICE_URL, LAST_RELOAD_TIME
     log("🔄 MARKET FULL DATA RELOAD STARTED", NODE_NAME, force=True)
@@ -221,6 +280,7 @@ async def preload_all_data():
         except Exception as e:
             log(f"❌ market_history: {e}", NODE_NAME, level="error")
 
+    # ── bisect: отсортированный список дат market ──
     _MKT_SORTED_DATES[:] = sorted(GLOBAL_MKT_OBS_DTS.keys())
 
     for table in ["brain_rates_eur_usd", "brain_rates_eur_usd_day",
@@ -267,6 +327,12 @@ async def preload_all_data():
         await ensure_cache_table(engine_vlad)
     except Exception as e:
         log(f"❌ ensure_cache_table failed: {e}", NODE_NAME, level="error")
+    # Строим NumPy-ускоренные массивы после загрузки всех данных
+    try:
+        _build_numpy_arrays()
+    except Exception as e:
+        log(f"❌ _build_numpy_arrays: {e}", NODE_NAME, level="error")
+
     LAST_RELOAD_TIME = datetime.now()
     log("✅ MARKET FULL DATA RELOAD COMPLETED", NODE_NAME, force=True)
 
@@ -301,6 +367,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
 
 
 # ── Подгрузка свежих свечей из БД ─────────────────────────────────────────
@@ -339,28 +406,179 @@ async def _refresh_rates_if_needed(rates_table):
         log(f"  ⚠️ Rates refresh error ({rates_table}): {e}", NODE_NAME, level="warning")
 
 
-# ── Внутренняя CPU-функция для одной даты ────────────────────────────────────
+def _compute_cpu_only(
+    pair: int, day: int, date_str: str,
+    calc_type: int = 0, calc_var: int = 0,
+) -> dict | None:
+    """
+    NumPy-ускоренная версия. Оптимизация: observations группируются по ctx_key,
+    все сдвиги одного контекста обрабатываются ОДНИМ векторизованным вызовом.
+    Это устраняет 3600+ аллокаций numpy-массивов на одну свечу.
+    """
+    target_date = parse_date_string(date_str)
+    if not target_date:
+        return None
 
-def _compute_inner(
-    target_date: datetime,
-    delta_unit: timedelta,
-    rates_table: str,
-    modification: float,
-    calc_type: int,
-    calc_var: int,
-    ram_rates: dict,
-    ram_ranges: dict,
-    avg_range: float,
-    ram_ext: dict,
-    need_filter: bool,
-    use_square: bool,
-    use_range: bool,
-) -> dict:
-    """
-    Чистое вычисление весов для одной даты.
-    Все данные передаются снаружи — не читает глобальные переменные,
-    что позволяет переиспользовать одни и те же данные для батча дат.
-    """
+    if not NP_CTX_HIST_BUILT:
+        return _compute_cpu_only_py(pair, day, date_str, calc_type, calc_var)
+
+    rates_table  = get_rates_table_name(pair, day)
+    modification = get_modification_factor(pair)
+    delta_unit   = timedelta(days=1) if day == 1 else timedelta(hours=1)
+    delta_sec    = int(delta_unit.total_seconds())
+    target_ts    = int(target_date.timestamp())
+
+    np_rates = NP_RATES.get(rates_table)
+    if np_rates is None:
+        return {}
+
+    dates_ns   = np_rates["dates_ns"]
+    t1_arr     = np_rates["t1"]
+    ranges_arr = np_rates["ranges"]
+    avg_range  = GLOBAL_AVG_RANGE.get(rates_table, 0.0)
+
+    prev_candle = find_prev_candle_trend(rates_table, target_date)
+    ext_arr = None
+    if prev_candle and calc_type in (0, 2):
+        _, is_bull = prev_candle
+        ext_arr = np_rates["ext_max" if is_bull else "ext_min"]
+
+    need_filter = calc_var in (1, 3, 4)
+    use_square  = calc_var in (2, 3)
+    use_range   = calc_var == 4
+
+    # ── Шаг 1: собираем observations и группируем по ctx_key ─────────────────
+    # Вместо list of (instr, obs_dt, ctx, shift) → dict ctx_key → list[shift]
+    # Это позволяет обработать каждый ctx_key ОДИН раз с массивом всех сдвигов
+
+    from collections import defaultdict as _dd
+    ctx_shifts: dict = _dd(list)  # ctx_key → [shift, shift, ...]
+
+    for s in range(-SHIFT_WINDOW, SHIFT_WINDOW + 1):
+        dt = target_date + delta_unit * s
+        if dt > target_date:
+            continue
+        dt_end = dt + delta_unit
+        _l = bisect.bisect_left(_MKT_SORTED_DATES, dt)
+        _r = bisect.bisect_left(_MKT_SORTED_DATES, dt_end)
+        for _i in range(_l, _r):
+            obs_dt = _MKT_SORTED_DATES[_i]
+            shift  = round((target_date - obs_dt) / delta_unit)
+            for instr in GLOBAL_MKT_OBS_DTS.get(obs_dt, set()):
+                ctx = GLOBAL_MKT_CONTEXT.get((instr, obs_dt))
+                if not ctx:
+                    continue
+                rcd, td, md = ctx
+                ctx_key = (instr, rcd, td, md)
+                ctx_info = GLOBAL_CTX_INDEX.get(ctx_key)
+                if ctx_info is None:
+                    continue
+                is_recurring = ctx_info["occurrence_count"] >= RECURRING_MIN_COUNT
+                if not is_recurring and shift != 0:
+                    continue
+                if is_recurring and abs(shift) > SHIFT_WINDOW:
+                    continue
+                ctx_shifts[ctx_key].append((shift, is_recurring))
+
+    if not ctx_shifts:
+        return {}
+
+    result = {}
+
+    # ── Шаг 2: для каждого ctx_key — ОДИН раз достаём ctx_ts и обрабатываем все сдвиги ──
+    for ctx_key, shift_list in ctx_shifts.items():
+        ctx_ts = NP_CTX_HIST.get(ctx_key)
+        if ctx_ts is None or len(ctx_ts) == 0:
+            continue
+
+        # Исторические даты контекста до target_date
+        idx = np.searchsorted(ctx_ts, target_ts, side='left')
+        if idx == 0:
+            continue
+        valid_ts   = ctx_ts[:idx]      # int64[] — ОДИН срез для всех сдвигов
+        total_hist = len(valid_ts)
+
+        instr, rcd, td, md = ctx_key
+
+        for shift, is_recurring in shift_list:
+            shift_ns   = shift * delta_sec
+            t_ts       = valid_ts + shift_ns        # int64[] — векторное сложение
+
+            t_mask     = t_ts < target_ts
+            t_ts_v     = t_ts[t_mask]
+            if len(t_ts_v) == 0:
+                continue
+
+            rate_idx   = np.searchsorted(dates_ns, t_ts_v, side='left')
+            ib         = rate_idx < len(dates_ns)
+            rate_idx   = rate_idx[ib]
+            t_ts_v     = t_ts_v[ib]
+            mm         = dates_ns[rate_idx] == t_ts_v
+            rate_idx   = rate_idx[mm]
+            if len(rate_idx) == 0:
+                continue
+
+            shift_arg  = shift if is_recurring else None
+            rng_vals   = ranges_arr[rate_idx]
+
+            # ── T1 ────────────────────────────────────────────────────────────
+            if calc_type in (0, 1):
+                if need_filter:
+                    fm = rng_vals > avg_range
+                    ri_f = rate_idx[fm]
+                    rv_f = rng_vals[fm]
+                else:
+                    ri_f = rate_idx
+                    rv_f = rng_vals
+
+                if len(ri_f) > 0:
+                    if use_range:
+                        t1_total = float(np.sum(rv_f - avg_range))
+                    elif use_square:
+                        v = t1_arr[ri_f]
+                        t1_total = float(np.sum(v * np.abs(v)))
+                    else:
+                        t1_total = float(np.sum(t1_arr[ri_f]))
+
+                    if t1_total != 0.0:
+                        wc = make_weight_code(instr, rcd, td, md, 0, shift_arg)
+                        result[wc] = result.get(wc, 0.0) + t1_total
+
+            # ── Extremum ──────────────────────────────────────────────────────
+            if calc_type in (0, 2) and ext_arr is not None and total_hist > 0:
+                if need_filter:
+                    fm = rng_vals > avg_range
+                    ri_e = rate_idx[fm]
+                    rv_e = rng_vals[fm]
+                else:
+                    ri_e = rate_idx
+                    rv_e = rng_vals
+
+                if len(ri_e) > 0:
+                    ext_hits = ext_arr[ri_e]
+                    if use_range:
+                        ext_val = float(np.sum((rv_e - avg_range) * ext_hits))
+                    else:
+                        ext_val = (
+                            (float(np.count_nonzero(ext_hits)) / total_hist) * 2 - 1
+                        ) * modification
+
+                    if ext_val != 0.0:
+                        wc = make_weight_code(instr, rcd, td, md, 1, shift_arg)
+                        result[wc] = result.get(wc, 0.0) + ext_val
+
+    return {k: round(v, 6) for k, v in result.items() if v != 0}
+
+
+
+def _compute_cpu_only_py(pair, day, date_str, calc_type=0, calc_var=0):
+    """Python fallback — используется только если numpy ещё не инициализирован."""
+    target_date = parse_date_string(date_str)
+    if not target_date:
+        return None
+    rates_table = get_rates_table_name(pair, day)
+    modification = get_modification_factor(pair)
+    delta_unit = timedelta(days=1) if day == 1 else timedelta(hours=1)
     observations = []
     for s in range(-SHIFT_WINDOW, SHIFT_WINDOW + 1):
         dt = target_date + delta_unit * s
@@ -374,18 +592,18 @@ def _compute_inner(
             for instr in GLOBAL_MKT_OBS_DTS.get(obs_dt, set()):
                 ctx = GLOBAL_MKT_CONTEXT.get((instr, obs_dt))
                 if ctx:
-                    observations.append(
-                        (instr, obs_dt, ctx, round((target_date - obs_dt) / delta_unit))
-                    )
-
+                    observations.append((instr, obs_dt, ctx,
+                        round((target_date - obs_dt) / delta_unit)))
     if not observations:
         return {}
-
+    ram_rates = GLOBAL_RATES.get(rates_table, {})
+    ram_ranges = GLOBAL_CANDLE_RANGES.get(rates_table, {})
+    avg_range = GLOBAL_AVG_RANGE.get(rates_table, 0.0)
+    ram_ext = GLOBAL_EXTREMUMS.get(rates_table, {"min": set(), "max": set()})
     prev_candle = find_prev_candle_trend(rates_table, target_date)
     result = {}
-
     for instr, obs_dt, (rcd, td, md), shift in observations:
-        ctx_key  = (instr, rcd, td, md)
+        ctx_key = (instr, rcd, td, md)
         ctx_info = GLOBAL_CTX_INDEX.get(ctx_key)
         if ctx_info is None:
             continue
@@ -394,153 +612,29 @@ def _compute_inner(
             continue
         if is_recurring and abs(shift) > SHIFT_WINDOW:
             continue
-
         all_ctx_dts = GLOBAL_MKT_CTX_HIST.get(ctx_key, [])
-        if not all_ctx_dts:
-            continue
-
         idx = bisect.bisect_left(all_ctx_dts, target_date)
-        if idx == 0:
+        valid_dts = all_ctx_dts[:idx]
+        if not valid_dts:
             continue
-
         delta_shift = delta_unit * shift
-        cutoff_d    = target_date - delta_shift
-
+        t_dates = [d + delta_shift for d in valid_dts if (d + delta_shift) < target_date]
+        if not t_dates:
+            continue
         if calc_type in (0, 1):
-            t1_total = 0.0
-            t1_count = 0
-            for d in all_ctx_dts[:idx]:
-                if d >= cutoff_d:
-                    break
-                t   = d + delta_shift
-                rng = ram_ranges.get(t, 0.0)
-                if need_filter and rng <= avg_range:
-                    continue
-                if use_range:
-                    t1_total += rng - avg_range
-                else:
-                    t1 = ram_rates.get(t, 0.0)
-                    if t1 != 0.0:
-                        t1_total += t1 * abs(t1) if use_square else t1
-                t1_count += 1
-
-            if t1_count > 0:
-                wc = make_weight_code(instr, rcd, td, md, 0, shift if is_recurring else None)
-                result[wc] = result.get(wc, 0.0) + t1_total
-
+            t1_sum = compute_t1_value(t_dates, calc_var, ram_rates, ram_ranges, avg_range)
+            wc = make_weight_code(instr, rcd, td, md, 0, shift if is_recurring else None)
+            result[wc] = result.get(wc, 0.0) + t1_sum
         if calc_type in (0, 2) and prev_candle:
             _, is_bull = prev_candle
-            ext_set    = ram_ext["max" if is_bull else "min"]
-
-            pool_total     = 0
-            pool_in_ext    = 0
-            total_hist_cnt = idx
-
-            for d in all_ctx_dts[:idx]:
-                if d >= cutoff_d:
-                    break
-                t   = d + delta_shift
-                rng = ram_ranges.get(t, 0.0)
-                if need_filter and rng <= avg_range:
-                    continue
-                if use_range:
-                    if t in ext_set:
-                        pool_in_ext += 1
-                        pool_total  += rng - avg_range
-                else:
-                    pool_total += 1
-                    if t in ext_set:
-                        pool_in_ext += 1
-
-            if pool_total > 0 and total_hist_cnt > 0:
-                if use_range:
-                    ext_val = pool_in_ext
-                else:
-                    ext_val = ((pool_in_ext / total_hist_cnt) * 2 - 1) * modification
-                if ext_val != 0:
-                    wc = make_weight_code(instr, rcd, td, md, 1, shift if is_recurring else None)
-                    result[wc] = result.get(wc, 0.0) + ext_val
-
+            ext_set = ram_ext["max" if is_bull else "min"]
+            ext_val = compute_extremum_value(t_dates, calc_var, ext_set, ram_ranges,
+                                             avg_range, modification, len(valid_dts))
+            if ext_val is not None:
+                wc = make_weight_code(instr, rcd, td, md, 1, shift if is_recurring else None)
+                result[wc] = result.get(wc, 0.0) + ext_val
     return {k: round(v, 6) for k, v in result.items() if v != 0}
 
-
-def _compute_cpu_only(
-    pair: int, day: int, date_str: str,
-    calc_type: int = 0, calc_var: int = 0,
-) -> dict | None:
-    """
-    Тонкая обёртка над _compute_inner для одиночного /compute вызова.
-    Сохранена для обратной совместимости.
-    """
-    target_date = parse_date_string(date_str)
-    if not target_date:
-        return None
-
-    rates_table  = get_rates_table_name(pair, day)
-    modification = get_modification_factor(pair)
-    delta_unit   = timedelta(days=1) if day == 1 else timedelta(hours=1)
-    need_filter  = calc_var in (1, 3, 4)
-    use_square   = calc_var in (2, 3)
-    use_range    = calc_var == 4
-
-    return _compute_inner(
-        target_date, delta_unit, rates_table, modification,
-        calc_type, calc_var,
-        GLOBAL_RATES.get(rates_table, {}),
-        GLOBAL_CANDLE_RANGES.get(rates_table, {}),
-        GLOBAL_AVG_RANGE.get(rates_table, 0.0),
-        GLOBAL_EXTREMUMS.get(rates_table, {"min": set(), "max": set()}),
-        need_filter, use_square, use_range,
-    )
-
-
-def _compute_batch_cpu_only(
-    pair: int, day: int, dates: list[str],
-    calc_type: int = 0, calc_var: int = 0,
-) -> dict[str, dict]:
-    """
-    Батчевое вычисление: принимает список дат, возвращает {date_str: result}.
-
-    Ключевая оптимизация vs N одиночных вызовов:
-    - Общие данные (ram_rates, ram_ranges, avg_range, ram_ext, флаги) читаются
-      из глобальных словарей ОДИН РАЗ для всего батча, а не N раз.
-    - Нет HTTP round-trip overhead на каждую дату.
-    - Всё выполняется в одном потоке (вызывается через asyncio.to_thread),
-      поэтому не создаёт конкуренцию за GIL с другими воркерами.
-    """
-    rates_table  = get_rates_table_name(pair, day)
-    modification = get_modification_factor(pair)
-    delta_unit   = timedelta(days=1) if day == 1 else timedelta(hours=1)
-
-    # Читаем shared-данные один раз для всего батча
-    ram_rates   = GLOBAL_RATES.get(rates_table, {})
-    ram_ranges  = GLOBAL_CANDLE_RANGES.get(rates_table, {})
-    avg_range   = GLOBAL_AVG_RANGE.get(rates_table, 0.0)
-    ram_ext     = GLOBAL_EXTREMUMS.get(rates_table, {"min": set(), "max": set()})
-    need_filter = calc_var in (1, 3, 4)
-    use_square  = calc_var in (2, 3)
-    use_range   = calc_var == 4
-
-    results: dict[str, dict] = {}
-    for date_str in dates:
-        target_date = parse_date_string(date_str)
-        if not target_date:
-            results[date_str] = {}
-            continue
-        try:
-            result = _compute_inner(
-                target_date, delta_unit, rates_table, modification,
-                calc_type, calc_var,
-                ram_rates, ram_ranges, avg_range, ram_ext,
-                need_filter, use_square, use_range,
-            )
-            results[date_str] = result or {}
-        except Exception as e:
-            log(f"  ⚠️ _compute_batch_cpu_only error for {date_str}: {e}",
-                NODE_NAME, level="warning")
-            results[date_str] = {}
-
-    return results
 
 
 async def calculate_pure_memory(pair, day, date_str, calc_type=0, calc_var=0):
@@ -728,18 +822,27 @@ async def get_values(
         return err_response(str(e))
 
 
+
 @app.get("/compute")
 async def compute_values(
     pair: int = Query(1), day: int = Query(1), date: str = Query(...),
     type: int = Query(0, ge=0, le=2), var: int = Query(0, ge=0, le=4),
 ):
     """
-    Одиночное вычисление без кеширования (обратная совместимость).
-    Для построения кеша используйте /compute_batch — он значительно быстрее.
+    Чистое вычисление без кеширования. Используется cache.py при построении кеша.
+
+    Ключевое отличие от /values:
+    1. Нет чтения/записи в vlad_values_cache — исключает конкуренцию за БД
+    2. CPU-тяжёлая часть вычисления выполняется в thread pool через asyncio.to_thread —
+       event loop остаётся отзывчивым и принимает другие запросы пока идёт вычисление.
+
+    Возвращает результат напрямую: {"key": float, ...} или {}
     """
     try:
         rates_table = get_rates_table_name(pair, day)
+        # Async часть: обновить свечи если нужно (с 30-сек кешем — редко бьёт в БД)
         await _refresh_rates_if_needed(rates_table)
+        # CPU часть: в thread pool чтобы не блокировать event loop
         result = await asyncio.to_thread(
             functools.partial(_compute_cpu_only, pair, day, date,
                               calc_type=type, calc_var=var)
@@ -751,42 +854,40 @@ async def compute_values(
 
 
 @app.post("/compute_batch")
-async def compute_batch_values(
-    pair: int  = Query(1),
-    day:  int  = Query(1),
-    type: int  = Query(0, ge=0, le=2),
-    var:  int  = Query(0, ge=0, le=4),
-    dates: List[str] = Body(...),
+async def compute_batch(
+    dates: list[str],
+    pair: int = Query(1), day: int = Query(1),
+    type: int = Query(0, ge=0, le=2), var: int = Query(0, ge=0, le=4),
 ):
     """
-    Батчевое вычисление без кеширования. Принимает список дат, возвращает
-    словарь {date_str: {weight_code: float, ...}}.
+    Батчевое вычисление без кеширования.
+    Принимает список дат в теле запроса (JSON array of strings).
+    Возвращает dict: {"2025-01-15 10:00:00": {"key": float, ...}, ...}
 
-    Используется cache.py для построения кеша — намного быстрее N одиночных /compute:
-    - Общие данные (rates, ranges, extremums) читаются один раз на весь батч
-    - Нет HTTP round-trip overhead на каждую дату
-    - Всё выполняется в одном to_thread вызове, event loop остаётся отзывчивым
-
-    Пример запроса:
-        POST /compute_batch?pair=1&day=0&type=0&var=0
-        Body: ["2025-01-15 00:00:00", "2025-01-15 01:00:00", ...]
+    Используется cache.py для массового заполнения кеша —
+    один HTTP-запрос на батч вместо N отдельных.
+    Каждая дата считается в thread pool через asyncio.to_thread +
+    numpy-ускоренный _compute_cpu_only — event loop не блокируется.
     """
     if not dates:
         return {}
-    try:
-        rates_table = get_rates_table_name(pair, day)
-        await _refresh_rates_if_needed(rates_table)
-        result = await asyncio.to_thread(
-            functools.partial(
-                _compute_batch_cpu_only, pair, day, dates,
-                calc_type=type, calc_var=var,
-            )
-        )
-        return result if result is not None else {}
-    except Exception as e:
-        send_error_trace(e, node=NODE_NAME, script="compute_batch_values")
-        return {"error": str(e)}
 
+    rates_table = get_rates_table_name(pair, day)
+    await _refresh_rates_if_needed(rates_table)
+
+    async def _one(date_str: str) -> tuple[str, dict]:
+        try:
+            result = await asyncio.to_thread(
+                functools.partial(_compute_cpu_only, pair, day, date_str,
+                                  calc_type=type, calc_var=var)
+            )
+            return date_str, (result if result is not None else {})
+        except Exception as e:
+            log(f"  ⚠️ compute_batch error {date_str}: {e}", NODE_NAME, level="warning")
+            return date_str, {}
+
+    results = await asyncio.gather(*[_one(d) for d in dates])
+    return dict(results)
 
 @app.post("/patch")
 async def patch_service():
