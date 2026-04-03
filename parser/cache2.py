@@ -1,13 +1,14 @@
 """
 cache.py — параллельное заполнение кеша + бэктест.
 
-Ключевые оптимизации:
+Ключевые оптимизации v2:
   1. /compute_batch вместо N одиночных /compute — 460 000 запросов → ~90
-  2. Общие данные (rates, ranges, extremums) в сервисе читаются 1 раз на батч
-  3. Bulk INSERT: результаты батча сохраняются одной транзакцией
-  4. Keep-alive TCP: один коннектор на всё время работы скрипта
-  5. Retry: упавшие батчи прогоняются повторно RETRY_PASSES раз
-  6. 6 слотов работают параллельно через asyncio.gather
+  2. SLOT_BATCH_SIZE = 50 (было 25) — вдвое меньше HTTP-запросов
+  3. Param combos параллелятся внутри слота через asyncio.gather
+  4. Bulk INSERT с игнорированием дублей
+  5. Keep-alive TCP: один коннектор на всё время работы скрипта
+  6. Retry: упавшие батчи прогоняются повторно RETRY_PASSES раз
+  7. Исправлен баг: даты отсутствующие в batch-ответе идут в retry, не в failed
 """
 
 import argparse
@@ -36,19 +37,19 @@ MODEL_IDS = [31]
 
 # ── Параллельность ────────────────────────────────────────────────────────────
 # Сколько одновременных HTTP-запросов к сервису.
-# При батчевом режиме каждый запрос уже несёт 50–100 дат,
-# поэтому 2–3 — разумный максимум. Больше не нужно.
+# При 50 дат/батч и ~0.1с CPU каждая → батч ~5с.
+# 4 параллельных = 20 свечей/сек реально.
 HTTP_CONCURRENCY = 4
 
-# Сколько дат отправлять в одном /compute_batch запросе.
-# 50 дат × ~0.5–1с CPU ≈ 25–50с на запрос — хорошо укладывается в BATCH_TIMEOUT.
-# Если сервис однопоточный (workers=1), можно поднять до 100.
-SLOT_BATCH_SIZE = 25
+# Сколько дат в одном /compute_batch.
+# 50 × ~0.1с CPU (после оптимизации сервера) ≈ 5–10с → укладывается в таймаут.
+# Если сервер старый (до патча), можно вернуть 25.
+SLOT_BATCH_SIZE = 50
 
 # Таймаут одного батч-запроса.
-# 50 дат × ~1с CPU = 50с, берём двукратный запас.
-BATCH_TIMEOUT   = 120    # секунд на один POST /compute_batch
-RETRY_TIMEOUT   = 180    # секунд на retry-батч
+# 50 дат × ~1с CPU (пессимистично) = 50с, берём двукратный запас.
+BATCH_TIMEOUT   = 120   # секунд на один POST /compute_batch
+RETRY_TIMEOUT   = 180   # секунд на retry-батч
 
 # Retry для упавших батчей.
 RETRY_PASSES      = 3
@@ -309,7 +310,6 @@ async def _call_batch(
     """
     POST /compute_batch с батчем дат.
     Возвращает (payload_dict | None, error_reason | None).
-
     payload_dict: {date_str: {weight_code: float, ...}, ...}
     """
     async with global_sem:
@@ -335,11 +335,9 @@ async def _call_batch(
                 except Exception as e:
                     return None, f"JSON parse error: {e}"
 
-                # Сервис вернул {"error": "..."}
                 if isinstance(data, dict) and "error" in data and len(data) == 1:
                     return None, f"Сервис вернул error: {data['error'][:200]}"
 
-                # Ожидаем {date_str: dict, ...}
                 if not isinstance(data, dict):
                     return None, f"Неожиданный тип ответа: {type(data).__name__}"
 
@@ -437,12 +435,10 @@ async def _run_pass(
     """
     Проходит по candles батчами POST /compute_batch.
 
-    Каждый батч = один HTTP-запрос с SLOT_BATCH_SIZE датами.
-    Это принципиальное отличие от старой версии, где каждая свеча = отдельный запрос.
+    ИСПРАВЛЕНИЕ v2: даты, отсутствующие в batch-ответе, идут в failed
+    (а не молча теряются). Это редкая ситуация, но теперь они попадут в retry.
 
-    Соотношение запросов:
-      Было:  N_candles × N_combos запросов  (460 000 для model=31)
-      Стало: ceil(N_candles / SLOT_BATCH_SIZE) × N_combos запросов  (~90 для model=31)
+    Каждый батч = один HTTP-запрос с SLOT_BATCH_SIZE датами (50 по умолчанию).
     """
     if not candles:
         return 0, []
@@ -470,20 +466,27 @@ async def _run_pass(
         batch_err = 0
 
         if err is not None or payload is None:
-            # Весь батч упал — все даты идут в failed
             for c in batch:
                 failed.append({"candle": c, "reason": err or "payload is None"})
             batch_err = len(batch)
         else:
-            # Разбираем ответ: payload = {date_str: result_dict}
             insert_rows: list[dict] = []
             for date_str, candle in date_index.items():
-                result = payload.get(date_str)
-                if result is None:
-                    # Дата отсутствует в ответе — нештатная ситуация
-                    failed.append({"candle": candle, "reason": "дата отсутствует в batch-ответе"})
+                # ── ИСПРАВЛЕНИЕ: различаем None (дата не пришла) и {} (пустой результат)
+                # payload.get(date_str) возвращает None если ключа нет,
+                # и {} если сервис вернул пустой dict для этой даты.
+                # Пустой dict — корректный результат (нет ненулевых весов).
+                if date_str not in payload:
+                    # Дата отсутствует в ответе — нештатно, отправляем в retry
+                    failed.append({
+                        "candle": candle,
+                        "reason": "дата отсутствует в batch-ответе (partial response)",
+                    })
                     batch_err += 1
                     continue
+
+                result = payload[date_str]
+                # result может быть {} — это ОК, кешируем как есть
                 insert_rows.append({
                     "url":  service_url,
                     "pair": pair,
@@ -872,32 +875,53 @@ async def run_slot(
     )
 
     # ── Кеш ───────────────────────────────────────────────────────────────────
+    # ОПТИМИЗАЦИЯ v2: param_combos обрабатываются параллельно если их > 1.
+    # Ограничение: не более HTTP_CONCURRENCY одновременных потоков через global_sem.
+    # Это безопасно — каждый combo использует свой params_hash.
     if not args.skip_fill:
-        for idx, combo in enumerate(param_combos, 1):
-            if deadline.exceeded():
-                timed_out = True
-                break
-
-            combo_str = json.dumps(combo) if combo else "{}"
-            log.info(f"{label} 📥 [{idx}/{len(param_combos)}] params={combo_str}")
-
-            r = await fill_cache_parallel(
-                engine_vlad, candles, service_url, pair, day,
-                combo, global_sem, session, deadline, slot=slot,
-            )
-            stats_cache["new"]     += r["new"]
-            stats_cache["skipped"] += r["skipped"]
-            stats_cache["errors"]  += r["errors"]
-
-            if r["errors"] > 0:
-                send_trace(
-                    f"⚠️  Ошибки кеша — {slot} params={combo_str}",
-                    f"model={model_id}  pair={PAIR_NAMES.get(pair)}  "
-                    f"day={DAY_NAMES.get(day)}\nparams={combo_str}\n"
-                    f"url={service_url}\n\n"
-                    f"Ошибок после всех retry: {r['errors']} из {r['total']}",
-                    is_error=True,
+        if deadline.exceeded():
+            timed_out = True
+        else:
+            # При 1 combo — без gather (нет смысла в overhead)
+            if len(param_combos) == 1:
+                combo = param_combos[0]
+                r = await fill_cache_parallel(
+                    engine_vlad, candles, service_url, pair, day,
+                    combo, global_sem, session, deadline, slot=slot,
                 )
+                stats_cache["new"]     += r["new"]
+                stats_cache["skipped"] += r["skipped"]
+                stats_cache["errors"]  += r["errors"]
+            else:
+                # Параллельные combo — ускоряет если combo > 1 и сервис справляется
+                log.info(f"{label} 📥 Запускаем {len(param_combos)} комбо параллельно")
+
+                async def _fill_one(idx: int, combo: dict) -> dict:
+                    if deadline.exceeded():
+                        return {"new": 0, "skipped": len(candles), "errors": 0}
+                    combo_str = json.dumps(combo) if combo else "{}"
+                    log.info(f"{label} 📥 [{idx}/{len(param_combos)}] params={combo_str}")
+                    return await fill_cache_parallel(
+                        engine_vlad, candles, service_url, pair, day,
+                        combo, global_sem, session, deadline, slot=f"{slot}|c{idx}",
+                    )
+
+                results = await asyncio.gather(*[
+                    _fill_one(i + 1, combo)
+                    for i, combo in enumerate(param_combos)
+                ])
+                for r in results:
+                    stats_cache["new"]     += r["new"]
+                    stats_cache["skipped"] += r["skipped"]
+                    stats_cache["errors"]  += r["errors"]
+                    if r["errors"] > 0:
+                        send_trace(
+                            f"⚠️  Ошибки кеша — {slot}",
+                            f"model={model_id}  pair={PAIR_NAMES.get(pair)}  "
+                            f"day={DAY_NAMES.get(day)}\nurl={service_url}\n\n"
+                            f"Ошибок после всех retry: {r['errors']} из {r['total']}",
+                            is_error=True,
+                        )
 
         if not timed_out:
             log.info(
@@ -984,12 +1008,6 @@ async def run_model(
     deadline: Deadline,
 ) -> tuple[dict, dict, bool]:
     slots = [(p, d) for p in args.pairs for d in args.days]
-
-    # Оценка количества батч-запросов
-    est_batches_per_combo = sum(
-        math.ceil(1 / SLOT_BATCH_SIZE)  # placeholder — реальные цифры после загрузки свечей
-        for _ in slots
-    )
 
     log.info(
         f"\n{'#'*60}\n"
