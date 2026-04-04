@@ -838,6 +838,17 @@ async def get_values(
     type: int = Query(0, ge=0, le=2), var: int = Query(0, ge=0, le=4),
 ):
     try:
+        rates_table = get_rates_table_name(pair, day)
+ 
+        async def _compute():
+            # Async-часть: обновить свежие свечи если нужно
+            await _refresh_rates_if_needed(rates_table)
+            # CPU-часть: в thread pool — event loop НЕ блокируется
+            return await asyncio.to_thread(
+                functools.partial(_compute_cpu_only, pair, day, date,
+                                  calc_type=type, calc_var=var)
+            )
+ 
         return await cached_values(
             engine_vlad=engine_vlad,
             service_url  = SERVICE_URL,
@@ -845,8 +856,7 @@ async def get_values(
             day          = day,
             date         = date,
             extra_params = {"type": type, "var": var},
-            compute_fn   = lambda: calculate_pure_memory(pair, day, date,
-                                                          calc_type=type, calc_var=var),
+            compute_fn   = _compute,
             node         = NODE_NAME,
         )
     except Exception as e:
