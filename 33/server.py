@@ -65,6 +65,7 @@ GLOBAL_EXTREMUMS     = {}
 GLOBAL_CANDLE_RANGES = {}
 GLOBAL_AVG_RANGE     = {}
 GLOBAL_LAST_CANDLES  = {}
+GLOBAL_EVENT_NAMES   = {}   # event_id → title (загружается при старте)
 SERVICE_URL          = ""
 LAST_RELOAD_TIME     = None
 
@@ -126,6 +127,28 @@ def make_weight_code(event_id, currency, importance, fcd, scd, rcd, mode, hour_s
             f"{REVISION_MAP.get(rcd,'X')}_{mode}")
     return base if hour_shift is None else f"{base}_{hour_shift}"
 
+def decode_weight_code(code: str) -> dict | None:
+    """E{id}_{curr}_{imp}_{fcd}_{scd}_{rcd}_{mode}[_{shift}]  →  dict полей."""
+    if not code.startswith("E"):
+        return None
+    parts = code[1:].split("_")
+    if len(parts) < 7:
+        return None
+    try:
+        return {
+            "event_id":     int(parts[0]),
+            "currency_code": parts[1],
+            "importance":   IMPORTANCE_MAP_REV.get(parts[2], parts[2]),
+            "forecast_dir": FORECAST_MAP_REV.get(parts[3], parts[3]),
+            "surprise_dir": SURPRISE_MAP_REV.get(parts[4], parts[4]),
+            "revision_dir": REVISION_MAP_REV.get(parts[5], parts[5]),
+            "mode_val":     int(parts[6]),
+            "hour_shift":   int(parts[7]) if len(parts) > 7 else None,
+        }
+    except (ValueError, IndexError):
+        return None
+
+
 def compute_t1_value(t_dates, calc_var, ram_rates, candle_ranges, avg_range):
     need_filter = calc_var in (1, 3, 4)
     use_square  = calc_var in (2, 3)
@@ -172,6 +195,7 @@ async def preload_all_data():
     GLOBAL_CANDLE_RANGES.clear()
     GLOBAL_AVG_RANGE.clear()
     GLOBAL_LAST_CANDLES.clear()
+    GLOBAL_EVENT_NAMES.clear()
     _CAL_SORTED_DATES.clear()
     _CAL_SORTED_DATA.clear()
 
@@ -212,6 +236,21 @@ async def preload_all_data():
         log(f"  url→event_id map: {len(url_to_event_id)} entries", NODE_NAME)
     except Exception as e:
         log(f"❌ url→event_id map error: {e}", NODE_NAME, level="error")
+
+    # Загрузка названий событий (event_id → Title)
+    try:
+        async with engine_vlad.connect() as conn:
+            res = await conn.execute(text("""
+                SELECT EventId, Title
+                FROM brain_calendar
+                WHERE EventId IS NOT NULL AND Title IS NOT NULL
+                GROUP BY EventId, Title
+            """))
+            for r in res.fetchall():
+                GLOBAL_EVENT_NAMES[r[0]] = r[1]
+        log(f"  event_names: {len(GLOBAL_EVENT_NAMES)} entries", NODE_NAME)
+    except Exception as e:
+        log(f"⚠️  event_names load error (Title column may differ): {e}", NODE_NAME, level="warning")
 
     # Загрузка календарных событий из engine_brain
     try:
@@ -616,7 +655,7 @@ async def get_values(
     type: int = Query(0, ge=0, le=2), var: int = Query(0, ge=0, le=4),
 ):
     try:
-        return await cached_values(
+        response = await cached_values(
             engine_vlad=engine_vlad,
             service_url  = SERVICE_URL,
             pair         = pair,
@@ -627,6 +666,36 @@ async def get_values(
                                                           calc_type=type, calc_var=var),
             node         = NODE_NAME,
         )
+
+        # ── details: расшифровка каждого weight_code из payLoad ──────────────
+        payload = response.get("payLoad") or {}
+        details = []
+        for wc, value in payload.items():
+            dec = decode_weight_code(wc)
+            if dec is None:
+                continue
+            eid     = dec["event_id"]
+            ctx_key = (eid, dec["currency_code"], dec["importance"],
+                       dec["forecast_dir"], dec["surprise_dir"], dec["revision_dir"])
+            ctx_info = GLOBAL_CAL_CTX_INDEX.get(ctx_key, {})
+            details.append({
+                "weight_code":      wc,
+                "event_id":         eid,
+                "event_name":       GLOBAL_EVENT_NAMES.get(eid),
+                "currency_code":    dec["currency_code"],
+                "importance":       dec["importance"],
+                "forecast_dir":     dec["forecast_dir"],
+                "surprise_dir":     dec["surprise_dir"],
+                "revision_dir":     dec["revision_dir"],
+                "mode_val":         dec["mode_val"],
+                "hour_shift":       dec["hour_shift"],
+                "occurrence_count": ctx_info.get("occurrence_count"),
+                "value":            value,
+            })
+
+        response["details"] = details
+        return response
+
     except OperationalError as e:
         log(f"Database connection error in get_values: {e}", NODE_NAME, level="error")
         return err_response(f"Database connection error: {str(e)}")
