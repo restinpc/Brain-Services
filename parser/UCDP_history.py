@@ -3,9 +3,8 @@ UCDP GED Collector — загружает все события 1989–2024 + ca
 Таблица: vlad_ucdp
 """
 
-import os, sys, argparse, json, time, random, traceback
-from datetime import datetime, date
-
+import os, sys, argparse, time, random, traceback
+from datetime import date
 import requests
 from requests.adapters import HTTPAdapter
 from requests.exceptions import ChunkedEncodingError, ConnectionError as RequestsConnectionError
@@ -18,12 +17,10 @@ load_dotenv()
 TRACE_URL = "https://server.brain-project.online/trace.php"
 NODE_NAME = os.getenv("NODE_NAME", "ucdp_history")
 EMAIL = os.getenv("ALERT_EMAIL", "vladyurjevitch@yandex.ru")
-
 UCDP_TOKEN = os.getenv("UCDP_TOKEN", "")
 UCDP_API_BASE = "https://ucdpapi.pcr.uu.se/api"
 UCDP_GED_VERSION = "25.1"
 UCDP_CANDIDATE_VERSION = "26.0.1"
-
 MAX_PAGE_RETRIES = 5
 RETRY_BACKOFF_BASE = 10
 
@@ -34,45 +31,31 @@ def send_error_trace(exc, script_name="UCDP_history.py"):
     except:
         pass
 
-# Поддерживаем оба формата: и старый (позиционные), и новый (с флагами)
-parser = argparse.ArgumentParser(description="UCDP GED Events (full history + incremental) → MySQL")
-parser.add_argument("table_name", nargs="?", help="Имя целевой таблицы (опционально, будет vlad_ucdp)")
-parser.add_argument("host", nargs="?", help="MySQL host")
-parser.add_argument("port", nargs="?", help="MySQL port")
-parser.add_argument("user", nargs="?", help="MySQL user")
-parser.add_argument("password", nargs="?", help="MySQL password")
-parser.add_argument("database", nargs="?", help="MySQL database name")
-
-# Добавляем флаги как альтернативный вариант
-parser.add_argument("--host", dest="host_flag", help="MySQL host")
-parser.add_argument("--port", dest="port_flag", help="MySQL port")
-parser.add_argument("--user", dest="user_flag", help="MySQL user")
-parser.add_argument("--password", dest="password_flag", help="MySQL password")
-parser.add_argument("--database", dest="database_flag", help="MySQL database name")
-
+# Позиционные аргументы (все опциональны, можно использовать .env)
+parser = argparse.ArgumentParser(description="UCDP GED Events → MySQL")
+parser.add_argument("host", nargs="?", default=None, help="MySQL host")
+parser.add_argument("port", nargs="?", default=None, help="MySQL port")
+parser.add_argument("user", nargs="?", default=None, help="MySQL user")
+parser.add_argument("password", nargs="?", default=None, help="MySQL password")
+parser.add_argument("database", nargs="?", default=None, help="MySQL database name")
 args = parser.parse_args()
 
-# ФИКСИРОВАННОЕ ИМЯ ТАБЛИЦЫ (игнорируем то, что передали в аргументах)
-TABLE_NAME = "vlad_ucdp"
-
-# Определяем параметры подключения:
-# Сначала пробуем взять из флагов, потом из позиционных аргументов, потом из .env
-DB_HOST = args.host_flag or args.host or os.getenv("DB_HOST")
-DB_PORT = args.port_flag or args.port or os.getenv("DB_PORT", "3306")
-DB_USER = args.user_flag or args.user or os.getenv("DB_USER")
-DB_PASSWORD = args.password_flag or args.password or os.getenv("DB_PASSWORD")
-DB_DATABASE = args.database_flag or args.database or os.getenv("DB_NAME")
+# Берём из аргументов, если не указаны — из .env
+DB_HOST = args.host or os.getenv("DB_HOST")
+DB_PORT = args.port or os.getenv("DB_PORT", "3306")
+DB_USER = args.user or os.getenv("DB_USER")
+DB_PASSWORD = args.password or os.getenv("DB_PASSWORD")
+DB_DATABASE = args.database or os.getenv("DB_NAME")
 
 if not all([DB_HOST, DB_USER, DB_PASSWORD, DB_DATABASE]):
     print("❌ Ошибка: не указаны параметры подключения")
-    print("\nИспользование (позиционные аргументы):")
-    print("  python UCDP_history.py vlad_ucdp 127.0.0.1 3306 root password brain")
-    print("\nИли (с флагами):")
-    print("  python UCDP_history.py --host 127.0.0.1 --user root --password password --database brain")
+    print("\nИспользование:")
+    print("  python UCDP_history.py host port user password database")
     print("\nИли через .env файл:")
     print("  DB_HOST=127.0.0.1")
+    print("  DB_PORT=3306")
     print("  DB_USER=root")
-    print("  DB_PASSWORD=password")
+    print("  DB_PASSWORD=yourpass")
     print("  DB_NAME=brain")
     sys.exit(1)
 
@@ -89,8 +72,7 @@ DB_CONFIG = {
     'database': DB_DATABASE
 }
 
-print(f"🔌 Подключение к БД: {DB_HOST}:{DB_PORT}/{DB_DATABASE} as {DB_USER}")
-
+TABLE_NAME = "vlad_ucdp"
 
 class UCDPCollector:
     def __init__(self):
@@ -99,13 +81,8 @@ class UCDPCollector:
 
     def _make_session(self):
         s = requests.Session()
-        retry = Retry(
-            total=5,
-            backoff_factor=3,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["GET"],
-            raise_on_status=False,
-        )
+        retry = Retry(total=5, backoff_factor=3, status_forcelist=[429, 500, 502, 503, 504],
+                      allowed_methods=["GET"], raise_on_status=False)
         s.mount("https://", HTTPAdapter(max_retries=retry))
         s.headers.update({"x-ucdp-access-token": UCDP_TOKEN})
         return s
@@ -118,7 +95,6 @@ class UCDPCollector:
         params = {"pagesize": pagesize, "page": page}
         if year_filter:
             params["year"] = year_filter
-
         resp = self.session.get(url, params=params, timeout=90)
         if resp.status_code == 429:
             wait = 30 + random.uniform(5, 15)
@@ -126,21 +102,14 @@ class UCDPCollector:
             time.sleep(wait)
             return self.fetch_page(version, page, pagesize, year_filter)
         resp.raise_for_status()
-
         data = resp.json()
         if not isinstance(data, dict):
-            raise ValueError(
-                f"Неожиданный тип ответа на стр.{page}: "
-                f"{type(data).__name__} вместо dict. "
-                f"Содержимое (первые 200 символов): {str(data)[:200]}"
-            )
+            raise ValueError(f"Неожиданный тип ответа на стр.{page}")
         return data
 
     def fetch_all_events(self, version, year_filter=None):
         all_events = []
         page = 0
-        total_pages = None
-
         while True:
             for attempt in range(1, MAX_PAGE_RETRIES + 1):
                 try:
@@ -159,49 +128,27 @@ class UCDPCollector:
             total_pages = data.get("TotalPages", 0)
             total_count = data.get("TotalCount", 0)
 
-            if not isinstance(results, list):
-                print(f"\n⚠️ Стр.{page+1}: 'Result' не список ({type(results).__name__}), пропускаем")
-                break
-
-            valid_events = []
-            for idx, e in enumerate(results):
-                if isinstance(e, dict):
-                    valid_events.append(e)
-                else:
-                    print(f"\n⚠️ Стр.{page+1}, элемент {idx}: ожидался dict, получен {type(e).__name__} = {e!r}")
-
-            if not valid_events and results:
-                print(f"\n⚠️ Стр.{page+1}: все {len(results)} элементов отфильтрованы как невалидные")
-                break
-
-            if not valid_events:
-                break
-
+            valid_events = [e for e in results if isinstance(e, dict)]
             all_events.extend(valid_events)
+
             current_page = data.get("CurrentPage", page)
-            print(
-                f"📥 Стр. {current_page+1}/{total_pages}: "
-                f"+{len(valid_events)}, всего {len(all_events)}/{total_count} ",
-                end="\r"
-            )
+            print(f"📥 Стр. {current_page+1}/{total_pages}: +{len(valid_events)}, всего {len(all_events)}/{total_count} ", end="\r")
 
             if current_page + 1 >= total_pages:
                 break
-
             page += 1
-            time.sleep(random.uniform(0.3, 1.0))
+            time.sleep(random.uniform(0.3, 0.8))
 
-        print()
+        print(f"\n✅ Загружено {len(all_events)} событий")
         return all_events
 
     def ensure_table(self):
         conn = self.get_db_connection()
         c = conn.cursor()
         
-        # Проверяем, существует ли таблица со старой схемой (с iso3)
+        # Проверяем, нет ли старой таблицы с iso3
         c.execute(f"SHOW TABLES LIKE '{self.table_name}'")
         if c.fetchone():
-            # Проверяем, есть ли поле iso3
             c.execute(f"SHOW COLUMNS FROM `{self.table_name}` LIKE 'iso3'")
             if c.fetchone():
                 print(f"⚠️ Обнаружена старая таблица с полем iso3. Удаляем...")
@@ -212,10 +159,10 @@ class UCDPCollector:
             CREATE TABLE IF NOT EXISTS `{self.table_name}` (
                 id INT AUTO_INCREMENT PRIMARY KEY,
                 ucdp_id INT NOT NULL COMMENT 'UCDP event ID',
-                relid VARCHAR(50) COMMENT 'UCDP relational key',
+                relid VARCHAR(50),
                 year INT NOT NULL,
-                event_type VARCHAR(100) COMMENT 'type_of_violence text',
-                type_of_violence TINYINT COMMENT '1=state,2=non-state,3=one-sided',
+                event_type VARCHAR(100),
+                type_of_violence TINYINT,
                 conflict_name VARCHAR(500),
                 dyad_name VARCHAR(500),
                 side_a VARCHAR(300),
@@ -234,7 +181,7 @@ class UCDPCollector:
                 deaths_b INT DEFAULT 0,
                 deaths_civilians INT DEFAULT 0,
                 deaths_unknown INT DEFAULT 0,
-                best_estimate INT DEFAULT 0 COMMENT 'Best fatality estimate',
+                best_estimate INT DEFAULT 0,
                 low_estimate INT DEFAULT 0,
                 high_estimate INT DEFAULT 0,
                 source_article TEXT,
@@ -261,13 +208,10 @@ class UCDPCollector:
             c = conn.cursor()
             c.execute("SHOW TABLES LIKE %s", (self.table_name,))
             if not c.fetchone():
-                c.close()
-                conn.close()
-                return None
+                c.close(); conn.close(); return None
             c.execute(f"SELECT MAX(year) FROM `{self.table_name}`")
             row = c.fetchone()
-            c.close()
-            conn.close()
+            c.close(); conn.close()
             return row[0] if row and row[0] else None
         except:
             return None
@@ -278,8 +222,7 @@ class UCDPCollector:
             c = conn.cursor()
             c.execute(f"SELECT COUNT(*) FROM `{self.table_name}`")
             cnt = c.fetchone()[0]
-            c.close()
-            conn.close()
+            c.close(); conn.close()
             return cnt
         except:
             return 0
@@ -303,35 +246,24 @@ class UCDPCollector:
         placeholders = ", ".join(["%s"] * len(columns))
         sql = f"INSERT IGNORE INTO `{self.table_name}` ({cols_str}) VALUES ({placeholders})"
 
-        def sf(v):
-            if v is None or v == "":
-                return None
-            try:
-                return float(v)
-            except:
-                return None
-
         def si(v):
-            if v is None or v == "":
-                return None
-            try:
-                return int(v)
-            except:
-                return None
+            if v is None or v == "": return None
+            try: return int(v)
+            except: return None
+
+        def sf(v):
+            if v is None or v == "": return None
+            try: return float(v)
+            except: return None
 
         TYPE_MAP = {1: "State-based", 2: "Non-state", 3: "One-sided violence"}
 
         total = 0
-        skipped = 0
         for i in range(0, len(events), 1000):
             batch = events[i:i+1000]
             rows = []
             for e in batch:
-                if not isinstance(e, dict):
-                    print(f"\n⚠️ insert_events: пропускаем элемент типа {type(e).__name__}: {e!r}")
-                    skipped += 1
-                    continue
-
+                if not isinstance(e, dict): continue
                 tov = si(e.get("type_of_violence"))
                 rows.append((
                     si(e.get("id")),
@@ -365,95 +297,68 @@ class UCDPCollector:
                     e.get("source_date"),
                     (e.get("where_description", "") or "")[:2000],
                 ))
-
-            if not rows:
-                continue
-
-            c.executemany(sql, rows)
-            total += c.rowcount if c.rowcount >= 0 else len(rows)
+            if rows:
+                c.executemany(sql, rows)
+                total += c.rowcount if c.rowcount >= 0 else len(rows)
 
         conn.commit()
         c.close()
         conn.close()
-        if skipped:
-            print(f"\n⚠️ Пропущено невалидных элементов: {skipped}")
         return total
 
     def process(self):
         self.ensure_table()
-
         last_year = self.get_last_year()
         current_count = self.get_row_count()
 
         if last_year is None:
-            # Полная загрузка 1989–2024
+            # === BACKFILL: весь датасет одним проходом ===
             print(f"\n📦 BACKFILL MODE: UCDP GED v{UCDP_GED_VERSION} (1989–2024)")
-            print(f"   Таблица пуста, начинаем полную загрузку\n")
+            print("   Скачиваем весь датасет за один проход...\n")
+            events = self.fetch_all_events(UCDP_GED_VERSION)
+            n = self.insert_events(events)
+            print(f"\n🏁 BACKFILL завершён: вставлено {n} записей")
 
-            total_inserted = 0
-            for year in range(1989, 2025):
-                print(f"\n📅 Год {year}:")
-                events = self.fetch_all_events(UCDP_GED_VERSION, year_filter=year)
-                if events:
-                    n = self.insert_events(events)
-                    total_inserted += n
-                    print(f"   ✅ {year}: {n} новых из {len(events)}")
-                else:
-                    print(f"   ⚠️ {year}: нет данных")
-                time.sleep(random.uniform(1, 3))
-
-            print(f"\n🏁 BACKFILL GED завершён: {total_inserted} записей")
-
-            # Candidate events
-            print(f"\n📦 Загрузка UCDP Candidate v{UCDP_CANDIDATE_VERSION} (2025+)")
+            # Candidate
+            print(f"\n📦 Загрузка Candidate v{UCDP_CANDIDATE_VERSION}")
             events = self.fetch_all_events(UCDP_CANDIDATE_VERSION)
-            if events:
-                n = self.insert_events(events)
-                print(f"   ✅ Candidate: {n} новых из {len(events)}")
-
+            n = self.insert_events(events)
+            print(f"   ✅ Candidate: {n} записей")
         else:
-            # Инкрементальный режим
+            # === INCREMENTAL ===
             print(f"\n🔄 INCREMENTAL MODE")
             print(f"   Последний год в БД: {last_year}")
             print(f"   Текущих записей: {current_count}\n")
-
+            
             current_year = date.today().year
-            for year in range(max(last_year - 1, 1989), current_year):
+            for year in range(max(last_year - 1, 1989), 2025):
                 print(f"   📥 GED v{UCDP_GED_VERSION}, год {year}...")
                 events = self.fetch_all_events(UCDP_GED_VERSION, year_filter=year)
-                if events:
-                    n = self.insert_events(events)
-                    if n > 0:
-                        print(f"      +{n} новых")
+                n = self.insert_events(events)
+                if n > 0:
+                    print(f"      +{n} новых")
                 time.sleep(random.uniform(0.5, 1.5))
 
             print(f"   📥 Candidate v{UCDP_CANDIDATE_VERSION}...")
             events = self.fetch_all_events(UCDP_CANDIDATE_VERSION)
-            if events:
-                n = self.insert_events(events)
-                print(f"      +{n} новых из candidate")
+            n = self.insert_events(events)
+            print(f"      +{n} новых из candidate")
 
         final_count = self.get_row_count()
-        print(f"\n📊 Всего записей в {self.table_name}: {final_count}")
-
+        print(f"\n📊 ИТОГО в таблице {self.table_name}: {final_count} записей")
 
 def main():
-    print(f"🚀 UCDP GED Collector (backfill + incremental)")
+    print(f"🚀 UCDP GED Collector")
+    print(f"База: {DB_HOST}:{DB_PORT}/{DB_DATABASE}")
     print(f"🎯 Таблица: {TABLE_NAME}")
     print("=" * 60)
     UCDPCollector().process()
     print("=" * 60)
     print("🏁 ЗАГРУЗКА ЗАВЕРШЕНА")
 
-
 if __name__ == "__main__":
     try:
         main()
-    except SystemExit:
-        raise
-    except KeyboardInterrupt:
-        print("\n🛑 Прервано")
-        sys.exit(1)
     except Exception as e:
         print(f"\n❌ Критическая ошибка: {e!r}")
         traceback.print_exc()
