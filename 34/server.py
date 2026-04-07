@@ -13,6 +13,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared"))
 import uvicorn
 import asyncio
 import bisect
+import functools
+import numpy as np
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
@@ -91,6 +93,11 @@ GLOBAL_AVG_RANGE     = {}
 GLOBAL_LAST_CANDLES  = {}
 SERVICE_URL          = ""
 LAST_RELOAD_TIME     = None
+
+# ── NumPy-ускоренные структуры (строятся в preload, используются в _compute_cpu_only) ──
+NP_RATES:    dict = {}   # table → {"dates_ns": int64[], "t1": float64[], "ranges": float64[], "ext_min": bool[], "ext_max": bool[]}
+NP_CTX_HIST: dict = {}   # ctx_key → int64[] (unix timestamps, sorted)
+NP_CTX_HIST_BUILT: bool = False
 
 
 # ── Вспомогательные функции ───────────────────────────────────────────────────
@@ -249,99 +256,120 @@ def compute_extremum_value(t_dates, calc_var, ext_set, candle_ranges,
     return val if val != 0 else None
 
 
-# ── Preload ───────────────────────────────────────────────────────────────────
-
 async def preload_all_data():
-    global SERVICE_URL, LAST_RELOAD_TIME
-    log("🔄 MARKET-TECH FULL DATA RELOAD STARTED", NODE_NAME, force=True)
+    """Инициализация всех глобальных структур."""
+    global GLOBAL_MKT_BY_INSTR, GLOBAL_MKT_CONTEXT, GLOBAL_MKT_OBS_DTS
+    global _MKT_SORTED_DATES, GLOBAL_MKT_CTX_HIST, GLOBAL_CTX_INDEX
+    global GLOBAL_WEIGHT_CODES, GLOBAL_RATES, GLOBAL_EXTREMUMS, GLOBAL_CANDLE_RANGES
+    global GLOBAL_AVG_RANGE, GLOBAL_LAST_CANDLES, SERVICE_URL, LAST_RELOAD_TIME
+    global NP_RATES, NP_CTX_HIST, NP_CTX_HIST_BUILT
 
-    GLOBAL_WEIGHT_CODES.clear();  GLOBAL_CTX_INDEX.clear()
-    GLOBAL_MKT_BY_INSTR.clear();  GLOBAL_MKT_CONTEXT.clear()
-    GLOBAL_MKT_OBS_DTS.clear();   GLOBAL_MKT_CTX_HIST.clear()
-    GLOBAL_RATES.clear();          GLOBAL_EXTREMUMS.clear()
-    GLOBAL_CANDLE_RANGES.clear();  GLOBAL_AVG_RANGE.clear()
-    GLOBAL_LAST_CANDLES.clear()
+    log("🔄 MARKET-TECH FULL DATA RELOAD START", NODE_NAME, force=True)
 
-    # ── vlad DB: weight_codes + ctx_index ────────────────────────────────────
-    async with engine_vlad.connect() as conn:
+    # Очищаем старые данные
+    GLOBAL_MKT_BY_INSTR.clear()
+    GLOBAL_MKT_CONTEXT.clear()
+    GLOBAL_MKT_OBS_DTS.clear()
+    _MKT_SORTED_DATES[:] = []
+    GLOBAL_MKT_CTX_HIST.clear()
+    GLOBAL_CTX_INDEX.clear()
+    GLOBAL_WEIGHT_CODES.clear()
+    NP_RATES.clear()
+    NP_CTX_HIST_BUILT = False
 
-        try:
-            res = await conn.execute(
-                text("SELECT weight_code FROM vlad_market_tech_weights"))
-            GLOBAL_WEIGHT_CODES.extend(r[0] for r in res.fetchall())
-            log(f"  weight_codes: {len(GLOBAL_WEIGHT_CODES)}", NODE_NAME)
-        except Exception as e:
-            log(f"❌ weight_codes: {e}", NODE_NAME, level="error")
-
-        try:
+    # ── vlad DB: weights и context_idx ────────────────────────────────────────
+    try:
+        async with engine_vlad.connect() as conn:
+            # Веса
             res = await conn.execute(text("""
-                SELECT instrument, rate_change_dir, trend_dir, momentum_dir,
-                       vol_zone, bb_zone, occurrence_count
-                FROM vlad_market_tech_context_idx
+                SELECT weight_code FROM vlad_market_tech_weights
+                GROUP BY weight_code
+            """))
+            GLOBAL_WEIGHT_CODES = [r[0] for r in res.fetchall()]
+
+            # Индекс контекстов
+            res = await conn.execute(text("""
+                SELECT weight_code, occurrence_count FROM vlad_market_tech_context_idx
             """))
             for r in res.mappings().all():
-                key = (r["instrument"], r["rate_change_dir"], r["trend_dir"],
-                       r["momentum_dir"], r["vol_zone"], r["bb_zone"])
-                GLOBAL_CTX_INDEX[key] = {"occurrence_count": r["occurrence_count"] or 0}
-            log(f"  ctx_index (5D): {len(GLOBAL_CTX_INDEX)}", NODE_NAME)
-        except Exception as e:
-            log(f"❌ ctx_index: {e}", NODE_NAME, level="error")
+                weight_code = r["weight_code"]
+                parts = weight_code.split("_")
+                if len(parts) >= 6:
+                    try:
+                        instr_id = int(parts[0])
+                        instr_name = {v: k for k, v in INSTRUMENT_MAP.items()}.get(instr_id, "UNKNOWN")
+                        rcd = {v: k for k, v in RATE_CHANGE_MAP.items()}.get(int(parts[1]), "UNKNOWN")
+                        td = {v: k for k, v in TREND_MAP.items()}.get(int(parts[2]), "UNKNOWN")
+                        md = {v: k for k, v in MOMENTUM_MAP.items()}.get(int(parts[3]), "UNKNOWN")
+                        vol = {v: k for k, v in VOL_MAP.items()}.get(int(parts[4]), "UNKNOWN")
+                        bb = {v: k for k, v in BB_MAP.items()}.get(int(parts[5]), "UNKNOWN")
+                        ctx_key = (instr_name, rcd, td, md, vol, bb)
+                        GLOBAL_CTX_INDEX[ctx_key] = {
+                            "occurrence_count": int(r["occurrence_count"])
+                        }
+                    except (ValueError, IndexError):
+                        pass
+        log(f"  Market weights: {len(GLOBAL_WEIGHT_CODES)}, contexts: {len(GLOBAL_CTX_INDEX)}",
+            NODE_NAME)
+    except Exception as e:
+        log(f"❌ Market weights/contexts from vlad: {e}", NODE_NAME, level="error", force=True)
 
-        # ── vlad_market_history из базы vlad (исправлено) ────────────────────────
-        try:
-            col_parts  = []
-            instruments = list(INSTRUMENT_COLUMNS.keys())
+    # ── brain DB: market_history ──────────────────────────────────────────────
+    try:
+        instruments = list(INSTRUMENT_COLUMNS.keys())
+        if instruments:
+            col_parts = []
             for instr in instruments:
                 close_col, vol_col = INSTRUMENT_COLUMNS[instr]
-                col_parts.append(f"`{close_col}`")
-                col_parts.append(f"`{vol_col}`")
+                col_parts.extend([close_col, vol_col])
 
-            res  = await conn.execute(text(
-                f"SELECT `datetime`, {', '.join(col_parts)} "
-                f"FROM vlad_market_history ORDER BY `datetime`"))
-            rows = res.fetchall()
-            log(f"  vlad_market_history (from vlad DB): {len(rows)} rows", NODE_NAME)
+            async with engine_brain.connect() as conn:
+                res  = await conn.execute(text(
+                    f"SELECT `datetime`, {', '.join(col_parts)} "
+                    f"FROM market_history ORDER BY `datetime`"))
+                rows = res.fetchall()
+                log(f"  market_history (from brain DB): {len(rows)} rows", NODE_NAME)
 
-            by_instr_close  = {instr: [] for instr in instruments}
-            by_instr_volume = {instr: [] for instr in instruments}
+                by_instr_close  = {instr: [] for instr in instruments}
+                by_instr_volume = {instr: [] for instr in instruments}
 
-            for row in rows:
-                dt = row[0]
-                for i, instr in enumerate(instruments):
-                    close_val = row[1 + i * 2]
-                    vol_val   = row[2 + i * 2]
-                    if close_val is not None:
-                        by_instr_close[instr].append((dt, float(close_val)))
-                        by_instr_volume[instr].append(
-                            float(vol_val) if vol_val is not None else None)
+                for row in rows:
+                    dt = row[0]
+                    for i, instr in enumerate(instruments):
+                        close_val = row[1 + i * 2]
+                        vol_val   = row[2 + i * 2]
+                        if close_val is not None:
+                            by_instr_close[instr].append((dt, float(close_val)))
+                            by_instr_volume[instr].append(
+                                float(vol_val) if vol_val is not None else None)
 
-            for instr in instruments:
-                close_series  = by_instr_close[instr]
-                volume_series = by_instr_volume[instr]
-                if not close_series:
-                    continue
-                threshold = THRESHOLD_BY_INSTRUMENT.get(instr, DEFAULT_THRESHOLD)
-                GLOBAL_MKT_BY_INSTR[instr] = close_series
+                for instr in instruments:
+                    close_series  = by_instr_close[instr]
+                    volume_series = by_instr_volume[instr]
+                    if not close_series:
+                        continue
+                    threshold = THRESHOLD_BY_INSTRUMENT.get(instr, DEFAULT_THRESHOLD)
+                    GLOBAL_MKT_BY_INSTR[instr] = close_series
 
-                for dt, rcd, td, md, vol_zone, bb_zone in classify_market_observations(
-                        close_series, volume_series, threshold):
-                    ctx_tuple = (rcd, td, md, vol_zone, bb_zone)
-                    GLOBAL_MKT_CONTEXT[(instr, dt)] = ctx_tuple
-                    GLOBAL_MKT_OBS_DTS[dt].add(instr)
-                    key = (instr, rcd, td, md, vol_zone, bb_zone)
-                    GLOBAL_MKT_CTX_HIST.setdefault(key, []).append(dt)
+                    for dt, rcd, td, md, vol_zone, bb_zone in classify_market_observations(
+                            close_series, volume_series, threshold):
+                        ctx_tuple = (rcd, td, md, vol_zone, bb_zone)
+                        GLOBAL_MKT_CONTEXT[(instr, dt)] = ctx_tuple
+                        GLOBAL_MKT_OBS_DTS[dt].add(instr)
+                        key = (instr, rcd, td, md, vol_zone, bb_zone)
+                        GLOBAL_MKT_CTX_HIST.setdefault(key, []).append(dt)
 
-            for key in GLOBAL_MKT_CTX_HIST:
-                GLOBAL_MKT_CTX_HIST[key].sort()
+                for key in GLOBAL_MKT_CTX_HIST:
+                    GLOBAL_MKT_CTX_HIST[key].sort()
 
-            total_obs = sum(len(v) for v in GLOBAL_MKT_CTX_HIST.values())
-            log(f"  instruments: {len(GLOBAL_MKT_BY_INSTR)}, "
-                f"contexts: {len(GLOBAL_MKT_CONTEXT)}, obs: {total_obs}", NODE_NAME)
-        except Exception as e:
-            log(f"❌ vlad_market_history: {e}", NODE_NAME, level="error")
+                total_obs = sum(len(v) for v in GLOBAL_MKT_CTX_HIST.values())
+                log(f"  instruments: {len(GLOBAL_MKT_BY_INSTR)}, "
+                    f"contexts: {len(GLOBAL_MKT_CONTEXT)}, obs: {total_obs}", NODE_NAME)
+    except Exception as e:
+        log(f"❌ market_history (brain): {e}", NODE_NAME, level="error")
 
-        # ── bisect: отсортированный список дат market ──
-        _MKT_SORTED_DATES[:] = sorted(GLOBAL_MKT_OBS_DTS.keys())
+    # ── bisect: отсортированный список дат market ──
+    _MKT_SORTED_DATES[:] = sorted(GLOBAL_MKT_OBS_DTS.keys())
 
     # ── brain DB: brain_rates_* (остается без изменений) ────────────────────────
     async with engine_brain.connect() as conn:
@@ -387,6 +415,7 @@ async def preload_all_data():
 
     try:
         SERVICE_URL = await load_service_url(engine_super, SERVICE_ID)
+        log(f"  SERVICE_URL loaded", NODE_NAME)
     except Exception as e:
         log(f"⚠️  load_service_url skipped: {e}", NODE_NAME, level="warn")
 
@@ -445,7 +474,9 @@ async def _refresh_rates_if_needed(rates_table):
     ram = GLOBAL_RATES.get(rates_table)
     if not ram:
         return
-    max_dt = max(ram.keys())
+    max_dt = max(ram.keys()) if ram else None
+    if not max_dt:
+        return
     try:
         async with engine_brain.connect() as conn:
             res = await conn.execute(text(
@@ -466,14 +497,15 @@ async def _refresh_rates_if_needed(rates_table):
     except Exception as e:
         log(f"  ⚠️ Rates refresh error ({rates_table}): {e}", NODE_NAME, level="warning")
 
-async def calculate_pure_memory(pair: int, day: int, date_str: str,
-                                 calc_type: int = 0, calc_var: int = 0) -> dict | None:
+
+def _compute_cpu_only(pair: int, day: int, date_str: str,
+                      calc_type: int = 0, calc_var: int = 0) -> dict | None:
+    """CPU-only вычисление — использует NumPy если доступно, иначе чистый Python."""
     target_date = parse_date_string(date_str)
     if not target_date:
         return None
 
     rates_table  = get_rates_table_name(pair, day)
-    await _refresh_rates_if_needed(rates_table)
     modification = get_modification_factor(pair)
     delta_unit   = timedelta(days=1) if day == 1 else timedelta(hours=1)
     check_dts    = [target_date + delta_unit * s
@@ -523,6 +555,8 @@ async def calculate_pure_memory(pair: int, day: int, date_str: str,
 
         t_dates   = [d + delta_unit * shift for d in valid_dts
                      if (d + delta_unit * shift) < target_date]
+        if not t_dates:
+            continue
         shift_arg = shift if is_recurring else None
 
         if calc_type in (0, 1):
@@ -543,10 +577,31 @@ async def calculate_pure_memory(pair: int, day: int, date_str: str,
     return {k: round(v, 6) for k, v in result.items() if v != 0}
 
 
-# ── Endpoints (без изменений) ─────────────────────────────────────────────────
+async def calculate_pure_memory(pair: int, day: int, date_str: str,
+                                 calc_type: int = 0, calc_var: int = 0) -> dict | None:
+    """Основной endpoint /values — использует кеш + вычисление."""
+    target_date = parse_date_string(date_str)
+    if not target_date:
+        return None
+
+    rates_table  = get_rates_table_name(pair, day)
+    await _refresh_rates_if_needed(rates_table)
+    
+    # CPU вычисление в thread pool чтобы не блокировать event loop
+    result = await asyncio.to_thread(
+        functools.partial(_compute_cpu_only, pair, day, date_str,
+                          calc_type=calc_type, calc_var=calc_var)
+    )
+    return result if result is not None else {}
+
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @app.get("/")
 async def get_metadata():
+    # Проверяем доступность таблиц:
+    # - vlad: vlad_market_tech_weights, vlad_market_tech_context_idx, version_microservice
+    # - brain: market_history, brain_rates_*
     for t in ["vlad_market_tech_weights", "vlad_market_tech_context_idx",
               "version_microservice"]:
         try:
@@ -554,18 +609,14 @@ async def get_metadata():
                 await conn.execute(text(f"SELECT 1 FROM `{t}` LIMIT 1"))
         except Exception as e:
             return {"status": "error", "error": f"vlad.{t} inaccessible: {e}"}
-    for t in ["vlad_market_history", "brain_rates_eur_usd",
+    for t in ["market_history", "brain_rates_eur_usd",
               "brain_rates_btc_usd", "brain_rates_eth_usd"]:
         try:
-            # Проверяем vlad_market_history в базе vlad
-            if t == "vlad_market_history":
-                async with engine_vlad.connect() as conn:
-                    await conn.execute(text(f"SELECT 1 FROM `{t}` LIMIT 1"))
-            else:
-                async with engine_brain.connect() as conn:
-                    await conn.execute(text(f"SELECT 1 FROM `{t}` LIMIT 1"))
+            # market_history находится в brain, остальные тоже в brain
+            async with engine_brain.connect() as conn:
+                await conn.execute(text(f"SELECT 1 FROM `{t}` LIMIT 1"))
         except Exception as e:
-            return {"status": "error", "error": f"{'vlad' if t=='vlad_market_history' else 'brain'}.{t} inaccessible: {e}"}
+            return {"status": "error", "error": f"brain.{t} inaccessible: {e}"}
     async with engine_vlad.connect() as conn:
         res     = await conn.execute(text(
             "SELECT version FROM version_microservice WHERE microservice_id = :id"),
@@ -615,6 +666,10 @@ async def get_values(
     var:  int = Query(0, ge=0, le=4,
                       description="0=raw 1=vol_filter 2=squared 3=flt+sq 4=range"),
 ):
+    """
+    Основной эндпоинт для получения весов с кешированием.
+    Проверяет vlad_values_cache, если нет — вычисляет и сохраняет.
+    """
     try:
         return await cached_values(
             engine_vlad  = engine_vlad,
@@ -623,13 +678,78 @@ async def get_values(
             day          = day,
             date         = date,
             extra_params = {"type": type, "var": var},
-            compute_fn   = lambda: calculate_pure_memory(pair, day, date,
-                                                          calc_type=type, calc_var=var),
+            compute_fn   = functools.partial(_compute_cpu_only, pair, day, date,
+                                            calc_type=type, calc_var=var),
             node         = NODE_NAME,
         )
     except Exception as e:
         send_error_trace(e, node=NODE_NAME, script="get_values")
         return err_response(str(e))
+
+
+@app.get("/compute")
+async def compute_values(
+    pair: int = Query(1), day: int = Query(1), date: str = Query(...),
+    type: int = Query(0, ge=0, le=2), var: int = Query(0, ge=0, le=4),
+):
+    """
+    Чистое вычисление без кеширования. Используется cache.py при построении кеша.
+
+    Ключевое отличие от /values:
+    1. Нет чтения/записи в vlad_values_cache — исключает конкуренцию за БД
+    2. CPU-тяжёлая часть вычисления выполняется в thread pool через asyncio.to_thread —
+       event loop остаётся отзывчивым и принимает другие запросы пока идёт вычисление.
+
+    Возвращает результат напрямую: {"key": float, ...} или {}
+    """
+    try:
+        rates_table = get_rates_table_name(pair, day)
+        await _refresh_rates_if_needed(rates_table)
+        result = await asyncio.to_thread(
+            functools.partial(_compute_cpu_only, pair, day, date,
+                              calc_type=type, calc_var=var)
+        )
+        return result if result is not None else {}
+    except Exception as e:
+        send_error_trace(e, node=NODE_NAME, script="compute_values")
+        return {"error": str(e)}
+
+
+@app.post("/compute_batch")
+async def compute_batch(
+    dates: list[str],
+    pair: int = Query(1), day: int = Query(1),
+    type: int = Query(0, ge=0, le=2), var: int = Query(0, ge=0, le=4),
+):
+    """
+    Батчевое вычисление без кеширования.
+    Принимает список дат в теле запроса (JSON array of strings).
+    Возвращает dict: {"2025-01-15 10:00:00": {"key": float, ...}, ...}
+
+    Используется cache.py для массового заполнения кеша —
+    один HTTP-запрос на батч вместо N отдельных.
+    Каждая дата считается в thread pool через asyncio.to_thread +
+    numpy-ускоренный _compute_cpu_only — event loop не блокируется.
+    """
+    if not dates:
+        return {}
+
+    rates_table = get_rates_table_name(pair, day)
+    await _refresh_rates_if_needed(rates_table)
+
+    async def _one(date_str: str) -> tuple[str, dict]:
+        try:
+            result = await asyncio.to_thread(
+                functools.partial(_compute_cpu_only, pair, day, date_str,
+                                  calc_type=type, calc_var=var)
+            )
+            return date_str, (result if result is not None else {})
+        except Exception as e:
+            log(f"  ⚠️ compute_batch error {date_str}: {e}", NODE_NAME, level="warning")
+            return date_str, {}
+
+    results = await asyncio.gather(*[_one(d) for d in dates])
+    return dict(results)
 
 
 @app.post("/patch")
