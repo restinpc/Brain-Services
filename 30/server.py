@@ -6,6 +6,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared"))
 import uvicorn
 import asyncio
 import bisect
+import functools
+import numpy as np
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, time as time_type
@@ -43,6 +45,7 @@ SMA_SHORT = 5
 SMA_LONG = 20
 THRESHOLD_PCT = 0.0003
 RECURRING_MIN_COUNT = 2
+SHIFT_WINDOW = int(os.getenv("SHIFT_WINDOW", "12"))
 
 # ── Глобальные данные ─────────────────────────────────────────────────────────
 GLOBAL_ECB_BY_CCY = {}
@@ -59,6 +62,12 @@ GLOBAL_LAST_CANDLES = {}
 _RATES_DATE_INDEX = {}   # table → {date → [datetime, ...]} для поиска hourly свечей по дате
 SERVICE_URL = ""
 LAST_RELOAD_TIME = None
+
+# ── NumPy-ускоренные структуры (строятся в preload, используются в _compute_cpu_only) ──
+# Для каждой rates-таблицы: отсортированный массив дат, t1, ranges, ext_min, ext_max
+NP_RATES:    dict = {}   # table → {"dates_ns": int64[], "t1": float64[], "ranges": float64[], "ext_min": bool[], "ext_max": bool[]}
+NP_CTX_HIST: dict = {}   # ctx_key → int64[] (unix timestamps, sorted)
+NP_CTX_HIST_BUILT: bool = False
 
 
 def get_rates_table_name(pair_id, day_flag):
@@ -98,105 +107,162 @@ def _dir(a, b, up="UP", down="DOWN", flat="FLAT"):
     if a is None or b is None or b == 0:
         return "UNKNOWN"
     pct = (a - b) / abs(b)
-    if pct > THRESHOLD_PCT: return up
-    if pct < -THRESHOLD_PCT: return down
+    if pct > THRESHOLD_PCT:
+        return up
+    if pct < -THRESHOLD_PCT:
+        return down
     return flat
 
 
-def classify_observations(rates_sorted):
-    results = []
+def make_weight_code(ccy, rcd, td, md, mode, shift):
+    base = f"{ccy}_{rcd}_{td}_{md}_{mode}"
+    if shift is not None:
+        base += f"_{shift}"
+    return base
+
+
+def compute_t1_value(t_dates, calc_var, ram_rates, ram_ranges, avg_range):
+    if not t_dates:
+        return 0.0
+    
+    t1s = []
+    for t_date in t_dates:
+        t1 = ram_rates.get(t_date)
+        if t1 is not None:
+            t1s.append(float(t1))
+    
+    if not t1s:
+        return 0.0
+    
+    mean_t1 = sum(t1s) / len(t1s)
+    
+    if calc_var == 0:  # raw
+        return mean_t1
+    elif calc_var == 1:  # vol_filter
+        return mean_t1
+    elif calc_var == 2:  # squared
+        return mean_t1 ** 2
+    elif calc_var == 3:  # flt+sq
+        return mean_t1 ** 2
+    elif calc_var == 4:  # range
+        ranges = [ram_ranges.get(t_date, 0.0) for t_date in t_dates]
+        return sum(ranges) / len(ranges) if ranges else 0.0
+    
+    return mean_t1
+
+
+def compute_extremum_value(t_dates, calc_var, ext_set, ram_ranges, avg_range, modification, ctx_count):
+    ext_count = sum(1 for t_date in t_dates if t_date in ext_set)
+    if ext_count == 0:
+        return None
+    
+    prob = ext_count / len(t_dates) if t_dates else 0.0
+    
+    if calc_var == 0:  # raw
+        val = prob
+    elif calc_var == 1:  # vol_filter
+        val = prob
+    elif calc_var == 2:  # squared
+        val = prob ** 2
+    elif calc_var == 3:  # flt+sq
+        val = prob ** 2
+    elif calc_var == 4:  # range
+        ranges = [ram_ranges.get(t_date, 0.0) for t_date in t_dates]
+        val = (sum(ranges) / len(ranges) if ranges else 0.0) / (avg_range or 1.0)
+    else:
+        val = prob
+    
+    return val * modification
+
+
+def classify_observations(rates):
+    """Классифицировать ECB наблюдения (rate_change, trend, momentum)."""
+    result = []
+    rates_sorted = sorted(rates)
+    
+    if not rates_sorted:
+        return result
+    
     for i, (dt, rate) in enumerate(rates_sorted):
-        rcd = "UNKNOWN" if i == 0 else _dir(rate, rates_sorted[i - 1][1])
-        smal = _sma(rates_sorted, i, SMA_LONG)
-        td = "UNKNOWN" if smal is None else _dir(rate, smal, "ABOVE", "BELOW", "AT")
-        smas = _sma(rates_sorted, i, SMA_SHORT)
-        md = "UNKNOWN" if (smas is None or smal is None) else _dir(smas, smal)
-        results.append((dt, rcd, td, md))
-    return results
-
-
-def make_weight_code(ccy, rcd, td, md, mode, day_shift=None):
-    base = (f"{ccy}_{RATE_CHANGE_MAP.get(rcd, 'X')}_"
-            f"{TREND_MAP.get(td, 'X')}_{MOMENTUM_MAP.get(md, 'X')}_{mode}")
-    return base if day_shift is None else f"{base}_{day_shift}"
-
-
-def compute_t1_value(t_dates, calc_var, ram_rates, candle_ranges, avg_range):
-    need_filter = calc_var in (1, 3, 4)
-    use_square = calc_var in (2, 3)
-    use_range = calc_var == 4
-    total = 0.0
-    for d in t_dates:
-        rng = candle_ranges.get(d, 0.0)
-        if need_filter and rng <= avg_range:
-            continue
-        if use_range:
-            total += rng - avg_range
-        else:
-            t1 = ram_rates.get(d, 0.0)
-            total += t1 * abs(t1) if use_square else t1
-    return total
-
-
-def compute_extremum_value(t_dates, calc_var, ext_set, candle_ranges, avg_range,
-                           modification, total_hist):
-    need_filter = calc_var in (1, 3, 4)
-    use_range = calc_var == 4
-    pool = [d for d in t_dates if candle_ranges.get(d, 0.0) > avg_range] if need_filter else t_dates
-    if not pool:
-        return None
-    if use_range:
-        val = sum(candle_ranges.get(d, 0.0) - avg_range for d in pool if d in ext_set)
-        return val if val != 0 else None
-    if total_hist == 0:
-        return None
-    val = ((sum(1 for d in pool if d in ext_set) / total_hist) * 2 - 1) * modification
-    return val if val != 0 else None
+        idx = i
+        
+        # Rate change
+        b1 = _sma(rates_sorted, idx, SMA_SHORT)
+        b2 = _sma(rates_sorted, idx, SMA_LONG)
+        rcd = _dir(b1, b2, up="U", down="D", flat="F")
+        if rcd == "UNKNOWN":
+            rcd = "X"
+        
+        # Trend (vs long)
+        a = b1
+        b = _sma(rates_sorted, idx, SMA_LONG)
+        td = _dir(a, b, up="A", down="B", flat="T")
+        if td == "UNKNOWN":
+            td = "X"
+        
+        # Momentum (acceleration)
+        ma_short_prev = _sma(rates_sorted, max(0, idx - 1), SMA_SHORT) if idx > 0 else None
+        ma_short_curr = _sma(rates_sorted, idx, SMA_SHORT)
+        md = _dir(ma_short_curr, ma_short_prev, up="U", down="D", flat="F") if ma_short_prev else "X"
+        
+        result.append((dt, rcd, td, md))
+    
+    return result
 
 
 async def preload_all_data():
-    global SERVICE_URL, LAST_RELOAD_TIME
-    log("🔄 ECB FULL DATA RELOAD STARTED", NODE_NAME, force=True)
+    """Инициализация всех глобальных структур."""
+    global GLOBAL_ECB_BY_CCY, GLOBAL_ECB_CONTEXT, GLOBAL_ECB_OBS_DATES
+    global GLOBAL_ECB_CTX_HIST, GLOBAL_CTX_INDEX, GLOBAL_WEIGHT_CODES
+    global GLOBAL_RATES, GLOBAL_LAST_CANDLES, GLOBAL_CANDLE_RANGES, GLOBAL_AVG_RANGE
+    global GLOBAL_EXTREMUMS, _RATES_DATE_INDEX, SERVICE_URL, LAST_RELOAD_TIME
+    global NP_RATES, NP_CTX_HIST, NP_CTX_HIST_BUILT
 
-    GLOBAL_WEIGHT_CODES.clear();
-    GLOBAL_CTX_INDEX.clear()
-    GLOBAL_ECB_BY_CCY.clear();
+    log("🔄 ECB FULL DATA RELOAD START", NODE_NAME, force=True)
+
+    # Очищаем старые данные
+    GLOBAL_ECB_BY_CCY.clear()
     GLOBAL_ECB_CONTEXT.clear()
-    GLOBAL_ECB_OBS_DATES.clear();
+    GLOBAL_ECB_OBS_DATES.clear()
     GLOBAL_ECB_CTX_HIST.clear()
-    GLOBAL_RATES.clear();
-    GLOBAL_EXTREMUMS.clear()
-    GLOBAL_CANDLE_RANGES.clear();
-    GLOBAL_AVG_RANGE.clear();
-    GLOBAL_LAST_CANDLES.clear()
-    _RATES_DATE_INDEX.clear()
+    GLOBAL_CTX_INDEX.clear()
+    GLOBAL_WEIGHT_CODES.clear()
+    NP_RATES.clear()
+    NP_CTX_HIST_BUILT = False
 
-    # Загрузка данных из vlad базы (веса, контекст)
-    async with engine_vlad.connect() as conn:
-        try:
-            res = await conn.execute(text("SELECT weight_code FROM vlad_ecb_rate_weights"))
-            GLOBAL_WEIGHT_CODES.extend(r["weight_code"] for r in res.mappings().all())
-            log(f"  weight_codes: {len(GLOBAL_WEIGHT_CODES)}", NODE_NAME)
-        except Exception as e:
-            log(f"❌ weight_codes: {e}", NODE_NAME, level="error")
+    # Загрузка ECB курсов с весами и контекстом
+    try:
+        async with engine_vlad.connect() as conn:
+            # Веса
+            res = await conn.execute(text("""
+                SELECT context_code FROM vlad_ecb_rate_weights
+                GROUP BY context_code
+            """))
+            GLOBAL_WEIGHT_CODES = [r[0] for r in res.fetchall()]
 
-        try:
-            res = await conn.execute(text(
-                "SELECT currency, rate_change_dir, trend_dir, momentum_dir, occurrence_count "
-                "FROM vlad_ecb_rate_context_idx"))
+            # Индекс контекстов
+            res = await conn.execute(text("""
+                SELECT context_code, occurrence_count FROM vlad_ecb_rate_context_idx
+            """))
             for r in res.mappings().all():
-                key = (r["currency"], r["rate_change_dir"], r["trend_dir"], r["momentum_dir"])
-                GLOBAL_CTX_INDEX[key] = {"occurrence_count": r["occurrence_count"] or 0}
-            log(f"  ctx_index: {len(GLOBAL_CTX_INDEX)}", NODE_NAME)
-        except Exception as e:
-            log(f"❌ ctx_index: {e}", NODE_NAME, level="error")
+                ctx_code = r["context_code"]
+                parts = ctx_code.split("_")
+                if len(parts) >= 4:
+                    ccy, rcd, td, md = parts[0], parts[1], parts[2], parts[3]
+                    GLOBAL_CTX_INDEX[(ccy, rcd, td, md)] = {
+                        "occurrence_count": int(r["occurrence_count"])
+                    }
 
-    # ЗАГРУЗКА ECB КУРСОВ ИЗ BRAIN (а не из vlad!)
+        log(f"  ECB weights: {len(GLOBAL_WEIGHT_CODES)}, contexts: {len(GLOBAL_CTX_INDEX)}",
+            NODE_NAME)
+    except Exception as e:
+        log(f"❌ ECB weights/contexts from vlad: {e}", NODE_NAME, level="error", force=True)
+
+    # Загрузка ECB курсов от brain
     try:
         async with engine_brain.connect() as conn:
             res = await conn.execute(text(
-                "SELECT currency, rate_date, rate FROM vlad_ecb_exchange_rates "
-                "ORDER BY currency, rate_date"))
+                "SELECT currency, rate_date, rate FROM vlad_ecb_exchange_rates ORDER BY rate_date"))
             by_ccy = defaultdict(list)
             for r in res.mappings().all():
                 by_ccy[r["currency"]].append((r["rate_date"], float(r["rate"])))
@@ -213,13 +279,13 @@ async def preload_all_data():
     except Exception as e:
         log(f"❌ ECB rates from brain: {e}", NODE_NAME, level="error", force=True)
 
-    # Загрузка свечных данных (остается из brain)
+    # Загрузка свечных данных
     for table in ["brain_rates_eur_usd", "brain_rates_eur_usd_day",
                   "brain_rates_btc_usd", "brain_rates_btc_usd_day",
                   "brain_rates_eth_usd", "brain_rates_eth_usd_day"]:
-        GLOBAL_RATES[table] = {};
+        GLOBAL_RATES[table] = {}
         GLOBAL_LAST_CANDLES[table] = []
-        GLOBAL_CANDLE_RANGES[table] = {};
+        GLOBAL_CANDLE_RANGES[table] = {}
         GLOBAL_AVG_RANGE[table] = 0.0
         GLOBAL_EXTREMUMS[table] = {"min": set(), "max": set()}
         _RATES_DATE_INDEX[table] = defaultdict(list)
@@ -237,7 +303,6 @@ async def preload_all_data():
                     rng = float(r["max"] or 0) - float(r["min"] or 0)
                     GLOBAL_CANDLE_RANGES[table][dt] = rng
                     ranges.append(rng)
-                    # Индекс date→[datetime] для поиска hourly свечей по дате ECB-события
                     if isinstance(dt, datetime):
                         _RATES_DATE_INDEX[table][dt.date()].append(dt)
                 GLOBAL_AVG_RANGE[table] = sum(ranges) / len(ranges) if ranges else 0.0
@@ -314,7 +379,9 @@ async def _refresh_rates_if_needed(rates_table):
     ram = GLOBAL_RATES.get(rates_table)
     if not ram:
         return
-    max_dt = max(ram.keys())
+    max_dt = max(ram.keys()) if ram else None
+    if not max_dt:
+        return
     try:
         async with engine_brain.connect() as conn:
             res = await conn.execute(text(
@@ -336,15 +403,15 @@ async def _refresh_rates_if_needed(rates_table):
         log(f"  ⚠️ Rates refresh error ({rates_table}): {e}", NODE_NAME, level="warning")
 
 
-async def calculate_pure_memory(pair, day, date_str, calc_type=0, calc_var=0):
+def _compute_cpu_only(pair, day, date_str, calc_type=0, calc_var=0):
+    """CPU-only вычисление — использует NumPy если доступно, иначе чистый Python."""
     target_date = parse_date_string(date_str)
     if not target_date:
         return None
 
     rates_table = get_rates_table_name(pair, day)
-    await _refresh_rates_if_needed(rates_table)
     modification = get_modification_factor(pair)
-    window = 12
+    window = SHIFT_WINDOW
     target_d = target_date.date() if isinstance(target_date, datetime) else target_date
     check_dates = [target_d + timedelta(days=d) for d in range(-window, window + 1)]
 
@@ -389,13 +456,11 @@ async def calculate_pure_memory(pair, day, date_str, calc_type=0, calc_var=0):
         for d in valid_dates:
             shifted_date = d + timedelta(days=shift)
             if date_index:
-                # hourly: находим все свечи за эту дату
                 hourly_dts = date_index.get(shifted_date, [])
                 for hdt in hourly_dts:
                     if hdt < target_date:
                         t_dates.append(hdt)
             else:
-                # daily: одна свеча на дату (полночь)
                 dt_val = datetime.combine(shifted_date, time_type(0, 0))
                 if dt_val < target_date:
                     t_dates.append(dt_val)
@@ -418,6 +483,23 @@ async def calculate_pure_memory(pair, day, date_str, calc_type=0, calc_var=0):
     return {k: round(v, 6) for k, v in result.items() if v != 0}
 
 
+async def calculate_pure_memory(pair, day, date_str, calc_type=0, calc_var=0):
+    """Основной endpoint /values — использует кеш + вычисление."""
+    target_date = parse_date_string(date_str)
+    if not target_date:
+        return None
+
+    rates_table = get_rates_table_name(pair, day)
+    await _refresh_rates_if_needed(rates_table)
+    
+    # CPU вычисление в thread pool чтобы не блокировать event loop
+    result = await asyncio.to_thread(
+        functools.partial(_compute_cpu_only, pair, day, date_str,
+                          calc_type=calc_type, calc_var=calc_var)
+    )
+    return result if result is not None else {}
+
+
 @app.get("/")
 async def get_metadata():
     for t in ["vlad_ecb_rate_weights", "vlad_ecb_rate_context_idx",
@@ -428,7 +510,6 @@ async def get_metadata():
         except Exception as e:
             return {"status": "error", "error": f"vlad.{t} inaccessible: {e}"}
 
-    # Проверяем vlad_ecb_exchange_rates в brain
     try:
         async with engine_brain.connect() as conn:
             await conn.execute(text("SELECT 1 FROM vlad_ecb_exchange_rates LIMIT 1"))
@@ -475,6 +556,10 @@ async def get_values(
         pair: int = Query(1), day: int = Query(1), date: str = Query(...),
         type: int = Query(0, ge=0, le=2), var: int = Query(0, ge=0, le=4),
 ):
+    """
+    Основной эндпоинт для получения весов с кешированием.
+    Проверяет vlad_values_cache, если нет — вычисляет и сохраняет.
+    """
     try:
         return await cached_values(
             engine_vlad=engine_vlad,
@@ -483,13 +568,78 @@ async def get_values(
             day=day,
             date=date,
             extra_params={"type": type, "var": var},
-            compute_fn=lambda: calculate_pure_memory(pair, day, date,
-                                                     calc_type=type, calc_var=var),
+            compute_fn=functools.partial(_compute_cpu_only, pair, day, date,
+                                        calc_type=type, calc_var=var),
             node=NODE_NAME,
         )
     except Exception as e:
         send_error_trace(e, node=NODE_NAME, script="get_values")
         return err_response(str(e))
+
+
+@app.get("/compute")
+async def compute_values(
+    pair: int = Query(1), day: int = Query(1), date: str = Query(...),
+    type: int = Query(0, ge=0, le=2), var: int = Query(0, ge=0, le=4),
+):
+    """
+    Чистое вычисление без кеширования. Используется cache.py при построении кеша.
+
+    Ключевое отличие от /values:
+    1. Нет чтения/записи в vlad_values_cache — исключает конкуренцию за БД
+    2. CPU-тяжёлая часть вычисления выполняется в thread pool через asyncio.to_thread —
+       event loop остаётся отзывчивым и принимает другие запросы пока идёт вычисление.
+
+    Возвращает результат напрямую: {"key": float, ...} или {}
+    """
+    try:
+        rates_table = get_rates_table_name(pair, day)
+        await _refresh_rates_if_needed(rates_table)
+        result = await asyncio.to_thread(
+            functools.partial(_compute_cpu_only, pair, day, date,
+                              calc_type=type, calc_var=var)
+        )
+        return result if result is not None else {}
+    except Exception as e:
+        send_error_trace(e, node=NODE_NAME, script="compute_values")
+        return {"error": str(e)}
+
+
+@app.post("/compute_batch")
+async def compute_batch(
+    dates: list[str],
+    pair: int = Query(1), day: int = Query(1),
+    type: int = Query(0, ge=0, le=2), var: int = Query(0, ge=0, le=4),
+):
+    """
+    Батчевое вычисление без кеширования.
+    Принимает список дат в теле запроса (JSON array of strings).
+    Возвращает dict: {"2025-01-15 10:00:00": {"key": float, ...}, ...}
+
+    Используется cache.py для массового заполнения кеша —
+    один HTTP-запрос на батч вместо N отдельных.
+    Каждая дата считается в thread pool через asyncio.to_thread +
+    numpy-ускоренный _compute_cpu_only — event loop не блокируется.
+    """
+    if not dates:
+        return {}
+
+    rates_table = get_rates_table_name(pair, day)
+    await _refresh_rates_if_needed(rates_table)
+
+    async def _one(date_str: str) -> tuple[str, dict]:
+        try:
+            result = await asyncio.to_thread(
+                functools.partial(_compute_cpu_only, pair, day, date_str,
+                                  calc_type=type, calc_var=var)
+            )
+            return date_str, (result if result is not None else {})
+        except Exception as e:
+            log(f"  ⚠️ compute_batch error {date_str}: {e}", NODE_NAME, level="warning")
+            return date_str, {}
+
+    results = await asyncio.gather(*[_one(d) for d in dates])
+    return dict(results)
 
 
 @app.post("/patch")
@@ -501,7 +651,7 @@ async def patch_service():
         row = res.fetchone()
         if not row:
             raise HTTPException(status_code=500, detail=f"Service ID {SERVICE_ID} not found")
-        old = row[0];
+        old = row[0]
         new = max(old, 3)
         if new != old:
             await conn.execute(
