@@ -28,7 +28,6 @@ UCDP_API_BASE = "https://ucdpapi.pcr.uu.se/api"
 UCDP_GED_VERSION = "25.1"
 UCDP_CANDIDATE_VERSION = "26.0.1"
 
-# Параметры retry для сетевых ошибок
 MAX_PAGE_RETRIES = 5
 RETRY_BACKOFF_BASE = 10  # секунд
 
@@ -69,7 +68,6 @@ class UCDPCollector:
         self.session = self._make_session()
 
     def _make_session(self):
-        """Создаёт сессию с retry-политикой. Пересоздаётся после обрыва."""
         s = requests.Session()
         retry = Retry(
             total=5,
@@ -99,31 +97,40 @@ class UCDPCollector:
             time.sleep(wait)
             return self.fetch_page(version, page, pagesize, year_filter)
         resp.raise_for_status()
-        return resp.json()
+
+        data = resp.json()
+
+        # ── ЗАЩИТА: убеждаемся что data — словарь ──
+        if not isinstance(data, dict):
+            raise ValueError(
+                f"Неожиданный тип ответа на стр.{page}: "
+                f"{type(data).__name__} вместо dict. "
+                f"Содержимое (первые 200 символов): {str(data)[:200]}"
+            )
+
+        return data
 
     def fetch_all_events(self, version, year_filter=None):
         """
         Загружает все события с пагинацией.
         При ChunkedEncodingError / ConnectionError пересоздаёт сессию
         и повторяет именно упавшую страницу (до MAX_PAGE_RETRIES раз).
-        Уже загруженные страницы не теряются.
         """
         all_events = []
         page = 0
         total_pages = None
 
         while True:
-            # ── retry конкретной страницы при сетевых обрывах ──
             for attempt in range(1, MAX_PAGE_RETRIES + 1):
                 try:
                     data = self.fetch_page(version, page=page, year_filter=year_filter)
-                    break  # успех
+                    break
                 except (ChunkedEncodingError, RequestsConnectionError, OSError) as e:
                     if attempt == MAX_PAGE_RETRIES:
                         raise
                     wait = RETRY_BACKOFF_BASE * (2 ** (attempt - 1)) + random.uniform(2, 8)
-                    print(f"\n   ⚠️  Сетевой сбой на стр.{page+1} (попытка {attempt}/{MAX_PAGE_RETRIES}): {e!r}")
-                    print(f"   🔄 Пересоздаём сессию, ждём {wait:.0f}с...")
+                    print(f"\n⚠️ Сетевой сбой на стр.{page+1} (попытка {attempt}/{MAX_PAGE_RETRIES}): {e!r}")
+                    print(f"🔄 Пересоздаём сессию, ждём {wait:.0f}с...")
                     self.session = self._make_session()
                     time.sleep(wait)
 
@@ -131,14 +138,30 @@ class UCDPCollector:
             total_pages = data.get("TotalPages", 0)
             total_count = data.get("TotalCount", 0)
 
-            if not results:
+            # ── ЗАЩИТА: фильтруем не-словари в results ──
+            if not isinstance(results, list):
+                print(f"\n⚠️ Стр.{page+1}: 'Result' не список ({type(results).__name__}), пропускаем")
                 break
 
-            all_events.extend(results)
+            valid_events = []
+            for idx, e in enumerate(results):
+                if isinstance(e, dict):
+                    valid_events.append(e)
+                else:
+                    print(f"\n⚠️ Стр.{page+1}, элемент {idx}: ожидался dict, получен {type(e).__name__} = {e!r}")
+
+            if not valid_events and results:
+                print(f"\n⚠️ Стр.{page+1}: все {len(results)} элементов отфильтрованы как невалидные")
+                break
+
+            if not valid_events:
+                break
+
+            all_events.extend(valid_events)
             current_page = data.get("CurrentPage", page)
             print(
-                f"   📥 Стр. {current_page+1}/{total_pages}: "
-                f"+{len(results)}, всего {len(all_events)}/{total_count}",
+                f"📥 Стр. {current_page+1}/{total_pages}: "
+                f"+{len(valid_events)}, всего {len(all_events)}/{total_count} ",
                 end="\r"
             )
 
@@ -248,16 +271,23 @@ class UCDPCollector:
         TYPE_MAP = {1: "State-based", 2: "Non-state", 3: "One-sided violence"}
 
         total = 0
+        skipped = 0
         for i in range(0, len(events), 1000):
             batch = events[i:i+1000]
             rows = []
             for e in batch:
+                # ── ЗАЩИТА: пропускаем не-словари ──
+                if not isinstance(e, dict):
+                    print(f"\n⚠️ insert_events: пропускаем элемент типа {type(e).__name__}: {e!r}")
+                    skipped += 1
+                    continue
+
                 tov = si(e.get("type_of_violence"))
                 rows.append((
                     si(e.get("id")),
-                    e.get("relid", "")[:50],
+                    (e.get("relid", "") or "")[:50],
                     si(e.get("year")),
-                    TYPE_MAP.get(tov, str(tov)),
+                    TYPE_MAP.get(tov, str(tov) if tov is not None else None),
                     tov,
                     (e.get("conflict_name", "") or "")[:500],
                     (e.get("dyad_name", "") or "")[:500],
@@ -285,10 +315,18 @@ class UCDPCollector:
                     e.get("source_date"),
                     (e.get("where_description", "") or "")[:2000],
                 ))
+
+            if not rows:
+                continue
+
             c.executemany(sql, rows)
-            total += c.rowcount
+            # mysql.connector возвращает -1 для executemany — считаем сами через rowcount батча
+            # Используем len(rows) как верхнюю оценку, INSERT IGNORE не бросает исключений на дубли
+            total += c.rowcount if c.rowcount >= 0 else len(rows)
 
         conn.commit(); c.close(); conn.close()
+        if skipped:
+            print(f"\n⚠️ Пропущено невалидных элементов: {skipped}")
         return total
 
     # ── Основная логика ───────────────────────────────────────
@@ -372,5 +410,6 @@ if __name__ == "__main__":
         print("\n🛑 Прервано"); sys.exit(1)
     except Exception as e:
         print(f"\n❌ Критическая ошибка: {e!r}")
+        traceback.print_exc()   # теперь виден полный стектрейс в консоли
         send_error_trace(e)
         sys.exit(1)
