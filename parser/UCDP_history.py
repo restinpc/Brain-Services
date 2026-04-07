@@ -1,8 +1,6 @@
-#!/usr/bin/env python3
 """
 UCDP GED Collector — загружает все события 1989–2024 + candidate.
-Таблица: vlad_ucdp (фиксированное имя)
-Запуск: python UCDP_history.py [host] [port] [user] [password] [database]
+Таблица: vlad_ucdp
 """
 
 import os, sys, argparse, json, time, random, traceback
@@ -36,30 +34,62 @@ def send_error_trace(exc, script_name="UCDP_history.py"):
     except:
         pass
 
+# Поддерживаем оба формата: и старый (позиционные), и новый (с флагами)
 parser = argparse.ArgumentParser(description="UCDP GED Events (full history + incremental) → MySQL")
-parser.add_argument("--host",     default=os.getenv("DB_HOST"), help="MySQL host")
-parser.add_argument("--port",     default=os.getenv("DB_PORT", "3306"), help="MySQL port")
-parser.add_argument("--user",     default=os.getenv("DB_USER"), help="MySQL user")
-parser.add_argument("--password", default=os.getenv("DB_PASSWORD"), help="MySQL password")
-parser.add_argument("--database", default=os.getenv("DB_NAME"), help="MySQL database name")
+parser.add_argument("table_name", nargs="?", help="Имя целевой таблицы (опционально, будет vlad_ucdp)")
+parser.add_argument("host", nargs="?", help="MySQL host")
+parser.add_argument("port", nargs="?", help="MySQL port")
+parser.add_argument("user", nargs="?", help="MySQL user")
+parser.add_argument("password", nargs="?", help="MySQL password")
+parser.add_argument("database", nargs="?", help="MySQL database name")
+
+# Добавляем флаги как альтернативный вариант
+parser.add_argument("--host", dest="host_flag", help="MySQL host")
+parser.add_argument("--port", dest="port_flag", help="MySQL port")
+parser.add_argument("--user", dest="user_flag", help="MySQL user")
+parser.add_argument("--password", dest="password_flag", help="MySQL password")
+parser.add_argument("--database", dest="database_flag", help="MySQL database name")
+
 args = parser.parse_args()
 
-# Если какие-то параметры не указаны ни в аргументах, ни в .env — ошибка
-if not all([args.host, args.user, args.password, args.database]):
-    print("❌ Ошибка: не указаны параметры подключения (host, user, password, database)")
+# ФИКСИРОВАННОЕ ИМЯ ТАБЛИЦЫ (игнорируем то, что передали в аргументах)
+TABLE_NAME = "vlad_ucdp"
+
+# Определяем параметры подключения:
+# Сначала пробуем взять из флагов, потом из позиционных аргументов, потом из .env
+DB_HOST = args.host_flag or args.host or os.getenv("DB_HOST")
+DB_PORT = args.port_flag or args.port or os.getenv("DB_PORT", "3306")
+DB_USER = args.user_flag or args.user or os.getenv("DB_USER")
+DB_PASSWORD = args.password_flag or args.password or os.getenv("DB_PASSWORD")
+DB_DATABASE = args.database_flag or args.database or os.getenv("DB_NAME")
+
+if not all([DB_HOST, DB_USER, DB_PASSWORD, DB_DATABASE]):
+    print("❌ Ошибка: не указаны параметры подключения")
+    print("\nИспользование (позиционные аргументы):")
+    print("  python UCDP_history.py vlad_ucdp 127.0.0.1 3306 root password brain")
+    print("\nИли (с флагами):")
+    print("  python UCDP_history.py --host 127.0.0.1 --user root --password password --database brain")
+    print("\nИли через .env файл:")
+    print("  DB_HOST=127.0.0.1")
+    print("  DB_USER=root")
+    print("  DB_PASSWORD=password")
+    print("  DB_NAME=brain")
     sys.exit(1)
+
 if not UCDP_TOKEN:
     print("❌ Ошибка: не указан UCDP_TOKEN в .env")
     print("   Получить: https://ucdp.uu.se/apidocs/")
     sys.exit(1)
 
 DB_CONFIG = {
-    'host': args.host, 'port': int(args.port),
-    'user': args.user, 'password': args.password, 'database': args.database
+    'host': DB_HOST,
+    'port': int(DB_PORT),
+    'user': DB_USER,
+    'password': DB_PASSWORD,
+    'database': DB_DATABASE
 }
 
-# ФИКСИРОВАННОЕ ИМЯ ТАБЛИЦЫ
-TABLE_NAME = "vlad_ucdp"
+print(f"🔌 Подключение к БД: {DB_HOST}:{DB_PORT}/{DB_DATABASE} as {DB_USER}")
 
 
 class UCDPCollector:
@@ -167,6 +197,17 @@ class UCDPCollector:
     def ensure_table(self):
         conn = self.get_db_connection()
         c = conn.cursor()
+        
+        # Проверяем, существует ли таблица со старой схемой (с iso3)
+        c.execute(f"SHOW TABLES LIKE '{self.table_name}'")
+        if c.fetchone():
+            # Проверяем, есть ли поле iso3
+            c.execute(f"SHOW COLUMNS FROM `{self.table_name}` LIKE 'iso3'")
+            if c.fetchone():
+                print(f"⚠️ Обнаружена старая таблица с полем iso3. Удаляем...")
+                c.execute(f"DROP TABLE IF EXISTS `{self.table_name}`")
+                print(f"✅ Старая таблица удалена")
+        
         c.execute(f"""
             CREATE TABLE IF NOT EXISTS `{self.table_name}` (
                 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -303,7 +344,7 @@ class UCDPCollector:
                     (e.get("side_a", "") or "")[:300],
                     (e.get("side_b", "") or "")[:300],
                     e.get("country"),
-                    si(e.get("country_id")),   # ← ИСПРАВЛЕНО: теперь целое число
+                    si(e.get("country_id")),
                     e.get("region"),
                     (e.get("adm_1", "") or "")[:200],
                     (e.get("adm_2", "") or "")[:200],
@@ -398,7 +439,6 @@ class UCDPCollector:
 
 def main():
     print(f"🚀 UCDP GED Collector (backfill + incremental)")
-    print(f"База: {args.host}:{args.port}/{args.database}")
     print(f"🎯 Таблица: {TABLE_NAME}")
     print("=" * 60)
     UCDPCollector().process()
