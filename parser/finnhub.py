@@ -110,15 +110,15 @@ def ensure_tickers_table():
     conn.close()
 
 
-def load_saved_symbols_for_table(table_name: str) -> list:
+def load_saved_symbols_global() -> list:
     """
-    Загружает сохранённые тикеры для конкретной целевой таблицы.
+    Загружает глобальный список сохранённых тикеров
+    (без привязки к конкретной целевой таблице).
     """
     conn = mysql.connector.connect(**DB_CONFIG)
     c = conn.cursor()
     c.execute(
-        f"SELECT symbol FROM `{TICKERS_TABLE_NAME}` WHERE table_name = %s ORDER BY id ASC",
-        (table_name,)
+        f"SELECT DISTINCT symbol FROM `{TICKERS_TABLE_NAME}` ORDER BY symbol ASC"
     )
     rows = c.fetchall()
     c.close()
@@ -126,21 +126,22 @@ def load_saved_symbols_for_table(table_name: str) -> list:
     return [row[0].strip().upper() for row in rows if row and row[0]]
 
 
-def apply_saved_symbols_for_table(table_name: str):
+def apply_saved_symbols_to_all_tables():
     """
-    Применяет сохранённые в БД тикеры к DATASETS для указанной таблицы.
+    Применяет глобальные сохранённые в БД тикеры ко всем таблицам DATASETS.
     """
-    extra_symbols = load_saved_symbols_for_table(table_name)
-    merged = []
-    seen = set()
-    for symbol in DATASETS[table_name].get("symbols", []) + extra_symbols:
-        if not isinstance(symbol, str):
-            continue
-        symbol = symbol.strip().upper()
-        if symbol and symbol not in seen:
-            merged.append(symbol)
-            seen.add(symbol)
-    DATASETS[table_name]["symbols"] = merged
+    extra_symbols = load_saved_symbols_global()
+    for dataset_name in DATASETS:
+        merged = []
+        seen = set()
+        for symbol in DATASETS[dataset_name].get("symbols", []) + extra_symbols:
+            if not isinstance(symbol, str):
+                continue
+            symbol = symbol.strip().upper()
+            if symbol and symbol not in seen:
+                merged.append(symbol)
+                seen.add(symbol)
+        DATASETS[dataset_name]["symbols"] = merged
 
 
 def add_symbols_from_argument(table_name: str, tickers_arg: str, limit: int = 40):
@@ -162,8 +163,18 @@ def add_symbols_from_argument(table_name: str, tickers_arg: str, limit: int = 40
         return
 
     current_symbols = DATASETS[table_name].get("symbols", [])
-    existing = set(current_symbols)
-    new_unique = [s for s in parsed if s not in existing]
+    existing = set()
+    for dataset_name in DATASETS:
+        for s in DATASETS[dataset_name].get("symbols", []):
+            if isinstance(s, str) and s.strip():
+                existing.add(s.strip().upper())
+    new_unique = []
+    seen_new = set()
+    for symbol in parsed:
+        if symbol in existing or symbol in seen_new:
+            continue
+        new_unique.append(symbol)
+        seen_new.add(symbol)
 
     if not new_unique:
         print("ℹ️  Все переданные тикеры уже есть в списке")
@@ -178,16 +189,33 @@ def add_symbols_from_argument(table_name: str, tickers_arg: str, limit: int = 40
     conn = mysql.connector.connect(**DB_CONFIG)
     c = conn.cursor()
     c.executemany(
-        f"INSERT IGNORE INTO `{TICKERS_TABLE_NAME}` (table_name, symbol) VALUES (%s, %s)",
-        [(table_name, symbol) for symbol in new_unique]
+        f"""
+        INSERT INTO `{TICKERS_TABLE_NAME}` (table_name, symbol)
+        SELECT %s, %s
+        FROM DUAL
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM `{TICKERS_TABLE_NAME}`
+            WHERE symbol = %s
+        )
+        """,
+        [(table_name, symbol, symbol) for symbol in new_unique]
     )
     conn.commit()
     c.close()
     conn.close()
 
-    DATASETS[table_name]["symbols"] = current_symbols + new_unique
-    print(f"✅ Добавлено тикеров: {', '.join(new_unique)}")
-    print(f"📌 Всего тикеров для {table_name}: {len(DATASETS[table_name]['symbols'])}")
+    for dataset_name in DATASETS:
+        merged = []
+        seen = set()
+        for symbol in DATASETS[dataset_name].get("symbols", []) + new_unique:
+            if not isinstance(symbol, str):
+                continue
+            symbol = symbol.strip().upper()
+            if symbol and symbol not in seen:
+                merged.append(symbol)
+                seen.add(symbol)
+        DATASETS[dataset_name]["symbols"] = merged
 
 # ── 7. СОЗДАНИЕ ТАБЛИЦЫ ────────────────────────────────────────────────────────
 def ensure_table(table_name: str):
@@ -271,7 +299,6 @@ def fetch_data(config: dict) -> list:
             print(f"❌ Ошибка запроса для {symbol}: {e}")
             continue
 
-    print(f"📡 Finnhub → получено {len(rows)}/{len(symbols)} записей ({metric})")
     return rows
 
 # ── 10. ЗАПИСЬ В БД ───────────────────────────────────────────────────────────
@@ -327,7 +354,7 @@ def main():
     print(f"   API-ключ: {'✅ есть' if FINNHUB_API_KEY else '❌ нет'}")
 
     ensure_tickers_table()
-    apply_saved_symbols_for_table(args.table_name)
+    apply_saved_symbols_to_all_tables()
     add_symbols_from_argument(args.table_name, args.tickers)
     process(args.table_name)
 
