@@ -1,21 +1,68 @@
 """
-brain_framework.py — Фреймворк для создания brain-* микросервисов.
+brain_framework.py — Фреймворк brain-* микросервисов v8.
 
-Этот файл содержит ВСЮ повторяющуюся логику.
+Кладётся в shared/. Джуниор НИКОГДА не редактирует этот файл.
 
-Всё остальное (котировки, экстремумы, bisect-индекс, lifecycle,
-endpoints /, /weights, /values, /patch, кэш) делает этот файл.
+Использование:
+    # service36/server.py
+    import model
+    from brain_framework import build_app
+    app = build_app(model)
+
+build_app(model_module) читает конфиг из model_module и возвращает
+настроенный FastAPI app со всеми endpoints.
+
+Поддерживает два варианта model():
+  Простой  (без ctx): model(rates, dataset, date, *, type, var, param)
+  Расширенный (с ctx): model(rates, dataset, date, *, type, var, param, ctx)
+
+Выбор варианта — автоматически по inspect.signature(model_fn).
+
+Изменения v8 (относительно v7):
+  - fill_cache: дефолтный date_from = 2025-01-15 (вместо начала всей истории).
+    Задаётся через CACHE_DATE_FROM в model.py. Явный параметр имеет приоритет.
+  - pretest: event-aware выборка дат (target = event_date + du).
+  - _register_event: _ceil_to_hour — нормализация времени события к часу.
+    Исправляет нулевой T1 для news-сервисов.
+  - find_events: shift_val = shift (номер окна), не round((td-obs)/du).
+
+Изменения v7 (относительно v6):
+  - service_url строится как http://localhost:{PORT} — не из БД.
+  - fill_cache: лог empty={n}, авто-бэктест + авто-summary по завершению.
+  - pretest: детерминированная выборка, раздельные пороги hour/day.
+
+Изменения v6 (относительно v5):
+  - ENV-конфиг: PORT, NODE_NAME, SERVICE_ID, SERVICE_TEXT читаются из .env
+  - __detail__-механизм: model() может вернуть {"key": float, "__detail__": any}
+    При detail=1 в /values — detail отгружается, в кэш НЕ попадает
+  - CTX, EVENTS, WEIGHTS — полностью опциональны
+  - NP_RATES numpy-ускорение из v5 сохранено
 """
+
+from __future__ import annotations
 
 import asyncio
 import bisect
-from collections import defaultdict
+import inspect
+import json as _json
+import math
+import os
+import random
+import sys
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 
-from fastapi import FastAPI, HTTPException, Query
+import numpy as np
+
+from fastapi import FastAPI, Query
 from sqlalchemy import text
-from sqlalchemy.exc import OperationalError
+from dotenv import load_dotenv
+
+load_dotenv()
+
+_here = os.path.dirname(os.path.abspath(__file__))
+if _here not in sys.path:
+    sys.path.insert(0, _here)
 
 from common import (
     MODE, IS_DEV,
@@ -27,745 +74,2656 @@ from cache_helper import ensure_cache_table, load_service_url, cached_values
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# УТИЛИТЫ 
+# ── NUMPY-УТИЛИТЫ ─────────────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 
-def get_rates_table_name(pair_id: int, day_flag: int) -> str:
-    """
-    По ID инструмента и флагу таймфрейма возвращает имя таблицы с котировками.
-    Неизвестный pair_id → brain_rates_eur_usd (fallback).
-    Суффикс _day добавляется при day_flag=1.
+def _dt_to_ts(dt: datetime) -> int:
+    return int(dt.timestamp())
 
-        get_rates_table_name(1, 0) → "brain_rates_eur_usd"
-        get_rates_table_name(3, 1) → "brain_rates_btc_usd_day"
-    """
+
+def _build_np_rates_for_table(rates, candle_ranges, extremums):
+    if not rates:
+        return None
+    sorted_dates = sorted(rates.keys())
+    n = len(sorted_dates)
+    dates_ns   = np.array([_dt_to_ts(d) for d in sorted_dates], dtype=np.int64)
+    t1_arr     = np.array([rates.get(d, 0.0) for d in sorted_dates], dtype=np.float64)
+    ranges_arr = np.array([candle_ranges.get(d, 0.0) for d in sorted_dates], dtype=np.float64)
+    ext_min_set = extremums.get("min", set())
+    ext_max_set = extremums.get("max", set())
+    ext_min_arr = np.fromiter((d in ext_min_set for d in sorted_dates), dtype=bool, count=n)
+    ext_max_arr = np.fromiter((d in ext_max_set for d in sorted_dates), dtype=bool, count=n)
     return {
-        1: "brain_rates_eur_usd",
-        3: "brain_rates_btc_usd",
-        4: "brain_rates_eth_usd",
-    }.get(pair_id, "brain_rates_eur_usd") + ("_day" if day_flag == 1 else "")
+        "dates_ns": dates_ns, "t1": t1_arr, "ranges": ranges_arr,
+        "ext_min": ext_min_arr, "ext_max": ext_max_arr,
+    }
 
 
-def get_modification_factor(pair_id: int) -> float:
-    """
-    Возвращает коэффициент масштабирования для mode=1 (Extremum probability).
-    """
-    return {1: 0.001, 3: 1000.0, 4: 100.0}.get(pair_id, 1.0)
+# ══════════════════════════════════════════════════════════════════════════════
+# ── ВЫЧИСЛИТЕЛЬНЫЕ УТИЛИТЫ (Python-fallback) ──────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _compute_t1(t_dates, ram_rates, candle_ranges, avg_range):
+    return sum(ram_rates.get(d, 0.0) for d in t_dates)
 
 
-def parse_date_string(date_str: str) -> datetime | None:
-    """
-    Парсит строку с датой
-    """
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S",
-                "%Y-%m-%d", "%Y-%d-%m %H:%M:%S"):
+def _compute_extremum(t_dates, ext_set, candle_ranges, avg_range, modification, total_hist):
+    if not t_dates or total_hist == 0:
+        return None
+    val = ((sum(1 for d in t_dates if d in ext_set) / total_hist) * 2 - 1) * modification
+    return val if val != 0 else None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── ПУБЛИЧНЫЕ ХЕЛПЕРЫ ДЛЯ rebuild_index() ─────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def ensure_ctx_table(engine, table: str, extra_columns: str = "") -> None:
+    async with engine.begin() as conn:
+        await conn.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS `{table}` (
+                `id`               INT         NOT NULL AUTO_INCREMENT,
+                {extra_columns}
+                `fingerprint_hash` CHAR(32)    NOT NULL DEFAULT '',
+                `occurrence_count` INT         NOT NULL DEFAULT 0,
+                `first_dt`         DATETIME    NULL,
+                `last_dt`          DATETIME    NULL,
+                `updated_at`       TIMESTAMP   DEFAULT CURRENT_TIMESTAMP
+                                               ON UPDATE CURRENT_TIMESTAMP,
+                PRIMARY KEY (`id`),
+                UNIQUE KEY `uk_fingerprint` (`fingerprint_hash`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """))
+
+
+async def upsert_ctx_rows(engine, table: str, rows: list[dict]) -> dict[str, int]:
+    if not rows:
+        return {}
+    _reserved = {"fingerprint_hash", "occurrence_count", "first_dt", "last_dt"}
+    extra_cols   = [k for k in rows[0] if k not in _reserved]
+    extra_insert = (", ".join(f"`{c}`" for c in extra_cols) + ", ") if extra_cols else ""
+    extra_vals   = (", ".join(f":{c}" for c in extra_cols) + ", ") if extra_cols else ""
+    async with engine.begin() as conn:
+        for row in rows:
+            params = {"fp": row["fingerprint_hash"], "cnt": row["occurrence_count"],
+                      "fd": row.get("first_dt"), "ld": row.get("last_dt")}
+            for c in extra_cols:
+                params[c] = row.get(c)
+            await conn.execute(text(f"""
+                INSERT INTO `{table}`
+                    ({extra_insert}`fingerprint_hash`, `occurrence_count`, `first_dt`, `last_dt`)
+                VALUES ({extra_vals}:fp, :cnt, :fd, :ld)
+                ON DUPLICATE KEY UPDATE
+                    occurrence_count = occurrence_count + :cnt,
+                    last_dt  = IF(:ld > last_dt  OR last_dt  IS NULL, :ld,  last_dt),
+                    first_dt = IF(:fd < first_dt OR first_dt IS NULL, :fd, first_dt)
+            """), params)
+    fp_list  = [r["fingerprint_hash"] for r in rows]
+    fp_to_id: dict[str, int] = {}
+    async with engine.connect() as conn:
+        for i in range(0, len(fp_list), 500):
+            batch = fp_list[i:i + 500]
+            placeholders = ", ".join(f":fp{j}" for j in range(len(batch)))
+            params = {f"fp{j}": fp for j, fp in enumerate(batch)}
+            res = await conn.execute(text(
+                f"SELECT id, fingerprint_hash FROM `{table}` "
+                f"WHERE fingerprint_hash IN ({placeholders})"), params)
+            for r in res.fetchall():
+                fp_to_id[r[1]] = r[0]
+    return fp_to_id
+
+
+async def ensure_weights_table(engine, table: str) -> None:
+    async with engine.begin() as conn:
+        await conn.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS `{table}` (
+                `id`          INT         NOT NULL AUTO_INCREMENT,
+                `weight_code` VARCHAR(64) NOT NULL,
+                `ctx_id`      INT         NOT NULL,
+                `mode`        TINYINT     NOT NULL DEFAULT 0,
+                `shift`       SMALLINT    NOT NULL DEFAULT 0,
+                PRIMARY KEY (`id`),
+                UNIQUE KEY `uk_weight_code` (`weight_code`),
+                INDEX idx_ctx_id (`ctx_id`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """))
+
+
+async def insert_weight_codes(engine, table, ctx_id, make_code_fn,
+                               occurrence_count, recurring_min_count=2,
+                               shift_max=24, modes=(0, 1)) -> int:
+    max_shift = shift_max if occurrence_count >= recurring_min_count else 0
+    added = 0
+    async with engine.begin() as conn:
+        for mode in modes:
+            for shift in range(0, max_shift + 1):
+                wc = make_code_fn(ctx_id, mode, shift)
+                r  = await conn.execute(text(f"""
+                    INSERT IGNORE INTO `{table}` (weight_code, ctx_id, mode, shift)
+                    VALUES (:wc, :cid, :mode, :shift)
+                """), {"wc": wc, "cid": ctx_id, "mode": mode, "shift": shift})
+                added += r.rowcount
+    return added
+
+
+async def ensure_events_table(engine, table: str, extra_columns: str = "") -> None:
+    pk = extra_columns if extra_columns else "PRIMARY KEY (`ctx_id`, `event_date`),"
+    async with engine.begin() as conn:
+        await conn.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS `{table}` (
+                {pk}
+                `ctx_id`     INT      NOT NULL,
+                `event_date` DATETIME NULL,
+                INDEX idx_ctx_id    (`ctx_id`),
+                INDEX idx_event_date(`event_date`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """))
+
+
+async def insert_events(engine, table, events: list[dict]) -> int:
+    if not events:
+        return 0
+    _reserved  = {"ctx_id", "event_date"}
+    extra_cols = [k for k in events[0] if k not in _reserved]
+    extra_insert = (", ".join(f"`{c}`" for c in extra_cols) + ", ") if extra_cols else ""
+    extra_vals   = (", ".join(f":{c}" for c in extra_cols) + ", ") if extra_cols else ""
+    added = 0
+    async with engine.begin() as conn:
+        for ev in events:
+            params = {"cid": ev["ctx_id"], "ed": ev.get("event_date")}
+            for c in extra_cols:
+                params[c] = ev.get(c)
+            r = await conn.execute(text(f"""
+                INSERT IGNORE INTO `{table}`
+                    ({extra_insert}`ctx_id`, `event_date`)
+                VALUES ({extra_vals}:cid, :ed)
+            """), params)
+            added += r.rowcount
+    return added
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── ModelContext ───────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _ModelContext:
+    def __init__(self, table, pair_id, day_flag, target_date, state):
+        self._table       = table
+        self._target_date = target_date
+        self._state       = state
+        self.delta_unit   = timedelta(days=1) if day_flag else timedelta(hours=1)
+        self.modification = {1: 0.001, 3: 1000.0, 4: 100.0}.get(pair_id, 1.0)
+
+    @property
+    def ctx_index(self):     return self._state.ctx_index
+    @property
+    def rates_t1(self):      return self._state.rates.get(self._table, {})
+    @property
+    def candle_ranges(self): return self._state.candle_ranges.get(self._table, {})
+    @property
+    def avg_range(self):     return self._state.avg_range.get(self._table, 0.0)
+    @property
+    def extremums(self):     return self._state.extremums.get(self._table, {"min": set(), "max": set()})
+    @property
+    def prev_candle(self):
+        candles = self._state.last_candles.get(self._table, [])
+        if not candles:
+            return None
+        idx = bisect.bisect_left(candles, (self._target_date, False))
+        return candles[idx - 1] if idx > 0 else None
+
+    def find_events(self, shift_window=None):
+        s  = self._state
+        sw = shift_window if shift_window is not None else s.SHIFT_WINDOW
+        td = self._target_date
+        du = self.delta_unit
+
+        if s.np_built and s.np_sorted_dates_ns is not None and len(s.np_sorted_dates_ns):
+            target_ts  = _dt_to_ts(td)
+            delta_sec  = int(du.total_seconds())
+            snd        = s.np_sorted_dates_ns
+            shifts     = np.arange(-sw, sw + 1, dtype=np.int64)
+            dt_ts      = target_ts + shifts * delta_sec
+            dt_end_ts  = dt_ts + delta_sec
+            future_mask = dt_ts > target_ts
+            dt_ts      = dt_ts[~future_mask]
+            dt_end_ts  = dt_end_ts[~future_mask]
+            shifts_f   = shifts[~future_mask]
+            left_arr   = np.searchsorted(snd, dt_ts,     side="left")
+            right_arr  = np.searchsorted(snd, dt_end_ts, side="left")
+            observations = []
+            for i, (l, r, sh_arr) in enumerate(zip(left_arr, right_arr, shifts_f)):
+                if l >= r:
+                    continue
+                obs_dt    = s.sorted_dates[l:r]
+                shift_int = int(sh_arr)
+                for j, odt in enumerate(obs_dt):
+                    for event_key in s.sorted_data[l + j]:
+                        ctx_info = s.ctx_index.get(event_key)
+                        if ctx_info is None:
+                            continue
+                        occ = ctx_info.get("occurrence_count", 0)
+                        is_recurring = occ >= s.RECURRING_MIN_COUNT
+                        # shift_val = номер окна (из цикла), НЕ round((td-odt)/du).
+                        # Причина: даты событий хранятся ceil-округлёнными до часа,
+                        # поэтому оконный сдвиг — единственно корректный shift_val.
+                        # В model.py: t_date = event_date + du*shift_val
+                        # При shift_val=shift_int → t_date попадает на час котировки ✓
+                        shift_val = shift_int
+                        if not is_recurring and shift_val != 0:
+                            continue
+                        if is_recurring and abs(shift_val) > sw:
+                            continue
+                        observations.append((event_key, odt, shift_val))
+            return observations
+
+        observations = []
+        for shift in range(-sw, sw + 1):
+            dt = td + du * shift
+            if s.FILTER_FUTURE_EVENTS and dt > td:
+                continue
+            dt_end = dt + du
+            _l = bisect.bisect_left(s.sorted_dates, dt)
+            _r = bisect.bisect_left(s.sorted_dates, dt_end)
+            for _i in range(_l, _r):
+                obs_dt = s.sorted_dates[_i]
+                for event_key in s.sorted_data[_i]:
+                    ctx_info = s.ctx_index.get(event_key)
+                    if ctx_info is None:
+                        continue
+                    occ = ctx_info.get("occurrence_count", 0)
+                    is_recurring = occ >= s.RECURRING_MIN_COUNT
+                    # shift_val = shift из цикла (номер окна).
+                    # Не round((td - obs_dt) / du) — см. комментарий выше.
+                    shift_val = shift
+                    if not is_recurring and shift_val != 0:
+                        continue
+                    if is_recurring and abs(shift_val) > sw:
+                        continue
+                    observations.append((event_key, obs_dt, shift_val))
+        return observations
+
+    def event_history(self, event_key):
+        all_hist = self._state.event_history.get(event_key, [])
+        idx = bisect.bisect_left(all_hist, self._target_date)
+        return all_hist[:idx]
+
+    def compute_t1(self, t_dates):
+        s = self._state
+        np_rates = s.np_rates.get(self._table)
+        if s.np_built and np_rates is not None and t_dates:
+            t_ts = np.array([_dt_to_ts(d) for d in t_dates], dtype=np.int64)
+            ri   = np.searchsorted(np_rates["dates_ns"], t_ts, side="left")
+            n    = len(np_rates["dates_ns"])
+            in_b = ri < n
+            exact = np.zeros(len(t_ts), dtype=bool)
+            if np.any(in_b):
+                exact[in_b] = np_rates["dates_ns"][ri[in_b]] == t_ts[in_b]
+            if not np.any(exact):
+                return 0.0
+            return float(np.sum(np_rates["t1"][ri[exact]]))
+        return _compute_t1(t_dates, self.rates_t1, self.candle_ranges, self.avg_range)
+
+    def compute_extremum(self, t_dates, is_bull=True, total_hist=0):
+        if not t_dates or total_hist == 0:
+            return None
+        s = self._state
+        np_rates = s.np_rates.get(self._table)
+        if s.np_built and np_rates is not None:
+            t_ts = np.array([_dt_to_ts(d) for d in t_dates], dtype=np.int64)
+            ri   = np.searchsorted(np_rates["dates_ns"], t_ts, side="left")
+            n    = len(np_rates["dates_ns"])
+            in_b = ri < n
+            exact = np.zeros(len(t_ts), dtype=bool)
+            if np.any(in_b):
+                exact[in_b] = np_rates["dates_ns"][ri[in_b]] == t_ts[in_b]
+            if not np.any(exact):
+                return None
+            ext_arr  = np_rates["ext_max" if is_bull else "ext_min"]
+            ext_hits = ext_arr[ri[exact]]
+            val = (float(np.count_nonzero(ext_hits)) / total_hist) * 2 - 1
+            val *= self.modification
+            return val if val != 0 else None
+        ext_set = self.extremums["max" if is_bull else "min"]
+        return _compute_extremum(t_dates, ext_set, self.candle_ranges,
+                                 self.avg_range, self.modification, total_hist)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── STATE ──────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _State:
+    # Критичные переменные — читаются из ENV, переопределяются model.py
+    SERVICE_ID:   int = 0
+    PORT:         int = 9000
+    NODE_NAME:    str = "brain-svc"
+    SERVICE_TEXT: str = "Brain microservice"
+
+    # Опциональные таблицы (нарастаются в model.py по необходимости)
+    WEIGHTS_TABLE:       str | None = None
+    WEIGHTS_CODE_COLUMN: str        = "weight_code"
+    CTX_TABLE:           str | None = None
+    CTX_QUERY:           str | None = None
+    CTX_KEY_COLUMNS:     list       = None
+    EVENTS_TABLE:        str | None = None
+    EVENTS_QUERY:        str | None = None
+    EVENTS_ENGINE:       str        = "vlad"
+    EVENT_KEY_COLUMNS:   list       = None
+    EVENT_DATE_COLUMN:   str        = "event_date"
+    DATASET_TABLE:       str | None = None
+    DATASET_QUERY:       str | None = None
+    DATASET_ENGINE:      str        = "vlad"
+    FILTER_DATASET_BY_DATE: bool    = False
+    SHIFT_WINDOW:        int        = 12
+    RECURRING_MIN_COUNT: int        = 2
+    FILTER_FUTURE_EVENTS: bool      = True
+    RELOAD_INTERVAL:     int        = 3600
+    REBUILD_INTERVAL:    int        = 0
+    VAR_RANGE:           list       = None
+    REBUILD_SOURCE_QUERY:  str | None = None
+    REBUILD_SOURCE_ENGINE: str        = "vlad"
+    REBUILD_ID_COLUMN:     str        = "id"
+    REBUILD_DATE_COLUMN:   str | None = None
+    REBUILD_SHIFT_MAX:     int        = 0
+    # Дефолтный date_from для fill_cache (переопределяется через CACHE_DATE_FROM в model.py)
+    CACHE_DATE_FROM:       str        = "2025-01-15"
+    # Опциональная функция (event_key) → str для человекочитаемых имён в нарративе.
+    # Задаётся в model.py: LABEL_FN = lambda key: MY_DICT.get(key[0])
+    # Если None — используется str(event_key).
+    LABEL_FN: object = None
+
+    def __init__(self):
+        self.CTX_KEY_COLUMNS   = ["id"]
+        self.EVENT_KEY_COLUMNS = ["event_id"]
+        self.VAR_RANGE         = []
+        self.model_fn         = None
+        self.load_events_fn   = None
+        self.rebuild_index_fn = None
+        self.make_ctx_key_fn  = None
+        self.model_needs_ctx  = False
+        self.engine_vlad  = None
+        self.engine_brain = None
+        self.engine_super = None
+        self.weight_codes:  list       = []
+        self.ctx_index:     dict       = {}
+        self.events_by_dt:  dict       = {}
+        self.sorted_dates:  list       = []
+        self.sorted_data:   list       = []
+        self.event_history: dict       = {}
+        self.events_seen:   set        = set()
+        self.events_max_dt: datetime | None = None
+        self.dataset:       list[dict] = []
+        self.rates:         dict = {}
+        self.extremums:     dict = {}
+        self.candle_ranges: dict = {}
+        self.avg_range:     dict = {}
+        self.last_candles:  dict = {}
+        self.global_rates:  dict = {}
+        self.last_rates_refresh: dict = {}
+        self.ctx_row_count:     int = 0
+        self.weights_row_count: int = 0
+        self.service_url:   str  = ""
+        self.last_reload:   datetime | None = None
+        self.last_rebuild:  datetime | None = None
+        self.fill_task:   asyncio.Task | None = None
+        self.fill_cancel: asyncio.Event       = asyncio.Event()
+        self.fill_status: dict                = {"state": "idle"}
+        self.np_rates: dict                   = {}
+        self.np_sorted_dates_ns: np.ndarray | None = None
+        self.np_built: bool = False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── КОНСТАНТЫ ──────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+_RATES_TABLES = [
+    "brain_rates_eur_usd", "brain_rates_eur_usd_day",
+    "brain_rates_btc_usd", "brain_rates_btc_usd_day",
+    "brain_rates_eth_usd", "brain_rates_eth_usd_day",
+]
+_INSTRUMENTS = {
+    1: {"hour": "brain_rates_eur_usd", "day": "brain_rates_eur_usd_day"},
+    3: {"hour": "brain_rates_btc_usd", "day": "brain_rates_btc_usd_day"},
+    4: {"hour": "brain_rates_eth_usd", "day": "brain_rates_eth_usd_day"},
+}
+_PAIR_CFG = {
+    1: (0.0002, 100_000.0, 50_000.0),
+    3: (60.0,        1.0, 100_000.0),
+    4: (10.0,        1.0,   5_000.0),
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ───────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _parse_date(s: str) -> datetime | None:
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f",
+                "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d", "%Y-%d-%m %H:%M:%S"):
         try:
-            return datetime.strptime(date_str.strip(), fmt)
+            return datetime.strptime(s.strip(), fmt)
         except ValueError:
             continue
     return None
 
 
-def find_prev_candle_trend(candles: list, target_date: datetime):
-    """
-    Находит последнюю свечу строго ДО target_date и возвращает (datetime, is_bull).
-    is_bull = True если close > open (бычья свеча).
+def _rates_table(pair_id: int, day_flag: int) -> str:
+    base = {1: "brain_rates_eur_usd", 3: "brain_rates_btc_usd",
+            4: "brain_rates_eth_usd"}.get(pair_id, "brain_rates_eur_usd")
+    return base + ("_day" if day_flag == 1 else "")
 
-    Нужно для calculate(): направление предыдущей свечи определяет, какой тип
-    экстремума искать — max (после роста) или min (после падения).
 
-    Поиск через bisect_left — O(log N). Свеча с date == target_date не берётся,
-    она "текущая". Возвращает None еслb все свечи позже target_date.
-    """
-    if not candles:
-        return None
-    idx = bisect.bisect_left(candles, (target_date, False))
-    return candles[idx - 1] if idx > 0 else None
+def _engine_for(name: str, s: _State):
+    return {"vlad": s.engine_vlad, "brain": s.engine_brain,
+            "super": s.engine_super}.get(name, s.engine_vlad)
+
+
+def _params_hash(params: dict) -> str:
+    import hashlib
+    return hashlib.md5(
+        _json.dumps(params, sort_keys=True, ensure_ascii=False).encode()
+    ).hexdigest()
+
+
+def _filter_rates_lte(table: str, date: datetime, s: _State) -> list[dict]:
+    rows = s.global_rates.get(table, [])
+    if not rows:
+        return []
+    keys = [r["date"] for r in rows]
+    idx  = bisect.bisect_right(keys, date)
+    return rows[:idx]
+
+
+def _filter_dataset_lte(date: datetime, s: _State) -> list[dict]:
+    if not s.FILTER_DATASET_BY_DATE:
+        return s.dataset
+    return [e for e in s.dataset
+            if e.get("date") is not None and e["date"] <= date]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ВЫЧИСЛИТЕЛЬНЫЕ ФУНКЦИИ — mode=0 (T1) и mode=1 (Extremum)
+# ── NUMPY: BUILD / REBUILD / APPEND ───────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 
-def compute_t1_value(t_dates: list, calc_var: int,
-                     ram_rates: dict, candle_ranges: dict,
-                     avg_range: float) -> float:
-    """
-    Mode 0 — суммирует T1 по историческим аналогам из t_dates.
-
-    T1 — направление свечи: положительное = цена пошла вверх, отрицательное = вниз.
-    Смысл суммы: если на похожих новостях в прошлом рынок 8 раз рос и 2 падал,
-    сумма будет положительной.
-
-    calc_var меняет способ агрегации:
-        0 — просто сложить все T1
-        1 — считать только крупные свечи (range > avg_range), мелкий шум игнорируем
-        2 — T1 × |T1|, квадратичное усиление: сильные движения весят больше слабых
-        3 — комбинация: фильтр крупных + квадрат
-        4 — вместо T1 суммируем (range − avg_range), то есть амплитуду сверх средней
-
-    Если свеча для даты не нашлась в ram_rates / candle_ranges — пропускается (0.0).
-    """
-    need_filter = calc_var in (1, 3, 4)
-    use_square  = calc_var in (2, 3)
-    use_range   = calc_var == 4
-    total = 0.0
-    for d in t_dates:
-        rng = candle_ranges.get(d, 0.0)
-        if need_filter and rng <= avg_range:
-            continue
-        if use_range:
-            total += rng - avg_range
-        else:
-            t1 = ram_rates.get(d, 0.0)
-            total += t1 * abs(t1) if use_square else t1
-    return total
+def _rebuild_np_rates(s: _State) -> None:
+    s.np_built = False
+    s.np_rates.clear()
+    for table in _RATES_TABLES:
+        np_r = _build_np_rates_for_table(
+            s.rates.get(table, {}),
+            s.candle_ranges.get(table, {}),
+            s.extremums.get(table, {}),
+        )
+        if np_r is not None:
+            np_r["avg_range"] = s.avg_range.get(table, 0.0)
+        s.np_rates[table] = np_r
+    s.np_built = True
 
 
-def compute_extremum_value(t_dates: list, calc_var: int,
-                           ext_set: set, candle_ranges: dict,
-                           avg_range: float, modification: float,
-                           total_hist: int):
-    """
-    Mode 1 — считает, как часто исторические аналоги совпали с экстремумом рынка.
+def _rebuild_np_sorted_dates(s: _State) -> None:
+    if s.sorted_dates:
+        s.np_sorted_dates_ns = np.array(
+            [_dt_to_ts(d) for d in s.sorted_dates], dtype=np.int64)
+    else:
+        s.np_sorted_dates_ns = np.empty(0, dtype=np.int64)
 
-    Логика:
-        1. Отфильтровать t_dates — оставить только крупные свечи.
-        2. Посчитать, сколько дат из pool входит в ext_set (множество экстремумов).
-        3. Нормализовать: (попаданий / total_hist) × 2 − 1
-           → получаем [-1, +1], где +1 = "все аналоги были экстремумами"
-        4. Умножить на modification (масштаб инструмента).
 
-    Какой ext_set передавать (min или max) — решает calculate() по направлению
-    предыдущей свечи.
+def _append_np_rates_row(table, dt, t1, rng, s: _State) -> None:
+    np_r = s.np_rates.get(table)
+    if np_r is None:
+        return
+    ts = np.int64(_dt_to_ts(dt))
+    np_r["dates_ns"] = np.append(np_r["dates_ns"], ts)
+    np_r["t1"]       = np.append(np_r["t1"],       np.float64(t1 if t1 is not None else 0.0))
+    np_r["ranges"]   = np.append(np_r["ranges"],   np.float64(rng))
+    np_r["ext_min"]  = np.append(np_r["ext_min"],  False)
+    np_r["ext_max"]  = np.append(np_r["ext_max"],  False)
 
-    Возвращает None если результат ноль — в ответ добавлять нечего.
-    """
-    need_filter = calc_var in (1, 3, 4)
-    use_range   = calc_var == 4
-    pool = ([d for d in t_dates if candle_ranges.get(d, 0.0) > avg_range]
-            if need_filter else t_dates)
-    if not pool:
-        return None
-    if use_range:
-        val = sum(candle_ranges.get(d, 0.0) - avg_range
-                  for d in pool if d in ext_set)
-        return val if val != 0 else None
-    if total_hist == 0:
-        return None
-    val = ((sum(1 for d in pool if d in ext_set) / total_hist)
-           * 2 - 1) * modification
-    return val if val != 0 else None
 
 # ══════════════════════════════════════════════════════════════════════════════
-# БАЗОВЫЙ КЛАСС МИКРОСЕРВИСА
+# ── ЗАГРУЗКА ДАННЫХ ───────────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 
-class BaseBrainService:
-    """
-    Базовый класс для всех brain-* микросервисов.
-
-    Наследуем этот класс и реализуем 2 метода:
-      - load_my_data(conn_vlad, conn_brain) — загрузить weight_codes, ctx_index,
-        и для каждого события вызвать register_event(dt, event_key).
-      - make_weight_code(event_key, mode, shift_arg) — вернуть строку кода.
-
-    Всё остальное (котировки, экстремумы, bisect, lifecycle,
-    endpoints, кэш) берёт на себя BaseBrainService.
-    """
-
-    def __init__(self, service_id: int, port: int, node_name: str,
-                 shift_window: int = 12,
-                 recurring_min_count: int = 2,
-                 filter_future_events: bool = True,
-                 description: str = "Brain microservice"):
-        """
-        Инициализирует сервис, создаёт структуры данных и engines.
-        Соединения с БД здесь не открываются — только в preload и при запросах.
-
-        shift_window — сколько единиц delta_unit в каждую сторону смотреть
-            при поиске событий. Для часовых свечей это часы, для дневных — дни.
-
-        recurring_min_count — сколько раз должен встретиться ctx_id чтобы считаться
-            "регулярным". Регулярный → ищем все сдвиги 0..shift_window.
-            Нерегулярный → только точное совпадение (shift=0).
-
-        filter_future_events — True для рыночных данных (новость не может быть
-            из будущего), False для календарных событий (расписание известно заранее).
-        """
-        self.service_id             = service_id
-        self.port                   = port
-        self.node_name              = node_name
-        self.shift_window           = shift_window
-        self.recurring_min_count    = recurring_min_count
-        self.filter_future_events   = filter_future_events
-        self.description            = description
-
-        self.engine_vlad, self.engine_brain, self.engine_super = build_engines()
-
-        # Заполняем через load_my_data
-        self.weight_codes = []   # строковые коды весов → отдаём на GET /weights
-        self.ctx_index    = {}   # (ctx_id,) → {"occurrence_count": N}
-
-        # Заполняем register_event, строит _build_sorted_arrays
-        self._events_by_dt  = {}  # datetime → [event_key, ...]
-        self._sorted_dates  = []  # плоский отсортированный список дат для bisect
-        self._sorted_data   = []  # параллельный список event_keys
-        self._event_history = {}  # event_key → [datetime, ...] — вся история
-
-        # Заполняем _load_rates
-        self.rates         = {}   # table → {datetime: t1}
-        self.extremums     = {}   # table → {"min": set, "max": set}
-        self.candle_ranges = {}   # table → {datetime: high-low}
-        self.avg_range     = {}   # table → средний range
-        self.last_candles  = {}   # table → [(datetime, is_bull)] — для find_prev_candle_trend
-        self.service_url   = ""   # URL из brain_service — для записи кэша
-        self.last_reload_time = None
-
-        self._last_rates_refresh = {}  # throttle для _refresh_rates_if_needed
-
-        log(f"MODE={MODE}", self.node_name, force=True)
-
-    # ──────────────────────────────────────────────────────────────────
-    # МЕТОДЫ, КОТОРЫЕ НАДО РЕАЛИЗОВАТЬ САМОМУ
-    # ──────────────────────────────────────────────────────────────────
-
-    async def load_my_data(self, conn_vlad, conn_brain) -> None:
-        """
-        Загрузить данные из БД в RAM.
-
-        Вызывается из preload_all_data() при старте и каждые 3600 сек.
-        conn_vlad и conn_brain — уже открытые async-соединения.
-
-        Внутри нужно:
-          1. Заполнить self.weight_codes (SELECT weight_code FROM ...)
-          2. Заполнить self.ctx_index    (SELECT id, occurrence_count FROM ...)
-          3. Для каждого события вызвать self.register_event(dt, event_key)
-
-        Пример:
-            res = await conn_vlad.execute(text("SELECT weight_code FROM my_weights"))
-            for r in res.mappings().all():
-                self.weight_codes.append(r["weight_code"])
-
-            res = await conn_brain.execute(text("SELECT id, dt FROM my_events"))
-            for r in res.mappings().all():
-                self.register_event(r["dt"], (r["id"],))
-        """
-        raise NotImplementedError(
-            "Реализуй load_my_data() — загрузка твоих данных из БД")
-
-    def make_weight_code(self, event_key: tuple, mode: int,
-                         shift_arg: int | None) -> str:
-        """
-        Собрать строку кода из event_key, mode и shift.
-
-        Результат должен точно совпадать с weight_code в таблице весов.
-
-        shift_arg=None означает нерегулярное событие → подставлять 0 в строку.
-
-        Пример:
-            def make_weight_code(self, event_key, mode, shift_arg):
-                shift = shift_arg if shift_arg is not None else 0
-                return f"MY{event_key[0]}_{mode}_{shift}"
-        """
-        raise NotImplementedError(
-            "Реализуй make_weight_code() — формирование кода веса")
-
-    # ──────────────────────────────────────────────────────────────────
-    # МЕТОД РЕГИСТРАЦИИ СОБЫТИЙ (вызываем из load_my_data)
-    # ──────────────────────────────────────────────────────────────────
-
-    def register_event(self, dt: datetime, event_key: tuple) -> None:
-        """
-        Добавляет событие в два индекса. Вызывать из load_my_data().
-
-        _events_by_dt[dt] → [event_key, ...]
-            Нужен в calculate() для поиска событий в диапазоне дат (через bisect).
-
-        _event_history[event_key] → [datetime, ...]
-            Нужен чтобы взять всю историю конкретного ctx_id и построить t_dates.
-
-        После load_my_data() базовый класс вызовет _build_sorted_arrays(),
-        который отсортирует оба индекса.
-        """
-        self._events_by_dt.setdefault(dt, []).append(event_key)
-        self._event_history.setdefault(event_key, []).append(dt)
-
-    # ──────────────────────────────────────────────────────────────────
-    # ВНУТРЕННЯЯ ЛОГИКА — джуниор НЕ трогает
-    # ──────────────────────────────────────────────────────────────────
-
-    def _build_sorted_arrays(self):
-        """
-        Строит плоские отсортированные массивы для bisect.
-
-        Вызывается один раз после load_my_data(). Разделяет _events_by_dt
-        на два параллельных списка: даты и соответствующие им event_keys.
-        Такой формат нужен bisect_left.
-        Также сортирует _event_history по каждому ключу.
-        """
-        if self._events_by_dt:
-            sorted_items       = sorted(self._events_by_dt.items())
-            self._sorted_dates = [x[0] for x in sorted_items]
-            self._sorted_data  = [x[1] for x in sorted_items]
-        else:
-            self._sorted_dates = []
-            self._sorted_data  = []
-        for key in self._event_history:
-            self._event_history[key].sort()
-
-    async def _load_rates(self):
-        """
-        Загружает все 6 таблиц brain_rates_* в RAM.
-
-        Для каждой таблицы строит:
-          - rates[table]         — {datetime: t1} для compute_t1_value
-          - last_candles[table]  — [(datetime, is_bull)] для find_prev_candle_trend
-          - candle_ranges[table] — {datetime: high-low} для фильтра крупных свечей
-          - avg_range[table]     — средний range как порог фильтрации
-          - extremums[table]     — {"min": set, "max": set} для compute_extremum_value
-
-        Экстремумы ищутся SQL: свеча является max-экстремумом если
-        её max выше соседей слева и справа. Интервал соседства: 1 HOUR или 1 DAY.
-
-        Ошибка на одной таблице не роняет загрузку остальных.
-        """
-        tables = [
-            "brain_rates_eur_usd",     "brain_rates_eur_usd_day",
-            "brain_rates_btc_usd",     "brain_rates_btc_usd_day",
-            "brain_rates_eth_usd",     "brain_rates_eth_usd_day",
-        ]
-        for table in tables:
-            self.rates[table]         = {}
-            self.last_candles[table]  = []
-            self.candle_ranges[table] = {}
-            self.avg_range[table]     = 0.0
-            self.extremums[table]     = {"min": set(), "max": set()}
-            try:
-                async with self.engine_brain.connect() as conn:
-                    res = await conn.execute(text(
-                        f"SELECT date, open, close, `max`, `min`, t1 "
-                        f"FROM `{table}`"))
-                    rows   = sorted(res.mappings().all(), key=lambda x: x["date"])
-                    ranges = []
-                    for r in rows:
-                        dt = r["date"]
-                        if r["t1"] is not None:
-                            self.rates[table][dt] = float(r["t1"])
-                        self.last_candles[table].append(
-                            (dt, r["close"] > r["open"]))
-                        rng = float(r["max"] or 0) - float(r["min"] or 0)
-                        self.candle_ranges[table][dt] = rng
-                        ranges.append(rng)
-                    self.avg_range[table] = (
-                        sum(ranges) / len(ranges) if ranges else 0.0)
-
-                    interval = "1 DAY" if table.endswith("_day") else "1 HOUR"
-                    for typ in ("min", "max"):
-                        op = ">" if typ == "max" else "<"
-                        q = f"""SELECT t1.date FROM `{table}` t1
-                            JOIN `{table}` t_prev
-                              ON t_prev.date = t1.date - INTERVAL {interval}
-                            JOIN `{table}` t_next
-                              ON t_next.date = t1.date + INTERVAL {interval}
-                            WHERE t1.`{typ}` {op} t_prev.`{typ}`
-                              AND t1.`{typ}` {op} t_next.`{typ}`"""
-                        res_ext = await conn.execute(text(q))
-                        self.extremums[table][typ] = {
-                            r["date"] for r in res_ext.mappings().all()}
-                log(f"  {table}: {len(self.rates[table])} candles",
-                    self.node_name)
-            except Exception as e:
-                log(f"❌ {table}: {e}", self.node_name, level="error")
-
-    async def _refresh_rates_if_needed(self, rates_table: str):
-        """
-        Дозагружает свежие свечи из БД — не чаще раза в 30 секунд.
-
-        Вызывается в начале каждого calculate(). Нужно потому что полный reload
-        раз в час — недостаточно для актуальности T1 текущего часа. Берёт только
-        свечи с date > max известной даты, добавляет в RAM.
-
-        Если запрос упал — calculate() продолжит со старыми данными, не падает.
-        """
-        now  = datetime.now()
-        last = self._last_rates_refresh.get(rates_table)
-        if last and (now - last).total_seconds() < 30:
-            return
-        self._last_rates_refresh[rates_table] = now
-        ram = self.rates.get(rates_table)
-        if not ram:
-            return
-        max_dt = max(ram.keys())
+async def _load_rates(s: _State):
+    for table in _RATES_TABLES:
+        s.rates[table] = {}
+        s.last_candles[table] = []
+        s.candle_ranges[table] = {}
+        s.avg_range[table] = 0.0
+        s.extremums[table] = {"min": set(), "max": set()}
+        s.global_rates[table] = []
         try:
-            async with self.engine_brain.connect() as conn:
+            async with s.engine_brain.connect() as conn:
                 res = await conn.execute(text(
-                    f"SELECT date, open, close, t1 "
-                    f"FROM `{rates_table}` WHERE date > :dt "
-                    f"ORDER BY date"), {"dt": max_dt})
-                n = 0
+                    f"SELECT date, open, close, `max`, `min`, t1 "
+                    f"FROM `{table}` ORDER BY date"))
+                ranges = []
                 for r in res.mappings().all():
                     dt = r["date"]
+                    s.global_rates[table].append({
+                        "date":  dt,
+                        "open":  float(r["open"]  or 0),
+                        "close": float(r["close"] or 0),
+                        "min":   float(r["min"]   or 0),
+                        "max":   float(r["max"]   or 0),
+                    })
                     if r["t1"] is not None:
-                        ram[dt] = float(r["t1"])
-                    cl = self.last_candles.get(rates_table)
-                    if cl is not None:
-                        cl.append((dt, (r["close"] or 0) > (r["open"] or 0)))
-                    n += 1
-                if n > 0:
-                    log(f"  📥 Refreshed {n} candle(s) for {rates_table}",
-                        self.node_name)
+                        s.rates[table][dt] = float(r["t1"])
+                    s.last_candles[table].append((dt, r["close"] > r["open"]))
+                    rng = float(r["max"] or 0) - float(r["min"] or 0)
+                    s.candle_ranges[table][dt] = rng
+                    ranges.append(rng)
+                s.avg_range[table] = sum(ranges) / len(ranges) if ranges else 0.0
+                interval = "1 DAY" if table.endswith("_day") else "1 HOUR"
+                for typ in ("min", "max"):
+                    op = ">" if typ == "max" else "<"
+                    q = f"""SELECT t1.date FROM `{table}` t1
+                        JOIN `{table}` tp ON tp.date = t1.date - INTERVAL {interval}
+                        JOIN `{table}` tn ON tn.date = t1.date + INTERVAL {interval}
+                        WHERE t1.`{typ}` {op} tp.`{typ}`
+                          AND t1.`{typ}` {op} tn.`{typ}`"""
+                    res_ext = await conn.execute(text(q))
+                    s.extremums[table][typ] = {r["date"] for r in res_ext.mappings().all()}
+            log(f"  {table}: {len(s.rates[table])} candles", s.NODE_NAME)
         except Exception as e:
-            log(f"  ⚠️ Refresh error: {e}", self.node_name, level="warning")
+            log(f"  ❌ {table}: {e}", s.NODE_NAME, level="error")
+    try:
+        _rebuild_np_rates(s)
+        log(f"  ✅ NP_RATES built: {sum(1 for v in s.np_rates.values() if v)} tables",
+            s.NODE_NAME)
+    except Exception as e:
+        log(f"  ❌ NP_RATES build failed: {e}", s.NODE_NAME, level="error")
 
-    # ──────────────────────────────────────────────────────────────────
-    # PRELOAD — полная загрузка данных при старте
-    # ──────────────────────────────────────────────────────────────────
 
-    async def preload_all_data(self):
-        """
-        Полная перезагрузка всего в RAM. Вызывается при старте и каждые 3600 сек.
+async def _refresh_rates(table: str, s: _State):
+    now  = datetime.now()
+    last = s.last_rates_refresh.get(table)
+    if last and (now - last).total_seconds() < 30:
+        return
+    s.last_rates_refresh[table] = now
+    ram = s.rates.get(table)
+    if not ram:
+        return
+    max_dt = max(ram.keys())
+    try:
+        async with s.engine_brain.connect() as conn:
+            res = await conn.execute(text(
+                f"SELECT date, open, close, `max`, `min`, t1 "
+                f"FROM `{table}` WHERE date > :dt ORDER BY date"), {"dt": max_dt})
+            n = 0
+            for r in res.mappings().all():
+                dt  = r["date"]
+                t1  = float(r["t1"]) if r["t1"] is not None else None
+                rng = float(r["max"] or 0) - float(r["min"] or 0)
+                if t1 is not None:
+                    ram[dt] = t1
+                s.last_candles.setdefault(table, []).append(
+                    (dt, (r["close"] or 0) > (r["open"] or 0)))
+                s.candle_ranges.setdefault(table, {})[dt] = rng
+                s.global_rates.setdefault(table, []).append({
+                    "date":  dt, "open":  float(r["open"]  or 0),
+                    "close": float(r["close"] or 0),
+                    "min":   float(r["min"]   or 0), "max": float(r["max"] or 0),
+                })
+                if s.np_built:
+                    _append_np_rates_row(table, dt, t1, rng, s)
+                n += 1
+            if n > 0:
+                log(f"  📥 +{n} candle(s) {table}", s.NODE_NAME)
+    except Exception as e:
+        log(f"  ⚠️ refresh {table}: {e}", s.NODE_NAME, level="warning")
 
-        Порядок: очистка → load_my_data() → _build_sorted_arrays() →
-                 _load_rates() → service_url → cache table.
 
-        Каждый шаг в отдельном try/except — ошибка на одном шаге не роняет
-        следующие.
-        """
-        log("🔄 FULL DATA RELOAD STARTED", self.node_name, force=True)
+async def _load_weight_codes(s: _State):
+    if not s.WEIGHTS_TABLE:
+        s.weight_codes = []
+        return
+    try:
+        async with s.engine_vlad.connect() as conn:
+            res = await conn.execute(text(
+                f"SELECT `{s.WEIGHTS_CODE_COLUMN}` FROM `{s.WEIGHTS_TABLE}`"))
+            s.weight_codes = [r[0] for r in res.fetchall()]
+            s.weights_row_count = len(s.weight_codes)
+        log(f"  weight_codes: {len(s.weight_codes)}", s.NODE_NAME)
+    except Exception as e:
+        s.weight_codes = []
+        log(f"  ❌ weight_codes: {e}", s.NODE_NAME, level="error")
 
-        self.weight_codes.clear()
-        self.ctx_index.clear()
-        self._events_by_dt.clear()
-        self._sorted_dates.clear()
-        self._sorted_data.clear()
-        self._event_history.clear()
-        self.rates.clear()
-        self.extremums.clear()
-        self.candle_ranges.clear()
-        self.avg_range.clear()
-        self.last_candles.clear()
 
+async def _load_ctx_index(s: _State):
+    if not s.CTX_TABLE and not s.CTX_QUERY:
+        s.ctx_index = {}
+        return
+    query = s.CTX_QUERY or f"SELECT * FROM `{s.CTX_TABLE}`"
+    try:
+        async with s.engine_vlad.connect() as conn:
+            res = await conn.execute(text(query))
+            s.ctx_index = {}
+            for r in res.mappings().all():
+                key = tuple(r[col] for col in s.CTX_KEY_COLUMNS)
+                s.ctx_index[key] = dict(r)
+            s.ctx_row_count = len(s.ctx_index)
+        log(f"  ctx_index: {s.ctx_row_count}", s.NODE_NAME)
+    except Exception as e:
+        s.ctx_index = {}
+        log(f"  ❌ ctx_index: {e}", s.NODE_NAME, level="error")
+
+
+async def _load_ctx_index_incremental(s: _State) -> list:
+    if not s.CTX_TABLE and not s.CTX_QUERY:
+        return []
+    query = s.CTX_QUERY or f"SELECT * FROM `{s.CTX_TABLE}`"
+    new_keys = []
+    try:
+        async with s.engine_vlad.connect() as conn:
+            res = await conn.execute(text(query))
+            for r in res.mappings().all():
+                key = tuple(r[col] for col in s.CTX_KEY_COLUMNS)
+                if key not in s.ctx_index:
+                    new_keys.append(key)
+                s.ctx_index[key] = dict(r)
+            s.ctx_row_count = len(s.ctx_index)
+        if new_keys:
+            log(f"  🆕 ctx_index: +{len(new_keys)} ключей", s.NODE_NAME, force=True)
+    except Exception as e:
+        log(f"  ❌ ctx_index incremental: {e}", s.NODE_NAME, level="error")
+    return new_keys
+
+
+async def _load_dataset(s: _State):
+    if not s.DATASET_QUERY and not s.DATASET_TABLE:
+        s.dataset = []
+        return
+    query = s.DATASET_QUERY or f"SELECT * FROM `{s.DATASET_TABLE}`"
+    try:
+        async with _engine_for(s.DATASET_ENGINE, s).connect() as conn:
+            res = await conn.execute(text(query))
+            s.dataset = [dict(r) for r in res.mappings().all()]
+        log(f"  dataset: {len(s.dataset)} rows", s.NODE_NAME)
+    except Exception as e:
+        s.dataset = []
+        log(f"  ❌ dataset: {e}", s.NODE_NAME, level="error")
+
+
+def _ceil_to_hour(dt: datetime) -> datetime:
+    """
+    Округляет datetime вверх до начала следующего часа.
+
+    Почему это нужно:
+    Котировки привязаны к началу свечи (10:00, 11:00, ...).
+    Событие (новость) может прийти в любой момент (10:37:22).
+    В model.py фильтр: t_date = event_date + du*shift < target_date.
+    При shift=0, event_date=10:37, target_date=10:00 → 10:37 < 10:00 = False → пусто.
+    После ceil: event_date=11:00 → при target_date=12:00: 11:00 < 12:00 = True.
+    Семантика корректна: новость из 10:37 учитывается начиная с котировки 11:00.
+    Если время уже на границе часа (10:00:00) — не сдвигаем.
+    """
+    if dt.minute == 0 and dt.second == 0 and dt.microsecond == 0:
+        return dt  # уже на границе часа — не трогаем
+    # Сдвигаем до начала следующего часа
+    return dt.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+
+
+def _register_event(dt: datetime, event_key: tuple, s: _State) -> bool:
+    # Нормализуем время события к следующей часовой границе.
+    # Это устраняет несовместимость между точным временем события (10:37)
+    # и часовыми котировками (10:00, 11:00, ...).
+    dt = _ceil_to_hour(dt)
+    sig = (event_key, dt)
+    if sig in s.events_seen:
+        return False
+    s.events_seen.add(sig)
+    s.events_by_dt.setdefault(dt, []).append(event_key)
+    s.event_history.setdefault(event_key, []).append(dt)
+    if s.events_max_dt is None or dt > s.events_max_dt:
+        s.events_max_dt = dt
+    return True
+
+
+def _build_sorted_arrays(s: _State):
+    if s.events_by_dt:
+        items = sorted(s.events_by_dt.items())
+        s.sorted_dates = [x[0] for x in items]
+        s.sorted_data  = [x[1] for x in items]
+    else:
+        s.sorted_dates, s.sorted_data = [], []
+    for key in s.event_history:
+        s.event_history[key].sort()
+    _rebuild_np_sorted_dates(s)
+
+
+async def _load_events_append(since_dt: datetime | None, s: _State):
+    if s.load_events_fn is not None:
         try:
-            async with self.engine_vlad.connect() as cv:
-                async with self.engine_brain.connect() as cb:
-                    await self.load_my_data(cv, cb)
-            log(f"  events: {len(self._events_by_dt)} dates, "
-                f"weight_codes: {len(self.weight_codes)}, "
-                f"ctx_index: {len(self.ctx_index)}",
-                self.node_name)
+            async with s.engine_vlad.connect() as cv:
+                async with s.engine_brain.connect() as cb:
+                    pairs = await s.load_events_fn(cv, cb)
+            loaded = skipped = 0
+            for event_key, dt in pairs:
+                if not isinstance(event_key, tuple):
+                    event_key = (event_key,)
+                if event_key in s.ctx_index:
+                    _register_event(dt, event_key, s)
+                    loaded += 1
+                else:
+                    skipped += 1
+            log(f"  events(custom): +{loaded} skip={skipped}", s.NODE_NAME)
         except Exception as e:
-            log(f"❌ load_my_data: {e}", self.node_name, level="error")
-            send_error_trace(e, self.node_name, "load_my_data")
+            log(f"  ❌ load_events: {e}", s.NODE_NAME, level="error")
+        return
 
-        self._build_sorted_arrays()
-        await self._load_rates()
+    if s.EVENTS_TABLE and since_dt is not None:
+        query  = (f"SELECT * FROM `{s.EVENTS_TABLE}` "
+                  f"WHERE `{s.EVENT_DATE_COLUMN}` > :since "
+                  f"ORDER BY `{s.EVENT_DATE_COLUMN}`")
+        params = {"since": since_dt}
+    elif s.EVENTS_TABLE:
+        query  = f"SELECT * FROM `{s.EVENTS_TABLE}` ORDER BY `{s.EVENT_DATE_COLUMN}`"
+        params = {}
+    elif s.EVENTS_QUERY:
+        query, params = s.EVENTS_QUERY, {}
+    else:
+        return
 
+    try:
+        async with _engine_for(s.EVENTS_ENGINE, s).connect() as conn:
+            res = await conn.execute(text(query), params)
+            loaded = dup = skipped = 0
+            for r in res.mappings().all():
+                key = tuple(r[col] for col in s.EVENT_KEY_COLUMNS)
+                dt  = r[s.EVENT_DATE_COLUMN]
+                if dt is None:
+                    skipped += 1
+                    continue
+                if key in s.ctx_index:
+                    if _register_event(dt, key, s):
+                        loaded += 1
+                    else:
+                        dup += 1
+                else:
+                    skipped += 1
+        sfx = f" since={since_dt}" if since_dt else ""
+        log(f"  events{sfx}: +{loaded} dup={dup} skip={skipped}", s.NODE_NAME)
+    except Exception as e:
+        log(f"  ❌ events: {e}", s.NODE_NAME, level="error")
+
+
+async def _load_events_full(s: _State):
+    s.events_by_dt.clear()
+    s.event_history.clear()
+    s.events_seen.clear()
+    s.events_max_dt = None
+    await _load_events_append(None, s)
+
+
+async def _check_data_changed(s: _State) -> tuple[bool, bool]:
+    ctx_ch = wgt_ch = False
+    try:
+        if s.CTX_TABLE:
+            async with s.engine_vlad.connect() as conn:
+                cnt = (await conn.execute(
+                    text(f"SELECT COUNT(*) FROM `{s.CTX_TABLE}`"))).scalar()
+                if cnt != s.ctx_row_count:
+                    ctx_ch = True
+        if s.WEIGHTS_TABLE:
+            async with s.engine_vlad.connect() as conn:
+                cnt = (await conn.execute(
+                    text(f"SELECT COUNT(*) FROM `{s.WEIGHTS_TABLE}`"))).scalar()
+                if cnt != s.weights_row_count:
+                    wgt_ch = True
+    except Exception as e:
+        log(f"  ⚠️ check_changed: {e}", s.NODE_NAME, level="warning")
+    return ctx_ch, wgt_ch
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── DDL BACKTEST ───────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+_DDL_BT_RESULTS = """
+CREATE TABLE IF NOT EXISTS vlad_backtest_results (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    service_url VARCHAR(255) NOT NULL,
+    model_id INT NOT NULL DEFAULT 0,
+    pair TINYINT NOT NULL, day_flag TINYINT NOT NULL, tier TINYINT NOT NULL,
+    params_hash CHAR(32) NOT NULL, params_json TEXT NOT NULL,
+    date_from DATETIME NOT NULL, date_to DATETIME NOT NULL,
+    balance_final DECIMAL(18,4) NOT NULL DEFAULT 0,
+    total_result DECIMAL(18,4) NOT NULL DEFAULT 0,
+    summary_lost DECIMAL(18,6) NOT NULL DEFAULT 0,
+    value_score DECIMAL(18,4) NOT NULL DEFAULT 0,
+    trade_count INT NOT NULL DEFAULT 0, win_count INT NOT NULL DEFAULT 0,
+    accuracy DECIMAL(7,4) NOT NULL DEFAULT 0,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    UNIQUE KEY uq_bt (service_url(100), pair, day_flag, tier, params_hash, date_from, date_to),
+    INDEX idx_score (service_url(100), pair, day_flag, tier, value_score DESC)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+"""
+
+_DDL_BT_SUMMARY = """
+CREATE TABLE IF NOT EXISTS vlad_backtest_summary (
+    id INT NOT NULL AUTO_INCREMENT,
+    model_id INT NOT NULL, service_url VARCHAR(255) NOT NULL,
+    pair TINYINT NOT NULL, day_flag TINYINT NOT NULL, tier TINYINT NOT NULL,
+    date_from DATETIME NOT NULL, date_to DATETIME NOT NULL,
+    total_combinations INT NOT NULL DEFAULT 0,
+    best_score DECIMAL(18,4) NOT NULL DEFAULT 0,
+    avg_score DECIMAL(18,4) NOT NULL DEFAULT 0,
+    best_accuracy DECIMAL(7,4) NOT NULL DEFAULT 0,
+    avg_accuracy DECIMAL(7,4) NOT NULL DEFAULT 0,
+    best_params_json TEXT,
+    computed_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    UNIQUE KEY uq_sum (model_id, pair, day_flag, tier, date_from, date_to)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+"""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── _universal_rebuild ────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _universal_rebuild(s: _State) -> dict:
+    if not s.CTX_TABLE or not s.WEIGHTS_TABLE:
+        raise RuntimeError("Универсальный rebuild требует CTX_TABLE и WEIGHTS_TABLE")
+    if not s.EVENTS_TABLE:
+        raise RuntimeError("Универсальный rebuild требует EVENTS_TABLE")
+
+    events_table = s.EVENTS_TABLE
+    id_col       = s.REBUILD_ID_COLUMN
+    date_col     = s.REBUILD_DATE_COLUMN
+    shift_max    = s.REBUILD_SHIFT_MAX
+
+    last_id = 0
+    try:
+        async with s.engine_vlad.connect() as conn:
+            row = (await conn.execute(
+                text(f"SELECT MAX(`{id_col}`) FROM `{events_table}`")
+            )).fetchone()
+            last_id = int(row[0]) if row and row[0] is not None else 0
+    except Exception:
+        last_id = 0
+
+    engine = _engine_for(s.REBUILD_SOURCE_ENGINE, s)
+    async with engine.connect() as conn:
+        res = await conn.execute(text(s.REBUILD_SOURCE_QUERY), {"last_id": last_id})
+        rows = [dict(r) for r in res.mappings().all()]
+
+    if not rows:
+        return {"processed": 0, "new_contexts": 0, "new_weights": 0,
+                "new_events": 0, "last_id": last_id}
+
+    ctx_map: dict[str, dict] = {}
+    make_key = s.make_ctx_key_fn or (
+        lambda row: "|".join(str(row.get(col, "")) for col in s.CTX_KEY_COLUMNS)
+    )
+
+    for row in rows:
         try:
-            self.service_url = await load_service_url(
-                self.engine_super, self.service_id)
-        except Exception as e:
-            log(f"❌ service_url: {e}", self.node_name, level="error")
-            self.service_url = ""
+            ctx_key = make_key(row)
+        except Exception:
+            continue
+        row_id   = row.get(id_col)
+        row_date = row.get(date_col) if date_col else None
+        if ctx_key not in ctx_map:
+            ctx_map[ctx_key] = {"count": 0, "first_dt": row_date,
+                                "last_dt": row_date, "items": []}
+        d = ctx_map[ctx_key]
+        d["count"] += 1
+        if row_date:
+            if d["first_dt"] is None or row_date < d["first_dt"]:
+                d["first_dt"] = row_date
+            if d["last_dt"]  is None or row_date > d["last_dt"]:
+                d["last_dt"]  = row_date
+        if row_id is not None:
+            d["items"].append((row_id, row_date))
 
-        try:
-            await ensure_cache_table(self.engine_vlad)
-        except Exception as e:
-            log(f"❌ cache table: {e}", self.node_name, level="error")
+    async with s.engine_vlad.begin() as conn:
+        await conn.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS `{s.CTX_TABLE}` (
+                `id`               INT          NOT NULL AUTO_INCREMENT,
+                `ctx_key`          VARCHAR(255) NOT NULL DEFAULT '',
+                `occurrence_count` INT          NOT NULL DEFAULT 0,
+                `first_dt`         DATETIME     NULL,
+                `last_dt`          DATETIME     NULL,
+                `updated_at`       TIMESTAMP    DEFAULT CURRENT_TIMESTAMP
+                                                ON UPDATE CURRENT_TIMESTAMP,
+                PRIMARY KEY (`id`),
+                UNIQUE KEY `uk_ctx_key` (`ctx_key`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """))
+        for ctx_key, d in ctx_map.items():
+            await conn.execute(text(f"""
+                INSERT INTO `{s.CTX_TABLE}` (ctx_key, occurrence_count, first_dt, last_dt)
+                VALUES (:ck, :cnt, :fd, :ld)
+                ON DUPLICATE KEY UPDATE
+                    occurrence_count = occurrence_count + :cnt,
+                    last_dt  = IF(:ld > last_dt  OR last_dt  IS NULL, :ld,  last_dt),
+                    first_dt = IF(:fd < first_dt OR first_dt IS NULL, :fd, first_dt)
+            """), {"ck": ctx_key, "cnt": d["count"],
+                   "fd": d["first_dt"], "ld": d["last_dt"]})
 
-        self.last_reload_time = datetime.now()
-        log("✅ FULL DATA RELOAD COMPLETED", self.node_name, force=True)
+    ctx_key_to_id: dict[str, int] = {}
+    key_list = list(ctx_map.keys())
+    async with s.engine_vlad.connect() as conn:
+        for i in range(0, len(key_list), 500):
+            batch = key_list[i:i + 500]
+            placeholders = ", ".join(f":k{j}" for j in range(len(batch)))
+            params = {f"k{j}": k for j, k in enumerate(batch)}
+            res = await conn.execute(text(
+                f"SELECT id, ctx_key FROM `{s.CTX_TABLE}` "
+                f"WHERE ctx_key IN ({placeholders})"), params)
+            for r in res.fetchall():
+                ctx_key_to_id[r[1]] = r[0]
 
-    # ──────────────────────────────────────────────────────────────────
-    # CALCULATE — основной расчёт (вызывается из /values)
-    # ──────────────────────────────────────────────────────────────────
+    new_weights = 0
+    wc_prefix = s.NODE_NAME.replace("brain-", "").upper()[:4]
+    async with s.engine_vlad.begin() as conn:
+        await conn.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS `{s.WEIGHTS_TABLE}` (
+                `id`          INT         NOT NULL AUTO_INCREMENT,
+                `weight_code` VARCHAR(64) NOT NULL,
+                `ctx_id`      INT         NOT NULL,
+                `mode`        TINYINT     NOT NULL DEFAULT 0,
+                `shift`       SMALLINT    NOT NULL DEFAULT 0,
+                PRIMARY KEY (`id`),
+                UNIQUE KEY `uk_weight_code` (`weight_code`),
+                INDEX idx_ctx_id (`ctx_id`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """))
+        for ctx_key, ctx_id in ctx_key_to_id.items():
+            total_count = ctx_map.get(ctx_key, {}).get("count", 0)
+            max_shift   = shift_max if total_count >= s.RECURRING_MIN_COUNT else 0
+            for mode in (0, 1):
+                for shift in range(0, max_shift + 1):
+                    wc = f"{wc_prefix}{ctx_id}_{mode}_{shift}"
+                    r  = await conn.execute(text(f"""
+                        INSERT IGNORE INTO `{s.WEIGHTS_TABLE}`
+                            (weight_code, ctx_id, mode, shift)
+                        VALUES (:wc, :cid, :mode, :shift)
+                    """), {"wc": wc, "cid": ctx_id, "mode": mode, "shift": shift})
+                    new_weights += r.rowcount
 
-    async def calculate(self, pair: int, day: int, date_str: str,
-                        calc_type: int = 0, calc_var: int = 0) -> dict | None:
-        """
-        Считает веса для заданной целевой даты. Возвращает {weight_code: float}.
+    new_events = 0
+    if events_table and date_col:
+        async with s.engine_vlad.begin() as conn:
+            await conn.execute(text(f"""
+                CREATE TABLE IF NOT EXISTS `{events_table}` (
+                    `{id_col}`   BIGINT   NOT NULL,
+                    `ctx_id`     INT      NOT NULL,
+                    `{date_col}` DATETIME NULL,
+                    PRIMARY KEY (`{id_col}`),
+                    INDEX idx_ctx_id (`ctx_id`),
+                    INDEX idx_date   (`{date_col}`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """))
+            for ctx_key, d in ctx_map.items():
+                ctx_id = ctx_key_to_id.get(ctx_key)
+                if ctx_id is None:
+                    continue
+                for row_id, row_date in d["items"]:
+                    r = await conn.execute(text(f"""
+                        INSERT IGNORE INTO `{events_table}`
+                            (`{id_col}`, ctx_id, `{date_col}`)
+                        VALUES (:rid, :cid, :dt)
+                    """), {"rid": row_id, "cid": ctx_id, "dt": row_date})
+                    new_events += r.rowcount
 
-        Ищем в истории события с похожим контекстом (ctx_id), смотрим
-        как вёл себя рынок после них, суммируем. Нет сигнала → нет в ответе.
+    new_max_id = max((row.get(id_col) or 0) for row in rows) if rows else last_id
+    log(f"  universal_rebuild: processed={len(rows)} ctx={len(ctx_map)} "
+        f"weights={new_weights} events={new_events}", s.NODE_NAME, force=True)
+    return {
+        "processed":    len(rows),
+        "new_contexts": len(ctx_key_to_id),
+        "new_weights":  new_weights,
+        "new_events":   new_events,
+        "prev_last_id": last_id,
+        "new_last_id":  new_max_id,
+    }
 
-        Алгоритм по шагам:
-          1. Строим окно поиска [target_date - shift_window, target_date].
-          2. Через bisect находим все события в этом окне.
-          3. Для каждого события берём полную историю его ctx_id (только прошлое!).
-          4. Строим t_dates — даты "через shift часов после каждого прошлого вхождения".
-          5. Считаем T1-сумму и Extremum-вероятность по этим t_dates.
-          6. Нулевые значения не включаем в ответ.
 
-        Возвращает None если date_str не распарсился.
-        Возвращает {} если событий в окне нет.
+# ══════════════════════════════════════════════════════════════════════════════
+# ── __detail__ УТИЛИТЫ ────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 
-        calc_type: 0=T1+Extremum, 1=только T1, 2=только Extremum.
-        calc_var: вариация агрегации 0..4, см. compute_t1_value().
-        """
-        target_date = parse_date_string(date_str)
+_DETAIL_KEY = "__detail__"
+
+
+def _extract_detail(result: dict | None) -> tuple[dict | None, any]:
+    """
+    Извлекает __detail__ из результата model().
+    Возвращает (result_без_detail, detail_или_None).
+    result модифицируется IN-PLACE — __detail__ удаляется.
+    """
+    if result is None:
+        return result, None
+    detail = result.pop(_DETAIL_KEY, None)
+    return result, detail
+
+
+def _make_detail_serializable(detail) -> any:
+    """
+    Приводит detail к JSON-сериализуемому виду.
+    Поддерживает произвольную вложенность: dict, list, datetime, float, str, int.
+    """
+    if detail is None:
+        return None
+    if isinstance(detail, dict):
+        return {str(k): _make_detail_serializable(v) for k, v in detail.items()}
+    if isinstance(detail, (list, tuple)):
+        return [_make_detail_serializable(v) for v in detail]
+    if isinstance(detail, datetime):
+        return detail.isoformat()
+    if isinstance(detail, float):
+        if math.isnan(detail) or math.isinf(detail):
+            return None
+        return detail
+    if isinstance(detail, (int, str, bool)):
+        return detail
+    return str(detail)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── УНИВЕРСАЛЬНЫЙ ПОСТРОИТЕЛЬ НАРРАТИВА ───────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _pluralize_n(n: int, forms: tuple[str, str, str]) -> str:
+    """Склонение числительного. forms = (1, 2-4, 5+)."""
+    abs_n = abs(n)
+    if abs_n % 100 in range(11, 20):
+        return forms[2]
+    r = abs_n % 10
+    if r == 1:          return forms[0]
+    if r in (2, 3, 4):  return forms[1]
+    return forms[2]
+
+
+def _shift_label(shift: int | None, day_flag: int) -> str:
+    """Человекочитаемое описание сдвига: '3 часа назад', 'через 2 дня' и т.д."""
+    if shift is None or shift == 0:
+        return "в момент целевой свечи"
+    if day_flag:
+        forms = ("день", "дня", "дней")
+    else:
+        forms = ("час", "часа", "часов")
+    unit = _pluralize_n(shift, forms)
+    if shift > 0:
+        return f"{abs(shift)} {unit} назад"
+    return f"через {abs(shift)} {unit}"
+
+
+def build_detail_narrative(
+    observations: list[tuple],          # [(event_key, obs_dt, shift_val), ...]
+    result: dict,                        # итоговый {weight_code: float}
+    date: "datetime",                    # target_date
+    delta_unit: "timedelta",
+    shift_window: int,
+    ctx,                                 # _ModelContext
+    *,
+    label_fn=None,                       # (event_key) → str | None — человекочитаемое имя
+    day_flag: int = 0,
+    calc_type: int = 0,
+) -> list[str]:
+    """
+    Универсальный построитель нарратива detail (список строк).
+    Воспроизводит структуру сервиса 33 (calendar) в обобщённом виде.
+
+    Вызывается из model() при необходимости:
+
+        from brain_framework import build_detail_narrative
+        result["__detail__"] = build_detail_narrative(
+            observations, result, date, ctx.delta_unit, 24, ctx,
+            label_fn=lambda k: MY_LABELS.get(k[0]),
+            day_flag=day_flag,
+            calc_type=type,
+        )
+
+    Параметры:
+        observations — список (event_key, obs_dt, shift_val) из ctx.find_events()
+        result       — финальный dict {wc: float} (уже без __detail__)
+        date         — target_date
+        delta_unit   — ctx.delta_unit
+        shift_window — ctx._state.SHIFT_WINDOW
+        ctx          — ModelContext
+        label_fn     — функция event_key → str (название события/контекста).
+                       Если None — используется str(event_key).
+        day_flag     — 0=hourly, 1=daily
+        calc_type    — 0=оба, 1=T1, 2=Extremum
+
+    Возвращает list[str] — строки нарратива.
+    """
+    if not observations:
+        return ["Нет контекстных событий в заданном промежутке."]
+
+    sw        = shift_window
+    start_dt  = date - delta_unit * sw
+    end_dt    = date + delta_unit * sw
+
+    # ── Группировка наблюдений: event_key + shift → {wc: value} ──────────────
+    # Ключ группы: (event_key, shift_val)
+    groups: dict[tuple, dict] = {}
+    for event_key, obs_dt, shift_val in observations:
+        gk = (event_key, shift_val)
+        if gk not in groups:
+            ctx_info    = ctx.ctx_index.get(event_key, {})
+            occ         = ctx_info.get("occurrence_count", 0)
+            valid_dts   = ctx.event_history(event_key)
+            t_dates     = [d + delta_unit * shift_val for d in valid_dts
+                           if (d + delta_unit * shift_val) < date]
+            label       = (label_fn(event_key) if label_fn else None) or str(event_key)
+            groups[gk]  = {
+                "event_key":        event_key,
+                "shift_val":        shift_val,
+                "label":            label,
+                "occurrence_count": occ,
+                "t_dates_count":    len(t_dates),
+                "wc_t1":   {},   # wc → value (mode=0, T1)
+                "wc_ext":  {},   # wc → value (mode=1, extremum)
+            }
+        g = groups[gk]
+        for wc, val in result.items():
+            if wc not in g["wc_t1"] and wc not in g["wc_ext"]:
+                # Определяем принадлежность: ищем подстроку "_0_" / "_1_" в суффиксе
+                # Это простое эвристическое разделение; работает для всех наших кодов.
+                # mode закодирован как предпоследний числовой сегмент.
+                parts = wc.rsplit("_", 2 if g["shift_val"] is not None else 1)
+                try:
+                    mode_candidate = int(parts[-2]) if len(parts) >= 2 else -1
+                except ValueError:
+                    mode_candidate = -1
+                # Привязываем weight_code к группе по точному совпадению shift
+                shift_suffix = f"_{shift_val}" if (g["shift_val"] is not None and g["shift_val"] != 0) else ""
+                if wc.endswith(shift_suffix) or shift_val == 0:
+                    if mode_candidate == 0:
+                        g["wc_t1"][wc] = val
+                    elif mode_candidate == 1:
+                        g["wc_ext"][wc] = val
+
+    if not groups:
+        return ["Событий не найдено после группировки."]
+
+    # Сортировка: по убыванию shift (чем ближе к target — первее)
+    sorted_groups = sorted(groups.values(), key=lambda g: (-(g["shift_val"] or 0), str(g["event_key"])))
+    n = len(sorted_groups)
+
+    # ── Описание calc_type ────────────────────────────────────────────────────
+    type_desc = {
+        0: "Type = 0: учитывается и сумма свечей (T1), и вероятность экстремума.",
+        1: "Type = 1: учитывается только сумма свечей (T1).",
+        2: "Type = 2: учитывается только вероятность экстремума.",
+    }.get(calc_type, f"Type = {calc_type}.")
+
+    evt_word = _pluralize_n(n, ("событие", "события", "событий"))
+
+    lines: list[str] = []
+
+    # Заголовок
+    lines.append(
+        f"Окно поиска: {start_dt.strftime('%Y-%m-%d %H:%M')} — "
+        f"{end_dt.strftime('%Y-%m-%d %H:%M')}. "
+        f"Найдено {n} {evt_word}."
+    )
+    lines.append("")
+
+    # Нумерованный список
+    for i, g in enumerate(sorted_groups, 1):
+        tl = _shift_label(g["shift_val"], day_flag)
+        lines.append(f'{i}. "{g["label"]}" — {tl}')
+
+    lines.append("")
+    lines.append(type_desc)
+    lines.append("")
+
+    # Детальный разбор по каждому событию
+    for i, g in enumerate(sorted_groups, 1):
+        occ = g["occurrence_count"]
+        tl  = _shift_label(g["shift_val"], day_flag)
+        t1_sum  = round(sum(g["wc_t1"].values()),  6) if g["wc_t1"]  else None
+        ext_sum = round(sum(g["wc_ext"].values()), 6) if g["wc_ext"] else None
+
+        lines.append(f'Событие {i}. "{g["label"]}", {tl}.')
+
+        hist_parts = [f"В истории это событие повторялось {occ} раз(а)"]
+        if t1_sum is not None and calc_type in (0, 1):
+            hist_parts.append(f"сумма свечей (T1) = {t1_sum}")
+        if ext_sum is not None and calc_type in (0, 2):
+            hist_parts.append(f"вероятность экстремума = {ext_sum}")
+        lines.append(", ".join(hist_parts) + ".")
+
+        codes: list[str] = []
+        for wc, v in {**g["wc_t1"], **g["wc_ext"]}.items():
+            codes.append(f"{wc}: {v}")
+        if codes:
+            lines.append("Вес(а): " + ", ".join(codes) + ".")
+
+        lines.append("")
+
+    return lines
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── build_app ──────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_app(model_module) -> FastAPI:
+    s = _State()
+
+    def _g(attr, default):
+        return getattr(model_module, attr, default)
+
+    # ── Критичные переменные: ENV → переопределение из model.py ───────────────
+    # Порядок приоритета: model.py > .env > default
+    s.SERVICE_ID   = _g("SERVICE_ID",   int(os.getenv("SERVICE_ID",   "0")))
+    s.PORT         = _g("PORT",         int(os.getenv("PORT",         "9000")))
+    s.NODE_NAME    = _g("NODE_NAME",    os.getenv("NODE_NAME",    "brain-svc"))
+    s.SERVICE_TEXT = _g("SERVICE_TEXT", os.getenv("SERVICE_TEXT", "Brain microservice"))
+
+    # ── Опциональные таблицы и настройки ─────────────────────────────────────
+    s.WEIGHTS_TABLE          = _g("WEIGHTS_TABLE",          None)
+    s.WEIGHTS_CODE_COLUMN    = _g("WEIGHTS_CODE_COLUMN",    "weight_code")
+    s.CTX_TABLE              = _g("CTX_TABLE",              None)
+    s.CTX_QUERY              = _g("CTX_QUERY",              None)
+    s.CTX_KEY_COLUMNS        = _g("CTX_KEY_COLUMNS",        ["id"])
+    s.EVENTS_TABLE           = _g("EVENTS_TABLE",           None)
+    s.EVENTS_QUERY           = _g("EVENTS_QUERY",           None)
+    s.EVENTS_ENGINE          = _g("EVENTS_ENGINE",          "vlad")
+    s.EVENT_KEY_COLUMNS      = _g("EVENT_KEY_COLUMNS",      ["event_id"])
+    s.EVENT_DATE_COLUMN      = _g("EVENT_DATE_COLUMN",      "event_date")
+    s.DATASET_TABLE          = _g("DATASET_TABLE",          None)
+    s.DATASET_QUERY          = _g("DATASET_QUERY",          None)
+    s.DATASET_ENGINE         = _g("DATASET_ENGINE",         "vlad")
+    s.FILTER_DATASET_BY_DATE = _g("FILTER_DATASET_BY_DATE", False)
+    s.SHIFT_WINDOW           = _g("SHIFT_WINDOW",           12)
+    s.RECURRING_MIN_COUNT    = _g("RECURRING_MIN_COUNT",    2)
+    s.FILTER_FUTURE_EVENTS   = _g("FILTER_FUTURE_EVENTS",   True)
+    s.RELOAD_INTERVAL        = _g("RELOAD_INTERVAL",        3600)
+    s.REBUILD_INTERVAL       = int(_g("REBUILD_INTERVAL",   0))
+    s.VAR_RANGE              = _g("VAR_RANGE",              [0])
+    s.REBUILD_SOURCE_QUERY   = _g("REBUILD_SOURCE_QUERY",   None)
+    s.REBUILD_SOURCE_ENGINE  = _g("REBUILD_SOURCE_ENGINE",  "vlad")
+    s.REBUILD_ID_COLUMN      = _g("REBUILD_ID_COLUMN",      "id")
+    s.REBUILD_DATE_COLUMN    = _g("REBUILD_DATE_COLUMN",    None)
+    s.REBUILD_SHIFT_MAX      = _g("REBUILD_SHIFT_MAX",      0)
+    s.CACHE_DATE_FROM        = _g("CACHE_DATE_FROM",        "2025-01-15")
+    s.LABEL_FN               = _g("LABEL_FN",               None)
+
+    s.model_fn         = getattr(model_module, "model",         None)
+    s.load_events_fn   = getattr(model_module, "load_events",   None)
+    s.rebuild_index_fn = getattr(model_module, "rebuild_index", None)
+    s.make_ctx_key_fn  = getattr(model_module, "make_ctx_key",  None)
+
+    if s.model_fn is None:
+        raise RuntimeError("model_module должен определять функцию model()")
+
+    sig = inspect.signature(s.model_fn)
+    s.model_needs_ctx = "ctx" in sig.parameters
+
+    log(f"  model(): ctx={'yes' if s.model_needs_ctx else 'no'} | "
+        f"VAR_RANGE={s.VAR_RANGE} | "
+        f"rebuild={'custom' if s.rebuild_index_fn else ('universal' if s.REBUILD_SOURCE_QUERY else 'no')}",
+        s.NODE_NAME, force=True)
+
+    s.engine_vlad, s.engine_brain, s.engine_super = build_engines()
+
+    # ── _call_model ───────────────────────────────────────────────────────────
+    # Вызывает model() и возвращает (result, detail).
+    # detail = None если model() не вернул __detail__.
+    # result НЕ содержит __detail__ в любом случае.
+
+    async def _call_model(pair, day, date_str, calc_type=0, calc_var=0, param=""):
+        """Вызов model() без detail. Возвращает только result (dict | None)."""
+        target_date = _parse_date(date_str)
         if not target_date:
             return None
+        table = _rates_table(pair, day)
+        await _refresh_rates(table, s)
+        rates_filtered   = _filter_rates_lte(table, target_date, s)
+        dataset_filtered = _filter_dataset_lte(target_date, s)
+        if s.model_needs_ctx:
+            ctx = _ModelContext(table, pair, day, target_date, s)
+            result = s.model_fn(rates=rates_filtered, dataset=dataset_filtered,
+                                date=target_date, type=calc_type, var=calc_var,
+                                param=param, ctx=ctx)
+        else:
+            result = s.model_fn(rates=rates_filtered, dataset=dataset_filtered,
+                                date=target_date, type=calc_type, var=calc_var,
+                                param=param)
+        result, _ = _extract_detail(result)   # __detail__ отбрасывается
+        return result
 
-        rates_table  = get_rates_table_name(pair, day)
-        await self._refresh_rates_if_needed(rates_table)
-        modification = get_modification_factor(pair)
-        delta_unit   = timedelta(days=1) if day == 1 else timedelta(hours=1)
+    async def _call_model_with_detail(pair, day, date_str, calc_type=0, calc_var=0, param=""):
+        """Вызов model() с detail. Возвращает (result, detail)."""
+        target_date = _parse_date(date_str)
+        if not target_date:
+            return None, None
+        table = _rates_table(pair, day)
+        await _refresh_rates(table, s)
+        rates_filtered = _filter_rates_lte(table, target_date, s)
+        dataset_f      = _filter_dataset_lte(target_date, s)
+        if s.model_needs_ctx:
+            ctx = _ModelContext(table, pair, day, target_date, s)
+            result = s.model_fn(rates=rates_filtered, dataset=dataset_f,
+                                date=target_date, type=calc_type,
+                                var=calc_var, param=param, ctx=ctx)
+        else:
+            result = s.model_fn(rates=rates_filtered, dataset=dataset_f,
+                                date=target_date, type=calc_type,
+                                var=calc_var, param=param)
+        result, detail = _extract_detail(result)
+        return result, _make_detail_serializable(detail)
 
-        """
-        Окно поиска: 49 точек (shift_window=24 → от -24h до +24h),
-        но filter_future_events=True обрежет правую половину → остаётся 25 точек
-        Для новостей (filter_future_events=True)
-        Нельзя использовать новости из будущего
-        Ищем только события, которые случились до или в момент target_date
-        Правильно: [-24, 0]
-        
-        Для календарных событий (filter_future_events=False)
-        Расписание известно заранее (например, заседания ФРС)
-        Можно использовать и будущие события
-        Правильно: [-24, 24]
-        """
-        check_dts = [target_date + delta_unit * s
-                     for s in range(-self.shift_window, self.shift_window + 1)]
+    # ── _preload ──────────────────────────────────────────────────────────────
 
-        # Bisect-поиск: для каждой точки окна ищем события в интервале [dt, dt+1h)
-        observations = []
-        for dt in check_dts:
-            if self.filter_future_events and dt > target_date:
+    async def _preload():
+        log("🔄 FULL DATA RELOAD", s.NODE_NAME, force=True)
+        s.np_built = False
+        s.weight_codes.clear()
+        s.ctx_index.clear()
+        s.dataset.clear()
+        await _load_weight_codes(s)
+        await _load_ctx_index(s)
+        await _load_events_full(s)
+        _build_sorted_arrays(s)
+        await _load_rates(s)
+        await _load_dataset(s)
+        # service_url строится из PORT — не из БД.
+        # Именно эта строка пишется в vlad_values_cache.service_url.
+        s.service_url = f"http://localhost:{s.PORT}"
+        log(f"  service_url: {s.service_url}", s.NODE_NAME)
+        try:
+            await ensure_cache_table(s.engine_vlad)
+            async with s.engine_vlad.begin() as conn:
+                await conn.execute(text(_DDL_BT_RESULTS))
+                await conn.execute(text(_DDL_BT_SUMMARY))
+        except Exception as e:
+            log(f"  ❌ tables: {e}", s.NODE_NAME, level="error")
+        s.last_reload = datetime.now()
+        log(f"✅ RELOAD DONE: weights={len(s.weight_codes)} ctx={len(s.ctx_index)} "
+            f"events={len(s.events_by_dt)} dataset={len(s.dataset)} "
+            f"np_built={s.np_built}", s.NODE_NAME, force=True)
+
+    # ── _do_rebuild ───────────────────────────────────────────────────────────
+
+    async def _do_rebuild() -> dict:
+        if s.rebuild_index_fn is not None:
+            try:
+                stats = await s.rebuild_index_fn(
+                    s.engine_vlad, s.engine_brain, s.engine_super)
+                stats = stats or {}
+            except Exception as e:
+                log(f"  ❌ rebuild_index: {e}", s.NODE_NAME, level="error")
+                send_error_trace(e, s.NODE_NAME, "rebuild_index")
+                return {"error": str(e)}
+        elif s.REBUILD_SOURCE_QUERY is not None:
+            try:
+                stats = await _universal_rebuild(s)
+            except Exception as e:
+                log(f"  ❌ universal_rebuild: {e}", s.NODE_NAME, level="error")
+                send_error_trace(e, s.NODE_NAME, "universal_rebuild")
+                return {"error": str(e)}
+        else:
+            return {"error": "Нет rebuild_index() и не задан REBUILD_SOURCE_QUERY"}
+
+        new_keys = await _load_ctx_index_incremental(s)
+        await _load_weight_codes(s)
+        if new_keys:
+            await _load_events_full(s)
+        else:
+            since = s.events_max_dt
+            await _load_events_append(since, s)
+        _build_sorted_arrays(s)
+        s.last_rebuild = datetime.now()
+        log(f"✅ rebuild done: ctx={len(s.ctx_index)} weights={len(s.weight_codes)}",
+            s.NODE_NAME, force=True)
+        return {
+            "rebuild_stats":  stats,
+            "new_ctx_keys":   len(new_keys),
+            "ctx_total":      len(s.ctx_index),
+            "weights_total":  len(s.weight_codes),
+            "events_total":   len(s.events_by_dt),
+            "rebuilt_at":     s.last_rebuild.isoformat(),
+        }
+
+    # ── _bg_reload ────────────────────────────────────────────────────────────
+
+    async def _bg_reload():
+        while True:
+            await asyncio.sleep(s.RELOAD_INTERVAL)
+            try:
+                if ((s.rebuild_index_fn or s.REBUILD_SOURCE_QUERY)
+                        and s.REBUILD_INTERVAL > 0
+                        and (s.last_rebuild is None or
+                             (datetime.now() - s.last_rebuild).total_seconds()
+                             >= s.REBUILD_INTERVAL)):
+                    await _do_rebuild()
+                    s.last_reload = datetime.now()
+                    continue
+                ctx_ch, wgt_ch = await _check_data_changed(s)
+                events_updated = False
+                if ctx_ch:
+                    new_keys = await _load_ctx_index_incremental(s)
+                    if new_keys:
+                        await _load_events_full(s)
+                        events_updated = True
+                if wgt_ch:
+                    await _load_weight_codes(s)
+                if not events_updated:
+                    since = s.events_max_dt
+                    await _load_events_append(since, s)
+                    if s.events_max_dt != since:
+                        events_updated = True
+                if events_updated:
+                    _build_sorted_arrays(s)
+                s.last_reload = datetime.now()
+            except Exception as e:
+                log(f"❌ bg reload: {e}", s.NODE_NAME, level="error", force=True)
+                send_error_trace(e, s.NODE_NAME, "bg_reload")
+
+    # ── fill cache helpers ────────────────────────────────────────────────────
+
+    async def _bulk_insert(rows: list[dict]) -> int:
+        if not rows:
+            return 0
+        try:
+            async with s.engine_vlad.begin() as conn:
+                r = await conn.execute(text("""
+                    INSERT IGNORE INTO vlad_values_cache
+                        (service_url, pair, day_flag, date_val,
+                         params_hash, params_json, result_json)
+                    VALUES (:url, :pair, :day, :dv, :ph, :pj, :rj)
+                """), rows)
+                return r.rowcount
+        except Exception as e:
+            log(f"  ⚠️ bulk insert: {e}", s.NODE_NAME, level="warning")
+            return 0
+
+    async def _cached_dates(pair, day, p_hash) -> set:
+        try:
+            async with s.engine_vlad.connect() as conn:
+                res = await conn.execute(text("""
+                    SELECT date_val FROM vlad_values_cache
+                    WHERE service_url=:url AND pair=:pair
+                      AND day_flag=:day AND params_hash=:ph
+                """), {"url": s.service_url, "pair": pair, "day": day, "ph": p_hash})
+                return {row[0] for row in res.fetchall()}
+        except Exception:
+            return set()
+
+    async def _fill_worker(pairs, days, date_from_str, date_to_str, types, batch_size):
+        s.fill_cancel.clear()
+        dt_from = _parse_date(date_from_str) if date_from_str else None
+        dt_to   = _parse_date(date_to_str)   if date_to_str   else None
+        slots   = [(pair, day, tp, var)
+                   for pair in pairs for day in days
+                   for tp in types for var in s.VAR_RANGE]
+        # total_dates по уникальным (pair, day) — type/var не меняет число свечей
+        unique_pd = {(p, d) for p, d, *_ in slots}
+        total_dates = sum(
+            sum(1 for r in s.global_rates.get(_rates_table(p, d), [])
+                if (dt_from is None or r["date"] >= dt_from)
+                and (dt_to   is None or r["date"] <= dt_to))
+            for p, d in unique_pd
+        ) * len(types) * len(s.VAR_RANGE)  # умножаем на кол-во слотов на пару
+        s.fill_status = {
+            "state": "running", "pairs": pairs, "days": days,
+            "types": types, "var_range": s.VAR_RANGE, "batch_size": batch_size,
+            "slots_total": len(slots), "slots_done": 0,
+            "overall_total": total_dates, "overall_done": 0,
+            "overall_skipped": 0, "errors": 0,
+            "current_slot": None, "started_at": datetime.now().isoformat(),
+        }
+        log(f"🚀 fill_cache: {len(slots)} слотов, ~{total_dates} дат, batch={batch_size}",
+            s.NODE_NAME, force=True)
+        overall_done = overall_skipped = errors = 0
+
+        for slot_idx, (pair, day, calc_type, var) in enumerate(slots):
+            if s.fill_cancel.is_set():
+                s.fill_status["state"] = "stopped"
+                return
+            table   = _rates_table(pair, day)
+            candles = [r for r in s.global_rates.get(table, [])
+                       if (dt_from is None or r["date"] >= dt_from)
+                       and (dt_to   is None or r["date"] <= dt_to)]
+            if not candles:
+                s.fill_status["slots_done"] = slot_idx + 1
                 continue
-            dt_end = dt + delta_unit
-            _l = bisect.bisect_left(self._sorted_dates, dt)
-            _r = bisect.bisect_left(self._sorted_dates, dt_end)
-            for _i in range(_l, _r):
-                obs_dt = self._sorted_dates[_i]
-                for event_key in self._sorted_data[_i]:
-                    shift = round((target_date - obs_dt) / delta_unit)
-                    observations.append((event_key, obs_dt, shift))
+            extra       = {"type": calc_type, "var": var, "param": ""}
+            p_hash      = _params_hash(extra)
+            params_json = _json.dumps(extra, ensure_ascii=False)
+            slot_label  = f"pair={pair} day={'d' if day else 'h'} type={calc_type} var={var}"
+            s.fill_status["current_slot"] = slot_label
+            cached   = await _cached_dates(pair, day, p_hash)
+            to_fetch = [c for c in candles if c["date"] not in cached]
+            skipped  = len(candles) - len(to_fetch)
+            overall_skipped += skipped
+            log(f"  [{slot_label}] {len(candles)} дат: кеш={skipped} нужно={len(to_fetch)}",
+                s.NODE_NAME, force=True)
+            slot_done = 0
+            for batch_start in range(0, len(to_fetch), batch_size):
+                if s.fill_cancel.is_set():
+                    s.fill_status["state"] = "stopped"
+                    return
+                batch = to_fetch[batch_start: batch_start + batch_size]
 
-        if not observations:
-            return {}
+                def _sync_compute(candle):
+                    td = candle["date"]
+                    r  = _filter_rates_lte(table, td, s)
+                    ds = _filter_dataset_lte(td, s)
+                    try:
+                        if s.model_needs_ctx:
+                            ctx = _ModelContext(table, pair, day, td, s)
+                            res = s.model_fn(rates=r, dataset=ds, date=td,
+                                             type=calc_type, var=var, param="", ctx=ctx)
+                        else:
+                            res = s.model_fn(rates=r, dataset=ds, date=td,
+                                             type=calc_type, var=var, param="")
+                        # __detail__ в кэш НЕ попадает
+                        res, _ = _extract_detail(res)
+                        return res or {}
+                    except Exception:
+                        return None
 
-        ram_rates   = self.rates.get(rates_table, {})
-        ram_ranges  = self.candle_ranges.get(rates_table, {})
-        avg_rng     = self.avg_range.get(rates_table, 0.0)
-        ram_ext     = self.extremums.get(rates_table, {"min": set(), "max": set()})
-        prev_candle = find_prev_candle_trend(
-            self.last_candles.get(rates_table, []), target_date)
+                tasks   = [asyncio.to_thread(_sync_compute, c) for c in batch]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                insert_rows = []
+                for candle, result in zip(batch, results):
+                    if isinstance(result, Exception) or result is None:
+                        errors += 1
+                        continue
+                    insert_rows.append({
+                        "url": s.service_url, "pair": pair, "day": day,
+                        "dv": candle["date"], "ph": p_hash, "pj": params_json,
+                        "rj": _json.dumps(result, ensure_ascii=False),
+                    })
+                n_inserted = await _bulk_insert(insert_rows)
+                n_empty_batch = sum(1 for r in insert_rows if not _json.loads(r["rj"]))
+                slot_done    += len(batch)
+                overall_done += len(batch)
+                pct = overall_done * 100 // max(total_dates, 1)
+                s.fill_status.update({
+                    "overall_done": overall_done, "overall_skipped": overall_skipped,
+                    "errors": errors, "slot_done": slot_done,
+                    "slot_total": len(to_fetch),
+                })
+                empty_note = f" empty={n_empty_batch}" if n_empty_batch else ""
+                log(f"  [{slot_label}] {slot_done}/{len(to_fetch)} | "
+                    f"всего {overall_done}/{total_dates} ({pct}%)"
+                    f" written={n_inserted}{empty_note} err={errors}",
+                    s.NODE_NAME, force=True)
+            s.fill_status["slots_done"] = slot_idx + 1
+        s.fill_status.update({"state": "done", "finished_at": datetime.now().isoformat()})
+        log(f"✅ fill done: done={overall_done} skip={overall_skipped} err={errors}",
+            s.NODE_NAME, force=True)
 
-        result = {}
-        for event_key, obs_dt, shift in observations:
-            ctx_info = self.ctx_index.get(event_key)
-            if ctx_info is None:
-                continue
-
-            occ          = ctx_info.get("occurrence_count", 0)
-            is_recurring = occ >= self.recurring_min_count
-
-            # Нерегулярный ctx_id: брать только если новость вышла именно сейчас (shift=0).
-            # Регулярный: допускаем любой сдвиг в пределах окна.
-            if not is_recurring and shift != 0:
-                continue
-            if is_recurring and abs(shift) > self.shift_window:
-                continue
-
-            # Берём историю ctx_id и обрезаем будущее — защита от look-ahead bias.
-            # bisect_left находит первую дату >= target_date, берём всё левее.
-            all_hist  = self._event_history.get(event_key, [])
-            idx       = bisect.bisect_left(all_hist, target_date)
-            valid_dts = all_hist[:idx]
-            if not valid_dts:
-                continue
-
-            # t_dates: "через shift часов после каждого прошлого вхождения этого ctx_id"
-            # Это и есть исторические аналоги — свечи, по которым считаем вес.
-            t_dates = [d + delta_unit * shift for d in valid_dts
-                       if (d + delta_unit * shift) < target_date]
-            if not t_dates:
-                continue
-
-            # shift_arg=None → нерегулярное событие, make_weight_code подставит 0
-            shift_arg = shift if is_recurring else None
-
-            # Mode 0: сумма T1 по аналогам
-            if calc_type in (0, 1):
-                t1_sum = compute_t1_value(
-                    t_dates, calc_var, ram_rates, ram_ranges, avg_rng)
-                wc         = self.make_weight_code(event_key, 0, shift_arg)
-                result[wc] = result.get(wc, 0.0) + t1_sum
-
-            # Mode 1: вероятность экстремума.
-            # Тип (max/min) определяем по направлению предыдущей свечи.
-            if calc_type in (0, 2) and prev_candle:
-                _, is_bull = prev_candle
-                ext_set    = ram_ext["max" if is_bull else "min"]
-                ext_val    = compute_extremum_value(
-                    t_dates, calc_var, ext_set, ram_ranges,
-                    avg_rng, modification, len(valid_dts))
-                if ext_val is not None:
-                    wc         = self.make_weight_code(event_key, 1, shift_arg)
-                    result[wc] = result.get(wc, 0.0) + ext_val
-
-        # Нули не отдаём — нет сигнала = нет в ответе.
-        # Округление до 6 знаковн.
-        return {k: round(v, 6) for k, v in result.items() if v != 0}
-
-    # ──────────────────────────────────────────────────────────────────
-    # FastAPI APP — создание приложения со всеми endpoints
-    # ──────────────────────────────────────────────────────────────────
-
-    def create_app(self) -> FastAPI:
-        """
-        Создаёт FastAPI-приложение со всеми стандартными endpoints и lifecycle.
-
-        Endpoints:
-            GET  /         — метаданные (version, размеры индексов, время reload)
-            GET  /weights  — список всех weight_codes для PHP-стороны
-            GET  /values   — основной расчёт (кэш → calculate)
-            POST /patch    — инкремент версии в version_microservice (при деплое)
-
-        Lifecycle:
-            startup  → preload_all_data() + запуск background_reload()
-            shutdown → cancel background_reload() + dispose engines
-
-        background_reload(): каждые 3600 сек вызывает preload_all_data().
-        Ошибки в reload логируются, но цикл не останавливается.
-        """
-        svc = self  # замыкание для вложенных async-функций
-
-        async def background_reload():
-            while True:
-                await asyncio.sleep(3600)
+        # ── Авто-бэктест после заполнения кэша ───────────────────────────────
+        log("🔁 auto-backtest после fill_cache...", s.NODE_NAME, force=True)
+        bt_date_from = _parse_date(date_from_str) if date_from_str else datetime(2025, 1, 1)
+        bt_date_to   = _parse_date(date_to_str)   if date_to_str   else datetime.now()
+        for bt_pair in pairs:
+            for bt_day in days:
+                for bt_type in types:
+                    for bt_var in s.VAR_RANGE:
+                        try:
+                            bt_result = await _backtest(
+                                bt_pair, bt_day, tier=0,
+                                extra_params={"type": bt_type, "var": bt_var},
+                                df=bt_date_from, dt=bt_date_to,
+                            )
+                            label = f"pair={bt_pair} day={'d' if bt_day else 'h'} type={bt_type} var={bt_var}"
+                            if "error" in bt_result:
+                                log(f"  ⚠️ backtest [{label}]: {bt_result['error']}",
+                                    s.NODE_NAME, force=True)
+                            else:
+                                log(f"  ✅ backtest [{label}]: "
+                                    f"score={bt_result.get('value_score')} "
+                                    f"acc={bt_result.get('accuracy')} "
+                                    f"trades={bt_result.get('trade_count')}",
+                                    s.NODE_NAME, force=True)
+                        except Exception as e:
+                            log(f"  ❌ backtest error pair={bt_pair} day={bt_day} type={bt_type} var={bt_var}: {e}",
+                                s.NODE_NAME, level="error")
                 try:
-                    await svc.preload_all_data()
+                    await _upsert_summary(bt_pair, bt_day, tier=0,
+                                          df=bt_date_from, dt=bt_date_to)
                 except Exception as e:
-                    log(f"❌ Reload: {e}", svc.node_name,
-                        level="error", force=True)
-                    send_error_trace(e, svc.node_name, "reload")
+                    log(f"  ⚠️ summary pair={bt_pair} day={bt_day}: {e}",
+                        s.NODE_NAME, level="warning")
+        s.fill_status["auto_backtest"] = "done"
+        log("✅ auto-backtest завершён", s.NODE_NAME, force=True)
 
-        @asynccontextmanager
-        async def lifespan(app: FastAPI):
+    # ── _backtest ─────────────────────────────────────────────────────────────
+
+    async def _backtest(pair, day, tier, extra_params, df, dt) -> dict:
+        p_hash = _params_hash(extra_params)
+        async with s.engine_vlad.connect() as conn:
+            ex = (await conn.execute(text("""
+                SELECT value_score, accuracy, trade_count FROM vlad_backtest_results
+                WHERE service_url=:url AND pair=:pair AND day_flag=:day
+                  AND tier=:tier AND params_hash=:ph AND date_from=:df AND date_to=:dt
+                LIMIT 1
+            """), {"url": s.service_url, "pair": pair, "day": day, "tier": tier,
+                   "ph": p_hash, "df": df, "dt": dt})).fetchone()
+        if ex:
+            return {"value_score": float(ex[0]), "accuracy": float(ex[1]),
+                    "trade_count": int(ex[2]), "params": extra_params, "skipped": True}
+        async with s.engine_vlad.connect() as conn:
+            res = await conn.execute(text("""
+                SELECT date_val, result_json FROM vlad_values_cache
+                WHERE service_url=:url AND pair=:pair AND day_flag=:day
+                  AND params_hash=:ph AND date_val>=:df AND date_val<=:dt
+                ORDER BY date_val
+            """), {"url": s.service_url, "pair": pair, "day": day,
+                   "ph": p_hash, "df": df, "dt": dt})
+            cache_map = {row[0]: _json.loads(row[1]) for row in res.fetchall()}
+        if not cache_map:
+            return {"error": "no cached data"}
+        table  = _rates_table(pair, day)
+        rows   = [r for r in s.global_rates.get(table, []) if df <= r["date"] <= dt]
+        spread, mod, lot_div = _PAIR_CFG.get(pair, (0.0002, 100_000.0, 50_000.0))
+        balance = highest = 10_000.0
+        summary_lost = 0.0
+        trade_count = win_count = 0
+        position = None
+        for candle in rows:
+            vals = cache_map.get(candle["date"])
+            signal = sum(vals.values()) if vals else 0.0
+            if position is not None:
+                direction, entry_price = position
+                should_close = (signal == 0.0
+                                or (signal > 0 and direction < 0)
+                                or (signal < 0 and direction > 0))
+                if should_close:
+                    op = candle["open"]
+                    if op:
+                        lot = max(round(balance / lot_div, 2), 0.01)
+                        pct = (op - entry_price) / entry_price * direction
+                        pnl = lot * mod * pct
+                        balance += pnl
+                        trade_count += 1
+                        if pnl >= 0:
+                            win_count += 1
+                        else:
+                            summary_lost += abs(pnl)
+                        if balance > highest:
+                            highest = balance
+                    position = None
+            if signal != 0.0 and position is None:
+                position = (1.0 if signal > 0 else -1.0, candle["open"])
+        if trade_count < 5:
+            return {"error": f"not enough trades: {trade_count}"}
+        total_result = balance - 10_000.0
+        value_score  = total_result - summary_lost
+        accuracy     = win_count / trade_count
+        result = {
+            "balance_final": round(balance, 4), "total_result": round(total_result, 4),
+            "summary_lost":  round(summary_lost, 6), "value_score": round(value_score, 4),
+            "trade_count":   trade_count, "win_count": win_count,
+            "accuracy":      round(accuracy, 4), "params": extra_params,
+        }
+        try:
+            async with s.engine_vlad.begin() as conn:
+                await conn.execute(text("""
+                    INSERT INTO vlad_backtest_results
+                        (service_url, model_id, pair, day_flag, tier,
+                         params_hash, params_json, date_from, date_to,
+                         balance_final, total_result, summary_lost,
+                         value_score, trade_count, win_count, accuracy)
+                    VALUES (:url,:mid,:pair,:day,:tier,:ph,:pj,:df,:dt,
+                            :bf,:tr,:sl,:vs,:tc,:wc,:acc)
+                    ON DUPLICATE KEY UPDATE
+                        balance_final=VALUES(balance_final),total_result=VALUES(total_result),
+                        summary_lost=VALUES(summary_lost),value_score=VALUES(value_score),
+                        trade_count=VALUES(trade_count),win_count=VALUES(win_count),
+                        accuracy=VALUES(accuracy),created_at=CURRENT_TIMESTAMP
+                """), {
+                    "url": s.service_url, "mid": s.SERVICE_ID,
+                    "pair": pair, "day": day, "tier": tier, "ph": p_hash,
+                    "pj": _json.dumps(extra_params, ensure_ascii=False),
+                    "df": df, "dt": dt,
+                    "bf": result["balance_final"], "tr": result["total_result"],
+                    "sl": result["summary_lost"],  "vs": result["value_score"],
+                    "tc": trade_count, "wc": win_count, "acc": result["accuracy"],
+                })
+        except Exception as e:
+            log(f"  ⚠️ backtest save: {e}", s.NODE_NAME, level="warning")
+        return result
+
+    async def _upsert_summary(pair, day, tier, df, dt):
+        async with s.engine_vlad.connect() as conn:
+            row = (await conn.execute(text("""
+                SELECT COUNT(*), MAX(value_score), AVG(value_score),
+                       MAX(accuracy), AVG(accuracy),
+                       MAX(CASE WHEN value_score=(
+                           SELECT MAX(value_score) FROM vlad_backtest_results r2
+                           WHERE r2.service_url=:url AND r2.pair=:pair
+                             AND r2.day_flag=:day AND r2.tier=:tier
+                             AND r2.date_from=:df AND r2.date_to=:dt)
+                       THEN params_json END)
+                FROM vlad_backtest_results
+                WHERE service_url=:url AND pair=:pair AND day_flag=:day
+                  AND tier=:tier AND date_from=:df AND date_to=:dt
+            """), {"url": s.service_url, "pair": pair, "day": day,
+                   "tier": tier, "df": df, "dt": dt})).fetchone()
+        if not row or not row[0]:
+            return
+        async with s.engine_vlad.begin() as conn:
+            await conn.execute(text("""
+                INSERT INTO vlad_backtest_summary
+                    (model_id,service_url,pair,day_flag,tier,date_from,date_to,
+                     total_combinations,best_score,avg_score,
+                     best_accuracy,avg_accuracy,best_params_json)
+                VALUES (:mid,:url,:pair,:day,:tier,:df,:dt,
+                        :cnt,:bs,:as_,:ba,:aa,:bpj)
+                ON DUPLICATE KEY UPDATE
+                    total_combinations=VALUES(total_combinations),
+                    best_score=VALUES(best_score),avg_score=VALUES(avg_score),
+                    best_accuracy=VALUES(best_accuracy),avg_accuracy=VALUES(avg_accuracy),
+                    best_params_json=VALUES(best_params_json),computed_at=CURRENT_TIMESTAMP
+            """), {
+                "mid": s.SERVICE_ID, "url": s.service_url,
+                "pair": pair, "day": day, "tier": tier, "df": df, "dt": dt,
+                "cnt": row[0], "bs": float(row[1] or 0), "as_": float(row[2] or 0),
+                "ba": float(row[3] or 0), "aa": float(row[4] or 0), "bpj": row[5],
+            })
+
+    # ── FastAPI ───────────────────────────────────────────────────────────────
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        try:
+            await _preload()
+        except Exception as e:
+            log(f"❌ initial load: {e}", s.NODE_NAME, level="error", force=True)
+        task = asyncio.create_task(_bg_reload())
+        yield
+        task.cancel()
+        s.fill_cancel.set()
+        for eng in (s.engine_vlad, s.engine_brain, s.engine_super):
             try:
-                await svc.preload_all_data()
-            except Exception as e:
-                log(f"❌ Preload failed: {e}", svc.node_name,
-                    level="error", force=True)
-            task = asyncio.create_task(background_reload())
-            yield
-            task.cancel()
-            for name, eng in [("vlad",  svc.engine_vlad),
-                               ("brain", svc.engine_brain),
-                               ("super", svc.engine_super)]:
-                try:
-                    await eng.dispose()
-                except Exception:
-                    pass
+                await eng.dispose()
+            except Exception:
+                pass
 
-        app = FastAPI(lifespan=lifespan)
+    app = FastAPI(lifespan=lifespan)
 
-        @app.get("/")
-        async def metadata():
-            # Версия из version_microservice нужна PHP-стороне для инвалидации кэша.
-            # Формат "1.{version}.0" — исторически сложившийся, не менять.
-            # Ошибка чтения → version=0, сервис не падает.
-            version = 0
-            try:
-                async with svc.engine_vlad.connect() as _conn:
-                    _res = await _conn.execute(
-                        text("SELECT version FROM version_microservice "
-                             "WHERE microservice_id = :id"),
-                        {"id": svc.service_id},
-                    )
-                    _row = _res.fetchone()
-                    if _row:
-                        version = _row[0]
-            except Exception as _e:
-                log(f"⚠️ version_microservice read failed: {_e}",
-                    svc.node_name, level="warning")
-
-            return {
-                "status":  "ok",
-                "version": f"1.{version}.0",
-                "mode":    MODE,
-                "name":    svc.node_name,
-                "text":    svc.description,
-                "metadata": {
-                    "weight_codes": len(svc.weight_codes),
-                    "ctx_index":    len(svc.ctx_index),
-                    "events":       len(svc._events_by_dt),
-                    "last_reload":  (svc.last_reload_time.isoformat()
-                                     if svc.last_reload_time else None),
-                },
-            }
-
-        @app.get("/weights")
-        async def weights():
-            # PHP-сторона спрашивает этот список перед тем как запрашивать /values.
-            return ok_response(svc.weight_codes)
-
-        @app.get("/values")
-        async def values(
-            pair: int = Query(1),
-            day:  int = Query(1),
-            date: str = Query(...),
-            type: int = Query(0, ge=0, le=2),
-            var:  int = Query(0, ge=0, le=4),
-        ):
-            # cached_values проверяет кэш, при miss вызывает compute_fn и сохраняет.
-            try:
-                return await cached_values(
-                    engine_vlad=svc.engine_vlad,
-                    service_url=svc.service_url,
-                    pair=pair, day=day, date=date,
-                    extra_params={"type": type, "var": var},
-                    compute_fn=lambda: svc.calculate(
-                        pair, day, date,
-                        calc_type=type, calc_var=var),
-                    node=svc.node_name,
-                )
-            except Exception as e:
-                send_error_trace(e, node=svc.node_name, script="get_values")
-                return err_response(str(e))
-
-        @app.post("/patch")
-        async def patch():
-            # Если version=0 → ставим 1. Если запись не найдена → 500.
-            async with svc.engine_vlad.begin() as conn:
+    @app.get("/")
+    async def ep_root():
+        version = 0
+        try:
+            async with s.engine_vlad.connect() as conn:
                 res = await conn.execute(text(
-                    "SELECT version FROM version_microservice "
-                    "WHERE microservice_id = :id"),
-                    {"id": svc.service_id})
+                    "SELECT version FROM version_microservice WHERE microservice_id=:id"),
+                    {"id": s.SERVICE_ID})
+                row = res.fetchone()
+                if row:
+                    version = row[0]
+        except Exception:
+            pass
+        return {
+            "status": "ok", "version": f"1.{version}.0",
+            "mode": MODE, "name": s.NODE_NAME, "text": s.SERVICE_TEXT,
+            "metadata": {
+                "weight_codes":   len(s.weight_codes),
+                "ctx_index":      len(s.ctx_index),
+                "events":         len(s.events_by_dt),
+                "events_max_dt":  s.events_max_dt.isoformat() if s.events_max_dt else None,
+                "dataset":        len(s.dataset),
+                "var_range":      s.VAR_RANGE,
+                "model_has_ctx":  s.model_needs_ctx,
+                "np_built":       s.np_built,
+                "last_reload":    s.last_reload.isoformat() if s.last_reload else None,
+                "last_rebuild":   s.last_rebuild.isoformat() if s.last_rebuild else None,
+                "rebuild_auto":   s.REBUILD_INTERVAL > 0 and (
+                    s.rebuild_index_fn is not None or s.REBUILD_SOURCE_QUERY is not None),
+                "rebuild_interval_sec": s.REBUILD_INTERVAL,
+            },
+        }
+
+    @app.get("/weights")
+    async def ep_weights():
+        return ok_response({"codes": s.weight_codes, "var_range": s.VAR_RANGE})
+
+    def _build_narrative(payload: dict, date_str: str, day_flag: int, calc_type: int) -> list[str]:
+        """
+        Строит текстовый нарратив из payload {weight_code: float} без участия model.py.
+        Работает аналогично сервису 33: декодирует weight_code → shift + event_key,
+        обогащает из ctx_index, строит читаемые строки.
+
+        Формат weight_code ожидается как: PREFIX{ctx_id}_{mode}_{shift}
+        где shift — целое число (может быть отрицательным: NW5_0_-3).
+        Если ctx_index пуст или weight_code не декодируется — возвращает краткий нарратив.
+        """
+        if not payload:
+            return ["Нет данных для текущей даты."]
+
+        target_date = _parse_date(date_str)
+        if not target_date:
+            return [f"Не удалось разобрать дату: {date_str!r}"]
+
+        du       = timedelta(days=1) if day_flag else timedelta(hours=1)
+        sw       = s.SHIFT_WINDOW
+        start_dt = target_date - du * sw
+        end_dt   = target_date
+
+        type_desc = {
+            0: "Type = 0: учитывается и сумма свечей (T1), и вероятность экстремума.",
+            1: "Type = 1: учитывается только сумма свечей (T1).",
+            2: "Type = 2: учитывается только вероятность экстремума.",
+        }.get(calc_type, f"Type = {calc_type}.")
+
+        # ── Декодирование weight_code → группы ───────────────────────────────
+        # Формат: <prefix><ctx_id>_<mode>_<shift>
+        # Prefix — любые буквы, ctx_id — цифры, mode — 0|1, shift — целое.
+        import re as _re
+        _wc_pat = _re.compile(r'^[A-Za-z]+(\d+)_(\d+)_(-?\d+)$')
+
+        # Группа: (ctx_id, shift) → {mode0: {wc: val}, mode1: {wc: val}}
+        groups: dict[tuple, dict] = {}
+        unmatched: dict[str, float] = {}
+
+        for wc, val in payload.items():
+            m = _wc_pat.match(wc)
+            if not m:
+                unmatched[wc] = val
+                continue
+            ctx_id = int(m.group(1))
+            mode   = int(m.group(2))
+            shift  = int(m.group(3))
+            gk = (ctx_id, shift)
+            if gk not in groups:
+                # Ищем label: сначала через LABEL_FN, потом ctx_index
+                label = None
+                if s.LABEL_FN:
+                    try:
+                        label = s.LABEL_FN((ctx_id,))
+                    except Exception:
+                        pass
+                if not label:
+                    # Ищем в ctx_index по любому ключу содержащему ctx_id
+                    for key, info in s.ctx_index.items():
+                        if key[0] == ctx_id:
+                            label = (info.get("person_token") or
+                                     info.get("ctx_key") or
+                                     info.get("event_name") or
+                                     info.get("name"))
+                            if label:
+                                break
+                if not label:
+                    label = f"ctx_id={ctx_id}"
+
+                # occurrence_count из ctx_index
+                occ = 0
+                for key, info in s.ctx_index.items():
+                    if key[0] == ctx_id:
+                        occ = info.get("occurrence_count", 0)
+                        break
+
+                groups[gk] = {
+                    "ctx_id": ctx_id,
+                    "shift":  shift,
+                    "label":  label,
+                    "occ":    occ,
+                    "t1":  {},   # mode=0
+                    "ext": {},   # mode=1
+                }
+            g = groups[gk]
+            if mode == 0:
+                g["t1"][wc]  = val
+            elif mode == 1:
+                g["ext"][wc] = val
+
+        if not groups and not unmatched:
+            return ["Нет событий для декодирования."]
+
+        # Сортировка: по убыванию shift (ближе к target — первее)
+        sorted_groups = sorted(groups.values(), key=lambda g: (-g["shift"], g["ctx_id"]))
+        n = len(sorted_groups)
+        evt_word = _pluralize_n(n, ("событие", "события", "событий"))
+
+        lines: list[str] = []
+
+        # Заголовок
+        lines.append(
+            f"Окно поиска: {start_dt.strftime('%Y-%m-%d %H:%M')} — "
+            f"{end_dt.strftime('%Y-%m-%d %H:%M')}. "
+            f"Найдено {n} {evt_word}."
+        )
+        lines.append("")
+
+        # Нумерованный список
+        for i, g in enumerate(sorted_groups, 1):
+            tl = _shift_label(g["shift"], day_flag)
+            lines.append(f'{i}. "{g["label"]}" — {tl}')
+
+        lines.append("")
+        lines.append(type_desc)
+        lines.append("")
+
+        # Детали по каждому событию
+        for i, g in enumerate(sorted_groups, 1):
+            tl      = _shift_label(g["shift"], day_flag)
+            t1_sum  = round(sum(g["t1"].values()),  6) if g["t1"]  else None
+            ext_sum = round(sum(g["ext"].values()), 6) if g["ext"] else None
+
+            lines.append(f'Событие {i}. "{g["label"]}", {tl}.')
+
+            hist_parts = [f"В истории это событие повторялось {g['occ']} раз(а)"]
+            if t1_sum is not None and calc_type in (0, 1):
+                hist_parts.append(f"сумма свечей (T1) = {t1_sum}")
+            if ext_sum is not None and calc_type in (0, 2):
+                hist_parts.append(f"вероятность экстремума = {ext_sum}")
+            lines.append(", ".join(hist_parts) + ".")
+
+            codes = [f"{wc}: {v}" for wc, v in {**g["t1"], **g["ext"]}.items()]
+            if codes:
+                lines.append("Веса: " + ", ".join(codes) + ".")
+            lines.append("")
+
+        # Нераспознанные коды (если есть)
+        if unmatched:
+            lines.append(f"Прочие веса ({len(unmatched)}): " +
+                         ", ".join(f"{k}: {v}" for k, v in list(unmatched.items())[:10]) +
+                         ("..." if len(unmatched) > 10 else "") + ".")
+
+        return lines
+
+    @app.get("/values")
+    async def ep_values(
+        pair:  int = Query(1), day: int = Query(1),
+        date:  str = Query(...),
+        type:  int = Query(0, ge=0, le=2),
+        var:   int = Query(0),
+        param: str = Query(""),
+    ):
+        """
+        Расчёт весов модели с текстовым нарративом (аналог сервиса 33).
+        Нарратив строится всегда — из payload, без флага detail.
+        Читает из кэша если есть, иначе считает live.
+        """
+        if s.VAR_RANGE and var not in s.VAR_RANGE:
+            return err_response(f"var={var} не входит в VAR_RANGE={s.VAR_RANGE}")
+        try:
+            resp = await cached_values(
+                engine_vlad=s.engine_vlad, service_url=s.service_url,
+                pair=pair, day=day, date=date,
+                extra_params={"type": type, "var": var, "param": param},
+                compute_fn=lambda: _call_model(pair, day, date,
+                                               calc_type=type, calc_var=var, param=param),
+                node=s.NODE_NAME,
+            )
+            # Строим нарратив из payload — всегда, как в сервисе 33
+            payload = resp.get("payLoad") or {}
+            day_flag = 1 if day == 1 else 0
+            resp["details"] = _build_narrative(payload, date, day_flag, type)
+            return resp
+        except Exception as e:
+            send_error_trace(e, node=s.NODE_NAME, script="get_values")
+            return err_response(str(e))
+
+    @app.post("/compute_batch")
+    async def ep_compute_batch(
+        dates: list[str],
+        pair: int = Query(1), day: int = Query(1),
+        type: int = Query(0), var: int = Query(0), param: str = Query(""),
+    ):
+        result = {}
+        for date_str in dates:
+            try:
+                r = await _call_model(pair, day, date_str,
+                                      calc_type=type, calc_var=var, param=param)
+                result[date_str] = r or {}
+            except Exception:
+                result[date_str] = {}
+        return result
+
+    @app.get("/fill_cache")
+    async def ep_fill_cache(
+        pairs:      str = Query("1,3,4"),
+        days:       str = Query("0,1"),
+        date_from:  str = Query(""),
+        date_to:    str = Query(""),
+        batch_size: int = Query(300),
+    ):
+        """
+        Заполняет кэш для всех type (0, 1, 2) × всех var из VAR_RANGE.
+        Уже посчитанные (pair, day, date, type, var) пропускаются (INSERT IGNORE).
+        После завершения автоматически запускает бэктест и summary.
+        """
+        if s.fill_task and not s.fill_task.done():
+            return err_response("Fill already running.")
+        try:
+            pl = [int(p.strip()) for p in pairs.split(",") if p.strip()]
+            dl = [int(d.strip()) for d in days.split(",")  if d.strip()]
+        except ValueError:
+            return err_response("pairs и days — числа через запятую")
+        if not all(p in {1, 3, 4} for p in pl):
+            return err_response("Допустимые pair: 1 (EUR), 3 (BTC), 4 (ETH)")
+        if not all(d in {0, 1} for d in dl):
+            return err_response("Допустимые day: 0 (hourly), 1 (daily)")
+        all_types = [0, 1, 2]
+        effective_date_from = date_from if date_from.strip() else s.CACHE_DATE_FROM
+        s.fill_task = asyncio.create_task(
+            _fill_worker(pl, dl, effective_date_from, date_to, all_types, batch_size))
+        return ok_response({
+            "started":    True,
+            "pairs":      pl,
+            "days":       dl,
+            "types":      all_types,
+            "var_range":  s.VAR_RANGE,
+            "batch_size": batch_size,
+            "date_from":  effective_date_from,
+            "date_to":    date_to or "now",
+            "slots_total": len(pl) * len(dl) * len(all_types) * len(s.VAR_RANGE),
+        })
+
+    @app.get("/fill_status")
+    async def ep_fill_status():
+        return ok_response(s.fill_status)
+
+    @app.get("/fill_stop")
+    async def ep_fill_stop():
+        s.fill_cancel.set()
+        return ok_response({"stopped": True})
+
+    @app.get("/reload")
+    async def ep_reload():
+        try:
+            await _preload()
+            return ok_response({"reloaded_at": s.last_reload.isoformat()})
+        except Exception as e:
+            send_error_trace(e, s.NODE_NAME, "reload")
+            return err_response(str(e))
+
+    @app.get("/rebuild_index")
+    async def ep_rebuild_index():
+        if s.rebuild_index_fn is None and s.REBUILD_SOURCE_QUERY is None:
+            return err_response(
+                "Rebuild не настроен. Добавь rebuild_index() в model.py "
+                "или задай REBUILD_SOURCE_QUERY.")
+        result = await _do_rebuild()
+        if "error" in result:
+            return err_response(result["error"])
+        return ok_response(result)
+
+    @app.get("/patch")
+    async def ep_patch():
+        try:
+            async with s.engine_vlad.begin() as conn:
+                res = await conn.execute(text(
+                    "SELECT version FROM version_microservice WHERE microservice_id=:id"),
+                    {"id": s.SERVICE_ID})
                 row = res.fetchone()
                 if not row:
-                    raise HTTPException(status_code=500,
-                        detail=f"SID {svc.service_id} not found")
+                    return err_response(f"SID {s.SERVICE_ID} not found")
                 old = row[0]
-                new = max(old, 1)
-                if new != old:
-                    await conn.execute(text(
-                        "UPDATE version_microservice "
-                        "SET version = :v "
-                        "WHERE microservice_id = :id"),
-                        {"v": new, "id": svc.service_id})
+                new = old + 1
+                await conn.execute(text(
+                    "UPDATE version_microservice SET version=:v WHERE microservice_id=:id"),
+                    {"v": new, "id": s.SERVICE_ID})
             return {"status": "ok", "from": old, "to": new}
+        except Exception as e:
+            return err_response(str(e))
 
-        return app
-
-    # ──────────────────────────────────────────────────────────────────
-    # RUN — запуск сервера
-    # ──────────────────────────────────────────────────────────────────
-
-    def run(self):
+    @app.get("/backtest")
+    async def ep_backtest(
+        pairs:     str = Query("1,3,4"),
+        days:      str = Query("0,1"),
+        tier:      int = Query(0, ge=0, le=1),
+        date_from: str = Query(""),
+        date_to:   str = Query(""),
+        type:      int = Query(0),
+        var:       int = Query(-1),
+    ):
         """
-        Запускает uvicorn. Число воркеров читается из БД через resolve_workers(),
-        при ошибке — fallback на 1.
+        Запускает бэктест и сохраняет результаты в vlad_backtest_results + vlad_backtest_summary.
+
+        pairs     — инструменты через запятую: "1,3,4" (1=EUR, 3=BTC, 4=ETH)
+        days      — таймфреймы через запятую: "0,1" (0=hourly, 1=daily)
+        tier      — 0 или 1
+        date_from — начало периода (дефолт = CACHE_DATE_FROM)
+        date_to   — конец периода (дефолт = сейчас)
+        type      — тип расчёта (0=оба, 1=T1, 2=Extremum)
+        var       — конкретная вариация или -1 для всех из VAR_RANGE
         """
-        import uvicorn
-        import asyncio as _asyncio
         try:
-            _workers = _asyncio.run(
-                resolve_workers(self.engine_super, self.service_id, default=1))
-        except Exception:
-            _workers = 1
-        log(f"Starting with {_workers} worker(s) in {MODE} mode",
-            self.node_name, force=True)
-        uvicorn.run("server:app", host="0.0.0.0", port=self.port,
-                    reload=False, workers=_workers)
+            pl = [int(p.strip()) for p in pairs.split(",") if p.strip()]
+            dl = [int(d.strip()) for d in days.split(",")  if d.strip()]
+        except ValueError:
+            return err_response("pairs и days — числа через запятую")
+        if not pl or not dl:
+            return err_response("pairs и days не могут быть пустыми")
+
+        df = _parse_date(date_from) if date_from.strip() else _parse_date(s.CACHE_DATE_FROM)
+        dt = _parse_date(date_to)   if date_to.strip()   else datetime.now()
+        if df is None or dt is None:
+            return err_response("Invalid date format")
+
+        vars_to_run = s.VAR_RANGE if var == -1 else [var]
+        all_results = {}
+
+        for bt_pair in pl:
+            for bt_day in dl:
+                key = f"pair={bt_pair} day={'d' if bt_day else 'h'}"
+                all_results[key] = {}
+                for v in vars_to_run:
+                    try:
+                        all_results[key][f"var={v}"] = await _backtest(
+                            bt_pair, bt_day, tier, {"type": type, "var": v}, df, dt)
+                    except Exception as e:
+                        all_results[key][f"var={v}"] = {"error": str(e)}
+                try:
+                    await _upsert_summary(bt_pair, bt_day, tier, df, dt)
+                except Exception as e:
+                    log(f"  ⚠️ summary pair={bt_pair} day={bt_day}: {e}",
+                        s.NODE_NAME, level="warning")
+
+        return ok_response({
+            "pairs":     pl,
+            "days":      dl,
+            "tier":      tier,
+            "date_from": df.isoformat(),
+            "date_to":   dt.isoformat(),
+            "vars":      vars_to_run,
+            "results":   all_results,
+        })
+
+    @app.get("/summary")
+    async def ep_summary(pair: int = Query(-1), day: int = Query(-1),
+                         tier: int = Query(-1)):
+        conds  = ["service_url=:url"]
+        params = {"url": s.service_url}
+        if pair >= 0: conds.append("pair=:pair");    params["pair"] = pair
+        if day  >= 0: conds.append("day_flag=:day"); params["day"]  = day
+        if tier >= 0: conds.append("tier=:tier");    params["tier"] = tier
+        try:
+            async with s.engine_vlad.connect() as conn:
+                res = await conn.execute(text(
+                    f"SELECT model_id,pair,day_flag,tier,date_from,date_to,"
+                    f"total_combinations,best_score,avg_score,"
+                    f"best_accuracy,avg_accuracy,best_params_json,computed_at "
+                    f"FROM vlad_backtest_summary WHERE {' AND '.join(conds)} "
+                    f"ORDER BY computed_at DESC"), params)
+                rows = []
+                for r in res.mappings().all():
+                    rows.append({
+                        "model_id":   r["model_id"], "pair": r["pair"],
+                        "day_flag":   r["day_flag"], "tier": r["tier"],
+                        "date_from":  r["date_from"].isoformat() if r["date_from"] else None,
+                        "date_to":    r["date_to"].isoformat()   if r["date_to"]   else None,
+                        "total_combinations": r["total_combinations"],
+                        "best_score":    float(r["best_score"]),
+                        "avg_score":     float(r["avg_score"]),
+                        "best_accuracy": float(r["best_accuracy"]),
+                        "avg_accuracy":  float(r["avg_accuracy"]),
+                        "best_params":   _json.loads(r["best_params_json"])
+                                         if r["best_params_json"] else None,
+                        "computed_at":   r["computed_at"].isoformat()
+                                         if r["computed_at"] else None,
+                    })
+            return ok_response(rows)
+        except Exception as e:
+            return err_response(str(e))
+
+    @app.get("/pretest")
+    async def ep_pretest():
+        log("🔍 PRETEST START", s.NODE_NAME, force=True)
+        model_path = os.path.join(os.path.dirname(os.path.abspath(
+            sys.modules[model_module.__name__].__file__)), "model.py")
+        try:
+            import ast
+            with open(model_path, "r", encoding="utf-8") as f:
+                ast.parse(f.read())
+        except SyntaxError as e:
+            return {"status": "error",
+                    "error": f"[Тест 1 — Синтаксис] строка {e.lineno}: {e.msg}"}
+        except OSError:
+            pass
+        log("  ✅ Тест 1: синтаксис model.py OK", s.NODE_NAME, force=True)
+
+        rates_indices: dict[str, list] = {}
+        for table in _RATES_TABLES:
+            rows = s.global_rates.get(table, [])
+            if rows:
+                rates_indices[table] = [r["date"] for r in rows]
+
+        for pair_id, tfs in _INSTRUMENTS.items():
+            rows = s.global_rates.get(tfs["hour"], [])
+            if not rows:
+                continue
+            mid = rows[len(rows) // 2]
+            td  = mid["date"]
+            dates_idx = rates_indices.get(tfs["hour"], [])
+            if dates_idx:
+                idx = bisect.bisect_right(dates_idx, td)
+                rf  = rows[:idx]
+            else:
+                rf  = []
+            ds  = _filter_dataset_lte(td, s)
+            try:
+                if s.model_needs_ctx:
+                    ctx = _ModelContext(tfs["hour"], pair_id, 0, td, s)
+                    res = s.model_fn(rates=rf, dataset=ds, date=td,
+                                     type=0, var=s.VAR_RANGE[0], param="", ctx=ctx)
+                else:
+                    res = s.model_fn(rates=rf, dataset=ds, date=td,
+                                     type=0, var=s.VAR_RANGE[0], param="")
+            except Exception as e:
+                return {"status": "error",
+                        "error": f"[Тест 2 — Структура] model() exception: {e}"}
+            # Извлекаем detail перед валидацией структуры
+            res, _ = _extract_detail(res)
+            if res is None:
+                return {"status": "error",
+                        "error": "[Тест 2 — Структура] model() вернул None"}
+            if not isinstance(res, dict):
+                return {"status": "error",
+                        "error": f"[Тест 2 — Структура] ожидается dict, получен {type(res).__name__}"}
+            for k, v in res.items():
+                if not isinstance(k, str):
+                    return {"status": "error",
+                            "error": f"[Тест 2 — Структура] ключ {k!r} не str"}
+                if not isinstance(v, (int, float)) or v != v or abs(v) == float("inf"):
+                    return {"status": "error",
+                            "error": f"[Тест 2 — Структура] значение '{k}' не float"}
+            break
+        log("  ✅ Тест 2: структура model() OK", s.NODE_NAME, force=True)
+
+        failures = []
+        test3_pairs = []
+        for pair_id, tfs in _INSTRUMENTS.items():
+            for tf_name, table in tfs.items():
+                rows = s.global_rates.get(table, [])
+                if rows:
+                    test3_pairs.append((pair_id, tf_name, table))
+        test3_total = len(test3_pairs)
+        test3_count = 0
+
+        # Пороги покрытия: дневные данные имеют меньше событийных совпадений
+        # по природе (меньше свечей пересекается с hourly-событиями датасета).
+        # hour ≥ 90%, day ≥ 70% — оба порога считаются нормой.
+        _COVERAGE_THRESHOLD = {"hour": 0.90, "day": 0.70}
+
+        # Диапазон событий для корректной выборки дат в Тесте 3.
+        # Выборка должна попадать ВНУТРЬ диапазона событий — иначе модель
+        # всегда вернёт {} (нет событий в окне поиска → ложный провал).
+        # ── Тест 3: стратегия выборки ────────────────────────────────────────────
+        #
+        # Для EVENT-SPARSE моделей (news, calendar) большинство часов не содержат
+        # событий. Случайные свечи дадут model()={} не из-за бага, а по природе
+        # данных. Поэтому выборка строится из дат, ГАРАНТИРОВАННО близких к
+        # событиям: target_date = event_date + delta_unit (следующая свеча после
+        # события). Если sorted_dates пуст (модель без событий) — берём случайные
+        # свечи из второй половины истории, как и раньше.
+        #
+        # Порог 90% означает: из 20 таких "near-event" дат 90% должны вернуть
+        # непустой dict. Это проверяет работу pipeline (event_history, t_dates,
+        # compute_t1/extremum), а не плотность событий.
+
+        _COVERAGE_THRESHOLD = {"hour": 0.90, "day": 0.70}
+
+        # Строим rate_lookup: дата → индекс в rows (для каждой таблицы)
+        # Нужен чтобы быстро найти свечу, следующую после события.
+        rate_date_sets: dict[str, set] = {}
+        rate_date_lists: dict[str, list] = {}
+        for _tbl in _RATES_TABLES:
+            _rr = s.global_rates.get(_tbl, [])
+            rate_date_lists[_tbl] = [r["date"] for r in _rr]
+            rate_date_sets[_tbl] = set(rate_date_lists[_tbl])
+
+        for pair_id, tf_name, table in test3_pairs:
+            test3_count += 1
+            rows = s.global_rates.get(table, [])
+            if not rows:
+                failures.append(f"pair{pair_id}/{tf_name}: нет данных")
+                continue
+            day_flag = 1 if tf_name == "day" else 0
+            threshold = _COVERAGE_THRESHOLD.get(tf_name, 0.90)
+            du_test   = timedelta(days=1) if day_flag else timedelta(hours=1)
+
+            if s.sorted_dates:
+                # Event-aware выборка: берём даты сразу ПОСЛЕ событий.
+                # target = event_date + du (следующая свеча после события).
+                # Это гарантирует, что find_events найдёт хотя бы одно событие
+                # в окне shift=-1. Берём равномерную выборку из sorted_dates.
+                n_evt = len(s.sorted_dates)
+                step_evt = max(1, n_evt // 30)  # до 30 кандидатов
+                candidate_events = s.sorted_dates[::step_evt]
+                rdates = rate_date_lists[table]
+                sample_dates = []
+                for ev_dt in candidate_events:
+                    # Ищем первую свечу >= ev_dt + du в таблице котировок
+                    target_candidate = ev_dt + du_test
+                    idx_r = bisect.bisect_left(rdates, target_candidate)
+                    if idx_r < len(rdates):
+                        candidate = rdates[idx_r]
+                        # Убеждаемся что событие попадёт в окно shift≤-1
+                        if candidate > ev_dt and candidate not in sample_dates:
+                            sample_dates.append(candidate)
+                    if len(sample_dates) >= 20:
+                        break
+                # Если event-aware выборка слишком мала — добавить из второй половины
+                if len(sample_dates) < 5:
+                    fallback_pool = rows[max(len(rows) // 2, 1):]
+                    step_f = max(1, len(fallback_pool) // 20)
+                    for r in fallback_pool[::step_f]:
+                        if r["date"] not in sample_dates:
+                            sample_dates.append(r["date"])
+                        if len(sample_dates) >= 20:
+                            break
+            else:
+                # Модель без событий (чисто rate-based): вторая половина истории
+                fallback_pool = rows[max(len(rows) // 2, 1):]
+                step_f = max(1, len(fallback_pool) // 20)
+                sample_dates = [fallback_pool[i * step_f]["date"]
+                                for i in range(min(20, len(fallback_pool) // step_f))]
+
+            sample_dates = sample_dates[:20]
+
+            log(f"  [Тест 3 — {test3_count}/{test3_total}] pair{pair_id}/{tf_name}: "
+                f"проверка {len(sample_dates)} дат...", s.NODE_NAME, force=True)
+
+            dates_idx = rates_indices.get(table, [])
+            non_empty = 0
+            for td_num, td in enumerate(sample_dates):
+                if dates_idx:
+                    idx = bisect.bisect_right(dates_idx, td)
+                    rf  = rows[:idx]
+                else:
+                    rf = []
+                ds = _filter_dataset_lte(td, s)
+                try:
+                    if s.model_needs_ctx:
+                        ctx = _ModelContext(table, pair_id, day_flag, td, s)
+                        r = s.model_fn(rates=rf, dataset=ds, date=td,
+                                       type=0, var=s.VAR_RANGE[0], param="", ctx=ctx)
+                    else:
+                        r = s.model_fn(rates=rf, dataset=ds, date=td,
+                                       type=0, var=s.VAR_RANGE[0], param="")
+                    r, _ = _extract_detail(r)
+                    if r:
+                        non_empty += 1
+                except Exception as e:
+                    log(f"    ⚠️ date {td}: {e}", s.NODE_NAME, level="warning")
+                if (td_num + 1) % max(1, len(sample_dates) // 3) == 0 or td_num + 1 == len(sample_dates):
+                    log(f"    ⏳ {td_num + 1}/{len(sample_dates)} ...", s.NODE_NAME, force=True)
+
+            rate = non_empty / len(sample_dates) if sample_dates else 0
+            if rate < threshold:
+                failures.append(
+                    f"pair{pair_id}/{tf_name}: "
+                    f"{non_empty}/{len(sample_dates)} ({rate:.0%}) < {threshold:.0%}")
+            log(f"  ✅ Тест 3 — pair{pair_id}/{tf_name}: {non_empty}/{len(sample_dates)}"
+                f" (порог {threshold:.0%}) OK", s.NODE_NAME, force=True)
+
+        if failures:
+            log(f"❌ PRETEST FAILED: {failures}", s.NODE_NAME, force=True)
+            return {"status": "error",
+                    "error": f"[Тест 3 — Покрытие] {' | '.join(failures)}"}
+
+        log("✅ PRETEST PASSED", s.NODE_NAME, force=True)
+        return {"status": "ok", "var_range": s.VAR_RANGE,
+                "model_has_ctx": s.model_needs_ctx, "np_built": s.np_built}
+
+    @app.get("/universe_sync")
+    async def ep_universe_sync():
+        try:
+            async with s.engine_vlad.begin() as conn:
+                await conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS `vlad_weights_universe` (
+                        `id`          INT         NOT NULL AUTO_INCREMENT,
+                        `service_id`  INT         NOT NULL,
+                        `weight_code` VARCHAR(64) NOT NULL,
+                        `added_at`    TIMESTAMP   DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (`id`),
+                        UNIQUE KEY `uk_svc_code` (`service_id`, `weight_code`),
+                        INDEX idx_service_id (`service_id`)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """))
+            async with s.engine_vlad.connect() as conn:
+                res = await conn.execute(text("""
+                    SELECT DISTINCT weight_code FROM vlad_values_cache
+                    WHERE service_url=:url
+                      AND weight_code IS NOT NULL AND weight_code != ''
+                """), {"url": s.service_url})
+                cache_codes: set[str] = {row[0] for row in res.fetchall()}
+            if not cache_codes:
+                return ok_response({
+                    "total_in_cache": 0, "already_in_universe": 0, "added": 0,
+                    "note": "Кеш пуст. Сначала /fill_cache, потом /universe_sync.",
+                })
+            async with s.engine_vlad.connect() as conn:
+                res = await conn.execute(text("""
+                    SELECT weight_code FROM vlad_weights_universe
+                    WHERE service_id=:sid
+                """), {"sid": s.SERVICE_ID})
+                existing: set[str] = {row[0] for row in res.fetchall()}
+            new_codes = cache_codes - existing
+            if new_codes:
+                async with s.engine_vlad.begin() as conn:
+                    for code in new_codes:
+                        await conn.execute(text("""
+                            INSERT IGNORE INTO vlad_weights_universe
+                                (service_id, weight_code)
+                            VALUES (:sid, :code)
+                        """), {"sid": s.SERVICE_ID, "code": code})
+            return ok_response({
+                "total_in_cache":      len(cache_codes),
+                "already_in_universe": len(existing & cache_codes),
+                "added":               len(new_codes),
+            })
+        except Exception as e:
+            send_error_trace(e, s.NODE_NAME, "universe_sync")
+            return err_response(str(e))
+
+    @app.get("/posttest")
+    async def ep_posttest(
+        pairs:     str = Query("1,3,4"),
+        days:      str = Query("0,1"),
+        date_from: str = Query(""),
+        date_to:   str = Query(""),
+    ):
+        """
+        Пост-тест модели — запускается после заполнения кэша, перед деплоем.
+        Возвращает развёрнутую статистику (не бинарный статус).
+
+        Оптимизации:
+        - Тест 1: SQL-агрегат JSON_LENGTH — без Python-парсинга всего кэша.
+        - Тест 2: читает result_json потоком, суммирует знаки без хранения dict.
+        - Тест 3: живой вызов model() с текущей датой.
+        - Тесты 4,5: читают кэш ОДИН раз как {date: signal_sum}, CPU в to_thread.
+        - Все pair×day запускаются параллельно через asyncio.gather.
+        - date_from/date_to ограничивают период (дефолт = CACHE_DATE_FROM..now).
+
+        Формат ответа:
+          { "1": { "hour": { "data": {...}, "values": {...}, "sync": {...},
+                             "hole": int, "history": {...} }, "day": {...} },
+            "3": {...}, "4": {...} }
+        """
+        try:
+            pl = [int(p.strip()) for p in pairs.split(",") if p.strip()]
+            dl = [int(d.strip()) for d in days.split(",")  if d.strip()]
+        except ValueError:
+            return err_response("pairs и days — числа через запятую")
+
+        from datetime import datetime as _dt
+
+        dt_from = _parse_date(date_from) if date_from.strip() else _parse_date(s.CACHE_DATE_FROM)
+        dt_to   = _parse_date(date_to)   if date_to.strip()   else _dt.now()
+
+        async def _process_slot(pair_id: int, day_flag: int) -> dict:
+            tf_name = "day" if day_flag else "hour"
+            table   = _rates_table(pair_id, day_flag)
+            all_rows = s.global_rates.get(table, [])
+            rows = [r for r in all_rows
+                    if (dt_from is None or r["date"] >= dt_from)
+                    and (dt_to   is None or r["date"] <= dt_to)]
+
+            url_p = {"url": s.service_url, "pair": pair_id, "day": day_flag,
+                     "df": dt_from, "dt": dt_to}
+
+            # ── Тест 1: SQL-агрегат по количеству ключей ─────────────────────
+            data_stats = {"min": 0.0, "max": 0.0, "avg": 0.0}
+            try:
+                async with s.engine_vlad.connect() as conn:
+                    res = await conn.execute(text("""
+                        SELECT MIN(JSON_LENGTH(result_json)),
+                               MAX(JSON_LENGTH(result_json)),
+                               AVG(JSON_LENGTH(result_json))
+                        FROM vlad_values_cache
+                        WHERE service_url=:url AND pair=:pair AND day_flag=:day
+                          AND result_json != '{}'
+                          AND (:df IS NULL OR date_val >= :df)
+                          AND (:dt IS NULL OR date_val <= :dt)
+                    """), url_p)
+                    row = res.fetchone()
+                    if row and row[0] is not None:
+                        data_stats = {"min": float(row[0]), "max": float(row[1]),
+                                      "avg": round(float(row[2]), 4)}
+            except Exception as e:
+                log(f"  ⚠️ posttest t1 {pair_id}/{tf_name}: {e}", s.NODE_NAME, level="warning")
+
+            # ── Тест 2: подсчёт знаков потоком (без хранения всех dict) ──────
+            values_stats = {"plus": 0, "minus": 0}
+            try:
+                async with s.engine_vlad.connect() as conn:
+                    res = await conn.execute(text("""
+                        SELECT result_json FROM vlad_values_cache
+                        WHERE service_url=:url AND pair=:pair AND day_flag=:day
+                          AND result_json != '{}'
+                          AND (:df IS NULL OR date_val >= :df)
+                          AND (:dt IS NULL OR date_val <= :dt)
+                    """), url_p)
+                    plus_cnt = minus_cnt = 0
+                    for (rj_str,) in res:
+                        try:
+                            for v in _json.loads(rj_str).values():
+                                if v > 0:   plus_cnt  += 1
+                                elif v < 0: minus_cnt += 1
+                        except Exception:
+                            pass
+                    values_stats = {"plus": plus_cnt, "minus": minus_cnt}
+            except Exception as e:
+                log(f"  ⚠️ posttest t2 {pair_id}/{tf_name}: {e}", s.NODE_NAME, level="warning")
+
+            # ── Тест 3: живой вызов с актуальной датой ────────────────────────
+            now_str = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
+            try:
+                sync_result = await _call_model(pair_id, day_flag, now_str)
+                sync_out = sync_result or {}
+            except Exception as e:
+                sync_out = {"error": str(e)}
+
+            # ── Читаем кэш один раз: {date: signal_sum} ──────────────────────
+            # Только суммарный сигнал — в 10-100x меньше памяти чем полный dict.
+            # Используется для тестов 4 и 5.
+            cache_signals: dict = {}
+            try:
+                async with s.engine_vlad.connect() as conn:
+                    res = await conn.execute(text("""
+                        SELECT date_val, result_json FROM vlad_values_cache
+                        WHERE service_url=:url AND pair=:pair AND day_flag=:day
+                          AND (:df IS NULL OR date_val >= :df)
+                          AND (:dt IS NULL OR date_val <= :dt)
+                        ORDER BY date_val
+                    """), url_p)
+                    for (dt_val, rj_str) in res:
+                        try:
+                            rj = _json.loads(rj_str)
+                            cache_signals[dt_val] = (bool(rj), sum(rj.values()) if rj else 0.0)
+                        except Exception:
+                            cache_signals[dt_val] = (False, 0.0)
+            except Exception as e:
+                log(f"  ⚠️ posttest cache {pair_id}/{tf_name}: {e}", s.NODE_NAME, level="warning")
+
+            def _compute_hole_and_sim():
+                # ── Тест 4: максимальная проплешина ──────────────────────────
+                non_empty = np.array(
+                    [cache_signals.get(r["date"], (False, 0.0))[0] for r in rows],
+                    dtype=bool,
+                )
+                if len(non_empty) == 0 or np.all(non_empty):
+                    hole = 0
+                elif not np.any(non_empty):
+                    hole = len(rows)
+                else:
+                    padded = np.concatenate(([False], ~non_empty, [False]))
+                    diffs  = np.diff(padded.astype(np.int8))
+                    runs   = np.where(diffs == -1)[0] - np.where(diffs == 1)[0]
+                    hole   = int(np.max(runs)) if len(runs) > 0 else 0
+
+                # ── Тест 5: симуляция торговли ────────────────────────────────
+                _, mod, lot_div = _PAIR_CFG.get(pair_id, (0.0002, 100_000.0, 50_000.0))
+                equity = 10_000.0
+                total_profit = total_dropdown = 0.0
+                wins = trades = 0
+                position = None
+
+                for i, r in enumerate(rows):
+                    _, signal = cache_signals.get(r["date"], (False, 0.0))
+                    if i + 1 >= len(rows):
+                        continue
+                    op = rows[i + 1]["open"]
+                    if not op:
+                        continue
+                    if position is not None:
+                        direction, entry_price = position
+                        if (signal == 0.0
+                                or (signal > 0 and direction < 0)
+                                or (signal < 0 and direction > 0)):
+                            pnl    = equity * 0.10 * (op - entry_price) / entry_price * direction
+                            equity += pnl
+                            trades += 1
+                            if pnl >= 0: total_profit   += pnl;  wins += 1
+                            else:        total_dropdown += abs(pnl)
+                            position = None
+                    if signal != 0.0 and position is None:
+                        position = (1.0 if signal > 0 else -1.0, op)
+
+                if position is not None and rows:
+                    lp = rows[-1]["close"]
+                    if lp and entry_price:
+                        pnl    = equity * 0.10 * (lp - entry_price) / entry_price * direction
+                        equity += pnl
+                        trades += 1
+                        if pnl >= 0: total_profit   += pnl;  wins += 1
+                        else:        total_dropdown += abs(pnl)
+
+                cw = round(wins / trades, 4) if trades > 0 else 0.0
+                return hole, {
+                    "profit":   round(total_profit,   2),
+                    "dropdown": round(total_dropdown, 2),
+                    "cw":       cw,
+                    "result":   round(total_profit - total_dropdown, 2),
+                }
+
+            hole, history_stats = await asyncio.to_thread(_compute_hole_and_sim)
+
+            return {
+                "data":    data_stats,
+                "values":  values_stats,
+                "sync":    sync_out,
+                "hole":    hole,
+                "history": history_stats,
+            }
+
+        # ── Параллельный запуск всех pair×day ────────────────────────────────
+        slots   = [(p, d) for p in pl for d in dl]
+        tasks   = [asyncio.create_task(_process_slot(p, d)) for p, d in slots]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        output: dict = {}
+        for (pair_id, day_flag), result in zip(slots, results):
+            pair_str = str(pair_id)
+            tf_name  = "day" if day_flag else "hour"
+            output.setdefault(pair_str, {})
+            output[pair_str][tf_name] = (
+                {"error": str(result)} if isinstance(result, Exception) else result
+            )
+
+        return ok_response(output)
+
+
+    return app
