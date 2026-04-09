@@ -1,6 +1,6 @@
 """
 Описание: Данные о курсе акций и рыночной капитализации
-           для NVDA, AAPL, MSFT, AMZN, GOOGL из Finnhub API (можно увеличить количество компаний до 40-45)
+           для NVDA, AAPL, MSFT, AMZN, GOOGL из Finnhub API
 Запуск:   python finnhub.py <table_name> [host] [port] [user] [password] [database]
 Ограничение: 60 запросов/минуту
 Строка в .env FINNHUB_API_KEY=
@@ -25,6 +25,7 @@ _HANDLER   = os.getenv("HANDLER", "https://server.brain-project.online").rstrip(
 TRACE_URL  = f"{_HANDLER}/trace.php"
 NODE_NAME  = os.getenv("NODE_NAME", "finnhub")
 EMAIL      = os.getenv("ALERT_EMAIL", "samuray150305@gmail.com")
+TICKERS_TABLE_NAME = "sasha_add_tikers_for_finnhub"
 
 # ── 3. ТРАССИРОВКА ОШИБОК ─────────────────────────────────────────────────────
 def send_error_trace(exc: Exception, script_name: str = "finnhub.py"):
@@ -50,6 +51,10 @@ parser.add_argument("port",        nargs="?", default=os.getenv("DB_PORT", "3306
 parser.add_argument("user",        nargs="?", default=os.getenv("DB_USER"))
 parser.add_argument("password",    nargs="?", default=os.getenv("DB_PASSWORD"))
 parser.add_argument("database",    nargs="?", default=os.getenv("DB_NAME"))
+parser.add_argument(
+    "--tickers",
+    help="Новые тикеры через запятую (например: TSLA,META,AMD)"
+)
 args = parser.parse_args()
 
 if not all([args.host, args.user, args.password, args.database]):
@@ -71,18 +76,120 @@ DB_CONFIG = {
 # ── 5. ТАБЛИЦЫ (table_name → конфиг запроса) ─────────────────────────────────
 DATASETS = {
     "sasha_finnhub_stock_prices": {
-        "description": "Дневной курс акций NVDA, AAPL, MSFT, AMZN, GOOGL (поле value = текущая цена)",
+        "description": "Дневной курс акций (поле value = текущая цена)",
         "metric": "price",
         "symbols": ["NVDA", "AAPL", "MSFT", "AMZN", "GOOGL"]
     },
     "sasha_finnhub_stock_marketcaps": {
-        "description": "Рыночная капитализация компаний NVDA, AAPL, MSFT, AMZN, GOOGL (поле value = marketCapitalization)",
+        "description": "Рыночная капитализация компаний (поле value = marketCapitalization)",
         "metric": "marketcap",
         "symbols": ["NVDA", "AAPL", "MSFT", "AMZN", "GOOGL"]
     },
 }
 
-# ── 6. СОЗДАНИЕ ТАБЛИЦЫ ────────────────────────────────────────────────────────
+# ── 6. УПРАВЛЕНИЕ СПИСКОМ ТИКЕРОВ ──────────────────────────────────────────────
+def ensure_tickers_table():
+    """
+    Создаёт таблицу для хранения дополнительных тикеров, если её ещё нет.
+    """
+    conn = mysql.connector.connect(**DB_CONFIG)
+    c = conn.cursor()
+    c.execute(f"""
+        CREATE TABLE IF NOT EXISTS `{TICKERS_TABLE_NAME}` (
+            id          INT AUTO_INCREMENT PRIMARY KEY,
+            table_name  VARCHAR(128) NOT NULL,
+            symbol      VARCHAR(10)  NOT NULL,
+            created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE KEY uq_table_symbol (table_name, symbol),
+            INDEX idx_table_name (table_name)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        COMMENT='Дополнительные тикеры для Finnhub parser';
+    """)
+    conn.commit()
+    c.close()
+    conn.close()
+
+
+def load_saved_symbols_for_table(table_name: str) -> list:
+    """
+    Загружает сохранённые тикеры для конкретной целевой таблицы.
+    """
+    conn = mysql.connector.connect(**DB_CONFIG)
+    c = conn.cursor()
+    c.execute(
+        f"SELECT symbol FROM `{TICKERS_TABLE_NAME}` WHERE table_name = %s ORDER BY id ASC",
+        (table_name,)
+    )
+    rows = c.fetchall()
+    c.close()
+    conn.close()
+    return [row[0].strip().upper() for row in rows if row and row[0]]
+
+
+def apply_saved_symbols_for_table(table_name: str):
+    """
+    Применяет сохранённые в БД тикеры к DATASETS для указанной таблицы.
+    """
+    extra_symbols = load_saved_symbols_for_table(table_name)
+    merged = []
+    seen = set()
+    for symbol in DATASETS[table_name].get("symbols", []) + extra_symbols:
+        if not isinstance(symbol, str):
+            continue
+        symbol = symbol.strip().upper()
+        if symbol and symbol not in seen:
+            merged.append(symbol)
+            seen.add(symbol)
+    DATASETS[table_name]["symbols"] = merged
+
+
+def add_symbols_from_argument(table_name: str, tickers_arg: str, limit: int = 40):
+    """
+    Добавляет новые тикеры (через запятую) в symbols для указанной таблицы.
+    Если итоговое количество тикеров > limit, ничего не добавляет.
+    """
+    if not tickers_arg:
+        return
+
+    parsed = []
+    for token in tickers_arg.split(","):
+        symbol = token.strip().upper()
+        if symbol:
+            parsed.append(symbol)
+
+    if not parsed:
+        print("⚠️  Параметр --tickers передан, но тикеры не распознаны")
+        return
+
+    current_symbols = DATASETS[table_name].get("symbols", [])
+    existing = set(current_symbols)
+    new_unique = [s for s in parsed if s not in existing]
+
+    if not new_unique:
+        print("ℹ️  Все переданные тикеры уже есть в списке")
+        return
+
+    total_after_add = len(current_symbols) + len(new_unique)
+    if total_after_add > limit:
+        print(f"❌ Нельзя добавить тикеры: будет {total_after_add}, лимит {limit}")
+        print(f"   Текущее количество: {len(current_symbols)}")
+        return
+
+    conn = mysql.connector.connect(**DB_CONFIG)
+    c = conn.cursor()
+    c.executemany(
+        f"INSERT IGNORE INTO `{TICKERS_TABLE_NAME}` (table_name, symbol) VALUES (%s, %s)",
+        [(table_name, symbol) for symbol in new_unique]
+    )
+    conn.commit()
+    c.close()
+    conn.close()
+
+    DATASETS[table_name]["symbols"] = current_symbols + new_unique
+    print(f"✅ Добавлено тикеров: {', '.join(new_unique)}")
+    print(f"📌 Всего тикеров для {table_name}: {len(DATASETS[table_name]['symbols'])}")
+
+# ── 7. СОЗДАНИЕ ТАБЛИЦЫ ────────────────────────────────────────────────────────
 def ensure_table(table_name: str):
     conn = mysql.connector.connect(**DB_CONFIG)
     c = conn.cursor()
@@ -103,7 +210,7 @@ def ensure_table(table_name: str):
     c.close()
     conn.close()
 
-# ── 7. ПОСЛЕДНЯЯ ДАТА В БД (для логов) ───────────────────────────────────────
+# ── 8. ПОСЛЕДНЯЯ ДАТА В БД (для логов) ───────────────────────────────────────
 def get_latest_date(table_name: str):
     """
     Возвращает максимальную дату из таблицы или None если таблица пуста.
@@ -119,7 +226,7 @@ def get_latest_date(table_name: str):
     except:
         return None
 
-# ── 8. ПОЛУЧЕНИЕ ДАННЫХ ───────────────────────────────────────────────────────
+# ── 9. ПОЛУЧЕНИЕ ДАННЫХ ───────────────────────────────────────────────────────
 def fetch_data(config: dict) -> list:
     """
     Запрос к Finnhub. Возвращает список готовых кортежей:
@@ -167,7 +274,7 @@ def fetch_data(config: dict) -> list:
     print(f"📡 Finnhub → получено {len(rows)}/{len(symbols)} записей ({metric})")
     return rows
 
-# ── 9. ЗАПИСЬ В БД ────────────────────────────────────────────────────────────
+# ── 10. ЗАПИСЬ В БД ───────────────────────────────────────────────────────────
 def save_rows(table_name: str, rows: list):
     if not rows:
         print("⚠️  Нет данных для записи")
@@ -188,7 +295,7 @@ def save_rows(table_name: str, rows: list):
     c.close()
     conn.close()
 
-# ── 10. ОСНОВНАЯ ЛОГИКА ────────────────────────────────────────────────────────
+# ── 11. ОСНОВНАЯ ЛОГИКА ───────────────────────────────────────────────────────
 def process(table_name: str):
     config = DATASETS[table_name]
 
@@ -206,7 +313,7 @@ def process(table_name: str):
     print(f"🆕 Строк для записи: {len(rows)}")
     save_rows(table_name, rows)
 
-# ── 11. ТОЧКА ВХОДА ────────────────────────────────────────────────────────────
+# ── 12. ТОЧКА ВХОДА ───────────────────────────────────────────────────────────
 def main():
     if args.table_name not in DATASETS:
         print(f"❌ Неизвестная таблица '{args.table_name}'. Допустимые:")
@@ -219,6 +326,9 @@ def main():
     print(f"   Таблица: {args.table_name}")
     print(f"   API-ключ: {'✅ есть' if FINNHUB_API_KEY else '❌ нет'}")
 
+    ensure_tickers_table()
+    apply_saved_symbols_for_table(args.table_name)
+    add_symbols_from_argument(args.table_name, args.tickers)
     process(args.table_name)
 
     print("🏁 ГОТОВО")
