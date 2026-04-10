@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 import argparse
 import logging
 import os
@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
 from telethon import TelegramClient, events
+from telethon import connection
 
 # ==================== НАСТРОЙКИ ====================
 load_dotenv()
@@ -23,6 +24,18 @@ SESSIONS = [
     os.getenv("SESSION_FILE_2", "/brain/Brain-Services/parser/session_2"),
     os.getenv("SESSION_FILE_3", "/brain/Brain-Services/parser/session_3"),
 ]
+
+# ============= НАСТРОЙКИ MTProto ПРОКСИ =============
+MTPROTO_HOST   = "77.110.121.105"      # IP
+MTPROTO_PORT   = 8443                     # порт прокси
+MTPROTO_SECRET = "22029ceb10bf65d1e998a57a698afd1a"      # hex-строка
+# ========================================================================
+
+# Формируем прокси только если хост указан
+if MTPROTO_HOST and MTPROTO_HOST != "":
+    MTPROTO_PROXY = (MTPROTO_HOST, MTPROTO_PORT, MTPROTO_SECRET)
+else:
+    MTPROTO_PROXY = None
 
 # Квоты по активу: сколько запросов каждый аккаунт отправляет за цикл (24 запуска)
 QUOTAS = {
@@ -49,7 +62,7 @@ MAX_WAIT         = int(os.getenv("MAX_WAIT", 120))
 
 TRACE_URL   = os.getenv("TRACE_URL",   "https://server.brain-project.online/trace.php")
 NODE_NAME   = os.getenv("NODE_NAME",   "bybit_trend_bot")
-ALERT_EMAIL = os.getenv("ALERT_EMAIL", "your@email.com")
+ALERT_EMAIL = os.getenv("ALERT_EMAIL", "vladyurjevitch@yandex.ru")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -84,12 +97,6 @@ def save_counter(asset: str, value: int):
 
 
 def pick_account(asset: str, request_index: int) -> int:
-    """
-    По порядковому номеру запроса (0-based) определяет аккаунт.
-    Пример для BTC (квоты 20/4/0):
-      запросы  0-19 -> аккаунт #0
-      запросы 20-23 -> аккаунт #1
-    """
     cumulative = 0
     for idx, quota in enumerate(QUOTAS[asset]):
         cumulative += quota
@@ -122,7 +129,6 @@ def send_error_trace(exc: Exception, script_name: str = "Bybit_Tg_Bot.py"):
 
 
 def extract_asset(query: str) -> str:
-    """Определяет актив из текста запроса (BTC или ETH)."""
     for token in query.upper().split():
         if token in ('BTC', 'ETH'):
             return token
@@ -207,10 +213,6 @@ def save_record(engine, table_name, asset, raw_response):
 # ==================== ОСНОВНАЯ ЛОГИКА ====================
 
 async def run_query(asset: str, query: str, engine, table_name: str):
-    """
-    Читает счётчик актива, определяет аккаунт, отправляет запрос,
-    сохраняет результат, обновляет счётчик.
-    """
     total_quota = sum(QUOTAS[asset])
     total_sent  = load_counter(asset)
 
@@ -229,7 +231,20 @@ async def run_query(asset: str, query: str, engine, table_name: str):
         f"(квота акк. {QUOTAS[asset][acc_idx]}): {query}"
     )
 
-    client = TelegramClient(SESSIONS[acc_idx], API_ID, API_HASH)
+    # Создаём клиент с поддержкой MTProto прокси (если настроен)
+    if MTPROTO_PROXY:
+        log.info(f"Используем MTProto прокси: {MTPROTO_HOST}:{MTPROTO_PORT}")
+        client = TelegramClient(
+            SESSIONS[acc_idx],
+            API_ID,
+            API_HASH,
+            connection=connection.ConnectionTcpMTProxyRandomizedIntermediate,
+            proxy=MTPROTO_PROXY
+        )
+    else:
+        log.info("Работаем без прокси (прямое подключение)")
+        client = TelegramClient(SESSIONS[acc_idx], API_ID, API_HASH)
+
     try:
         await client.connect()
         if not await client.is_user_authorized():
@@ -349,6 +364,10 @@ def main():
     if asset != 'UNKNOWN':
         log.info(f"Квоты акк.:    {QUOTAS[asset]}")
         log.info(f"Файл счётчика: {COUNTER_FILES[asset]}")
+    if MTPROTO_PROXY:
+        log.info(f"MTProto прокси: {MTPROTO_HOST}:{MTPROTO_PORT}")
+    else:
+        log.info("MTProto прокси: не используется")
     log.info("=" * 60)
 
     try:
