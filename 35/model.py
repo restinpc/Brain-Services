@@ -1,14 +1,14 @@
 """
-model.py — Сервис 36: Веса новостей на основе NER-контекстов.
+model.py — Сервис 35: Веса новостей на основе NER-контекстов.
 
-Sources: CNN, NYT, TWP, TGD, WSJ (5 NER-моделей)
-Context = NER fingerprint (feed_cat | person | location | misc)
-Consensus >= 2/3 моделей по каждой сущности.
+Источники: CNN, NYT, TWP, TGD, WSJ (5 NER-моделей)
+Контекст = NER-отпечаток (feed_cat | person | location | misc)
+Консенсус >= 2/3 моделей по каждой сущности.
 
-Weight code: NW{ctx_id}_{mode}_{shift}
-  mode=0 → T1 sum
-  mode=1 → Extremum probability
-  shift  → сдвиг в часах (0..24 для recurring)
+Код веса: NW{ctx_id}_{mode}_{shift}
+  mode=0 → сумма T1
+  mode=1 → экстремумная вероятность
+  shift  → сдвиг в часах (0..24 для повторяющихся)
 
 Критичные переменные (PORT, NODE_NAME, SERVICE_ID, SERVICE_TEXT)
 лежат в .env рядом с этим файлом и НЕ дублируются здесь.
@@ -47,7 +47,7 @@ REBUILD_INTERVAL = 3600   # секунд между автоматическим
 
 # ── Вариации ─────────────────────────────────────────────────────────────────
 #
-#   var=0  простая сумма T1 / базовый Extremum
+#   var=0  простая сумма T1 / базовый экстремум
 #   var=1  только крупные свечи (range > avg_range)
 #   var=2  T1 × |T1| — квадратичное усиление
 #   var=3  крупные свечи + квадрат
@@ -91,6 +91,7 @@ _SHIFT_MAX      = 24
 
 
 def _get_feed_cat(feed: str) -> str:
+    """Определяет категорию ленты по названию."""
     feed_lower = (feed or "").lower()
     for key, cat in _FEED_CAT_MAP.items():
         if key in feed_lower:
@@ -99,15 +100,22 @@ def _get_feed_cat(feed: str) -> str:
 
 
 def _normalize_token(raw: str) -> str:
+    """Нормализует токен сущности: нижний регистр, обрезка до 2 слов, макс 64 символа."""
     if not raw:
         return ""
     return " ".join(raw.strip().lower().split()[:2])[:64]
 
 
 def _consensus_entities(ner_rows: list[dict]) -> dict:
+    """
+    Вычисляет консенсусные сущности из NER-данных нескольких моделей.
+    Сущность включается, если встречается как минимум в _MIN_MODELS моделях.
+    Возвращает топ-2 для каждого типа.
+    """
     persons   = Counter()
     locations = Counter()
     miscs     = Counter()
+    
     for row in ner_rows:
         for token in (row.get("person") or "").lower().split():
             if len(token) > 2:
@@ -123,10 +131,15 @@ def _consensus_entities(ner_rows: list[dict]) -> dict:
         words = [k for k, v in counter.items() if v >= _MIN_MODELS]
         return " ".join(sorted(words)[:2])
 
-    return {"person": top2(persons), "location": top2(locations), "misc": top2(miscs)}
+    return {
+        "person": top2(persons),
+        "location": top2(locations),
+        "misc": top2(miscs)
+    }
 
 
 def _make_fingerprint(feed_cat: str, person: str, location: str, misc: str) -> str:
+    """Создаёт MD5-отпечаток контекста из четырёх компонент."""
     raw = f"{feed_cat}|{person}|{location}|{misc}"
     return hashlib.md5(raw.encode()).hexdigest()[:16]
 
@@ -137,8 +150,20 @@ def _make_fingerprint(feed_cat: str, person: str, location: str, misc: str) -> s
 
 def model(rates, dataset, date, *, type=0, var=0, param="", ctx):
     """
-    T1 + Extremum по NER-контекстам новостей.
-    Weight code: NW{ctx_id}_{mode}_{shift}
+    Вычисляет веса T1 + Extremum по NER-контекстам новостей.
+
+    Параметры:
+        rates: входные ставки (не используются напрямую)
+        dataset: набор данных
+        date: текущая дата
+        type: 0 - оба режима, 1 - только T1, 2 - только Extremum
+        var: вариант расчёта (0..4)
+        param: доп. параметры (не используются)
+        ctx: контекст с методами compute_t1, compute_extremum и др.
+
+    Возвращает:
+        словарь {weight_code: значение}
+        Код веса: NW{ctx_id}_{mode}_{shift}
     """
     if not rates:
         return {}
@@ -271,6 +296,14 @@ async def rebuild_index(engine_vlad, engine_brain, engine_super=None) -> dict:
     Вызывается фреймворком автоматически раз в REBUILD_INTERVAL секунд,
     а также вручную через POST /rebuild_index.
     """
+    # Сбрасываем пулы соединений перед началом работы.
+    # rebuild_index вызывается редко (раз в час), за это время MySQL может
+    # закрыть неактивные соединения со своей стороны. dispose() закрывает
+    # все простаивающие соединения в пуле, принуждая создать свежие
+    # при следующем connect().
+    await engine_vlad.dispose()
+    await engine_brain.dispose()
+
     async with engine_vlad.connect() as conn:
         row = (await conn.execute(
             text("SELECT MAX(news_id) FROM vlad_news_ctx_map")
@@ -301,7 +334,7 @@ async def rebuild_index(engine_vlad, engine_brain, engine_super=None) -> dict:
                         "feed":     r.get("feed")     or "",
                     })
         except Exception:
-            pass
+            pass  # Пропускаем недоступные источники
 
     if not new_ner:
         return {
