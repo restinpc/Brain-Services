@@ -1,3 +1,22 @@
+"""
+brain_framework.py v11 — полная поддержка backtest в IS_SIMPLE режиме.
+
+Автодетекция режима по наличию RATES_TABLE в model.py:
+  IS_SIMPLE = True  → сервисы 36+ (одна таблица, без pair/day/ctx)
+  IS_SIMPLE = False → сервисы 33-35 (пары, дни, ctx, numpy)
+
+Изменения v11 (относительно v10):
+  - _fill_worker: кэш для IS_SIMPLE пишется с pair=0, day_flag=0
+  - _fill_worker: авто-бэктест после fill_cache в IS_SIMPLE
+  - _backtest: адаптирован для IS_SIMPLE (simple_rates, кэш с pair=0/day=0)
+  - /backtest: убран guard IS_SIMPLE, теперь работает для простых сервисов
+  - /summary: убран guard IS_SIMPLE
+  - /posttest: убран guard, добавлена ветка для IS_SIMPLE
+
+server.py для всех сервисов одинаковый:
+    from brain_framework import build_app
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -1474,7 +1493,7 @@ def build_app(model_module) -> FastAPI:
             f"events={len(s.events_by_dt)} dataset={len(s.dataset)} "
             f"np_built={s.np_built}", s.NODE_NAME, force=True)
 
-    # ── _do_rebuild (с ФИКСОМ 1: IS_SIMPLE не грузит ctx/events) ───────────────
+    # ── _do_rebuild (с поддержкой IS_SIMPLE) ───────────────────────────────────
 
     async def _do_rebuild() -> dict:
         stats = {}
@@ -1519,7 +1538,7 @@ def build_app(model_module) -> FastAPI:
                 send_error_trace(e, s.NODE_NAME, "universal_rebuild")
                 return {"error": str(e)}
 
-        # Шаг 5: обновление данных в памяти (ФИКС 1)
+        # Шаг 5: обновление данных в памяти
         await _load_weight_codes(s)
 
         if not s.IS_SIMPLE:
@@ -1696,9 +1715,9 @@ def build_app(model_module) -> FastAPI:
                                 for row in insert_rows:
                                     await conn.execute(text("""
                                         INSERT IGNORE INTO vlad_values_cache
-                                            (service_url, date_val, params_hash,
-                                             params_json, result_json)
-                                        VALUES (:url, :dv, :ph, :pj, :rj)
+                                            (service_url, pair, day_flag, date_val,
+                                             params_hash, params_json, result_json)
+                                        VALUES (:url, 0, 0, :dv, :ph, :pj, :rj)
                                     """), row)
                         except Exception as e:
                             log(f"  ⚠️ bulk insert: {e}", s.NODE_NAME, level="warning")
@@ -1711,6 +1730,38 @@ def build_app(model_module) -> FastAPI:
             s.fill_status.update({"state": state, "finished_at": datetime.now().isoformat()})
             log(f"✅ fill_cache (simple) {state}: done={done} skip={skipped} err={errors}",
                 s.NODE_NAME, force=True)
+
+            # ── Авто-бэктест после заполнения кэша (IS_SIMPLE) ────────────────
+            if not s.fill_cancel.is_set():
+                log("🔁 auto-backtest после fill_cache (simple)...", s.NODE_NAME, force=True)
+                bt_date_from = _parse_date(date_from_str) if date_from_str else datetime(2025, 1, 1)
+                bt_date_to   = _parse_date(date_to_str)   if date_to_str   else datetime.now()
+                for bt_type, bt_var in slots:
+                    try:
+                        bt_result = await _backtest(
+                            0, 0, tier=0,
+                            extra_params={"type": bt_type, "var": bt_var},
+                            df=bt_date_from, dt=bt_date_to,
+                        )
+                        label = f"type={bt_type} var={bt_var}"
+                        if "error" in bt_result:
+                            log(f"  ⚠️ backtest [{label}]: {bt_result['error']}",
+                                s.NODE_NAME, force=True)
+                        else:
+                            log(f"  ✅ backtest [{label}]: "
+                                f"score={bt_result.get('value_score')} "
+                                f"acc={bt_result.get('accuracy')} "
+                                f"trades={bt_result.get('trade_count')}",
+                                s.NODE_NAME, force=True)
+                    except Exception as e:
+                        log(f"  ❌ backtest error type={bt_type} var={bt_var}: {e}",
+                            s.NODE_NAME, level="error")
+                try:
+                    await _upsert_summary(0, 0, tier=0, df=bt_date_from, dt=bt_date_to)
+                except Exception as e:
+                    log(f"  ⚠️ summary (simple): {e}", s.NODE_NAME, level="warning")
+                s.fill_status["auto_backtest"] = "done"
+                log("✅ auto-backtest (simple) завершён", s.NODE_NAME, force=True)
             return
 
         # ── Полный режим (старый код) ────────────────────────────────────────
@@ -1851,7 +1902,7 @@ def build_app(model_module) -> FastAPI:
             s.fill_status["auto_backtest"] = "done"
             log("✅ auto-backtest завершён", s.NODE_NAME, force=True)
 
-    # ── _backtest и _upsert_summary (без изменений) ────────────────────────────
+    # ── _backtest (адаптирован для IS_SIMPLE) ─────────────────────────────────
 
     async def _backtest(pair, day, tier, extra_params, df, dt) -> dict:
         p_hash = _params_hash(extra_params)
@@ -1866,20 +1917,29 @@ def build_app(model_module) -> FastAPI:
         if ex:
             return {"value_score": float(ex[0]), "accuracy": float(ex[1]),
                     "trade_count": int(ex[2]), "params": extra_params, "skipped": True}
+
+        _cache_pair = 0 if s.IS_SIMPLE else pair
+        _cache_day  = 0 if s.IS_SIMPLE else day
         async with s.engine_vlad.connect() as conn:
             res = await conn.execute(text("""
                 SELECT date_val, result_json FROM vlad_values_cache
                 WHERE service_url=:url AND pair=:pair AND day_flag=:day
                   AND params_hash=:ph AND date_val>=:df AND date_val<=:dt
                 ORDER BY date_val
-            """), {"url": s.service_url, "pair": pair, "day": day,
+            """), {"url": s.service_url, "pair": _cache_pair, "day": _cache_day,
                    "ph": p_hash, "df": df, "dt": dt})
             cache_map = {row[0]: _json.loads(row[1]) for row in res.fetchall()}
         if not cache_map:
             return {"error": "no cached data"}
-        table  = _rates_table(pair, day)
-        rows   = [r for r in s.global_rates.get(table, []) if df <= r["date"] <= dt]
-        spread, mod, lot_div = _PAIR_CFG.get(pair, (0.0002, 100_000.0, 50_000.0))
+
+        if s.IS_SIMPLE:
+            rows = [r for r in s.simple_rates if df <= r["date"] <= dt]
+            spread, mod, lot_div = (0.0002, 100_000.0, 50_000.0)  # дефолт EUR
+        else:
+            table  = _rates_table(pair, day)
+            rows   = [r for r in s.global_rates.get(table, []) if df <= r["date"] <= dt]
+            spread, mod, lot_div = _PAIR_CFG.get(pair, (0.0002, 100_000.0, 50_000.0))
+
         balance = highest = 10_000.0
         summary_lost = 0.0
         trade_count = win_count = 0
@@ -2063,7 +2123,6 @@ def build_app(model_module) -> FastAPI:
         }.get(calc_type, f"Type = {calc_type}.")
 
         import re as _re
-        # ФИКС 2: поддержка кодов без префикса (например "5_0_3") — ноль или более букв
         _wc_pat = _re.compile(r'^[A-Za-z]*(\d+)_(\d+)_(-?\d+)$')
 
         groups: dict[tuple, dict] = {}
@@ -2303,15 +2362,18 @@ def build_app(model_module) -> FastAPI:
         type:      int = Query(0),
         var:       int = Query(-1),
     ):
+        # IS_SIMPLE: pairs/days игнорируются, всегда pair=0 day=0
         if s.IS_SIMPLE:
-            return err_response("Backtest не поддерживается в IS_SIMPLE режиме.")
-        try:
-            pl = [int(p.strip()) for p in pairs.split(",") if p.strip()]
-            dl = [int(d.strip()) for d in days.split(",")  if d.strip()]
-        except ValueError:
-            return err_response("pairs и days — числа через запятую")
-        if not pl or not dl:
-            return err_response("pairs и days не могут быть пустыми")
+            pl = [0]
+            dl = [0]
+        else:
+            try:
+                pl = [int(p.strip()) for p in pairs.split(",") if p.strip()]
+                dl = [int(d.strip()) for d in days.split(",")  if d.strip()]
+            except ValueError:
+                return err_response("pairs и days — числа через запятую")
+            if not pl or not dl:
+                return err_response("pairs и days не могут быть пустыми")
 
         df = _parse_date(date_from) if date_from.strip() else _parse_date(s.CACHE_DATE_FROM)
         dt = _parse_date(date_to)   if date_to.strip()   else datetime.now()
@@ -2323,7 +2385,7 @@ def build_app(model_module) -> FastAPI:
 
         for bt_pair in pl:
             for bt_day in dl:
-                key = f"pair={bt_pair} day={'d' if bt_day else 'h'}"
+                key = 'simple' if s.IS_SIMPLE else f"pair={bt_pair} day={'d' if bt_day else 'h'}"
                 all_results[key] = {}
                 for v in vars_to_run:
                     try:
@@ -2350,8 +2412,6 @@ def build_app(model_module) -> FastAPI:
     @app.get("/summary")
     async def ep_summary(pair: int = Query(-1), day: int = Query(-1),
                          tier: int = Query(-1)):
-        if s.IS_SIMPLE:
-            return err_response("Summary не поддерживается в IS_SIMPLE режиме.")
         conds  = ["service_url=:url"]
         params = {"url": s.service_url}
         if pair >= 0: conds.append("pair=:pair");    params["pair"] = pair
@@ -2615,13 +2675,16 @@ def build_app(model_module) -> FastAPI:
         date_from: str = Query(""),
         date_to:   str = Query(""),
     ):
+        # IS_SIMPLE: pairs/days игнорируются
         if s.IS_SIMPLE:
-            return err_response("posttest не поддерживается в IS_SIMPLE режиме.")
-        try:
-            pl = [int(p.strip()) for p in pairs.split(",") if p.strip()]
-            dl = [int(d.strip()) for d in days.split(",")  if d.strip()]
-        except ValueError:
-            return err_response("pairs и days — числа через запятую")
+            pl = [0]
+            dl = [0]
+        else:
+            try:
+                pl = [int(p.strip()) for p in pairs.split(",") if p.strip()]
+                dl = [int(d.strip()) for d in days.split(",")  if d.strip()]
+            except ValueError:
+                return err_response("pairs и days — числа через запятую")
 
         from datetime import datetime as _dt
 
@@ -2629,16 +2692,24 @@ def build_app(model_module) -> FastAPI:
         dt_to   = _parse_date(date_to)   if date_to.strip()   else _dt.now()
 
         async def _process_slot(pair_id: int, day_flag: int) -> dict:
-            tf_name = "day" if day_flag else "hour"
-            table   = _rates_table(pair_id, day_flag)
-            all_rows = s.global_rates.get(table, [])
-            rows = [r for r in all_rows
-                    if (dt_from is None or r["date"] >= dt_from)
-                    and (dt_to   is None or r["date"] <= dt_to)]
+            if s.IS_SIMPLE:
+                tf_name = "simple"
+                rows = [r for r in s.simple_rates
+                        if (dt_from is None or r["date"] >= dt_from)
+                        and (dt_to   is None or r["date"] <= dt_to)]
+                url_p = {"url": s.service_url, "pair": 0, "day": 0,
+                         "df": dt_from, "dt": dt_to}
+            else:
+                tf_name = "day" if day_flag else "hour"
+                table   = _rates_table(pair_id, day_flag)
+                all_rows = s.global_rates.get(table, [])
+                rows = [r for r in all_rows
+                        if (dt_from is None or r["date"] >= dt_from)
+                        and (dt_to   is None or r["date"] <= dt_to)]
+                url_p = {"url": s.service_url, "pair": pair_id, "day": day_flag,
+                         "df": dt_from, "dt": dt_to}
 
-            url_p = {"url": s.service_url, "pair": pair_id, "day": day_flag,
-                     "df": dt_from, "dt": dt_to}
-
+            # Тест 1: SQL-агрегат по количеству ключей
             data_stats = {"min": 0.0, "max": 0.0, "avg": 0.0}
             try:
                 async with s.engine_vlad.connect() as conn:
@@ -2659,6 +2730,7 @@ def build_app(model_module) -> FastAPI:
             except Exception as e:
                 log(f"  ⚠️ posttest t1 {pair_id}/{tf_name}: {e}", s.NODE_NAME, level="warning")
 
+            # Тест 2: подсчёт знаков
             values_stats = {"plus": 0, "minus": 0}
             try:
                 async with s.engine_vlad.connect() as conn:
@@ -2681,6 +2753,7 @@ def build_app(model_module) -> FastAPI:
             except Exception as e:
                 log(f"  ⚠️ posttest t2 {pair_id}/{tf_name}: {e}", s.NODE_NAME, level="warning")
 
+            # Тест 3: живой вызов с актуальной датой
             now_str = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
             try:
                 sync_result = await _call_model(pair_id, day_flag, now_str)
@@ -2688,6 +2761,7 @@ def build_app(model_module) -> FastAPI:
             except Exception as e:
                 sync_out = {"error": str(e)}
 
+            # Читаем кэш один раз
             cache_signals: dict = {}
             try:
                 async with s.engine_vlad.connect() as conn:
@@ -2722,11 +2796,13 @@ def build_app(model_module) -> FastAPI:
                     runs   = np.where(diffs == -1)[0] - np.where(diffs == 1)[0]
                     hole   = int(np.max(runs)) if len(runs) > 0 else 0
 
-                _, mod, lot_div = _PAIR_CFG.get(pair_id, (0.0002, 100_000.0, 50_000.0))
+                _, mod, lot_div = (0.0002, 100_000.0, 50_000.0) if s.IS_SIMPLE else _PAIR_CFG.get(pair_id, (0.0002, 100_000.0, 50_000.0))
                 equity = 10_000.0
                 total_profit = total_dropdown = 0.0
                 wins = trades = 0
                 position = None
+                entry_price = 0.0
+                direction = 0.0
 
                 for i, r in enumerate(rows):
                     _, signal = cache_signals.get(r["date"], (False, 0.0))
@@ -2736,7 +2812,6 @@ def build_app(model_module) -> FastAPI:
                     if not op:
                         continue
                     if position is not None:
-                        direction, entry_price = position
                         if (signal == 0.0
                                 or (signal > 0 and direction < 0)
                                 or (signal < 0 and direction > 0)):
@@ -2747,7 +2822,9 @@ def build_app(model_module) -> FastAPI:
                             else:        total_dropdown += abs(pnl)
                             position = None
                     if signal != 0.0 and position is None:
-                        position = (1.0 if signal > 0 else -1.0, op)
+                        direction = 1.0 if signal > 0 else -1.0
+                        entry_price = op
+                        position = (direction, entry_price)
 
                 if position is not None and rows:
                     lp = rows[-1]["close"]
