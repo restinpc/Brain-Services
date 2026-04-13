@@ -17,7 +17,7 @@ _shared = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "shared
 sys.path.insert(1, _shared)
 
 import model
-from brain_framework_simple import build_app
+from brain_framework import build_app
 
 app = build_app(model)
 
