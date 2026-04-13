@@ -1,11 +1,3 @@
-"""
-brain_framework.py v9 — патч (три изменения).
-
-Автообнаружение context_idx.py и weights.py рядом с model.py.
-Фреймворк вызывает build_index() → build_weights() автоматически.
-Обратная совместимость: сервисы без этих файлов работают как раньше.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -401,7 +393,6 @@ class _State:
         self.load_events_fn   = None
         self.rebuild_index_fn = None
         self.make_ctx_key_fn  = None
-        # ИЗМЕНЕНИЕ 1: добавить поля для строителей из внешних файлов
         self.index_builder_fn  = None   # async def build_index(ev, eb) → dict
         self.weight_builder_fn = None   # async def build_weights(ev) → dict
         self.model_needs_ctx  = False
@@ -435,6 +426,13 @@ class _State:
         self.np_rates: dict                   = {}
         self.np_sorted_dates_ns: np.ndarray | None = None
         self.np_built: bool = False
+
+        # IS_SIMPLE: автоматически True если model.py содержит RATES_TABLE
+        self.IS_SIMPLE:           bool  = False
+        self.RATES_TABLE_SIMPLE:  str   = "brain_rates_eur_usd"
+        self.simple_rates:        list  = []
+        self.simple_rates_dates:  list  = []
+        self.last_simple_rate_dt: datetime | None = None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -639,6 +637,62 @@ async def _refresh_rates(table: str, s: _State):
         log(f"  ⚠️ refresh {table}: {e}", s.NODE_NAME, level="warning")
 
 
+# ── IS_SIMPLE: загрузка одной таблицы котировок ───────────────────────────────
+async def _load_simple_rates(s: _State) -> None:
+    table = s.RATES_TABLE_SIMPLE
+    try:
+        async with s.engine_brain.connect() as conn:
+            res = await conn.execute(text(
+                f"SELECT date, open, close, `min`, `max` "
+                f"FROM `{table}` ORDER BY date"
+            ))
+            s.simple_rates = [
+                {"date":  r["date"],
+                 "open":  float(r["open"]  or 0),
+                 "close": float(r["close"] or 0),
+                 "min":   float(r["min"]   or 0),
+                 "max":   float(r["max"]   or 0)}
+                for r in res.mappings().all()
+            ]
+            s.simple_rates_dates  = [r["date"] for r in s.simple_rates]
+            s.last_simple_rate_dt = s.simple_rates_dates[-1] if s.simple_rates_dates else None
+        log(f"  simple_rates: {len(s.simple_rates)} candles from {table}", s.NODE_NAME)
+    except Exception as e:
+        log(f"  ❌ simple_rates: {e}", s.NODE_NAME, level="error")
+        s.simple_rates, s.simple_rates_dates = [], []
+
+
+async def _refresh_simple_rates(s: _State) -> None:
+    if not s.last_simple_rate_dt:
+        return
+    table = s.RATES_TABLE_SIMPLE
+    try:
+        async with s.engine_brain.connect() as conn:
+            res = await conn.execute(text(
+                f"SELECT date, open, close, `min`, `max` "
+                f"FROM `{table}` WHERE date > :dt ORDER BY date"
+            ), {"dt": s.last_simple_rate_dt})
+            new_rows = res.mappings().all()
+        for r in new_rows:
+            row = {"date":  r["date"],
+                   "open":  float(r["open"]  or 0),
+                   "close": float(r["close"] or 0),
+                   "min":   float(r["min"]   or 0),
+                   "max":   float(r["max"]   or 0)}
+            s.simple_rates.append(row)
+            s.simple_rates_dates.append(row["date"])
+        if new_rows:
+            s.last_simple_rate_dt = s.simple_rates_dates[-1]
+            log(f"  📥 +{len(new_rows)} candle(s) {table}", s.NODE_NAME)
+    except Exception as e:
+        log(f"  ⚠️ refresh simple_rates: {e}", s.NODE_NAME, level="warning")
+
+
+def _simple_rates_lte(date: datetime, s: _State) -> list:
+    idx = bisect.bisect_right(s.simple_rates_dates, date)
+    return s.simple_rates[:idx]
+
+
 async def _load_weight_codes(s: _State):
     if not s.WEIGHTS_TABLE:
         s.weight_codes = []
@@ -711,28 +765,12 @@ async def _load_dataset(s: _State):
 
 
 def _ceil_to_hour(dt: datetime) -> datetime:
-    """
-    Округляет datetime вверх до начала следующего часа.
-
-    Почему это нужно:
-    Котировки привязаны к началу свечи (10:00, 11:00, ...).
-    Событие (новость) может прийти в любой момент (10:37:22).
-    В model.py фильтр: t_date = event_date + du*shift < target_date.
-    При shift=0, event_date=10:37, target_date=10:00 → 10:37 < 10:00 = False → пусто.
-    После ceil: event_date=11:00 → при target_date=12:00: 11:00 < 12:00 = True.
-    Семантика корректна: новость из 10:37 учитывается начиная с котировки 11:00.
-    Если время уже на границе часа (10:00:00) — не сдвигаем.
-    """
     if dt.minute == 0 and dt.second == 0 and dt.microsecond == 0:
-        return dt  # уже на границе часа — не трогаем
-    # Сдвигаем до начала следующего часа
+        return dt
     return dt.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
 
 
 def _register_event(dt: datetime, event_key: tuple, s: _State) -> bool:
-    # Нормализуем время события к следующей часовой границе.
-    # Это устраняет несовместимость между точным временем события (10:37)
-    # и часовыми котировками (10:00, 11:00, ...).
     dt = _ceil_to_hour(dt)
     sig = (event_key, dt)
     if sig in s.events_seen:
@@ -1056,11 +1094,6 @@ _DETAIL_KEY = "__detail__"
 
 
 def _extract_detail(result: dict | None) -> tuple[dict | None, any]:
-    """
-    Извлекает __detail__ из результата model().
-    Возвращает (result_без_detail, detail_или_None).
-    result модифицируется IN-PLACE — __detail__ удаляется.
-    """
     if result is None:
         return result, None
     detail = result.pop(_DETAIL_KEY, None)
@@ -1068,10 +1101,6 @@ def _extract_detail(result: dict | None) -> tuple[dict | None, any]:
 
 
 def _make_detail_serializable(detail) -> any:
-    """
-    Приводит detail к JSON-сериализуемому виду.
-    Поддерживает произвольную вложенность: dict, list, datetime, float, str, int.
-    """
     if detail is None:
         return None
     if isinstance(detail, dict):
@@ -1094,7 +1123,6 @@ def _make_detail_serializable(detail) -> any:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _pluralize_n(n: int, forms: tuple[str, str, str]) -> str:
-    """Склонение числительного. forms = (1, 2-4, 5+)."""
     abs_n = abs(n)
     if abs_n % 100 in range(11, 20):
         return forms[2]
@@ -1105,7 +1133,6 @@ def _pluralize_n(n: int, forms: tuple[str, str, str]) -> str:
 
 
 def _shift_label(shift: int | None, day_flag: int) -> str:
-    """Человекочитаемое описание сдвига: '3 часа назад', 'через 2 дня' и т.д."""
     if shift is None or shift == 0:
         return "в момент целевой свечи"
     if day_flag:
@@ -1119,45 +1146,17 @@ def _shift_label(shift: int | None, day_flag: int) -> str:
 
 
 def build_detail_narrative(
-    observations: list[tuple],          # [(event_key, obs_dt, shift_val), ...]
-    result: dict,                        # итоговый {weight_code: float}
-    date: "datetime",                    # target_date
+    observations: list[tuple],
+    result: dict,
+    date: "datetime",
     delta_unit: "timedelta",
     shift_window: int,
-    ctx,                                 # _ModelContext
+    ctx,
     *,
-    label_fn=None,                       # (event_key) → str | None — человекочитаемое имя
+    label_fn=None,
     day_flag: int = 0,
     calc_type: int = 0,
 ) -> list[str]:
-    """
-    Универсальный построитель нарратива detail (список строк).
-    Воспроизводит структуру сервиса 33 (calendar) в обобщённом виде.
-
-    Вызывается из model() при необходимости:
-
-        from brain_framework import build_detail_narrative
-        result["__detail__"] = build_detail_narrative(
-            observations, result, date, ctx.delta_unit, 24, ctx,
-            label_fn=lambda k: MY_LABELS.get(k[0]),
-            day_flag=day_flag,
-            calc_type=type,
-        )
-
-    Параметры:
-        observations — список (event_key, obs_dt, shift_val) из ctx.find_events()
-        result       — финальный dict {wc: float} (уже без __detail__)
-        date         — target_date
-        delta_unit   — ctx.delta_unit
-        shift_window — ctx._state.SHIFT_WINDOW
-        ctx          — ModelContext
-        label_fn     — функция event_key → str (название события/контекста).
-                       Если None — используется str(event_key).
-        day_flag     — 0=hourly, 1=daily
-        calc_type    — 0=оба, 1=T1, 2=Extremum
-
-    Возвращает list[str] — строки нарратива.
-    """
     if not observations:
         return ["Нет контекстных событий в заданном промежутке."]
 
@@ -1165,8 +1164,6 @@ def build_detail_narrative(
     start_dt  = date - delta_unit * sw
     end_dt    = date + delta_unit * sw
 
-    # ── Группировка наблюдений: event_key + shift → {wc: value} ──────────────
-    # Ключ группы: (event_key, shift_val)
     groups: dict[tuple, dict] = {}
     for event_key, obs_dt, shift_val in observations:
         gk = (event_key, shift_val)
@@ -1183,21 +1180,17 @@ def build_detail_narrative(
                 "label":            label,
                 "occurrence_count": occ,
                 "t_dates_count":    len(t_dates),
-                "wc_t1":   {},   # wc → value (mode=0, T1)
-                "wc_ext":  {},   # wc → value (mode=1, extremum)
+                "wc_t1":   {},
+                "wc_ext":  {},
             }
         g = groups[gk]
         for wc, val in result.items():
             if wc not in g["wc_t1"] and wc not in g["wc_ext"]:
-                # Определяем принадлежность: ищем подстроку "_0_" / "_1_" в суффиксе
-                # Это простое эвристическое разделение; работает для всех наших кодов.
-                # mode закодирован как предпоследний числовой сегмент.
                 parts = wc.rsplit("_", 2 if g["shift_val"] is not None else 1)
                 try:
                     mode_candidate = int(parts[-2]) if len(parts) >= 2 else -1
                 except ValueError:
                     mode_candidate = -1
-                # Привязываем weight_code к группе по точному совпадению shift
                 shift_suffix = f"_{shift_val}" if (g["shift_val"] is not None and g["shift_val"] != 0) else ""
                 if wc.endswith(shift_suffix) or shift_val == 0:
                     if mode_candidate == 0:
@@ -1208,11 +1201,9 @@ def build_detail_narrative(
     if not groups:
         return ["Событий не найдено после группировки."]
 
-    # Сортировка: по убыванию shift (чем ближе к target — первее)
     sorted_groups = sorted(groups.values(), key=lambda g: (-(g["shift_val"] or 0), str(g["event_key"])))
     n = len(sorted_groups)
 
-    # ── Описание calc_type ────────────────────────────────────────────────────
     type_desc = {
         0: "Type = 0: учитывается и сумма свечей (T1), и вероятность экстремума.",
         1: "Type = 1: учитывается только сумма свечей (T1).",
@@ -1223,7 +1214,6 @@ def build_detail_narrative(
 
     lines: list[str] = []
 
-    # Заголовок
     lines.append(
         f"Окно поиска: {start_dt.strftime('%Y-%m-%d %H:%M')} — "
         f"{end_dt.strftime('%Y-%m-%d %H:%M')}. "
@@ -1231,7 +1221,6 @@ def build_detail_narrative(
     )
     lines.append("")
 
-    # Нумерованный список
     for i, g in enumerate(sorted_groups, 1):
         tl = _shift_label(g["shift_val"], day_flag)
         lines.append(f'{i}. "{g["label"]}" — {tl}')
@@ -1240,7 +1229,6 @@ def build_detail_narrative(
     lines.append(type_desc)
     lines.append("")
 
-    # Детальный разбор по каждому событию
     for i, g in enumerate(sorted_groups, 1):
         occ = g["occurrence_count"]
         tl  = _shift_label(g["shift_val"], day_flag)
@@ -1271,18 +1259,7 @@ def build_detail_narrative(
 # ── build_app ──────────────────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ИЗМЕНЕНИЕ 2: функция _discover_builders перед build_app
-
 def _discover_builders(model_module):
-    """
-    Ищет context_idx.py и weights.py в директории model.py.
-    Импортирует и возвращает (build_index_fn, build_weights_fn).
-    Если файл не найден — возвращает None.
-
-    Контракт файлов:
-        context_idx.py → async def build_index(engine_vlad, engine_brain) → dict
-        weights.py     → async def build_weights(engine_vlad) → dict
-    """
     import importlib.util as _ilu
     import os as _os
 
@@ -1326,7 +1303,6 @@ def build_app(model_module) -> FastAPI:
         return getattr(model_module, attr, default)
 
     # ── Критичные переменные: ENV → переопределение из model.py ───────────────
-    # Порядок приоритета: model.py > .env > default
     s.SERVICE_ID   = _g("SERVICE_ID",   int(os.getenv("SERVICE_ID",   "0")))
     s.PORT         = _g("PORT",         int(os.getenv("PORT",         "9000")))
     s.NODE_NAME    = _g("NODE_NAME",    os.getenv("NODE_NAME",    "brain-svc"))
@@ -1361,12 +1337,15 @@ def build_app(model_module) -> FastAPI:
     s.CACHE_DATE_FROM        = _g("CACHE_DATE_FROM",        "2025-01-15")
     s.LABEL_FN               = _g("LABEL_FN",               None)
 
+    # Автодетекция режима: RATES_TABLE в model.py → IS_SIMPLE (нет pair/day/ctx)
+    s.IS_SIMPLE          = hasattr(model_module, "RATES_TABLE")
+    s.RATES_TABLE_SIMPLE = _g("RATES_TABLE", "brain_rates_eur_usd")
+
     s.model_fn         = getattr(model_module, "model",         None)
     s.load_events_fn   = getattr(model_module, "load_events",   None)
     s.rebuild_index_fn = getattr(model_module, "rebuild_index", None)
     s.make_ctx_key_fn  = getattr(model_module, "make_ctx_key",  None)
 
-    # ИЗМЕНЕНИЕ 3A: добавить строку после получения rebuild_index_fn
     s.index_builder_fn, s.weight_builder_fn = _discover_builders(model_module)
 
     if s.model_fn is None:
@@ -1375,23 +1354,31 @@ def build_app(model_module) -> FastAPI:
     sig = inspect.signature(s.model_fn)
     s.model_needs_ctx = "ctx" in sig.parameters
 
-    log(f"  model(): ctx={'yes' if s.model_needs_ctx else 'no'} | "
+    log(f"  mode={'simple' if s.IS_SIMPLE else 'full'} | "
+        f"model(): ctx={'yes' if s.model_needs_ctx else 'no'} | "
         f"VAR_RANGE={s.VAR_RANGE} | "
         f"rebuild={'custom' if s.rebuild_index_fn else ('universal' if s.REBUILD_SOURCE_QUERY else 'no')}",
         s.NODE_NAME, force=True)
 
     s.engine_vlad, s.engine_brain, s.engine_super = build_engines()
 
-    # ── _call_model ───────────────────────────────────────────────────────────
-    # Вызывает model() и возвращает (result, detail).
-    # detail = None если model() не вернул __detail__.
-    # result НЕ содержит __detail__ в любом случае.
+    # ── _call_model (IS_SIMPLE + полный режим) ─────────────────────────────────
 
     async def _call_model(pair, day, date_str, calc_type=0, calc_var=0, param=""):
-        """Вызов model() без detail. Возвращает только result (dict | None)."""
         target_date = _parse_date(date_str)
         if not target_date:
             return None
+
+        if s.IS_SIMPLE:
+            await _refresh_simple_rates(s)
+            rates_f   = _simple_rates_lte(target_date, s)
+            dataset_f = _filter_dataset_lte(target_date, s)
+            result = s.model_fn(rates=rates_f, dataset=dataset_f,
+                                date=target_date, type=calc_type,
+                                var=calc_var, param=param)
+            result, _ = _extract_detail(result)
+            return result
+
         table = _rates_table(pair, day)
         await _refresh_rates(table, s)
         rates_filtered   = _filter_rates_lte(table, target_date, s)
@@ -1405,14 +1392,24 @@ def build_app(model_module) -> FastAPI:
             result = s.model_fn(rates=rates_filtered, dataset=dataset_filtered,
                                 date=target_date, type=calc_type, var=calc_var,
                                 param=param)
-        result, _ = _extract_detail(result)   # __detail__ отбрасывается
+        result, _ = _extract_detail(result)
         return result
 
     async def _call_model_with_detail(pair, day, date_str, calc_type=0, calc_var=0, param=""):
-        """Вызов model() с detail. Возвращает (result, detail)."""
         target_date = _parse_date(date_str)
         if not target_date:
             return None, None
+
+        if s.IS_SIMPLE:
+            await _refresh_simple_rates(s)
+            rates_f   = _simple_rates_lte(target_date, s)
+            dataset_f = _filter_dataset_lte(target_date, s)
+            result = s.model_fn(rates=rates_f, dataset=dataset_f,
+                                date=target_date, type=calc_type,
+                                var=calc_var, param=param)
+            result, detail = _extract_detail(result)
+            return result, _make_detail_serializable(detail)
+
         table = _rates_table(pair, day)
         await _refresh_rates(table, s)
         rates_filtered = _filter_rates_lte(table, target_date, s)
@@ -1429,7 +1426,7 @@ def build_app(model_module) -> FastAPI:
         result, detail = _extract_detail(result)
         return result, _make_detail_serializable(detail)
 
-    # ── _preload ──────────────────────────────────────────────────────────────
+    # ── _preload (IS_SIMPLE + полный режим) ────────────────────────────────────
 
     async def _preload():
         log("🔄 FULL DATA RELOAD", s.NODE_NAME, force=True)
@@ -1437,14 +1434,32 @@ def build_app(model_module) -> FastAPI:
         s.weight_codes.clear()
         s.ctx_index.clear()
         s.dataset.clear()
+
+        if s.IS_SIMPLE:
+            await _load_simple_rates(s)
+            await _load_dataset(s)
+            await _load_weight_codes(s)
+            s.service_url = f"http://localhost:{s.PORT}"
+            try:
+                await ensure_cache_table(s.engine_vlad)
+                async with s.engine_vlad.begin() as conn:
+                    await conn.execute(text(_DDL_BT_RESULTS))
+                    await conn.execute(text(_DDL_BT_SUMMARY))
+            except Exception as e:
+                log(f"  ❌ tables: {e}", s.NODE_NAME, level="error")
+            s.last_reload = datetime.now()
+            log(f"✅ RELOAD DONE (simple): rates={len(s.simple_rates)} "
+                f"dataset={len(s.dataset)} weights={len(s.weight_codes)}",
+                s.NODE_NAME, force=True)
+            return
+
+        # Полный режим (сервисы 33-35)
         await _load_weight_codes(s)
         await _load_ctx_index(s)
         await _load_events_full(s)
         _build_sorted_arrays(s)
         await _load_rates(s)
         await _load_dataset(s)
-        # service_url строится из PORT — не из БД.
-        # Именно эта строка пишется в vlad_values_cache.service_url.
         s.service_url = f"http://localhost:{s.PORT}"
         log(f"  service_url: {s.service_url}", s.NODE_NAME)
         try:
@@ -1459,20 +1474,11 @@ def build_app(model_module) -> FastAPI:
             f"events={len(s.events_by_dt)} dataset={len(s.dataset)} "
             f"np_built={s.np_built}", s.NODE_NAME, force=True)
 
-    # ИЗМЕНЕНИЕ 3Б: заменить _do_rebuild на новую версию
+    # ── _do_rebuild (с ФИКСОМ 1: IS_SIMPLE не грузит ctx/events) ───────────────
 
     async def _do_rebuild() -> dict:
-        """
-        Порядок вызовов:
-        1. context_idx.build_index()   — если есть context_idx.py
-        2. weights.build_weights()     — если есть weights.py
-        3. model.rebuild_index()       — legacy, только если нет п.1
-        4. universal_rebuild           — только если нет п.1 и п.3
-        5. Инкрементальное обновление ctx_index, weight_codes, events в памяти
-        """
         stats = {}
 
-        # Шаг 1: context_idx.py
         if s.index_builder_fn is not None:
             try:
                 index_stats = await s.index_builder_fn(s.engine_vlad, s.engine_brain)
@@ -1483,7 +1489,6 @@ def build_app(model_module) -> FastAPI:
                 send_error_trace(e, s.NODE_NAME, "build_index")
                 stats["index"] = {"error": str(e)}
 
-        # Шаг 2: weights.py
         if s.weight_builder_fn is not None:
             try:
                 weight_stats = await s.weight_builder_fn(s.engine_vlad)
@@ -1494,7 +1499,6 @@ def build_app(model_module) -> FastAPI:
                 send_error_trace(e, s.NODE_NAME, "build_weights")
                 stats["weights"] = {"error": str(e)}
 
-        # Шаг 3: legacy rebuild_index() из model.py (только если нет context_idx.py)
         elif s.rebuild_index_fn is not None and s.index_builder_fn is None:
             try:
                 legacy = await s.rebuild_index_fn(
@@ -1505,7 +1509,6 @@ def build_app(model_module) -> FastAPI:
                 send_error_trace(e, s.NODE_NAME, "rebuild_index")
                 return {"error": str(e)}
 
-        # Шаг 4: universal_rebuild (только если нет context_idx.py и нет legacy)
         elif (s.REBUILD_SOURCE_QUERY is not None
               and s.index_builder_fn is None
               and s.rebuild_index_fn is None):
@@ -1516,35 +1519,50 @@ def build_app(model_module) -> FastAPI:
                 send_error_trace(e, s.NODE_NAME, "universal_rebuild")
                 return {"error": str(e)}
 
-        # Шаг 5: обновление данных в памяти
-        new_keys = await _load_ctx_index_incremental(s)
+        # Шаг 5: обновление данных в памяти (ФИКС 1)
         await _load_weight_codes(s)
-        if new_keys:
-            await _load_events_full(s)
-        else:
-            since = s.events_max_dt
-            await _load_events_append(since, s)
-        _build_sorted_arrays(s)
-        s.last_rebuild = datetime.now()
 
-        log(f"✅ rebuild done: ctx={len(s.ctx_index)} weights={len(s.weight_codes)}",
-            s.NODE_NAME, force=True)
+        if not s.IS_SIMPLE:
+            new_keys = await _load_ctx_index_incremental(s)
+            if new_keys:
+                await _load_events_full(s)
+            else:
+                since = s.events_max_dt
+                await _load_events_append(since, s)
+            _build_sorted_arrays(s)
+            return_new_keys = len(new_keys)
+        else:
+            return_new_keys = 0
+
+        s.last_rebuild = datetime.now()
+        log(f"✅ rebuild done: weights={len(s.weight_codes)}", s.NODE_NAME, force=True)
 
         return {
             **stats,
-            "new_ctx_keys":  len(new_keys),
+            "new_ctx_keys":  return_new_keys,
             "ctx_total":     len(s.ctx_index),
             "weights_total": len(s.weight_codes),
             "events_total":  len(s.events_by_dt),
             "rebuilt_at":    s.last_rebuild.isoformat(),
         }
 
-    # ── _bg_reload ────────────────────────────────────────────────────────────
+    # ── _bg_reload (IS_SIMPLE + полный) ───────────────────────────────────────
 
     async def _bg_reload():
         while True:
             await asyncio.sleep(s.RELOAD_INTERVAL)
             try:
+                if s.IS_SIMPLE:
+                    await _refresh_simple_rates(s)
+                    if (s.REBUILD_INTERVAL > 0
+                            and (s.last_rebuild is None or
+                                 (datetime.now() - s.last_rebuild).total_seconds()
+                                 >= s.REBUILD_INTERVAL)):
+                        await _do_rebuild()
+                    s.last_reload = datetime.now()
+                    continue
+
+                # Полный режим
                 if ((s.rebuild_index_fn or s.REBUILD_SOURCE_QUERY)
                         and s.REBUILD_INTERVAL > 0
                         and (s.last_rebuild is None or
@@ -1574,7 +1592,7 @@ def build_app(model_module) -> FastAPI:
                 log(f"❌ bg reload: {e}", s.NODE_NAME, level="error", force=True)
                 send_error_trace(e, s.NODE_NAME, "bg_reload")
 
-    # ── fill cache helpers ────────────────────────────────────────────────────
+    # ── fill_cache helpers ────────────────────────────────────────────────────
 
     async def _bulk_insert(rows: list[dict]) -> int:
         if not rows:
@@ -1608,17 +1626,104 @@ def build_app(model_module) -> FastAPI:
         s.fill_cancel.clear()
         dt_from = _parse_date(date_from_str) if date_from_str else None
         dt_to   = _parse_date(date_to_str)   if date_to_str   else None
+
+        # ── IS_SIMPLE: игнорируем pairs/days ──────────────────────────────────
+        if s.IS_SIMPLE:
+            slots = [(tp, var) for tp in types for var in s.VAR_RANGE]
+            candles = [r for r in s.simple_rates
+                       if (dt_from is None or r["date"] >= dt_from)
+                       and (dt_to   is None or r["date"] <= dt_to)]
+            total = len(candles) * len(slots)
+            done = skipped = errors = 0
+            s.fill_status = {"state": "running", "total": total, "done": 0,
+                             "skipped": 0, "errors": 0,
+                             "started_at": datetime.now().isoformat()}
+            log(f"🚀 fill_cache (simple): {len(candles)} candles × {len(slots)} slots",
+                s.NODE_NAME, force=True)
+
+            for calc_type, var in slots:
+                if s.fill_cancel.is_set():
+                    break
+                extra       = {"type": calc_type, "var": var, "param": ""}
+                p_hash      = _params_hash(extra)
+                params_json = _json.dumps(extra, ensure_ascii=False)
+                try:
+                    async with s.engine_vlad.connect() as conn:
+                        res = await conn.execute(text("""
+                            SELECT date_val FROM vlad_values_cache
+                            WHERE service_url=:url AND params_hash=:ph
+                        """), {"url": s.service_url, "ph": p_hash})
+                        cached = {r[0] for r in res.fetchall()}
+                except Exception:
+                    cached = set()
+
+                to_fetch  = [c for c in candles if c["date"] not in cached]
+                skipped  += len(candles) - len(to_fetch)
+
+                for i in range(0, len(to_fetch), batch_size):
+                    if s.fill_cancel.is_set():
+                        break
+                    batch = to_fetch[i:i + batch_size]
+
+                    def _sync_simple(candle, _ct=calc_type, _v=var):
+                        td = candle["date"]
+                        try:
+                            res = s.model_fn(rates=_simple_rates_lte(td, s),
+                                             dataset=_filter_dataset_lte(td, s),
+                                             date=td, type=_ct, var=_v, param="")
+                            res, _ = _extract_detail(res)
+                            return res or {}
+                        except Exception:
+                            return None
+
+                    results = await asyncio.gather(
+                        *[asyncio.to_thread(_sync_simple, c) for c in batch],
+                        return_exceptions=True,
+                    )
+                    insert_rows = []
+                    for candle, result in zip(batch, results):
+                        if isinstance(result, Exception) or result is None:
+                            errors += 1
+                            continue
+                        insert_rows.append({
+                            "url": s.service_url, "dv": candle["date"],
+                            "ph": p_hash, "pj": params_json,
+                            "rj": _json.dumps(result, ensure_ascii=False),
+                        })
+                    if insert_rows:
+                        try:
+                            async with s.engine_vlad.begin() as conn:
+                                for row in insert_rows:
+                                    await conn.execute(text("""
+                                        INSERT IGNORE INTO vlad_values_cache
+                                            (service_url, date_val, params_hash,
+                                             params_json, result_json)
+                                        VALUES (:url, :dv, :ph, :pj, :rj)
+                                    """), row)
+                        except Exception as e:
+                            log(f"  ⚠️ bulk insert: {e}", s.NODE_NAME, level="warning")
+                    done += len(batch)
+                    s.fill_status.update({"done": done, "skipped": skipped, "errors": errors})
+                    log(f"  [simple {calc_type}/{var}] {done}/{total} err={errors}",
+                        s.NODE_NAME, force=True)
+
+            state = "stopped" if s.fill_cancel.is_set() else "done"
+            s.fill_status.update({"state": state, "finished_at": datetime.now().isoformat()})
+            log(f"✅ fill_cache (simple) {state}: done={done} skip={skipped} err={errors}",
+                s.NODE_NAME, force=True)
+            return
+
+        # ── Полный режим (старый код) ────────────────────────────────────────
         slots   = [(pair, day, tp, var)
                    for pair in pairs for day in days
                    for tp in types for var in s.VAR_RANGE]
-        # total_dates по уникальным (pair, day) — type/var не меняет число свечей
         unique_pd = {(p, d) for p, d, *_ in slots}
         total_dates = sum(
             sum(1 for r in s.global_rates.get(_rates_table(p, d), [])
                 if (dt_from is None or r["date"] >= dt_from)
                 and (dt_to   is None or r["date"] <= dt_to))
             for p, d in unique_pd
-        ) * len(types) * len(s.VAR_RANGE)  # умножаем на кол-во слотов на пару
+        ) * len(types) * len(s.VAR_RANGE)
         s.fill_status = {
             "state": "running", "pairs": pairs, "days": days,
             "types": types, "var_range": s.VAR_RANGE, "batch_size": batch_size,
@@ -1672,7 +1777,6 @@ def build_app(model_module) -> FastAPI:
                         else:
                             res = s.model_fn(rates=r, dataset=ds, date=td,
                                              type=calc_type, var=var, param="")
-                        # __detail__ в кэш НЕ попадает
                         res, _ = _extract_detail(res)
                         return res or {}
                     except Exception:
@@ -1710,43 +1814,44 @@ def build_app(model_module) -> FastAPI:
         log(f"✅ fill done: done={overall_done} skip={overall_skipped} err={errors}",
             s.NODE_NAME, force=True)
 
-        # ── Авто-бэктест после заполнения кэша ───────────────────────────────
-        log("🔁 auto-backtest после fill_cache...", s.NODE_NAME, force=True)
-        bt_date_from = _parse_date(date_from_str) if date_from_str else datetime(2025, 1, 1)
-        bt_date_to   = _parse_date(date_to_str)   if date_to_str   else datetime.now()
-        for bt_pair in pairs:
-            for bt_day in days:
-                for bt_type in types:
-                    for bt_var in s.VAR_RANGE:
-                        try:
-                            bt_result = await _backtest(
-                                bt_pair, bt_day, tier=0,
-                                extra_params={"type": bt_type, "var": bt_var},
-                                df=bt_date_from, dt=bt_date_to,
-                            )
-                            label = f"pair={bt_pair} day={'d' if bt_day else 'h'} type={bt_type} var={bt_var}"
-                            if "error" in bt_result:
-                                log(f"  ⚠️ backtest [{label}]: {bt_result['error']}",
-                                    s.NODE_NAME, force=True)
-                            else:
-                                log(f"  ✅ backtest [{label}]: "
-                                    f"score={bt_result.get('value_score')} "
-                                    f"acc={bt_result.get('accuracy')} "
-                                    f"trades={bt_result.get('trade_count')}",
-                                    s.NODE_NAME, force=True)
-                        except Exception as e:
-                            log(f"  ❌ backtest error pair={bt_pair} day={bt_day} type={bt_type} var={bt_var}: {e}",
-                                s.NODE_NAME, level="error")
-                try:
-                    await _upsert_summary(bt_pair, bt_day, tier=0,
-                                          df=bt_date_from, dt=bt_date_to)
-                except Exception as e:
-                    log(f"  ⚠️ summary pair={bt_pair} day={bt_day}: {e}",
-                        s.NODE_NAME, level="warning")
-        s.fill_status["auto_backtest"] = "done"
-        log("✅ auto-backtest завершён", s.NODE_NAME, force=True)
+        # ── Авто-бэктест после заполнения кэша (только для полного режима) ────
+        if not s.IS_SIMPLE:
+            log("🔁 auto-backtest после fill_cache...", s.NODE_NAME, force=True)
+            bt_date_from = _parse_date(date_from_str) if date_from_str else datetime(2025, 1, 1)
+            bt_date_to   = _parse_date(date_to_str)   if date_to_str   else datetime.now()
+            for bt_pair in pairs:
+                for bt_day in days:
+                    for bt_type in types:
+                        for bt_var in s.VAR_RANGE:
+                            try:
+                                bt_result = await _backtest(
+                                    bt_pair, bt_day, tier=0,
+                                    extra_params={"type": bt_type, "var": bt_var},
+                                    df=bt_date_from, dt=bt_date_to,
+                                )
+                                label = f"pair={bt_pair} day={'d' if bt_day else 'h'} type={bt_type} var={bt_var}"
+                                if "error" in bt_result:
+                                    log(f"  ⚠️ backtest [{label}]: {bt_result['error']}",
+                                        s.NODE_NAME, force=True)
+                                else:
+                                    log(f"  ✅ backtest [{label}]: "
+                                        f"score={bt_result.get('value_score')} "
+                                        f"acc={bt_result.get('accuracy')} "
+                                        f"trades={bt_result.get('trade_count')}",
+                                        s.NODE_NAME, force=True)
+                            except Exception as e:
+                                log(f"  ❌ backtest error pair={bt_pair} day={bt_day} type={bt_type} var={bt_var}: {e}",
+                                    s.NODE_NAME, level="error")
+                    try:
+                        await _upsert_summary(bt_pair, bt_day, tier=0,
+                                              df=bt_date_from, dt=bt_date_to)
+                    except Exception as e:
+                        log(f"  ⚠️ summary pair={bt_pair} day={bt_day}: {e}",
+                            s.NODE_NAME, level="warning")
+            s.fill_status["auto_backtest"] = "done"
+            log("✅ auto-backtest завершён", s.NODE_NAME, force=True)
 
-    # ── _backtest ─────────────────────────────────────────────────────────────
+    # ── _backtest и _upsert_summary (без изменений) ────────────────────────────
 
     async def _backtest(pair, day, tier, extra_params, df, dt) -> dict:
         p_hash = _params_hash(extra_params)
@@ -1881,7 +1986,7 @@ def build_app(model_module) -> FastAPI:
                 "ba": float(row[3] or 0), "aa": float(row[4] or 0), "bpj": row[5],
             })
 
-    # ── FastAPI ───────────────────────────────────────────────────────────────
+    # ── FastAPI (эндпоинты) ────────────────────────────────────────────────────
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -1939,15 +2044,6 @@ def build_app(model_module) -> FastAPI:
         return ok_response({"codes": s.weight_codes, "var_range": s.VAR_RANGE})
 
     def _build_narrative(payload: dict, date_str: str, day_flag: int, calc_type: int) -> list[str]:
-        """
-        Строит текстовый нарратив из payload {weight_code: float} без участия model.py.
-        Работает аналогично сервису 33: декодирует weight_code → shift + event_key,
-        обогащает из ctx_index, строит читаемые строки.
-
-        Формат weight_code ожидается как: PREFIX{ctx_id}_{mode}_{shift}
-        где shift — целое число (может быть отрицательным: NW5_0_-3).
-        Если ctx_index пуст или weight_code не декодируется — возвращает краткий нарратив.
-        """
         if not payload:
             return ["Нет данных для текущей даты."]
 
@@ -1966,13 +2062,10 @@ def build_app(model_module) -> FastAPI:
             2: "Type = 2: учитывается только вероятность экстремума.",
         }.get(calc_type, f"Type = {calc_type}.")
 
-        # ── Декодирование weight_code → группы ───────────────────────────────
-        # Формат: <prefix><ctx_id>_<mode>_<shift>
-        # Prefix — любые буквы, ctx_id — цифры, mode — 0|1, shift — целое.
         import re as _re
-        _wc_pat = _re.compile(r'^[A-Za-z]+(\d+)_(\d+)_(-?\d+)$')
+        # ФИКС 2: поддержка кодов без префикса (например "5_0_3") — ноль или более букв
+        _wc_pat = _re.compile(r'^[A-Za-z]*(\d+)_(\d+)_(-?\d+)$')
 
-        # Группа: (ctx_id, shift) → {mode0: {wc: val}, mode1: {wc: val}}
         groups: dict[tuple, dict] = {}
         unmatched: dict[str, float] = {}
 
@@ -1986,7 +2079,6 @@ def build_app(model_module) -> FastAPI:
             shift  = int(m.group(3))
             gk = (ctx_id, shift)
             if gk not in groups:
-                # Ищем label: сначала через LABEL_FN, потом ctx_index
                 label = None
                 if s.LABEL_FN:
                     try:
@@ -1994,7 +2086,6 @@ def build_app(model_module) -> FastAPI:
                     except Exception:
                         pass
                 if not label:
-                    # Ищем в ctx_index по любому ключу содержащему ctx_id
                     for key, info in s.ctx_index.items():
                         if key[0] == ctx_id:
                             label = (info.get("person_token") or
@@ -2006,7 +2097,6 @@ def build_app(model_module) -> FastAPI:
                 if not label:
                     label = f"ctx_id={ctx_id}"
 
-                # occurrence_count из ctx_index
                 occ = 0
                 for key, info in s.ctx_index.items():
                     if key[0] == ctx_id:
@@ -2018,8 +2108,8 @@ def build_app(model_module) -> FastAPI:
                     "shift":  shift,
                     "label":  label,
                     "occ":    occ,
-                    "t1":  {},   # mode=0
-                    "ext": {},   # mode=1
+                    "t1":  {},
+                    "ext": {},
                 }
             g = groups[gk]
             if mode == 0:
@@ -2030,14 +2120,11 @@ def build_app(model_module) -> FastAPI:
         if not groups and not unmatched:
             return ["Нет событий для декодирования."]
 
-        # Сортировка: по убыванию shift (ближе к target — первее)
         sorted_groups = sorted(groups.values(), key=lambda g: (-g["shift"], g["ctx_id"]))
         n = len(sorted_groups)
         evt_word = _pluralize_n(n, ("событие", "события", "событий"))
 
         lines: list[str] = []
-
-        # Заголовок
         lines.append(
             f"Окно поиска: {start_dt.strftime('%Y-%m-%d %H:%M')} — "
             f"{end_dt.strftime('%Y-%m-%d %H:%M')}. "
@@ -2045,7 +2132,6 @@ def build_app(model_module) -> FastAPI:
         )
         lines.append("")
 
-        # Нумерованный список
         for i, g in enumerate(sorted_groups, 1):
             tl = _shift_label(g["shift"], day_flag)
             lines.append(f'{i}. "{g["label"]}" — {tl}')
@@ -2054,7 +2140,6 @@ def build_app(model_module) -> FastAPI:
         lines.append(type_desc)
         lines.append("")
 
-        # Детали по каждому событию
         for i, g in enumerate(sorted_groups, 1):
             tl      = _shift_label(g["shift"], day_flag)
             t1_sum  = round(sum(g["t1"].values()),  6) if g["t1"]  else None
@@ -2074,7 +2159,6 @@ def build_app(model_module) -> FastAPI:
                 lines.append("Веса: " + ", ".join(codes) + ".")
             lines.append("")
 
-        # Нераспознанные коды (если есть)
         if unmatched:
             lines.append(f"Прочие веса ({len(unmatched)}): " +
                          ", ".join(f"{k}: {v}" for k, v in list(unmatched.items())[:10]) +
@@ -2090,11 +2174,6 @@ def build_app(model_module) -> FastAPI:
         var:   int = Query(0),
         param: str = Query(""),
     ):
-        """
-        Расчёт весов модели с текстовым нарративом (аналог сервиса 33).
-        Нарратив строится всегда — из payload, без флага detail.
-        Читает из кэша если есть, иначе считает live.
-        """
         if s.VAR_RANGE and var not in s.VAR_RANGE:
             return err_response(f"var={var} не входит в VAR_RANGE={s.VAR_RANGE}")
         try:
@@ -2106,7 +2185,6 @@ def build_app(model_module) -> FastAPI:
                                                calc_type=type, calc_var=var, param=param),
                 node=s.NODE_NAME,
             )
-            # Строим нарратив из payload — всегда, как в сервисе 33
             payload = resp.get("payLoad") or {}
             day_flag = 1 if day == 1 else 0
             resp["details"] = _build_narrative(payload, date, day_flag, type)
@@ -2139,11 +2217,6 @@ def build_app(model_module) -> FastAPI:
         date_to:    str = Query(""),
         batch_size: int = Query(300),
     ):
-        """
-        Заполняет кэш для всех type (0, 1, 2) × всех var из VAR_RANGE.
-        Уже посчитанные (pair, day, date, type, var) пропускаются (INSERT IGNORE).
-        После завершения автоматически запускает бэктест и summary.
-        """
         if s.fill_task and not s.fill_task.done():
             return err_response("Fill already running.")
         try:
@@ -2151,10 +2224,11 @@ def build_app(model_module) -> FastAPI:
             dl = [int(d.strip()) for d in days.split(",")  if d.strip()]
         except ValueError:
             return err_response("pairs и days — числа через запятую")
-        if not all(p in {1, 3, 4} for p in pl):
-            return err_response("Допустимые pair: 1 (EUR), 3 (BTC), 4 (ETH)")
-        if not all(d in {0, 1} for d in dl):
-            return err_response("Допустимые day: 0 (hourly), 1 (daily)")
+        if not s.IS_SIMPLE:
+            if not all(p in {1, 3, 4} for p in pl):
+                return err_response("Допустимые pair: 1 (EUR), 3 (BTC), 4 (ETH)")
+            if not all(d in {0, 1} for d in dl):
+                return err_response("Допустимые day: 0 (hourly), 1 (daily)")
         all_types = [0, 1, 2]
         effective_date_from = date_from if date_from.strip() else s.CACHE_DATE_FROM
         s.fill_task = asyncio.create_task(
@@ -2229,17 +2303,8 @@ def build_app(model_module) -> FastAPI:
         type:      int = Query(0),
         var:       int = Query(-1),
     ):
-        """
-        Запускает бэктест и сохраняет результаты в vlad_backtest_results + vlad_backtest_summary.
-
-        pairs     — инструменты через запятую: "1,3,4" (1=EUR, 3=BTC, 4=ETH)
-        days      — таймфреймы через запятую: "0,1" (0=hourly, 1=daily)
-        tier      — 0 или 1
-        date_from — начало периода (дефолт = CACHE_DATE_FROM)
-        date_to   — конец периода (дефолт = сейчас)
-        type      — тип расчёта (0=оба, 1=T1, 2=Extremum)
-        var       — конкретная вариация или -1 для всех из VAR_RANGE
-        """
+        if s.IS_SIMPLE:
+            return err_response("Backtest не поддерживается в IS_SIMPLE режиме.")
         try:
             pl = [int(p.strip()) for p in pairs.split(",") if p.strip()]
             dl = [int(d.strip()) for d in days.split(",")  if d.strip()]
@@ -2285,6 +2350,8 @@ def build_app(model_module) -> FastAPI:
     @app.get("/summary")
     async def ep_summary(pair: int = Query(-1), day: int = Query(-1),
                          tier: int = Query(-1)):
+        if s.IS_SIMPLE:
+            return err_response("Summary не поддерживается в IS_SIMPLE режиме.")
         conds  = ["service_url=:url"]
         params = {"url": s.service_url}
         if pair >= 0: conds.append("pair=:pair");    params["pair"] = pair
@@ -2335,6 +2402,10 @@ def build_app(model_module) -> FastAPI:
             pass
         log("  ✅ Тест 1: синтаксис model.py OK", s.NODE_NAME, force=True)
 
+        if s.IS_SIMPLE:
+            log("  ℹ️  IS_SIMPLE режим: пропускаем тесты 2-3 (нет ctx/events)", s.NODE_NAME, force=True)
+            return {"status": "ok", "mode": "simple", "var_range": s.VAR_RANGE}
+
         rates_indices: dict[str, list] = {}
         for table in _RATES_TABLES:
             rows = s.global_rates.get(table, [])
@@ -2365,7 +2436,6 @@ def build_app(model_module) -> FastAPI:
             except Exception as e:
                 return {"status": "error",
                         "error": f"[Тест 2 — Структура] model() exception: {e}"}
-            # Извлекаем detail перед валидацией структуры
             res, _ = _extract_detail(res)
             if res is None:
                 return {"status": "error",
@@ -2393,37 +2463,11 @@ def build_app(model_module) -> FastAPI:
         test3_total = len(test3_pairs)
         test3_count = 0
 
-        # Пороги покрытия: дневные данные имеют меньше событийных совпадений
-        # по природе (меньше свечей пересекается с hourly-событиями датасета).
-        # hour ≥ 90%, day ≥ 70% — оба порога считаются нормой.
         _COVERAGE_THRESHOLD = {"hour": 0.90, "day": 0.70}
-
-        # Диапазон событий для корректной выборки дат в Тесте 3.
-        # Выборка должна попадать ВНУТРЬ диапазона событий — иначе модель
-        # всегда вернёт {} (нет событий в окне поиска → ложный провал).
-        # ── Тест 3: стратегия выборки ────────────────────────────────────────────
-        #
-        # Для EVENT-SPARSE моделей (news, calendar) большинство часов не содержат
-        # событий. Случайные свечи дадут model()={} не из-за бага, а по природе
-        # данных. Поэтому выборка строится из дат, ГАРАНТИРОВАННО близких к
-        # событиям: target_date = event_date + delta_unit (следующая свеча после
-        # события). Если sorted_dates пуст (модель без событий) — берём случайные
-        # свечи из второй половины истории, как и раньше.
-        #
-        # Порог 90% означает: из 20 таких "near-event" дат 90% должны вернуть
-        # непустой dict. Это проверяет работу pipeline (event_history, t_dates,
-        # compute_t1/extremum), а не плотность событий.
-
-        _COVERAGE_THRESHOLD = {"hour": 0.90, "day": 0.70}
-
-        # Строим rate_lookup: дата → индекс в rows (для каждой таблицы)
-        # Нужен чтобы быстро найти свечу, следующую после события.
-        rate_date_sets: dict[str, set] = {}
         rate_date_lists: dict[str, list] = {}
         for _tbl in _RATES_TABLES:
             _rr = s.global_rates.get(_tbl, [])
             rate_date_lists[_tbl] = [r["date"] for r in _rr]
-            rate_date_sets[_tbl] = set(rate_date_lists[_tbl])
 
         for pair_id, tf_name, table in test3_pairs:
             test3_count += 1
@@ -2436,27 +2480,20 @@ def build_app(model_module) -> FastAPI:
             du_test   = timedelta(days=1) if day_flag else timedelta(hours=1)
 
             if s.sorted_dates:
-                # Event-aware выборка: берём даты сразу ПОСЛЕ событий.
-                # target = event_date + du (следующая свеча после события).
-                # Это гарантирует, что find_events найдёт хотя бы одно событие
-                # в окне shift=-1. Берём равномерную выборку из sorted_dates.
                 n_evt = len(s.sorted_dates)
-                step_evt = max(1, n_evt // 30)  # до 30 кандидатов
+                step_evt = max(1, n_evt // 30)
                 candidate_events = s.sorted_dates[::step_evt]
                 rdates = rate_date_lists[table]
                 sample_dates = []
                 for ev_dt in candidate_events:
-                    # Ищем первую свечу >= ev_dt + du в таблице котировок
                     target_candidate = ev_dt + du_test
                     idx_r = bisect.bisect_left(rdates, target_candidate)
                     if idx_r < len(rdates):
                         candidate = rdates[idx_r]
-                        # Убеждаемся что событие попадёт в окно shift≤-1
                         if candidate > ev_dt and candidate not in sample_dates:
                             sample_dates.append(candidate)
                     if len(sample_dates) >= 20:
                         break
-                # Если event-aware выборка слишком мала — добавить из второй половины
                 if len(sample_dates) < 5:
                     fallback_pool = rows[max(len(rows) // 2, 1):]
                     step_f = max(1, len(fallback_pool) // 20)
@@ -2466,7 +2503,6 @@ def build_app(model_module) -> FastAPI:
                         if len(sample_dates) >= 20:
                             break
             else:
-                # Модель без событий (чисто rate-based): вторая половина истории
                 fallback_pool = rows[max(len(rows) // 2, 1):]
                 step_f = max(1, len(fallback_pool) // 20)
                 sample_dates = [fallback_pool[i * step_f]["date"]
@@ -2521,6 +2557,8 @@ def build_app(model_module) -> FastAPI:
 
     @app.get("/universe_sync")
     async def ep_universe_sync():
+        if s.IS_SIMPLE:
+            return err_response("universe_sync не поддерживается в IS_SIMPLE режиме.")
         try:
             async with s.engine_vlad.begin() as conn:
                 await conn.execute(text("""
@@ -2577,23 +2615,8 @@ def build_app(model_module) -> FastAPI:
         date_from: str = Query(""),
         date_to:   str = Query(""),
     ):
-        """
-        Пост-тест модели — запускается после заполнения кэша, перед деплоем.
-        Возвращает развёрнутую статистику (не бинарный статус).
-
-        Оптимизации:
-        - Тест 1: SQL-агрегат JSON_LENGTH — без Python-парсинга всего кэша.
-        - Тест 2: читает result_json потоком, суммирует знаки без хранения dict.
-        - Тест 3: живой вызов model() с текущей датой.
-        - Тесты 4,5: читают кэш ОДИН раз как {date: signal_sum}, CPU в to_thread.
-        - Все pair×day запускаются параллельно через asyncio.gather.
-        - date_from/date_to ограничивают период (дефолт = CACHE_DATE_FROM..now).
-
-        Формат ответа:
-          { "1": { "hour": { "data": {...}, "values": {...}, "sync": {...},
-                             "hole": int, "history": {...} }, "day": {...} },
-            "3": {...}, "4": {...} }
-        """
+        if s.IS_SIMPLE:
+            return err_response("posttest не поддерживается в IS_SIMPLE режиме.")
         try:
             pl = [int(p.strip()) for p in pairs.split(",") if p.strip()]
             dl = [int(d.strip()) for d in days.split(",")  if d.strip()]
@@ -2616,7 +2639,6 @@ def build_app(model_module) -> FastAPI:
             url_p = {"url": s.service_url, "pair": pair_id, "day": day_flag,
                      "df": dt_from, "dt": dt_to}
 
-            # ── Тест 1: SQL-агрегат по количеству ключей ─────────────────────
             data_stats = {"min": 0.0, "max": 0.0, "avg": 0.0}
             try:
                 async with s.engine_vlad.connect() as conn:
@@ -2637,7 +2659,6 @@ def build_app(model_module) -> FastAPI:
             except Exception as e:
                 log(f"  ⚠️ posttest t1 {pair_id}/{tf_name}: {e}", s.NODE_NAME, level="warning")
 
-            # ── Тест 2: подсчёт знаков потоком (без хранения всех dict) ──────
             values_stats = {"plus": 0, "minus": 0}
             try:
                 async with s.engine_vlad.connect() as conn:
@@ -2660,7 +2681,6 @@ def build_app(model_module) -> FastAPI:
             except Exception as e:
                 log(f"  ⚠️ posttest t2 {pair_id}/{tf_name}: {e}", s.NODE_NAME, level="warning")
 
-            # ── Тест 3: живой вызов с актуальной датой ────────────────────────
             now_str = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
             try:
                 sync_result = await _call_model(pair_id, day_flag, now_str)
@@ -2668,9 +2688,6 @@ def build_app(model_module) -> FastAPI:
             except Exception as e:
                 sync_out = {"error": str(e)}
 
-            # ── Читаем кэш один раз: {date: signal_sum} ──────────────────────
-            # Только суммарный сигнал — в 10-100x меньше памяти чем полный dict.
-            # Используется для тестов 4 и 5.
             cache_signals: dict = {}
             try:
                 async with s.engine_vlad.connect() as conn:
@@ -2691,7 +2708,6 @@ def build_app(model_module) -> FastAPI:
                 log(f"  ⚠️ posttest cache {pair_id}/{tf_name}: {e}", s.NODE_NAME, level="warning")
 
             def _compute_hole_and_sim():
-                # ── Тест 4: максимальная проплешина ──────────────────────────
                 non_empty = np.array(
                     [cache_signals.get(r["date"], (False, 0.0))[0] for r in rows],
                     dtype=bool,
@@ -2706,7 +2722,6 @@ def build_app(model_module) -> FastAPI:
                     runs   = np.where(diffs == -1)[0] - np.where(diffs == 1)[0]
                     hole   = int(np.max(runs)) if len(runs) > 0 else 0
 
-                # ── Тест 5: симуляция торговли ────────────────────────────────
                 _, mod, lot_div = _PAIR_CFG.get(pair_id, (0.0002, 100_000.0, 50_000.0))
                 equity = 10_000.0
                 total_profit = total_dropdown = 0.0
@@ -2761,7 +2776,6 @@ def build_app(model_module) -> FastAPI:
                 "history": history_stats,
             }
 
-        # ── Параллельный запуск всех pair×day ────────────────────────────────
         slots   = [(p, d) for p in pl for d in dl]
         tasks   = [asyncio.create_task(_process_slot(p, d)) for p, d in slots]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -2776,6 +2790,5 @@ def build_app(model_module) -> FastAPI:
             )
 
         return ok_response(output)
-
 
     return app
