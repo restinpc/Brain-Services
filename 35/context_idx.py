@@ -1,34 +1,49 @@
 """
-brain_news_context_idx.py
-Шаг 1: Строит таблицу vlad_news_context_idx из NER-таблиц и brain_all_news.
-Логика: консенсус по 3 NER-моделям (>=2/3) → fingerprint → агрегация
+context_idx.py — Сервис 35: построение vlad_news_context_idx + vlad_news_ctx_map.
+
+Два режима запуска:
+  1. Самостоятельный скрипт (полная пересборка):
+         python context_idx.py
+     Читает .env, пересобирает таблицы с нуля (TRUNCATE + INSERT).
+
+  2. Вызов фреймворком (инкрементальное обновление):
+         from context_idx import build_index
+         stats = await build_index(engine_vlad, engine_brain)
+     Обновляет только новые news_id > MAX(news_id) из vlad_news_ctx_map.
+
+Источники: CNN, NYT, TWP, TGD, WSJ (5 NER-моделей)
+Консенсус сущностей >= MIN_MODELS моделей.
+Fingerprint = MD5(feed_cat | person | location | misc)[:16]
 """
 
-import os
-import hashlib
-from collections import Counter, defaultdict
-from datetime import datetime
+from __future__ import annotations
 
-import mysql.connector
+import asyncio
+import hashlib
+import os
+from collections import Counter
+
 from dotenv import load_dotenv
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
 
 load_dotenv()
 
-# --- Конфиг -------------------------------------------------------------------
-CTX_TABLE   = os.getenv("CTX_TABLE",   "vlad_news_context_idx")
-BATCH_SIZE  = int(os.getenv("BATCH_SIZE", "2000"))
-MIN_MODELS  = 2          # сущность попадает в fingerprint если встречается в >= MIN_MODELS моделях
-MIN_OCCURRENCE = 2       # минимум появлений контекста для включения в таблицу
+# ══════════════════════════════════════════════════════════════════════════════
+# КОНФИГ
+# ══════════════════════════════════════════════════════════════════════════════
+
+CTX_TABLE  = "vlad_news_context_idx"
+MAP_TABLE  = "vlad_news_ctx_map"
 
 NER_SOURCES = [
-    ("brain", "brain_cnn_ner",  "brain_cnn_news"),
-    ("brain", "brain_nyt_ner",  "brain_nyt_news"),
-    ("brain", "brain_twp_ner",  "brain_twp_news"),
-    ("brain", "brain_tgd_ner",  "brain_tgd_news"),
-    ("brain", "brain_wsj_ner",  "brain_wsj_news"),
+    ("brain_cnn_ner",  "brain_cnn_news"),
+    ("brain_nyt_ner",  "brain_nyt_news"),
+    ("brain_twp_ner",  "brain_twp_news"),
+    ("brain_tgd_ner",  "brain_tgd_news"),
+    ("brain_wsj_ner",  "brain_wsj_news"),
 ]
 
-# Маппинг feed → категория: F=Financial, P=Political, T=Tech, W=World, G=General
 FEED_CAT_MAP = {
     "cnn_money":       "F",
     "nyt_business":    "F",
@@ -47,69 +62,52 @@ FEED_CAT_MAP = {
     "cnn_world":       "W",
 }
 
+MIN_MODELS     = 2
+MIN_OCCURRENCE = 2
+BATCH_SIZE     = 2000
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # DDL
-DDL = f"""
+# ══════════════════════════════════════════════════════════════════════════════
+
+_DDL_CTX = f"""
 CREATE TABLE IF NOT EXISTS `{CTX_TABLE}` (
-  `id`               INT            NOT NULL AUTO_INCREMENT,
-  `feed_cat`         CHAR(1)        NOT NULL DEFAULT 'G',
-  `person_token`     VARCHAR(64)    NOT NULL DEFAULT '',
-  `location_token`   VARCHAR(64)    NOT NULL DEFAULT '',
-  `misc_token`       VARCHAR(64)    NOT NULL DEFAULT '',
-  `fingerprint_hash` CHAR(16)       NOT NULL DEFAULT '',
-  `occurrence_count` INT            NOT NULL DEFAULT 0,
-  `first_dt`         DATETIME       NULL,
-  `last_dt`          DATETIME       NULL,
-  `updated_at`       TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  PRIMARY KEY (`id`),
-  UNIQUE KEY `uk_fingerprint` (`fingerprint_hash`),
-  INDEX idx_feed_cat      (`feed_cat`),
-  INDEX idx_person_token  (`person_token`),
-  INDEX idx_location_token(`location_token`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    `id`               INT         NOT NULL AUTO_INCREMENT,
+    `feed_cat`         CHAR(1)     NOT NULL DEFAULT 'G',
+    `person_token`     VARCHAR(64) NOT NULL DEFAULT '',
+    `location_token`   VARCHAR(64) NOT NULL DEFAULT '',
+    `misc_token`       VARCHAR(64) NOT NULL DEFAULT '',
+    `fingerprint_hash` CHAR(16)    NOT NULL DEFAULT '',
+    `occurrence_count` INT         NOT NULL DEFAULT 0,
+    `first_dt`         DATETIME    NULL,
+    `last_dt`          DATETIME    NULL,
+    `updated_at`       TIMESTAMP   DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_fingerprint` (`fingerprint_hash`),
+    INDEX idx_feed_cat       (`feed_cat`),
+    INDEX idx_person_token   (`person_token`),
+    INDEX idx_location_token (`location_token`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 """
 
-# NEWS_CTX таблица: news_id → ctx_id (для быстрого RAM-поиска в сервере)
-NEWS_CTX_DDL = """
-CREATE TABLE IF NOT EXISTS `vlad_news_ctx_map` (
-  `news_id`   BIGINT NOT NULL,
-  `ctx_id`    INT    NOT NULL,
-  `news_date` DATETIME NULL,
-  PRIMARY KEY (`news_id`),
-  INDEX idx_ctx_id   (`ctx_id`),
-  INDEX idx_news_date(`news_date`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+_DDL_MAP = f"""
+CREATE TABLE IF NOT EXISTS `{MAP_TABLE}` (
+    `news_id`   BIGINT   NOT NULL,
+    `ctx_id`    INT      NOT NULL,
+    `news_date` DATETIME NULL,
+    PRIMARY KEY (`news_id`),
+    INDEX idx_ctx_id    (`ctx_id`),
+    INDEX idx_news_date (`news_date`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 """
 
 
-# --- DB -----------------------------------------------------------------------
+# ══════════════════════════════════════════════════════════════════════════════
+# NER-УТИЛИТЫ
+# ══════════════════════════════════════════════════════════════════════════════
 
-def get_brain_conn():
-    return mysql.connector.connect(
-        host=os.getenv("MASTER_HOST", "localhost"),
-        port=int(os.getenv("MASTER_PORT", "3307")),
-        user=os.getenv("MASTER_USER", "root"),
-        password=os.getenv("MASTER_PASSWORD", ""),
-        database=os.getenv("MASTER_NAME", "rss_db"),
-        autocommit=False,
-        charset="utf8mb4",
-    )
-
-def get_vlad_conn():
-    return mysql.connector.connect(
-        host=os.getenv("DB_HOST", "localhost"),
-        port=int(os.getenv("DB_PORT", "3306")),
-        user=os.getenv("DB_USER", "root"),
-        password=os.getenv("DB_PASSWORD", ""),
-        database=os.getenv("DB_NAME", "vlad"),
-        autocommit=False,
-        charset="utf8mb4",
-    )
-
-
-# --- NER обработка ------------------------------------------------------------
-
-def get_feed_cat(feed: str) -> str:
-    """Определяет категорию по полю feed."""
+def _get_feed_cat(feed: str) -> str:
     feed_lower = (feed or "").lower()
     for key, cat in FEED_CAT_MAP.items():
         if key in feed_lower:
@@ -117,24 +115,17 @@ def get_feed_cat(feed: str) -> str:
     return "G"
 
 
-def normalize_token(raw: str) -> str:
-    """
-    Нормализует строку сущности: берёт первые 2 слова, lowercase, strip.
-    Цель: 'wall street white house' → 'wall street'
-    """
+def _normalize_token(raw: str) -> str:
     if not raw:
         return ""
-    words = raw.strip().lower().split()
-    return " ".join(words[:2])[:64]
+    return " ".join(raw.strip().lower().split()[:2])[:64]
 
 
-def consensus_entities(ner_rows: list) -> dict:
+def _consensus_entities(ner_rows: list[dict]) -> dict:
     """
-    Принимает список NER-записей для одного news_id (от разных моделей).
-    Возвращает сущности с консенсусом >= MIN_MODELS.
-
-    Считаем "токены" после split+lower, затем голосуем по каждому слову.
-    Берём самый частотный консенсусный токен каждого типа.
+    Консенсус сущностей из нескольких NER-моделей.
+    Сущность включается если встречается в >= MIN_MODELS моделях.
+    Возвращает топ-2 слова для каждого типа (детерминировано: sorted).
     """
     persons   = Counter()
     locations = Counter()
@@ -151,233 +142,276 @@ def consensus_entities(ner_rows: list) -> dict:
             if len(token) > 2:
                 miscs[token] += 1
 
-    threshold = MIN_MODELS
-    p_words  = [k for k, v in persons.items()   if v >= threshold]
-    l_words  = [k for k, v in locations.items() if v >= threshold]
-    m_words  = [k for k, v in miscs.items()     if v >= threshold]
-
-    # Берём топ-2 слова, сортируем для детерминизма
-    def top2(words):
+    def top2(counter: Counter) -> str:
+        words = [k for k, v in counter.items() if v >= MIN_MODELS]
         return " ".join(sorted(words)[:2])
 
     return {
-        "person":   top2(p_words),
-        "location": top2(l_words),
-        "misc":     top2(m_words),
+        "person":   top2(persons),
+        "location": top2(locations),
+        "misc":     top2(miscs),
     }
 
 
-def make_fingerprint(feed_cat: str, person: str, location: str, misc: str) -> str:
-    """MD5 первые 16 символов — уникальный ключ контекста."""
+def _make_fingerprint(feed_cat: str, person: str, location: str, misc: str) -> str:
     raw = f"{feed_cat}|{person}|{location}|{misc}"
     return hashlib.md5(raw.encode()).hexdigest()[:16]
 
 
-# --- Загрузка NER-данных ------------------------------------------------------
+# ══════════════════════════════════════════════════════════════════════════════
+# ОБЩАЯ ЛОГИКА (используется обоими режимами)
+# ══════════════════════════════════════════════════════════════════════════════
 
-def load_ner_for_source(brain_conn, ner_table: str, news_table: str) -> dict:
-    """
-    Загружает NER-данные из одной пары таблиц.
-    Возвращает словарь: news_id → [ner_row, ...]
-    """
-    print(f"  Загрузка {ner_table} + {news_table}...")
-    cur = brain_conn.cursor(dictionary=True)
+async def _load_ner(engine_brain, max_id: int) -> dict[int, list[dict]]:
+    """Загружает NER-данные для news_id > max_id со всех источников."""
+    new_ner: dict[int, list[dict]] = {}
+    for ner_table, news_table in NER_SOURCES:
+        try:
+            async with engine_brain.connect() as conn:
+                res = await conn.execute(text(f"""
+                    SELECT n.news_id, n.person, n.location, n.misc,
+                           a.date, a.feed
+                    FROM `{ner_table}` n
+                    JOIN `{news_table}` a ON a.id = n.news_id
+                    WHERE a.date IS NOT NULL
+                      AND n.news_id > :max_id
+                    ORDER BY n.news_id
+                """), {"max_id": max_id})
+                for r in res.mappings().all():
+                    nid = int(r["news_id"])
+                    new_ner.setdefault(nid, []).append({
+                        "person":   r.get("person")   or "",
+                        "location": r.get("location") or "",
+                        "misc":     r.get("misc")     or "",
+                        "date":     r["date"],
+                        "feed":     r.get("feed")     or "",
+                    })
+        except Exception as e:
+            print(f"  Пропуск {ner_table}: {e}")
+    return new_ner
 
-    cur.execute(f"""
-        SELECT n.news_id, n.person, n.location, n.misc,
-               a.date, a.feed
-        FROM `{ner_table}` n
-        JOIN `{news_table}` a ON a.id = n.news_id
-        WHERE a.date IS NOT NULL
-    """)
-    rows = cur.fetchall()
-    cur.close()
 
-    # Группируем по news_id
-    by_news = defaultdict(list)
-    for row in rows:
-        by_news[row["news_id"]].append(row)
-
-    print(f"    Загружено: {len(rows)} NER-строк по {len(by_news)} новостям")
-    return by_news
-
-
-def build_fingerprint_map(ner_by_news: dict) -> list:
-    """
-    Принимает словарь {news_id: [ner_rows]}.
-    Возвращает список [(news_id, news_date, fingerprint_key, feed_cat, person, loc, misc)].
-    """
-    result = []
-    for news_id, rows in ner_by_news.items():
-        if not rows:
+def _build_fp_map(new_ner: dict[int, list[dict]]) -> dict[str, dict]:
+    """Строит словарь fingerprint → агрегированные данные."""
+    fp_map: dict[str, dict] = {}
+    for news_id, ner_rows in new_ner.items():
+        if not ner_rows:
             continue
-        # Берём date и feed из первой записи (одинаковы для всех моделей)
-        news_date = rows[0].get("date")
-        feed_cat  = get_feed_cat(rows[0].get("feed", ""))
-
-        ents = consensus_entities(rows)
-        fp   = make_fingerprint(feed_cat, ents["person"], ents["location"], ents["misc"])
-
-        result.append({
-            "news_id":  news_id,
-            "date":     news_date,
-            "fp":       fp,
-            "feed_cat": feed_cat,
-            "person":   normalize_token(ents["person"]),
-            "location": normalize_token(ents["location"]),
-            "misc":     normalize_token(ents["misc"]),
-        })
-    return result
-
-
-# --- Агрегация ----------------------------------------------------------------
-
-def aggregate_contexts(fp_records: list) -> dict:
-    """
-    Группирует fingerprint-записи в контексты.
-    Возвращает: {fp_hash: {feed_cat, person, location, misc, count, first_dt, last_dt}}
-    """
-    ctx_map = {}
-    for rec in fp_records:
-        fp = rec["fp"]
-        if fp not in ctx_map:
-            ctx_map[fp] = {
-                "feed_cat":  rec["feed_cat"],
-                "person":    rec["person"],
-                "location":  rec["location"],
-                "misc":      rec["misc"],
-                "count":     0,
-                "first_dt":  rec["date"],
-                "last_dt":   rec["date"],
-                "news_ids":  [],
+        feed_cat  = _get_feed_cat(ner_rows[0]["feed"])
+        news_date = ner_rows[0]["date"]
+        ents      = _consensus_entities(ner_rows)
+        fp        = _make_fingerprint(
+            feed_cat, ents["person"], ents["location"], ents["misc"]
+        )
+        if fp not in fp_map:
+            fp_map[fp] = {
+                "feed_cat":   feed_cat,
+                "person":     _normalize_token(ents["person"]),
+                "location":   _normalize_token(ents["location"]),
+                "misc":       _normalize_token(ents["misc"]),
+                "count":      0,
+                "first_dt":   news_date,
+                "last_dt":    news_date,
+                "news_items": [],
             }
-        ctx = ctx_map[fp]
-        ctx["count"] += 1
-        if rec["date"]:
-            if ctx["first_dt"] is None or rec["date"] < ctx["first_dt"]:
-                ctx["first_dt"] = rec["date"]
-            if ctx["last_dt"] is None or rec["date"] > ctx["last_dt"]:
-                ctx["last_dt"] = rec["date"]
-        ctx["news_ids"].append((rec["news_id"], rec["date"]))
-    return ctx_map
+        d = fp_map[fp]
+        d["count"] += 1
+        if news_date:
+            if d["first_dt"] is None or news_date < d["first_dt"]:
+                d["first_dt"] = news_date
+            if d["last_dt"]  is None or news_date > d["last_dt"]:
+                d["last_dt"]  = news_date
+        d["news_items"].append((news_id, news_date))
+    return fp_map
 
 
-# --- main ---------------------------------------------------------------------
+async def _upsert_ctx(engine_vlad, fp_map: dict[str, dict]) -> dict[str, int]:
+    """UPSERT fingerprints в CTX_TABLE. Возвращает {fp: ctx_id}."""
+    async with engine_vlad.begin() as conn:
+        for fp, d in fp_map.items():
+            await conn.execute(text(f"""
+                INSERT INTO `{CTX_TABLE}`
+                    (feed_cat, person_token, location_token, misc_token,
+                     fingerprint_hash, occurrence_count, first_dt, last_dt)
+                VALUES (:fc, :p, :l, :m, :fp, :cnt, :fd, :ld)
+                ON DUPLICATE KEY UPDATE
+                    occurrence_count = occurrence_count + :cnt,
+                    last_dt  = IF(:ld > last_dt  OR last_dt  IS NULL, :ld,  last_dt),
+                    first_dt = IF(:fd < first_dt OR first_dt IS NULL, :fd, first_dt)
+            """), {
+                "fc": d["feed_cat"], "p": d["person"],
+                "l":  d["location"], "m": d["misc"],
+                "fp": fp,            "cnt": d["count"],
+                "fd": d["first_dt"], "ld": d["last_dt"],
+            })
 
-def main():
-    brain_conn = get_brain_conn()
-    vlad_conn  = get_vlad_conn()
+    fp_list   = list(fp_map.keys())
+    fp_to_id: dict[str, int] = {}
+    async with engine_vlad.connect() as conn:
+        for i in range(0, len(fp_list), 500):
+            batch        = fp_list[i:i + 500]
+            placeholders = ", ".join(f":fp{j}" for j in range(len(batch)))
+            params       = {f"fp{j}": fp for j, fp in enumerate(batch)}
+            res = await conn.execute(text(f"""
+                SELECT id, fingerprint_hash FROM `{CTX_TABLE}`
+                WHERE fingerprint_hash IN ({placeholders})
+            """), params)
+            for r in res.fetchall():
+                fp_to_id[r[1]] = r[0]
+    return fp_to_id
+
+
+async def _insert_map(engine_vlad, fp_map: dict[str, dict],
+                      fp_to_id: dict[str, int]) -> int:
+    """INSERT IGNORE news → ctx mapping. Возвращает количество новых строк."""
+    new_events = 0
+    async with engine_vlad.begin() as conn:
+        for fp, d in fp_map.items():
+            ctx_id = fp_to_id.get(fp)
+            if ctx_id is None:
+                continue
+            for news_id, news_date in d["news_items"]:
+                r = await conn.execute(text(f"""
+                    INSERT IGNORE INTO `{MAP_TABLE}` (news_id, ctx_id, news_date)
+                    VALUES (:nid, :cid, :nd)
+                """), {"nid": news_id, "cid": ctx_id, "nd": news_date})
+                new_events += r.rowcount
+    return new_events
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# РЕЖИМ 1: вызов фреймворком (инкрементальный)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def build_index(engine_vlad, engine_brain) -> dict:
+    """
+    Инкрементально обновляет CTX_TABLE и MAP_TABLE.
+    Обрабатывает только news_id > MAX(news_id из MAP_TABLE).
+    Идемпотентна: безопасно запускать часто.
+    """
+    await engine_vlad.dispose()
+    await engine_brain.dispose()
+
+    # Создаём таблицы если не существуют
+    async with engine_vlad.begin() as conn:
+        await conn.execute(text(_DDL_CTX))
+        await conn.execute(text(_DDL_MAP))
+
+    # Определяем инкремент
+    async with engine_vlad.connect() as conn:
+        row = (await conn.execute(
+            text(f"SELECT MAX(news_id) FROM `{MAP_TABLE}`")
+        )).fetchone()
+    max_known_id: int = int(row[0]) if row and row[0] else 0
+
+    new_ner = await _load_ner(engine_brain, max_id=max_known_id)
+    if not new_ner:
+        return {
+            "processed_news": 0, "new_contexts": 0,
+            "new_events": 0, "max_news_id": max_known_id,
+        }
+
+    fp_map   = _build_fp_map(new_ner)
+    fp_to_id = await _upsert_ctx(engine_vlad, fp_map)
+    new_events = await _insert_map(engine_vlad, fp_map, fp_to_id)
+
+    return {
+        "processed_news":   len(new_ner),
+        "new_contexts":     len(fp_to_id),
+        "new_events":       new_events,
+        "prev_max_news_id": max_known_id,
+        "new_max_news_id":  max(new_ner.keys()) if new_ner else max_known_id,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# РЕЖИМ 2: самостоятельный скрипт (полная пересборка)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _run_standalone():
+    """Полная пересборка с нуля: TRUNCATE + INSERT (не инкрементально)."""
+
+    def _make_engine(url: str):
+        return create_async_engine(url, pool_pre_ping=True, echo=False)
+
+    brain_url = (
+        f"mysql+aiomysql://{os.getenv('MASTER_USER','root')}:"
+        f"{os.getenv('MASTER_PASSWORD','')}@"
+        f"{os.getenv('MASTER_HOST','localhost')}:"
+        f"{os.getenv('MASTER_PORT','3307')}/"
+        f"{os.getenv('MASTER_NAME','rss_db')}?charset=utf8mb4"
+    )
+    vlad_url = (
+        f"mysql+aiomysql://{os.getenv('DB_USER','root')}:"
+        f"{os.getenv('DB_PASSWORD','')}@"
+        f"{os.getenv('DB_HOST','localhost')}:"
+        f"{os.getenv('DB_PORT','3306')}/"
+        f"{os.getenv('DB_NAME','vlad')}?charset=utf8mb4"
+    )
+
+    engine_brain = _make_engine(brain_url)
+    engine_vlad  = _make_engine(vlad_url)
 
     try:
-        vcur = vlad_conn.cursor()
-
+        # Создаём таблицы
         print("Создание таблиц...")
-        vcur.execute(DDL)
-        vcur.execute(NEWS_CTX_DDL)
-        vlad_conn.commit()
+        async with engine_vlad.begin() as conn:
+            await conn.execute(text(_DDL_CTX))
+            await conn.execute(text(_DDL_MAP))
 
-        # Собираем NER со всех источников
-        all_fp_records = []
-        for db_name, ner_table, news_table in NER_SOURCES:
-            conn = brain_conn  # всё в brain DB
-            try:
-                by_news = load_ner_for_source(conn, ner_table, news_table)
-                fp_recs = build_fingerprint_map(by_news)
-                all_fp_records.extend(fp_recs)
-                print(f"    {ner_table}: {len(fp_recs)} fingerprint-записей")
-            except Exception as e:
-                print(f"  Пропуск {ner_table}: {e}")
+        # Загружаем ВСЕ NER-данные (max_id=0)
+        print("Загрузка NER-данных со всех источников...")
+        new_ner = await _load_ner(engine_brain, max_id=0)
+        print(f"  Загружено новостей: {len(new_ner)}")
 
-        print(f"\nВсего NER-fingerprint записей: {len(all_fp_records)}")
+        fp_map = _build_fp_map(new_ner)
+        print(f"  Уникальных fingerprints: {len(fp_map)}")
 
-        # Дедупликация по news_id (один и тот же news_id из нескольких источников)
-        seen_news = {}
-        deduped = []
-        for rec in all_fp_records:
-            if rec["news_id"] not in seen_news:
-                seen_news[rec["news_id"]] = rec
-                deduped.append(rec)
-        print(f"После дедупликации: {len(deduped)}")
+        # Фильтрация по MIN_OCCURRENCE (только для standalone — полная пересборка)
+        fp_filtered = {fp: d for fp, d in fp_map.items()
+                       if d["count"] >= MIN_OCCURRENCE}
+        print(f"  После фильтра (>= {MIN_OCCURRENCE}): {len(fp_filtered)}")
 
-        # Агрегируем контексты
-        ctx_map = aggregate_contexts(deduped)
-        print(f"Уникальных контекстов: {len(ctx_map)}")
+        # TRUNCATE перед полной пересборкой
+        print("Очистка таблиц...")
+        async with engine_vlad.begin() as conn:
+            await conn.execute(text(f"TRUNCATE TABLE `{CTX_TABLE}`"))
+            await conn.execute(text(f"TRUNCATE TABLE `{MAP_TABLE}`"))
 
-        # Фильтруем по минимальному числу появлений
-        ctx_filtered = {fp: ctx for fp, ctx in ctx_map.items()
-                        if ctx["count"] >= MIN_OCCURRENCE}
-        print(f"Контекстов после фильтра (>= {MIN_OCCURRENCE}): {len(ctx_filtered)}")
+        fp_to_id = await _upsert_ctx(engine_vlad, fp_filtered)
+        new_events = await _insert_map(engine_vlad, fp_filtered, fp_to_id)
 
-        # Записываем context_idx
-        print("\nЗапись в vlad_news_context_idx...")
-        vcur.execute(f"TRUNCATE TABLE `{CTX_TABLE}`;")
-        vlad_conn.commit()
+        # Итоги
+        async with engine_vlad.connect() as conn:
+            ctx_cnt = (await conn.execute(
+                text(f"SELECT COUNT(*) FROM `{CTX_TABLE}`"))).scalar()
+            map_cnt = (await conn.execute(
+                text(f"SELECT COUNT(*) FROM `{MAP_TABLE}`"))).scalar()
 
-        ctx_insert = f"""
-        INSERT INTO `{CTX_TABLE}`
-          (feed_cat, person_token, location_token, misc_token,
-           fingerprint_hash, occurrence_count, first_dt, last_dt)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        """
-        batch = []
-        for fp, ctx in ctx_filtered.items():
-            batch.append((
-                ctx["feed_cat"], ctx["person"], ctx["location"], ctx["misc"],
-                fp, ctx["count"], ctx["first_dt"], ctx["last_dt"],
-            ))
-            if len(batch) >= BATCH_SIZE:
-                vcur.executemany(ctx_insert, batch)
-                vlad_conn.commit()
-                batch.clear()
-        if batch:
-            vcur.executemany(ctx_insert, batch)
-            vlad_conn.commit()
-
-        # Читаем обратно ctx_id для маппинга news → ctx
-        vcur.execute(f"SELECT id, fingerprint_hash FROM `{CTX_TABLE}`")
-        fp_to_id = {row[1]: row[0] for row in vcur.fetchall()}
-
-        # Записываем news_ctx_map
-        print("Запись в vlad_news_ctx_map...")
-        vcur.execute("TRUNCATE TABLE `vlad_news_ctx_map`;")
-        vlad_conn.commit()
-
-        map_insert = "INSERT INTO `vlad_news_ctx_map` (news_id, ctx_id, news_date) VALUES (%s, %s, %s)"
-        batch = []
-        for rec in deduped:
-            ctx_id = fp_to_id.get(rec["fp"])
-            if ctx_id:
-                batch.append((rec["news_id"], ctx_id, rec["date"]))
-                if len(batch) >= BATCH_SIZE:
-                    vcur.executemany(map_insert, batch)
-                    vlad_conn.commit()
-                    batch.clear()
-        if batch:
-            vcur.executemany(map_insert, batch)
-            vlad_conn.commit()
-
-        vcur.execute(f"SELECT COUNT(*) FROM `{CTX_TABLE}`")
-        print(f"\nOK: context_idx rows = {vcur.fetchone()[0]}")
-        vcur.execute("SELECT COUNT(*) FROM `vlad_news_ctx_map`")
-        print(f"OK: news_ctx_map rows = {vcur.fetchone()[0]}")
+        print(f"\nOK: context_idx rows = {ctx_cnt}")
+        print(f"OK: news_ctx_map rows = {map_cnt}")
 
         # Топ-10 контекстов
         print("\n-- Топ-10 контекстов по частоте --")
-        vcur.execute(f"""
-            SELECT id, feed_cat, person_token, location_token, misc_token, occurrence_count
-            FROM `{CTX_TABLE}`
-            ORDER BY occurrence_count DESC LIMIT 10
-        """)
-        for row in vcur.fetchall():
-            print(f"  ctx={row[0]:5} | cat={row[1]} | person={row[2]:<20} | loc={row[3]:<20} | misc={row[4]:<20} | n={row[5]}")
-
-        vcur.close()
+        async with engine_vlad.connect() as conn:
+            res = await conn.execute(text(f"""
+                SELECT id, feed_cat, person_token, location_token,
+                       misc_token, occurrence_count
+                FROM `{CTX_TABLE}`
+                ORDER BY occurrence_count DESC LIMIT 10
+            """))
+            for row in res.fetchall():
+                print(
+                    f"  ctx={row[0]:5} | cat={row[1]} "
+                    f"| person={row[2]:<20} | loc={row[3]:<20} "
+                    f"| misc={row[4]:<20} | n={row[5]}"
+                )
         print("\nГотово.")
 
     finally:
-        brain_conn.close()
-        vlad_conn.close()
+        await engine_brain.dispose()
+        await engine_vlad.dispose()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(_run_standalone())
