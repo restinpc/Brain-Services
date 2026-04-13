@@ -1,42 +1,9 @@
 """
-brain_framework.py — Фреймворк brain-* микросервисов v8.
+brain_framework.py v9 — патч (три изменения).
 
-Кладётся в shared/. Джуниор НИКОГДА не редактирует этот файл.
-
-Использование:
-    # service36/server.py
-    import model
-    from brain_framework import build_app
-    app = build_app(model)
-
-build_app(model_module) читает конфиг из model_module и возвращает
-настроенный FastAPI app со всеми endpoints.
-
-Поддерживает два варианта model():
-  Простой  (без ctx): model(rates, dataset, date, *, type, var, param)
-  Расширенный (с ctx): model(rates, dataset, date, *, type, var, param, ctx)
-
-Выбор варианта — автоматически по inspect.signature(model_fn).
-
-Изменения v8 (относительно v7):
-  - fill_cache: дефолтный date_from = 2025-01-15 (вместо начала всей истории).
-    Задаётся через CACHE_DATE_FROM в model.py. Явный параметр имеет приоритет.
-  - pretest: event-aware выборка дат (target = event_date + du).
-  - _register_event: _ceil_to_hour — нормализация времени события к часу.
-    Исправляет нулевой T1 для news-сервисов.
-  - find_events: shift_val = shift (номер окна), не round((td-obs)/du).
-
-Изменения v7 (относительно v6):
-  - service_url строится как http://localhost:{PORT} — не из БД.
-  - fill_cache: лог empty={n}, авто-бэктест + авто-summary по завершению.
-  - pretest: детерминированная выборка, раздельные пороги hour/day.
-
-Изменения v6 (относительно v5):
-  - ENV-конфиг: PORT, NODE_NAME, SERVICE_ID, SERVICE_TEXT читаются из .env
-  - __detail__-механизм: model() может вернуть {"key": float, "__detail__": any}
-    При detail=1 в /values — detail отгружается, в кэш НЕ попадает
-  - CTX, EVENTS, WEIGHTS — полностью опциональны
-  - NP_RATES numpy-ускорение из v5 сохранено
+Автообнаружение context_idx.py и weights.py рядом с model.py.
+Фреймворк вызывает build_index() → build_weights() автоматически.
+Обратная совместимость: сервисы без этих файлов работают как раньше.
 """
 
 from __future__ import annotations
@@ -304,11 +271,6 @@ class _ModelContext:
                             continue
                         occ = ctx_info.get("occurrence_count", 0)
                         is_recurring = occ >= s.RECURRING_MIN_COUNT
-                        # shift_val = номер окна (из цикла), НЕ round((td-odt)/du).
-                        # Причина: даты событий хранятся ceil-округлёнными до часа,
-                        # поэтому оконный сдвиг — единственно корректный shift_val.
-                        # В model.py: t_date = event_date + du*shift_val
-                        # При shift_val=shift_int → t_date попадает на час котировки ✓
                         shift_val = shift_int
                         if not is_recurring and shift_val != 0:
                             continue
@@ -333,8 +295,6 @@ class _ModelContext:
                         continue
                     occ = ctx_info.get("occurrence_count", 0)
                     is_recurring = occ >= s.RECURRING_MIN_COUNT
-                    # shift_val = shift из цикла (номер окна).
-                    # Не round((td - obs_dt) / du) — см. комментарий выше.
                     shift_val = shift
                     if not is_recurring and shift_val != 0:
                         continue
@@ -441,6 +401,9 @@ class _State:
         self.load_events_fn   = None
         self.rebuild_index_fn = None
         self.make_ctx_key_fn  = None
+        # ИЗМЕНЕНИЕ 1: добавить поля для строителей из внешних файлов
+        self.index_builder_fn  = None   # async def build_index(ev, eb) → dict
+        self.weight_builder_fn = None   # async def build_weights(ev) → dict
         self.model_needs_ctx  = False
         self.engine_vlad  = None
         self.engine_brain = None
@@ -1308,6 +1271,54 @@ def build_detail_narrative(
 # ── build_app ──────────────────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ИЗМЕНЕНИЕ 2: функция _discover_builders перед build_app
+
+def _discover_builders(model_module):
+    """
+    Ищет context_idx.py и weights.py в директории model.py.
+    Импортирует и возвращает (build_index_fn, build_weights_fn).
+    Если файл не найден — возвращает None.
+
+    Контракт файлов:
+        context_idx.py → async def build_index(engine_vlad, engine_brain) → dict
+        weights.py     → async def build_weights(engine_vlad) → dict
+    """
+    import importlib.util as _ilu
+    import os as _os
+
+    model_dir = _os.path.dirname(_os.path.abspath(
+        sys.modules[model_module.__name__].__file__
+    ))
+
+    def _load(filename, fn_name):
+        path = _os.path.join(model_dir, filename)
+        if not _os.path.exists(path):
+            return None
+        try:
+            spec   = _ilu.spec_from_file_location(filename[:-3], path)
+            module = _ilu.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            fn = getattr(module, fn_name, None)
+            if fn is None:
+                log(f"  ⚠️ {filename} найден, но {fn_name}() отсутствует",
+                    "brain-framework", level="warning")
+            return fn
+        except Exception as e:
+            log(f"  ❌ ошибка импорта {filename}: {e}",
+                "brain-framework", level="error")
+            return None
+
+    build_index_fn   = _load("context_idx.py", "build_index")
+    build_weights_fn = _load("weights.py",     "build_weights")
+
+    if build_index_fn:
+        log("  ✅ context_idx.py (build_index)", "brain-framework", force=True)
+    if build_weights_fn:
+        log("  ✅ weights.py (build_weights)", "brain-framework", force=True)
+
+    return build_index_fn, build_weights_fn
+
+
 def build_app(model_module) -> FastAPI:
     s = _State()
 
@@ -1354,6 +1365,9 @@ def build_app(model_module) -> FastAPI:
     s.load_events_fn   = getattr(model_module, "load_events",   None)
     s.rebuild_index_fn = getattr(model_module, "rebuild_index", None)
     s.make_ctx_key_fn  = getattr(model_module, "make_ctx_key",  None)
+
+    # ИЗМЕНЕНИЕ 3A: добавить строку после получения rebuild_index_fn
+    s.index_builder_fn, s.weight_builder_fn = _discover_builders(model_module)
 
     if s.model_fn is None:
         raise RuntimeError("model_module должен определять функцию model()")
@@ -1445,28 +1459,64 @@ def build_app(model_module) -> FastAPI:
             f"events={len(s.events_by_dt)} dataset={len(s.dataset)} "
             f"np_built={s.np_built}", s.NODE_NAME, force=True)
 
-    # ── _do_rebuild ───────────────────────────────────────────────────────────
+    # ИЗМЕНЕНИЕ 3Б: заменить _do_rebuild на новую версию
 
     async def _do_rebuild() -> dict:
-        if s.rebuild_index_fn is not None:
+        """
+        Порядок вызовов:
+        1. context_idx.build_index()   — если есть context_idx.py
+        2. weights.build_weights()     — если есть weights.py
+        3. model.rebuild_index()       — legacy, только если нет п.1
+        4. universal_rebuild           — только если нет п.1 и п.3
+        5. Инкрементальное обновление ctx_index, weight_codes, events в памяти
+        """
+        stats = {}
+
+        # Шаг 1: context_idx.py
+        if s.index_builder_fn is not None:
             try:
-                stats = await s.rebuild_index_fn(
-                    s.engine_vlad, s.engine_brain, s.engine_super)
-                stats = stats or {}
+                index_stats = await s.index_builder_fn(s.engine_vlad, s.engine_brain)
+                stats["index"] = index_stats or {}
+                log(f"  ✅ build_index: {index_stats}", s.NODE_NAME, force=True)
             except Exception as e:
-                log(f"  ❌ rebuild_index: {e}", s.NODE_NAME, level="error")
+                log(f"  ❌ build_index: {e}", s.NODE_NAME, level="error")
+                send_error_trace(e, s.NODE_NAME, "build_index")
+                stats["index"] = {"error": str(e)}
+
+        # Шаг 2: weights.py
+        if s.weight_builder_fn is not None:
+            try:
+                weight_stats = await s.weight_builder_fn(s.engine_vlad)
+                stats["weights"] = weight_stats or {}
+                log(f"  ✅ build_weights: {weight_stats}", s.NODE_NAME, force=True)
+            except Exception as e:
+                log(f"  ❌ build_weights: {e}", s.NODE_NAME, level="error")
+                send_error_trace(e, s.NODE_NAME, "build_weights")
+                stats["weights"] = {"error": str(e)}
+
+        # Шаг 3: legacy rebuild_index() из model.py (только если нет context_idx.py)
+        elif s.rebuild_index_fn is not None and s.index_builder_fn is None:
+            try:
+                legacy = await s.rebuild_index_fn(
+                    s.engine_vlad, s.engine_brain, s.engine_super)
+                stats["legacy_rebuild"] = legacy or {}
+            except Exception as e:
+                log(f"  ❌ rebuild_index (legacy): {e}", s.NODE_NAME, level="error")
                 send_error_trace(e, s.NODE_NAME, "rebuild_index")
                 return {"error": str(e)}
-        elif s.REBUILD_SOURCE_QUERY is not None:
+
+        # Шаг 4: universal_rebuild (только если нет context_idx.py и нет legacy)
+        elif (s.REBUILD_SOURCE_QUERY is not None
+              and s.index_builder_fn is None
+              and s.rebuild_index_fn is None):
             try:
-                stats = await _universal_rebuild(s)
+                stats["universal_rebuild"] = await _universal_rebuild(s)
             except Exception as e:
                 log(f"  ❌ universal_rebuild: {e}", s.NODE_NAME, level="error")
                 send_error_trace(e, s.NODE_NAME, "universal_rebuild")
                 return {"error": str(e)}
-        else:
-            return {"error": "Нет rebuild_index() и не задан REBUILD_SOURCE_QUERY"}
 
+        # Шаг 5: обновление данных в памяти
         new_keys = await _load_ctx_index_incremental(s)
         await _load_weight_codes(s)
         if new_keys:
@@ -1476,15 +1526,17 @@ def build_app(model_module) -> FastAPI:
             await _load_events_append(since, s)
         _build_sorted_arrays(s)
         s.last_rebuild = datetime.now()
+
         log(f"✅ rebuild done: ctx={len(s.ctx_index)} weights={len(s.weight_codes)}",
             s.NODE_NAME, force=True)
+
         return {
-            "rebuild_stats":  stats,
-            "new_ctx_keys":   len(new_keys),
-            "ctx_total":      len(s.ctx_index),
-            "weights_total":  len(s.weight_codes),
-            "events_total":   len(s.events_by_dt),
-            "rebuilt_at":     s.last_rebuild.isoformat(),
+            **stats,
+            "new_ctx_keys":  len(new_keys),
+            "ctx_total":     len(s.ctx_index),
+            "weights_total": len(s.weight_codes),
+            "events_total":  len(s.events_by_dt),
+            "rebuilt_at":    s.last_rebuild.isoformat(),
         }
 
     # ── _bg_reload ────────────────────────────────────────────────────────────
