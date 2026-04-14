@@ -459,6 +459,8 @@ class _State:
         self.simple_rates:        list  = []
         self.simple_rates_dates:  list  = []
         self.last_simple_rate_dt: datetime | None = None
+        # Numpy-массивы для simple_rates (строятся в _load_simple_rates)
+        self.np_simple_rates: dict | None = None
 
         # Имя таблицы кеша для этого сервиса.
         # Формат: vlad_values_cache_svc{PORT} (напр. vlad_values_cache_svc9036)
@@ -673,6 +675,40 @@ async def _refresh_rates(table: str, s: _State):
 
 
 # ── IS_SIMPLE: загрузка одной таблицы котировок ───────────────────────────────
+def _build_np_simple_rates(s: _State) -> None:
+    """Строит numpy-массивы для simple_rates — аналог np_rates для IS_SIMPLE."""
+    if not s.simple_rates:
+        s.np_simple_rates = None
+        return
+    n = len(s.simple_rates)
+    dates_ns = np.array([_dt_to_ts(r['date']) for r in s.simple_rates], dtype=np.int64)
+    t1_arr   = np.array([float((r.get('close') or 0) - (r.get('open') or 0))
+                         for r in s.simple_rates], dtype=np.float64)
+    rng_arr  = np.array([float((r.get('max') or 0) - (r.get('min') or 0))
+                         for r in s.simple_rates], dtype=np.float64)
+    avg_rng  = float(np.mean(rng_arr)) if n > 0 else 0.0
+    # Локальные экстремумы
+    max_arr  = np.array([float(r.get('max') or 0) for r in s.simple_rates], dtype=np.float64)
+    min_arr  = np.array([float(r.get('min') or 0) for r in s.simple_rates], dtype=np.float64)
+    ext_max  = np.zeros(n, dtype=bool)
+    ext_min  = np.zeros(n, dtype=bool)
+    if n > 2:
+        ext_max[1:-1] = (max_arr[1:-1] > max_arr[:-2]) & (max_arr[1:-1] > max_arr[2:])
+        ext_min[1:-1] = (min_arr[1:-1] < min_arr[:-2]) & (min_arr[1:-1] < min_arr[2:])
+    close_arr = np.array([float(r.get('close') or 0) for r in s.simple_rates], dtype=np.float64)
+    open_arr  = np.array([float(r.get('open')  or 0) for r in s.simple_rates], dtype=np.float64)
+    s.np_simple_rates = {
+        'dates_ns': dates_ns,
+        't1':       t1_arr,
+        'ranges':   rng_arr,
+        'avg_range': avg_rng,
+        'ext_max':  ext_max,
+        'ext_min':  ext_min,
+        'close':    close_arr,
+        'open':     open_arr,
+    }
+
+
 async def _load_simple_rates(s: _State) -> None:
     table = s.RATES_TABLE_SIMPLE
     try:
@@ -691,10 +727,12 @@ async def _load_simple_rates(s: _State) -> None:
             ]
             s.simple_rates_dates  = [r["date"] for r in s.simple_rates]
             s.last_simple_rate_dt = s.simple_rates_dates[-1] if s.simple_rates_dates else None
+        _build_np_simple_rates(s)
         log(f"  simple_rates: {len(s.simple_rates)} candles from {table}", s.NODE_NAME)
     except Exception as e:
         log(f"  ❌ simple_rates: {e}", s.NODE_NAME, level="error")
         s.simple_rates, s.simple_rates_dates = [], []
+        s.np_simple_rates = None
 
 
 async def _refresh_simple_rates(s: _State) -> None:
@@ -718,6 +756,7 @@ async def _refresh_simple_rates(s: _State) -> None:
             s.simple_rates_dates.append(row["date"])
         if new_rows:
             s.last_simple_rate_dt = s.simple_rates_dates[-1]
+            _build_np_simple_rates(s)
             log(f"  📥 +{len(new_rows)} candle(s) {table}", s.NODE_NAME)
     except Exception as e:
         log(f"  ⚠️ refresh simple_rates: {e}", s.NODE_NAME, level="warning")
@@ -1440,7 +1479,7 @@ def build_app(model_module) -> FastAPI:
             dataset_f = _filter_dataset_lte(target_date, s)
             result = s.model_fn(rates=rates_f, dataset=dataset_f,
                                 date=target_date, type=calc_type,
-                                var=calc_var, param=param, dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else None))
+                                var=calc_var, param=param, dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field, "np_rates": s.np_simple_rates} if s.model_needs_index else None))
             result, _ = _extract_detail(result)
             return result
 
@@ -1452,11 +1491,11 @@ def build_app(model_module) -> FastAPI:
             ctx = _ModelContext(table, pair, day, target_date, s)
             result = s.model_fn(rates=rates_filtered, dataset=dataset_filtered,
                                 date=target_date, type=calc_type, var=calc_var,
-                                param=param, ctx=ctx, dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else None))
+                                param=param, ctx=ctx, dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field, "np_rates": s.np_simple_rates} if s.model_needs_index else None))
         else:
             result = s.model_fn(rates=rates_filtered, dataset=dataset_filtered,
                                 date=target_date, type=calc_type, var=calc_var,
-                                param=param, dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else None))
+                                param=param, dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field, "np_rates": s.np_simple_rates} if s.model_needs_index else None))
         result, _ = _extract_detail(result)
         return result
 
@@ -1471,7 +1510,7 @@ def build_app(model_module) -> FastAPI:
             dataset_f = _filter_dataset_lte(target_date, s)
             result = s.model_fn(rates=rates_f, dataset=dataset_f,
                                 date=target_date, type=calc_type,
-                                var=calc_var, param=param, dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else None))
+                                var=calc_var, param=param, dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field, "np_rates": s.np_simple_rates} if s.model_needs_index else None))
             result, detail = _extract_detail(result)
             return result, _make_detail_serializable(detail)
 
@@ -1483,11 +1522,11 @@ def build_app(model_module) -> FastAPI:
             ctx = _ModelContext(table, pair, day, target_date, s)
             result = s.model_fn(rates=rates_filtered, dataset=dataset_f,
                                 date=target_date, type=calc_type,
-                                var=calc_var, param=param, ctx=ctx, dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else None))
+                                var=calc_var, param=param, ctx=ctx, dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field, "np_rates": s.np_simple_rates} if s.model_needs_index else None))
         else:
             result = s.model_fn(rates=rates_filtered, dataset=dataset_f,
                                 date=target_date, type=calc_type,
-                                var=calc_var, param=param, dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else None))
+                                var=calc_var, param=param, dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field, "np_rates": s.np_simple_rates} if s.model_needs_index else None))
         result, detail = _extract_detail(result)
         return result, _make_detail_serializable(detail)
 
@@ -1746,19 +1785,21 @@ def build_app(model_module) -> FastAPI:
                         try:
                             res = s.model_fn(rates=_simple_rates_lte(td, s),
                                              dataset=_filter_dataset_lte(td, s),
-                                             date=td, type=_ct, var=_v, param="", dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else None))
+                                             date=td, type=_ct, var=_v, param="", dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field, "np_rates": s.np_simple_rates} if s.model_needs_index else None))
                             res, _ = _extract_detail(res)
                             return res or {}
                         except Exception:
                             return None
 
-                    results = await asyncio.gather(
-                        *[asyncio.to_thread(_sync_simple, c) for c in batch],
-                        return_exceptions=True,
+                    # Вычисляем весь батч в одном потоке — model() CPU-bound,
+                    # GIL не даёт выигрыша от to_thread для чистого Python.
+                    # asyncio.to_thread нужен только чтобы не блокировать event loop.
+                    results = await asyncio.to_thread(
+                        lambda: [_sync_simple(c) for c in batch]
                     )
                     insert_rows = []
                     for candle, result in zip(batch, results):
-                        if isinstance(result, Exception) or result is None:
+                        if result is None:
                             errors += 1
                             continue
                         insert_rows.append({
@@ -1770,13 +1811,12 @@ def build_app(model_module) -> FastAPI:
                         _tbl = s.cache_table
                         try:
                             async with s.engine_vlad.begin() as conn:
-                                for row in insert_rows:
-                                    await conn.execute(text(f"""
-                                        INSERT IGNORE INTO `{_tbl}`
-                                            (service_url, pair, day_flag, date_val,
-                                             params_hash, params_json, result_json)
-                                        VALUES (:url, 0, 0, :dv, :ph, :pj, :rj)
-                                    """), row)
+                                await conn.execute(text(f"""
+                                    INSERT IGNORE INTO `{_tbl}`
+                                        (service_url, pair, day_flag, date_val,
+                                         params_hash, params_json, result_json)
+                                    VALUES (:url, 0, 0, :dv, :ph, :pj, :rj)
+                                """), insert_rows)
                         except Exception as e:
                             log(f"  ⚠️ bulk insert: {e}", s.NODE_NAME, level="warning")
                     done += len(batch)
@@ -1882,10 +1922,10 @@ def build_app(model_module) -> FastAPI:
                         if s.model_needs_ctx:
                             ctx = _ModelContext(table, pair, day, td, s)
                             res = s.model_fn(rates=r, dataset=ds, date=td,
-                                             type=calc_type, var=var, param="", ctx=ctx, dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else None))
+                                             type=calc_type, var=var, param="", ctx=ctx, dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field, "np_rates": s.np_simple_rates} if s.model_needs_index else None))
                         else:
                             res = s.model_fn(rates=r, dataset=ds, date=td,
-                                             type=calc_type, var=var, param="", dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else None))
+                                             type=calc_type, var=var, param="", dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field, "np_rates": s.np_simple_rates} if s.model_needs_index else None))
                         res, _ = _extract_detail(res)
                         return res or {}
                     except Exception:
@@ -2559,7 +2599,7 @@ def build_app(model_module) -> FastAPI:
             _ds2 = _filter_dataset_lte(_td2, s)
             try:
                 _res2 = s.model_fn(rates=_rf2, dataset=_ds2, date=_td2,
-                                   type=0, var=s.VAR_RANGE[0], param="", dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else None))
+                                   type=0, var=s.VAR_RANGE[0], param="", dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field, "np_rates": s.np_simple_rates} if s.model_needs_index else None))
                 _res2, _ = _extract_detail(_res2)
             except Exception as _e2:
                 return {"status": "error",
@@ -2578,10 +2618,10 @@ def build_app(model_module) -> FastAPI:
                     if s.model_needs_ctx:
                         _ctx2 = _ModelContext(_tfs2["hour"], _pid2, 0, _td2, s)
                         _res2 = s.model_fn(rates=_rf2, dataset=_ds2, date=_td2,
-                                           type=0, var=s.VAR_RANGE[0], param="", ctx=_ctx2, dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else None))
+                                           type=0, var=s.VAR_RANGE[0], param="", ctx=_ctx2, dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field, "np_rates": s.np_simple_rates} if s.model_needs_index else None))
                     else:
                         _res2 = s.model_fn(rates=_rf2, dataset=_ds2, date=_td2,
-                                           type=0, var=s.VAR_RANGE[0], param="", dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else None))
+                                           type=0, var=s.VAR_RANGE[0], param="", dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field, "np_rates": s.np_simple_rates} if s.model_needs_index else None))
                 except Exception as _e2:
                     return {"status": "error",
                             "error": f"[Тест 2 — Структура] model() exception: {_e2}"}
@@ -2663,13 +2703,13 @@ def build_app(model_module) -> FastAPI:
                         def _mk3(_r=_rf3, _d=_ds3, _t=_td3, _c=_ctx3):
                             res, _ = _extract_detail(
                                 s.model_fn(rates=_r, dataset=_d, date=_t,
-                                           type=0, var=s.VAR_RANGE[0], param="", ctx=_c, dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else None)))
+                                           type=0, var=s.VAR_RANGE[0], param="", ctx=_c, dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field, "np_rates": s.np_simple_rates} if s.model_needs_index else None)))
                             return bool(res)
                     else:
                         def _mk3(_r=_rf3, _d=_ds3, _t=_td3):
                             res, _ = _extract_detail(
                                 s.model_fn(rates=_r, dataset=_d, date=_t,
-                                           type=0, var=s.VAR_RANGE[0], param="", dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else None)))
+                                           type=0, var=s.VAR_RANGE[0], param="", dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field, "np_rates": s.np_simple_rates} if s.model_needs_index else None)))
                             return bool(res)
 
                     _tasks3.append((_pid3, _tf3, _tbl3, _day3, _td3))
