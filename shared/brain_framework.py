@@ -1,3 +1,22 @@
+"""
+brain_framework.py v11 — полная поддержка backtest в IS_SIMPLE режиме.
+С патчем: per-service таблицы кеша (vlad_values_cache_svc{PORT}).
+
+Автодетекция режима по наличию RATES_TABLE в model.py:
+  IS_SIMPLE = True  → сервисы 36+ (одна таблица, без pair/day/ctx)
+  IS_SIMPLE = False → сервисы 33-35 (пары, дни, ctx, numpy)
+
+Изменения v11 (относительно v10):
+  - _fill_worker: кэш для IS_SIMPLE пишется с pair=0, day_flag=0
+  - _fill_worker: авто-бэктест после fill_cache в IS_SIMPLE
+  - _backtest: адаптирован для IS_SIMPLE (simple_rates, кэш с pair=0/day=0)
+  - /backtest: убран guard IS_SIMPLE, теперь работает для простых сервисов
+  - /summary: убран guard IS_SIMPLE
+  - /posttest: убран guard, добавлена ветка для IS_SIMPLE
+
+server.py для всех сервисов одинаковый:
+    from brain_framework import build_app
+"""
 
 from __future__ import annotations
 
@@ -1732,9 +1751,9 @@ def build_app(model_module) -> FastAPI:
                         td = candle["date"]
                         try:
                             _idx = {"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else {}
-                            res = s.model_fn(rates=_simple_rates_lte(td, s, **_idx),
+                            res = s.model_fn(rates=_simple_rates_lte(td, s),
                                              dataset=_filter_dataset_lte(td, s),
-                                             date=td, type=_ct, var=_v, param="")
+                                             date=td, type=_ct, var=_v, param="", **_idx)
                             res, _ = _extract_detail(res)
                             return res or {}
                         except Exception:
@@ -2548,8 +2567,9 @@ def build_app(model_module) -> FastAPI:
             _rf2 = _simple_rates_lte(_td2, s)
             _ds2 = _filter_dataset_lte(_td2, s)
             try:
+                _idx2 = {"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else {}
                 _res2 = s.model_fn(rates=_rf2, dataset=_ds2, date=_td2,
-                                   type=0, var=s.VAR_RANGE[0], param="")
+                                   type=0, var=s.VAR_RANGE[0], param="", **_idx2)
                 _res2, _ = _extract_detail(_res2)
             except Exception as _e2:
                 return {"status": "error",
@@ -2567,11 +2587,13 @@ def build_app(model_module) -> FastAPI:
                 try:
                     if s.model_needs_ctx:
                         _ctx2 = _ModelContext(_tfs2["hour"], _pid2, 0, _td2, s)
+                        _idx2 = {"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else {}
                         _res2 = s.model_fn(rates=_rf2, dataset=_ds2, date=_td2,
-                                           type=0, var=s.VAR_RANGE[0], param="", ctx=_ctx2)
+                                           type=0, var=s.VAR_RANGE[0], param="", ctx=_ctx2, **_idx2)
                     else:
+                        _idx2 = {"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else {}
                         _res2 = s.model_fn(rates=_rf2, dataset=_ds2, date=_td2,
-                                           type=0, var=s.VAR_RANGE[0], param="")
+                                           type=0, var=s.VAR_RANGE[0], param="", **_idx2)
                 except Exception as _e2:
                     return {"status": "error",
                             "error": f"[Тест 2 — Структура] model() exception: {_e2}"}
@@ -2651,15 +2673,17 @@ def build_app(model_module) -> FastAPI:
                     if s.model_needs_ctx:
                         _ctx3 = _ModelContext(_tbl3, _pid3, _day3, _td3, s)
                         def _mk3(_r=_rf3, _d=_ds3, _t=_td3, _c=_ctx3):
+                            _idx3 = {"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else {}
                             res, _ = _extract_detail(
                                 s.model_fn(rates=_r, dataset=_d, date=_t,
-                                           type=0, var=s.VAR_RANGE[0], param="", ctx=_c))
+                                           type=0, var=s.VAR_RANGE[0], param="", ctx=_c, **_idx3))
                             return bool(res)
                     else:
                         def _mk3(_r=_rf3, _d=_ds3, _t=_td3):
+                            _idx3 = {"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else {}
                             res, _ = _extract_detail(
                                 s.model_fn(rates=_r, dataset=_d, date=_t,
-                                           type=0, var=s.VAR_RANGE[0], param=""))
+                                           type=0, var=s.VAR_RANGE[0], param="", **_idx3))
                             return bool(res)
 
                     _tasks3.append((_pid3, _tf3, _tbl3, _day3, _td3))
