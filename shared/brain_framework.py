@@ -1,5 +1,6 @@
 """
 brain_framework.py v11 — полная поддержка backtest в IS_SIMPLE режиме.
+С патчем: per-service таблицы кеша (vlad_values_cache_svc{PORT}).
 
 Автодетекция режима по наличию RATES_TABLE в model.py:
   IS_SIMPLE = True  → сервисы 36+ (одна таблица, без pair/day/ctx)
@@ -452,6 +453,15 @@ class _State:
         self.simple_rates:        list  = []
         self.simple_rates_dates:  list  = []
         self.last_simple_rate_dt: datetime | None = None
+
+        # Имя таблицы кеша для этого сервиса.
+        # Формат: vlad_values_cache_svc{PORT} (напр. vlad_values_cache_svc9036)
+        # Устанавливается в _preload() после определения service_url.
+        self._cache_table: str = "vlad_values_cache"
+
+    @property
+    def cache_table(self) -> str:
+        return self._cache_table
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1459,8 +1469,9 @@ def build_app(model_module) -> FastAPI:
             await _load_dataset(s)
             await _load_weight_codes(s)
             s.service_url = f"http://localhost:{s.PORT}"
+            s._cache_table = f"vlad_values_cache_svc{s.PORT}"
             try:
-                await ensure_cache_table(s.engine_vlad)
+                await ensure_cache_table(s.engine_vlad, s.cache_table)
                 async with s.engine_vlad.begin() as conn:
                     await conn.execute(text(_DDL_BT_RESULTS))
                     await conn.execute(text(_DDL_BT_SUMMARY))
@@ -1480,9 +1491,11 @@ def build_app(model_module) -> FastAPI:
         await _load_rates(s)
         await _load_dataset(s)
         s.service_url = f"http://localhost:{s.PORT}"
-        log(f"  service_url: {s.service_url}", s.NODE_NAME)
+        s._cache_table = f"vlad_values_cache_svc{s.PORT}"
+        log(f"  service_url:  {s.service_url}", s.NODE_NAME)
+        log(f"  cache_table:  {s.cache_table}", s.NODE_NAME)
         try:
-            await ensure_cache_table(s.engine_vlad)
+            await ensure_cache_table(s.engine_vlad, s.cache_table)
             async with s.engine_vlad.begin() as conn:
                 await conn.execute(text(_DDL_BT_RESULTS))
                 await conn.execute(text(_DDL_BT_SUMMARY))
@@ -1616,10 +1629,11 @@ def build_app(model_module) -> FastAPI:
     async def _bulk_insert(rows: list[dict]) -> int:
         if not rows:
             return 0
+        _tbl = s.cache_table
         try:
             async with s.engine_vlad.begin() as conn:
-                r = await conn.execute(text("""
-                    INSERT IGNORE INTO vlad_values_cache
+                r = await conn.execute(text(f"""
+                    INSERT IGNORE INTO `{_tbl}`
                         (service_url, pair, day_flag, date_val,
                          params_hash, params_json, result_json)
                     VALUES (:url, :pair, :day, :dv, :ph, :pj, :rj)
@@ -1630,10 +1644,11 @@ def build_app(model_module) -> FastAPI:
             return 0
 
     async def _cached_dates(pair, day, p_hash) -> set:
+        _tbl = s.cache_table
         try:
             async with s.engine_vlad.connect() as conn:
-                res = await conn.execute(text("""
-                    SELECT date_val FROM vlad_values_cache
+                res = await conn.execute(text(f"""
+                    SELECT date_val FROM `{_tbl}`
                     WHERE service_url=:url AND pair=:pair
                       AND day_flag=:day AND params_hash=:ph
                 """), {"url": s.service_url, "pair": pair, "day": day, "ph": p_hash})
@@ -1666,10 +1681,11 @@ def build_app(model_module) -> FastAPI:
                 extra       = {"type": calc_type, "var": var, "param": ""}
                 p_hash      = _params_hash(extra)
                 params_json = _json.dumps(extra, ensure_ascii=False)
+                _tbl = s.cache_table
                 try:
                     async with s.engine_vlad.connect() as conn:
-                        res = await conn.execute(text("""
-                            SELECT date_val FROM vlad_values_cache
+                        res = await conn.execute(text(f"""
+                            SELECT date_val FROM `{_tbl}`
                             WHERE service_url=:url AND params_hash=:ph
                         """), {"url": s.service_url, "ph": p_hash})
                         cached = {r[0] for r in res.fetchall()}
@@ -1710,11 +1726,12 @@ def build_app(model_module) -> FastAPI:
                             "rj": _json.dumps(result, ensure_ascii=False),
                         })
                     if insert_rows:
+                        _tbl = s.cache_table
                         try:
                             async with s.engine_vlad.begin() as conn:
                                 for row in insert_rows:
-                                    await conn.execute(text("""
-                                        INSERT IGNORE INTO vlad_values_cache
+                                    await conn.execute(text(f"""
+                                        INSERT IGNORE INTO `{_tbl}`
                                             (service_url, pair, day_flag, date_val,
                                              params_hash, params_json, result_json)
                                         VALUES (:url, 0, 0, :dv, :ph, :pj, :rj)
@@ -1920,9 +1937,10 @@ def build_app(model_module) -> FastAPI:
 
         _cache_pair = 0 if s.IS_SIMPLE else pair
         _cache_day  = 0 if s.IS_SIMPLE else day
+        _tbl = s.cache_table
         async with s.engine_vlad.connect() as conn:
-            res = await conn.execute(text("""
-                SELECT date_val, result_json FROM vlad_values_cache
+            res = await conn.execute(text(f"""
+                SELECT date_val, result_json FROM `{_tbl}`
                 WHERE service_url=:url AND pair=:pair AND day_flag=:day
                   AND params_hash=:ph AND date_val>=:df AND date_val<=:dt
                 ORDER BY date_val
@@ -2243,6 +2261,7 @@ def build_app(model_module) -> FastAPI:
                 compute_fn=lambda: _call_model(pair, day, date,
                                                calc_type=type, calc_var=var, param=param),
                 node=s.NODE_NAME,
+                table_name=s.cache_table,
             )
             payload = resp.get("payLoad") or {}
             day_flag = 1 if day == 1 else 0
@@ -2709,17 +2728,19 @@ def build_app(model_module) -> FastAPI:
                 url_p = {"url": s.service_url, "pair": pair_id, "day": day_flag,
                          "df": dt_from, "dt": dt_to}
 
+            _tbl = s.cache_table
+
             # Тест 1: SQL-агрегат по количеству ключей
             data_stats = {"min": 0.0, "max": 0.0, "avg": 0.0}
             try:
                 async with s.engine_vlad.connect() as conn:
-                    res = await conn.execute(text("""
+                    res = await conn.execute(text(f"""
                         SELECT MIN(JSON_LENGTH(result_json)),
                                MAX(JSON_LENGTH(result_json)),
                                AVG(JSON_LENGTH(result_json))
-                        FROM vlad_values_cache
+                        FROM `{_tbl}`
                         WHERE service_url=:url AND pair=:pair AND day_flag=:day
-                          AND result_json != '{}'
+                          AND result_json != '{{}}'
                           AND (:df IS NULL OR date_val >= :df)
                           AND (:dt IS NULL OR date_val <= :dt)
                     """), url_p)
@@ -2734,10 +2755,10 @@ def build_app(model_module) -> FastAPI:
             values_stats = {"plus": 0, "minus": 0}
             try:
                 async with s.engine_vlad.connect() as conn:
-                    res = await conn.execute(text("""
-                        SELECT result_json FROM vlad_values_cache
+                    res = await conn.execute(text(f"""
+                        SELECT result_json FROM `{_tbl}`
                         WHERE service_url=:url AND pair=:pair AND day_flag=:day
-                          AND result_json != '{}'
+                          AND result_json != '{{}}'
                           AND (:df IS NULL OR date_val >= :df)
                           AND (:dt IS NULL OR date_val <= :dt)
                     """), url_p)
@@ -2765,8 +2786,8 @@ def build_app(model_module) -> FastAPI:
             cache_signals: dict = {}
             try:
                 async with s.engine_vlad.connect() as conn:
-                    res = await conn.execute(text("""
-                        SELECT date_val, result_json FROM vlad_values_cache
+                    res = await conn.execute(text(f"""
+                        SELECT date_val, result_json FROM `{_tbl}`
                         WHERE service_url=:url AND pair=:pair AND day_flag=:day
                           AND (:df IS NULL OR date_val >= :df)
                           AND (:dt IS NULL OR date_val <= :dt)
