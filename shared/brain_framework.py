@@ -1438,10 +1438,9 @@ def build_app(model_module) -> FastAPI:
             await _refresh_simple_rates(s)
             rates_f   = _simple_rates_lte(target_date, s)
             dataset_f = _filter_dataset_lte(target_date, s)
-            _idx = {"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else {}
             result = s.model_fn(rates=rates_f, dataset=dataset_f,
                                 date=target_date, type=calc_type,
-                                var=calc_var, param=param, **_idx)
+                                var=calc_var, param=param, dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else None))
             result, _ = _extract_detail(result)
             return result
 
@@ -1451,15 +1450,13 @@ def build_app(model_module) -> FastAPI:
         dataset_filtered = _filter_dataset_lte(target_date, s)
         if s.model_needs_ctx:
             ctx = _ModelContext(table, pair, day, target_date, s)
-            _idx = {"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else {}
             result = s.model_fn(rates=rates_filtered, dataset=dataset_filtered,
                                 date=target_date, type=calc_type, var=calc_var,
-                                param=param, ctx=ctx, **_idx)
+                                param=param, ctx=ctx, dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else None))
         else:
-            _idx = {"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else {}
             result = s.model_fn(rates=rates_filtered, dataset=dataset_filtered,
                                 date=target_date, type=calc_type, var=calc_var,
-                                param=param, **_idx)
+                                param=param, dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else None))
         result, _ = _extract_detail(result)
         return result
 
@@ -1472,10 +1469,9 @@ def build_app(model_module) -> FastAPI:
             await _refresh_simple_rates(s)
             rates_f   = _simple_rates_lte(target_date, s)
             dataset_f = _filter_dataset_lte(target_date, s)
-            _idx = {"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else {}
             result = s.model_fn(rates=rates_f, dataset=dataset_f,
                                 date=target_date, type=calc_type,
-                                var=calc_var, param=param, **_idx)
+                                var=calc_var, param=param, dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else None))
             result, detail = _extract_detail(result)
             return result, _make_detail_serializable(detail)
 
@@ -1485,15 +1481,13 @@ def build_app(model_module) -> FastAPI:
         dataset_f      = _filter_dataset_lte(target_date, s)
         if s.model_needs_ctx:
             ctx = _ModelContext(table, pair, day, target_date, s)
-            _idx = {"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else {}
             result = s.model_fn(rates=rates_filtered, dataset=dataset_f,
                                 date=target_date, type=calc_type,
-                                var=calc_var, param=param, ctx=ctx, **_idx)
+                                var=calc_var, param=param, ctx=ctx, dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else None))
         else:
-            _idx = {"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else {}
             result = s.model_fn(rates=rates_filtered, dataset=dataset_f,
                                 date=target_date, type=calc_type,
-                                var=calc_var, param=param, **_idx)
+                                var=calc_var, param=param, dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else None))
         result, detail = _extract_detail(result)
         return result, _make_detail_serializable(detail)
 
@@ -1750,10 +1744,9 @@ def build_app(model_module) -> FastAPI:
                     def _sync_simple(candle, _ct=calc_type, _v=var):
                         td = candle["date"]
                         try:
-                            _idx = {"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else {}
                             res = s.model_fn(rates=_simple_rates_lte(td, s),
                                              dataset=_filter_dataset_lte(td, s),
-                                             date=td, type=_ct, var=_v, param="", **_idx)
+                                             date=td, type=_ct, var=_v, param="", dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else None))
                             res, _ = _extract_detail(res)
                             return res or {}
                         except Exception:
@@ -1888,13 +1881,11 @@ def build_app(model_module) -> FastAPI:
                     try:
                         if s.model_needs_ctx:
                             ctx = _ModelContext(table, pair, day, td, s)
-                            _idx = {"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else {}
                             res = s.model_fn(rates=r, dataset=ds, date=td,
-                                             type=calc_type, var=var, param="", ctx=ctx, **_idx)
+                                             type=calc_type, var=var, param="", ctx=ctx, dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else None))
                         else:
-                            _idx = {"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else {}
                             res = s.model_fn(rates=r, dataset=ds, date=td,
-                                             type=calc_type, var=var, param="", **_idx)
+                                             type=calc_type, var=var, param="", dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else None))
                         res, _ = _extract_detail(res)
                         return res or {}
                     except Exception:
@@ -2567,9 +2558,8 @@ def build_app(model_module) -> FastAPI:
             _rf2 = _simple_rates_lte(_td2, s)
             _ds2 = _filter_dataset_lte(_td2, s)
             try:
-                _idx2 = {"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else {}
                 _res2 = s.model_fn(rates=_rf2, dataset=_ds2, date=_td2,
-                                   type=0, var=s.VAR_RANGE[0], param="", **_idx2)
+                                   type=0, var=s.VAR_RANGE[0], param="", dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else None))
                 _res2, _ = _extract_detail(_res2)
             except Exception as _e2:
                 return {"status": "error",
@@ -2587,13 +2577,11 @@ def build_app(model_module) -> FastAPI:
                 try:
                     if s.model_needs_ctx:
                         _ctx2 = _ModelContext(_tfs2["hour"], _pid2, 0, _td2, s)
-                        _idx2 = {"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else {}
                         _res2 = s.model_fn(rates=_rf2, dataset=_ds2, date=_td2,
-                                           type=0, var=s.VAR_RANGE[0], param="", ctx=_ctx2, **_idx2)
+                                           type=0, var=s.VAR_RANGE[0], param="", ctx=_ctx2, dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else None))
                     else:
-                        _idx2 = {"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else {}
                         _res2 = s.model_fn(rates=_rf2, dataset=_ds2, date=_td2,
-                                           type=0, var=s.VAR_RANGE[0], param="", **_idx2)
+                                           type=0, var=s.VAR_RANGE[0], param="", dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else None))
                 except Exception as _e2:
                     return {"status": "error",
                             "error": f"[Тест 2 — Структура] model() exception: {_e2}"}
@@ -2673,17 +2661,15 @@ def build_app(model_module) -> FastAPI:
                     if s.model_needs_ctx:
                         _ctx3 = _ModelContext(_tbl3, _pid3, _day3, _td3, s)
                         def _mk3(_r=_rf3, _d=_ds3, _t=_td3, _c=_ctx3):
-                            _idx3 = {"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else {}
                             res, _ = _extract_detail(
                                 s.model_fn(rates=_r, dataset=_d, date=_t,
-                                           type=0, var=s.VAR_RANGE[0], param="", ctx=_c, **_idx3))
+                                           type=0, var=s.VAR_RANGE[0], param="", ctx=_c, dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else None)))
                             return bool(res)
                     else:
                         def _mk3(_r=_rf3, _d=_ds3, _t=_td3):
-                            _idx3 = {"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else {}
                             res, _ = _extract_detail(
                                 s.model_fn(rates=_r, dataset=_d, date=_t,
-                                           type=0, var=s.VAR_RANGE[0], param="", **_idx3))
+                                           type=0, var=s.VAR_RANGE[0], param="", dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else None)))
                             return bool(res)
 
                     _tasks3.append((_pid3, _tf3, _tbl3, _day3, _td3))
