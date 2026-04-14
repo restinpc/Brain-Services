@@ -1,22 +1,3 @@
-"""
-brain_framework.py v11 — полная поддержка backtest в IS_SIMPLE режиме.
-С патчем: per-service таблицы кеша (vlad_values_cache_svc{PORT}).
-
-Автодетекция режима по наличию RATES_TABLE в model.py:
-  IS_SIMPLE = True  → сервисы 36+ (одна таблица, без pair/day/ctx)
-  IS_SIMPLE = False → сервисы 33-35 (пары, дни, ctx, numpy)
-
-Изменения v11 (относительно v10):
-  - _fill_worker: кэш для IS_SIMPLE пишется с pair=0, day_flag=0
-  - _fill_worker: авто-бэктест после fill_cache в IS_SIMPLE
-  - _backtest: адаптирован для IS_SIMPLE (simple_rates, кэш с pair=0/day=0)
-  - /backtest: убран guard IS_SIMPLE, теперь работает для простых сервисов
-  - /summary: убран guard IS_SIMPLE
-  - /posttest: убран guard, добавлена ветка для IS_SIMPLE
-
-server.py для всех сервисов одинаковый:
-    from brain_framework import build_app
-"""
 
 from __future__ import annotations
 
@@ -415,7 +396,8 @@ class _State:
         self.make_ctx_key_fn  = None
         self.index_builder_fn  = None   # async def build_index(ev, eb) → dict
         self.weight_builder_fn = None   # async def build_weights(ev) → dict
-        self.model_needs_ctx  = False
+        self.model_needs_ctx   = False
+        self.model_needs_index = False  # True если model() принимает dataset_index
         self.engine_vlad  = None
         self.engine_brain = None
         self.engine_super = None
@@ -428,6 +410,11 @@ class _State:
         self.events_seen:   set        = set()
         self.events_max_dt: datetime | None = None
         self.dataset:       list[dict] = []
+        # Индекс датасета — строится в _load_dataset, используется в model_fn
+        self.dataset_dates:     list = []   # все даты в порядке dataset
+        self.dataset_by_key:    dict = {}   # ключ -> [events...]
+        self.dataset_key_dates: dict = {}   # ключ -> [dates...] для bisect
+        self.dataset_key_field: str  = 'ctx_id'  # переопред. через DATASET_KEY в model.py
         self.rates:         dict = {}
         self.extremums:     dict = {}
         self.candle_ranges: dict = {}
@@ -784,13 +771,41 @@ async def _load_dataset(s: _State):
         return
     query = s.DATASET_QUERY or f"SELECT * FROM `{s.DATASET_TABLE}`"
     try:
+        from datetime import date as _date
         async with _engine_for(s.DATASET_ENGINE, s).connect() as conn:
             res = await conn.execute(text(query))
-            s.dataset = [dict(r) for r in res.mappings().all()]
+            rows = []
+            for r in res.mappings().all():
+                row = dict(r)
+                # MySQL DATE → Python datetime.date, но весь фреймворк работает
+                # с datetime.datetime. Нормализуем все date-поля при загрузке.
+                for k, v in row.items():
+                    if type(v) is _date:
+                        row[k] = datetime(v.year, v.month, v.day)
+                rows.append(row)
+            s.dataset = rows
+        _build_dataset_index(s)
         log(f"  dataset: {len(s.dataset)} rows", s.NODE_NAME)
     except Exception as e:
         s.dataset = []
         log(f"  ❌ dataset: {e}", s.NODE_NAME, level="error")
+
+
+def _build_dataset_index(s: _State) -> None:
+    from collections import defaultdict as _dd
+    key_field = s.dataset_key_field
+    dates: list = []
+    by_key: dict = _dd(list)
+    for e in s.dataset:
+        dates.append(e.get('date'))
+        k = e.get(key_field)
+        if k is not None:
+            by_key[k].append(e)
+    by_key = dict(by_key)
+    s.dataset_dates     = dates
+    s.dataset_by_key    = by_key
+    s.dataset_key_dates = {k: [e['date'] for e in evts] for k, evts in by_key.items()}
+    log(f'  dataset_index: {len(by_key)} unique {key_field}s', s.NODE_NAME)
 
 
 def _ceil_to_hour(dt: datetime) -> datetime:
@@ -1368,7 +1383,8 @@ def build_app(model_module) -> FastAPI:
 
     # Автодетекция режима: RATES_TABLE в model.py → IS_SIMPLE (нет pair/day/ctx)
     s.IS_SIMPLE          = hasattr(model_module, "RATES_TABLE")
-    s.RATES_TABLE_SIMPLE = _g("RATES_TABLE", "brain_rates_eur_usd")
+    s.RATES_TABLE_SIMPLE  = _g("RATES_TABLE", "brain_rates_eur_usd")
+    s.dataset_key_field   = _g("DATASET_KEY", "ctx_id")
 
     s.model_fn         = getattr(model_module, "model",         None)
     s.load_events_fn   = getattr(model_module, "load_events",   None)
@@ -1381,7 +1397,8 @@ def build_app(model_module) -> FastAPI:
         raise RuntimeError("model_module должен определять функцию model()")
 
     sig = inspect.signature(s.model_fn)
-    s.model_needs_ctx = "ctx" in sig.parameters
+    s.model_needs_ctx   = "ctx"           in sig.parameters
+    s.model_needs_index = "dataset_index" in sig.parameters
 
     log(f"  mode={'simple' if s.IS_SIMPLE else 'full'} | "
         f"model(): ctx={'yes' if s.model_needs_ctx else 'no'} | "
@@ -1402,9 +1419,10 @@ def build_app(model_module) -> FastAPI:
             await _refresh_simple_rates(s)
             rates_f   = _simple_rates_lte(target_date, s)
             dataset_f = _filter_dataset_lte(target_date, s)
+            _idx = {"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else {}
             result = s.model_fn(rates=rates_f, dataset=dataset_f,
                                 date=target_date, type=calc_type,
-                                var=calc_var, param=param)
+                                var=calc_var, param=param, **_idx)
             result, _ = _extract_detail(result)
             return result
 
@@ -1414,13 +1432,15 @@ def build_app(model_module) -> FastAPI:
         dataset_filtered = _filter_dataset_lte(target_date, s)
         if s.model_needs_ctx:
             ctx = _ModelContext(table, pair, day, target_date, s)
+            _idx = {"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else {}
             result = s.model_fn(rates=rates_filtered, dataset=dataset_filtered,
                                 date=target_date, type=calc_type, var=calc_var,
-                                param=param, ctx=ctx)
+                                param=param, ctx=ctx, **_idx)
         else:
+            _idx = {"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else {}
             result = s.model_fn(rates=rates_filtered, dataset=dataset_filtered,
                                 date=target_date, type=calc_type, var=calc_var,
-                                param=param)
+                                param=param, **_idx)
         result, _ = _extract_detail(result)
         return result
 
@@ -1433,9 +1453,10 @@ def build_app(model_module) -> FastAPI:
             await _refresh_simple_rates(s)
             rates_f   = _simple_rates_lte(target_date, s)
             dataset_f = _filter_dataset_lte(target_date, s)
+            _idx = {"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else {}
             result = s.model_fn(rates=rates_f, dataset=dataset_f,
                                 date=target_date, type=calc_type,
-                                var=calc_var, param=param)
+                                var=calc_var, param=param, **_idx)
             result, detail = _extract_detail(result)
             return result, _make_detail_serializable(detail)
 
@@ -1445,13 +1466,15 @@ def build_app(model_module) -> FastAPI:
         dataset_f      = _filter_dataset_lte(target_date, s)
         if s.model_needs_ctx:
             ctx = _ModelContext(table, pair, day, target_date, s)
+            _idx = {"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else {}
             result = s.model_fn(rates=rates_filtered, dataset=dataset_f,
                                 date=target_date, type=calc_type,
-                                var=calc_var, param=param, ctx=ctx)
+                                var=calc_var, param=param, ctx=ctx, **_idx)
         else:
+            _idx = {"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else {}
             result = s.model_fn(rates=rates_filtered, dataset=dataset_f,
                                 date=target_date, type=calc_type,
-                                var=calc_var, param=param)
+                                var=calc_var, param=param, **_idx)
         result, detail = _extract_detail(result)
         return result, _make_detail_serializable(detail)
 
@@ -1466,6 +1489,7 @@ def build_app(model_module) -> FastAPI:
 
         if s.IS_SIMPLE:
             await _load_simple_rates(s)
+            await _load_rates(s)
             await _load_dataset(s)
             await _load_weight_codes(s)
             s.service_url = f"http://localhost:{s.PORT}"
@@ -1478,7 +1502,9 @@ def build_app(model_module) -> FastAPI:
             except Exception as e:
                 log(f"  ❌ tables: {e}", s.NODE_NAME, level="error")
             s.last_reload = datetime.now()
+            global_rates_total = sum(len(v) for v in s.global_rates.values())
             log(f"✅ RELOAD DONE (simple): rates={len(s.simple_rates)} "
+                f"global_rates={global_rates_total} "
                 f"dataset={len(s.dataset)} weights={len(s.weight_codes)}",
                 s.NODE_NAME, force=True)
             return
@@ -1586,6 +1612,8 @@ def build_app(model_module) -> FastAPI:
             try:
                 if s.IS_SIMPLE:
                     await _refresh_simple_rates(s)
+                    for _tbl_bg in _RATES_TABLES:
+                        await _refresh_rates(_tbl_bg, s)
                     if (s.REBUILD_INTERVAL > 0
                             and (s.last_rebuild is None or
                                  (datetime.now() - s.last_rebuild).total_seconds()
@@ -1703,7 +1731,8 @@ def build_app(model_module) -> FastAPI:
                     def _sync_simple(candle, _ct=calc_type, _v=var):
                         td = candle["date"]
                         try:
-                            res = s.model_fn(rates=_simple_rates_lte(td, s),
+                            _idx = {"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else {}
+                            res = s.model_fn(rates=_simple_rates_lte(td, s, **_idx),
                                              dataset=_filter_dataset_lte(td, s),
                                              date=td, type=_ct, var=_v, param="")
                             res, _ = _extract_detail(res)
@@ -1840,11 +1869,13 @@ def build_app(model_module) -> FastAPI:
                     try:
                         if s.model_needs_ctx:
                             ctx = _ModelContext(table, pair, day, td, s)
+                            _idx = {"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else {}
                             res = s.model_fn(rates=r, dataset=ds, date=td,
-                                             type=calc_type, var=var, param="", ctx=ctx)
+                                             type=calc_type, var=var, param="", ctx=ctx, **_idx)
                         else:
+                            _idx = {"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field} if s.model_needs_index else {}
                             res = s.model_fn(rates=r, dataset=ds, date=td,
-                                             type=calc_type, var=var, param="")
+                                             type=calc_type, var=var, param="", **_idx)
                         res, _ = _extract_detail(res)
                         return res or {}
                     except Exception:
@@ -2470,10 +2501,12 @@ def build_app(model_module) -> FastAPI:
         log("🔍 PRETEST START", s.NODE_NAME, force=True)
         model_path = os.path.join(os.path.dirname(os.path.abspath(
             sys.modules[model_module.__name__].__file__)), "model.py")
+
+        # ── Тест 1: синтаксис model.py ────────────────────────────────────
         try:
-            import ast
+            import ast as _ast
             with open(model_path, "r", encoding="utf-8") as f:
-                ast.parse(f.read())
+                _ast.parse(f.read())
         except SyntaxError as e:
             return {"status": "error",
                     "error": f"[Тест 1 — Синтаксис] строка {e.lineno}: {e.msg}"}
@@ -2481,158 +2514,194 @@ def build_app(model_module) -> FastAPI:
             pass
         log("  ✅ Тест 1: синтаксис model.py OK", s.NODE_NAME, force=True)
 
+        # ══════════════════════════════════════════════════════════════════
+        # Тест 2: структура dict[str, float] на одной дате
+        # Тест 3: по КАЖДОМУ из 6 инструментов (EUR/BTC/ETH × hour/day):
+        #   - 10 дат равномерно из второй половины котировок инструмента
+        #   - 90% вызовов model() должны давать непустой dict
+        # IS_SIMPLE и full: одинаковая логика — global_rates загружен для обоих.
+        # ══════════════════════════════════════════════════════════════════
+
+        # Загружаем даты всех 6 инструментов из global_rates (одинаково для IS_SIMPLE и full).
+        _instr_dates: dict[str, list] = {}
+        for _tbl_pt in _RATES_TABLES:
+            _rr_pt = s.global_rates.get(_tbl_pt, [])
+            _instr_dates[_tbl_pt] = [r["date"] for r in _rr_pt]
+
+        # ── Тест 2: проверяем структуру model() ──────────────────────────
         if s.IS_SIMPLE:
-            log("  ℹ️  IS_SIMPLE режим: пропускаем тесты 2-3 (нет ctx/events)", s.NODE_NAME, force=True)
-            return {"status": "ok", "mode": "simple", "var_range": s.VAR_RANGE}
-
-        rates_indices: dict[str, list] = {}
-        for table in _RATES_TABLES:
-            rows = s.global_rates.get(table, [])
-            if rows:
-                rates_indices[table] = [r["date"] for r in rows]
-
-        for pair_id, tfs in _INSTRUMENTS.items():
-            rows = s.global_rates.get(tfs["hour"], [])
-            if not rows:
-                continue
-            mid = rows[len(rows) // 2]
-            td  = mid["date"]
-            dates_idx = rates_indices.get(tfs["hour"], [])
-            if dates_idx:
-                idx = bisect.bisect_right(dates_idx, td)
-                rf  = rows[:idx]
-            else:
-                rf  = []
-            ds  = _filter_dataset_lte(td, s)
+            if not s.simple_rates:
+                return {"status": "error",
+                        "error": "[Тест 2 — Структура] simple_rates пустой"}
+            if not s.dataset:
+                return {"status": "error",
+                        "error": "[Тест 2 — Структура] dataset пустой"}
+            _ds_dates_pt = sorted(
+                e["date"] for e in s.dataset if e.get("date") is not None)
+            if not _ds_dates_pt:
+                return {"status": "error",
+                        "error": "[Тест 2 — Структура] dataset не содержит дат"}
+            _mid_pt  = _ds_dates_pt[len(_ds_dates_pt) // 2]
+            _eur_dts = _instr_dates.get(s.RATES_TABLE_SIMPLE, s.simple_rates_dates)
+            _td2     = next((d for d in _eur_dts if d >= _mid_pt),
+                            s.simple_rates[-1]["date"])
+            _rf2 = _simple_rates_lte(_td2, s)
+            _ds2 = _filter_dataset_lte(_td2, s)
             try:
-                if s.model_needs_ctx:
-                    ctx = _ModelContext(tfs["hour"], pair_id, 0, td, s)
-                    res = s.model_fn(rates=rf, dataset=ds, date=td,
-                                     type=0, var=s.VAR_RANGE[0], param="", ctx=ctx)
-                else:
-                    res = s.model_fn(rates=rf, dataset=ds, date=td,
-                                     type=0, var=s.VAR_RANGE[0], param="")
-            except Exception as e:
+                _res2 = s.model_fn(rates=_rf2, dataset=_ds2, date=_td2,
+                                   type=0, var=s.VAR_RANGE[0], param="")
+                _res2, _ = _extract_detail(_res2)
+            except Exception as _e2:
                 return {"status": "error",
-                        "error": f"[Тест 2 — Структура] model() exception: {e}"}
-            res, _ = _extract_detail(res)
-            if res is None:
-                return {"status": "error",
-                        "error": "[Тест 2 — Структура] model() вернул None"}
-            if not isinstance(res, dict):
-                return {"status": "error",
-                        "error": f"[Тест 2 — Структура] ожидается dict, получен {type(res).__name__}"}
-            for k, v in res.items():
-                if not isinstance(k, str):
-                    return {"status": "error",
-                            "error": f"[Тест 2 — Структура] ключ {k!r} не str"}
-                if not isinstance(v, (int, float)) or v != v or abs(v) == float("inf"):
-                    return {"status": "error",
-                            "error": f"[Тест 2 — Структура] значение '{k}' не float"}
-            break
-        log("  ✅ Тест 2: структура model() OK", s.NODE_NAME, force=True)
-
-        failures = []
-        test3_pairs = []
-        for pair_id, tfs in _INSTRUMENTS.items():
-            for tf_name, table in tfs.items():
-                rows = s.global_rates.get(table, [])
-                if rows:
-                    test3_pairs.append((pair_id, tf_name, table))
-        test3_total = len(test3_pairs)
-        test3_count = 0
-
-        _COVERAGE_THRESHOLD = {"hour": 0.90, "day": 0.70}
-        rate_date_lists: dict[str, list] = {}
-        for _tbl in _RATES_TABLES:
-            _rr = s.global_rates.get(_tbl, [])
-            rate_date_lists[_tbl] = [r["date"] for r in _rr]
-
-        for pair_id, tf_name, table in test3_pairs:
-            test3_count += 1
-            rows = s.global_rates.get(table, [])
-            if not rows:
-                failures.append(f"pair{pair_id}/{tf_name}: нет данных")
-                continue
-            day_flag = 1 if tf_name == "day" else 0
-            threshold = _COVERAGE_THRESHOLD.get(tf_name, 0.90)
-            du_test   = timedelta(days=1) if day_flag else timedelta(hours=1)
-
-            if s.sorted_dates:
-                n_evt = len(s.sorted_dates)
-                step_evt = max(1, n_evt // 30)
-                candidate_events = s.sorted_dates[::step_evt]
-                rdates = rate_date_lists[table]
-                sample_dates = []
-                for ev_dt in candidate_events:
-                    target_candidate = ev_dt + du_test
-                    idx_r = bisect.bisect_left(rdates, target_candidate)
-                    if idx_r < len(rdates):
-                        candidate = rdates[idx_r]
-                        if candidate > ev_dt and candidate not in sample_dates:
-                            sample_dates.append(candidate)
-                    if len(sample_dates) >= 20:
-                        break
-                if len(sample_dates) < 5:
-                    fallback_pool = rows[max(len(rows) // 2, 1):]
-                    step_f = max(1, len(fallback_pool) // 20)
-                    for r in fallback_pool[::step_f]:
-                        if r["date"] not in sample_dates:
-                            sample_dates.append(r["date"])
-                        if len(sample_dates) >= 20:
-                            break
-            else:
-                fallback_pool = rows[max(len(rows) // 2, 1):]
-                step_f = max(1, len(fallback_pool) // 20)
-                sample_dates = [fallback_pool[i * step_f]["date"]
-                                for i in range(min(20, len(fallback_pool) // step_f))]
-
-            sample_dates = sample_dates[:20]
-
-            log(f"  [Тест 3 — {test3_count}/{test3_total}] pair{pair_id}/{tf_name}: "
-                f"проверка {len(sample_dates)} дат...", s.NODE_NAME, force=True)
-
-            dates_idx = rates_indices.get(table, [])
-            non_empty = 0
-            for td_num, td in enumerate(sample_dates):
-                if dates_idx:
-                    idx = bisect.bisect_right(dates_idx, td)
-                    rf  = rows[:idx]
-                else:
-                    rf = []
-                ds = _filter_dataset_lte(td, s)
+                        "error": f"[Тест 2 — Структура] model() exception: {_e2}"}
+        else:
+            _mid2_found = False
+            for _pid2, _tfs2 in _INSTRUMENTS.items():
+                _rows2 = s.global_rates.get(_tfs2["hour"], [])
+                if not _rows2:
+                    continue
+                _td2  = _rows2[len(_rows2) // 2]["date"]
+                _dts2 = _instr_dates.get(_tfs2["hour"], [])
+                _rf2  = _rows2[:bisect.bisect_right(_dts2, _td2)] if _dts2 else []
+                _ds2  = _filter_dataset_lte(_td2, s)
                 try:
                     if s.model_needs_ctx:
-                        ctx = _ModelContext(table, pair_id, day_flag, td, s)
-                        r = s.model_fn(rates=rf, dataset=ds, date=td,
-                                       type=0, var=s.VAR_RANGE[0], param="", ctx=ctx)
+                        _ctx2 = _ModelContext(_tfs2["hour"], _pid2, 0, _td2, s)
+                        _res2 = s.model_fn(rates=_rf2, dataset=_ds2, date=_td2,
+                                           type=0, var=s.VAR_RANGE[0], param="", ctx=_ctx2)
                     else:
-                        r = s.model_fn(rates=rf, dataset=ds, date=td,
-                                       type=0, var=s.VAR_RANGE[0], param="")
-                    r, _ = _extract_detail(r)
-                    if r:
-                        non_empty += 1
-                except Exception as e:
-                    log(f"    ⚠️ date {td}: {e}", s.NODE_NAME, level="warning")
-                if (td_num + 1) % max(1, len(sample_dates) // 3) == 0 or td_num + 1 == len(sample_dates):
-                    log(f"    ⏳ {td_num + 1}/{len(sample_dates)} ...", s.NODE_NAME, force=True)
+                        _res2 = s.model_fn(rates=_rf2, dataset=_ds2, date=_td2,
+                                           type=0, var=s.VAR_RANGE[0], param="")
+                except Exception as _e2:
+                    return {"status": "error",
+                            "error": f"[Тест 2 — Структура] model() exception: {_e2}"}
+                _res2, _ = _extract_detail(_res2)
+                _mid2_found = True
+                break
+            if not _mid2_found:
+                return {"status": "error",
+                        "error": "[Тест 2 — Структура] нет данных котировок"}
 
-            rate = non_empty / len(sample_dates) if sample_dates else 0
-            if rate < threshold:
-                failures.append(
-                    f"pair{pair_id}/{tf_name}: "
-                    f"{non_empty}/{len(sample_dates)} ({rate:.0%}) < {threshold:.0%}")
-            log(f"  ✅ Тест 3 — pair{pair_id}/{tf_name}: {non_empty}/{len(sample_dates)}"
-                f" (порог {threshold:.0%}) OK", s.NODE_NAME, force=True)
-
-        if failures:
-            log(f"❌ PRETEST FAILED: {failures}", s.NODE_NAME, force=True)
+        if _res2 is None:
             return {"status": "error",
-                    "error": f"[Тест 3 — Покрытие] {' | '.join(failures)}"}
+                    "error": "[Тест 2 — Структура] model() вернул None"}
+        if not isinstance(_res2, dict):
+            return {"status": "error",
+                    "error": f"[Тест 2 — Структура] ожидается dict, получен {type(_res2).__name__}"}
+        for _k2, _v2 in _res2.items():
+            if not isinstance(_k2, str):
+                return {"status": "error",
+                        "error": f"[Тест 2 — Структура] ключ {_k2!r} не str"}
+            if not isinstance(_v2, (int, float)) or _v2 != _v2 or abs(_v2) == float("inf"):
+                return {"status": "error",
+                        "error": f"[Тест 2 — Структура] значение '{_k2}' не конечный float"}
+        log(f"  ✅ Тест 2: структура model() OK — {len(_res2)} ключей",
+            s.NODE_NAME, force=True)
+
+        # ── Тест 3: по каждому из 6 инструментов ────────────────────────
+        # Даты берём из пересечения котировок инструмента и датасета/событий.
+        # Все вызовы model_fn запускаются параллельно через to_thread+gather.
+        if s.IS_SIMPLE:
+            _ds_with_date = sorted(e["date"] for e in s.dataset if e.get("date") is not None)
+            _anchor_pool  = _ds_with_date
+        else:
+            _anchor_pool = s.sorted_dates  # даты событий ctx-индекса
+
+        _failures3: list = []
+
+        # Собираем задачи для всех инструментов
+        _tasks3: list = []   # (pid, tf, tbl, day, sample) — метаданные
+        _coros3: list = []   # coroutine для каждого вызова model_fn
+
+        for _pid3, _tfs3 in _INSTRUMENTS.items():
+            for _tf3, _tbl3 in _tfs3.items():
+                _dts3 = _instr_dates.get(_tbl3, [])
+                if not _dts3:
+                    _failures3.append(f"pair{_pid3}/{_tf3}: нет котировок")
+                    continue
+
+                _day3  = 1 if _tf3 == "day" else 0
+                _rows3 = s.global_rates.get(_tbl3, [])
+
+                # 20 дат равномерно из пересечения котировок и датасета
+                # Датасет может начинаться позже/раньше котировок — берём overlap
+                if _anchor_pool:
+                    _ds_min = _anchor_pool[0]
+                    _ds_max = _anchor_pool[-1]
+                    _overlap = [d for d in _dts3 if _ds_min <= d <= _ds_max]
+                else:
+                    _overlap = _dts3
+                if not _overlap:
+                    _failures3.append(f"pair{_pid3}/{_tf3}: нет пересечения котировок и датасета")
+                    continue
+                # Берём из второй половины overlap (больше истории = стабильнее результат)
+                _n3      = len(_overlap)
+                _start3  = _n3 // 2
+                _avail3  = _n3 - _start3
+                _st3     = max(1, _avail3 // 20)
+                _sample3 = [_overlap[_start3 + _ii3 * _st3]
+                             for _ii3 in range(min(20, _avail3 // max(_st3, 1)))]
+                log(f"  [Тест 3] pair{_pid3}/{_tf3}: {len(_sample3)} дат...",
+                    s.NODE_NAME, force=True)
+
+                for _td3 in _sample3:
+                    _rf3 = _rows3[:bisect.bisect_right(_dts3, _td3)]
+                    _ds3 = _filter_dataset_lte(_td3, s)
+
+                    if s.model_needs_ctx:
+                        _ctx3 = _ModelContext(_tbl3, _pid3, _day3, _td3, s)
+                        def _mk3(_r=_rf3, _d=_ds3, _t=_td3, _c=_ctx3):
+                            res, _ = _extract_detail(
+                                s.model_fn(rates=_r, dataset=_d, date=_t,
+                                           type=0, var=s.VAR_RANGE[0], param="", ctx=_c))
+                            return bool(res)
+                    else:
+                        def _mk3(_r=_rf3, _d=_ds3, _t=_td3):
+                            res, _ = _extract_detail(
+                                s.model_fn(rates=_r, dataset=_d, date=_t,
+                                           type=0, var=s.VAR_RANGE[0], param=""))
+                            return bool(res)
+
+                    _tasks3.append((_pid3, _tf3, _tbl3, _day3, _td3))
+                    _coros3.append(asyncio.to_thread(_mk3))
+
+
+        # Запускаем все вызовы параллельно
+        _results3 = await asyncio.gather(*_coros3, return_exceptions=True)
+
+        # Агрегируем результаты по инструментам
+        _instr_counts: dict = {}   # (pid, tf) -> [ne, total]
+        for (_pid3, _tf3, _tbl3, _day3, _td3), _r3 in zip(_tasks3, _results3):
+            key = (_pid3, _tf3)
+            if key not in _instr_counts:
+                _instr_counts[key] = [0, 0]
+            _instr_counts[key][1] += 1
+            if isinstance(_r3, Exception):
+                log(f"    ⚠️ pair{_pid3}/{_tf3} {_td3}: {_r3}", s.NODE_NAME, level="warning")
+            elif _r3:
+                _instr_counts[key][0] += 1
+
+
+        for ((_pid3, _tf3), (_ne3, _tot3)) in _instr_counts.items():
+            _cov3 = _ne3 / _tot3 if _tot3 else 0
+            _ok3  = _cov3 >= 0.90
+            log(f"  {chr(9989) if _ok3 else chr(10060)} pair{_pid3}/{_tf3}: "
+                f"{_ne3}/{_tot3} ({_cov3:.0%}), порог 90%",
+                s.NODE_NAME, force=True)
+            if not _ok3:
+                _failures3.append(
+                    f"pair{_pid3}/{_tf3}: {_ne3}/{_tot3} ({_cov3:.0%}) < 90%")
+
+        if _failures3:
+            log(f"❌ PRETEST FAILED: {_failures3}", s.NODE_NAME, force=True)
+            return {"status": "error",
+                    "error": f"[Тест 3 — Покрытие] {' | '.join(_failures3)}"}
 
         log("✅ PRETEST PASSED", s.NODE_NAME, force=True)
         return {"status": "ok", "var_range": s.VAR_RANGE,
-                "model_has_ctx": s.model_needs_ctx, "np_built": s.np_built}
+                "model_has_ctx": s.model_needs_ctx,
+                "is_simple": s.IS_SIMPLE,
+                "np_built": s.np_built}
 
     @app.get("/universe_sync")
     async def ep_universe_sync():
@@ -2694,16 +2763,15 @@ def build_app(model_module) -> FastAPI:
         date_from: str = Query(""),
         date_to:   str = Query(""),
     ):
-        # IS_SIMPLE: pairs/days игнорируются
-        if s.IS_SIMPLE:
-            pl = [0]
-            dl = [0]
-        else:
-            try:
-                pl = [int(p.strip()) for p in pairs.split(",") if p.strip()]
-                dl = [int(d.strip()) for d in days.split(",")  if d.strip()]
-            except ValueError:
-                return err_response("pairs и days — числа через запятую")
+        # IS_SIMPLE и full: одинаковая структура вывода {"1":{"hour":{...},"day":{...}}, "3":{...}, "4":{...}}
+        # IS_SIMPLE: кеш хранится с pair=0/day=0, но статистика считается по котировкам
+        #   каждого из 6 инструментов отдельно (global_rates загружен для всех).
+        # full: котировки и кеш по каждой паре/таймфрейму.
+        try:
+            pl = [int(p.strip()) for p in pairs.split(",") if p.strip()]
+            dl = [int(d.strip()) for d in days.split(",")  if d.strip()]
+        except ValueError:
+            return err_response("pairs и days — числа через запятую")
 
         from datetime import datetime as _dt
 
@@ -2711,22 +2779,19 @@ def build_app(model_module) -> FastAPI:
         dt_to   = _parse_date(date_to)   if date_to.strip()   else _dt.now()
 
         async def _process_slot(pair_id: int, day_flag: int) -> dict:
-            if s.IS_SIMPLE:
-                tf_name = "simple"
-                rows = [r for r in s.simple_rates
-                        if (dt_from is None or r["date"] >= dt_from)
-                        and (dt_to   is None or r["date"] <= dt_to)]
-                url_p = {"url": s.service_url, "pair": 0, "day": 0,
-                         "df": dt_from, "dt": dt_to}
-            else:
-                tf_name = "day" if day_flag else "hour"
-                table   = _rates_table(pair_id, day_flag)
-                all_rows = s.global_rates.get(table, [])
-                rows = [r for r in all_rows
-                        if (dt_from is None or r["date"] >= dt_from)
-                        and (dt_to   is None or r["date"] <= dt_to)]
-                url_p = {"url": s.service_url, "pair": pair_id, "day": day_flag,
-                         "df": dt_from, "dt": dt_to}
+            tf_name = "day" if day_flag else "hour"
+            table   = _rates_table(pair_id, day_flag)
+            all_rows = s.global_rates.get(table, [])
+            rows = [r for r in all_rows
+                    if (dt_from is None or r["date"] >= dt_from)
+                    and (dt_to   is None or r["date"] <= dt_to)]
+
+            # IS_SIMPLE: кеш записывался с pair=0/day=0 — читаем оттуда.
+            # full:      кеш по реальной паре/таймфрейму.
+            _cache_pair = 0 if s.IS_SIMPLE else pair_id
+            _cache_day  = 0 if s.IS_SIMPLE else day_flag
+            url_p = {"url": s.service_url, "pair": _cache_pair, "day": _cache_day,
+                     "df": dt_from, "dt": dt_to}
 
             _tbl = s.cache_table
 
@@ -2775,6 +2840,8 @@ def build_app(model_module) -> FastAPI:
                 log(f"  ⚠️ posttest t2 {pair_id}/{tf_name}: {e}", s.NODE_NAME, level="warning")
 
             # Тест 3: живой вызов с актуальной датой
+            # IS_SIMPLE: _call_model использует simple_rates (корректно для model())
+            # full:      _call_model использует котировки конкретной пары
             now_str = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
             try:
                 sync_result = await _call_model(pair_id, day_flag, now_str)
@@ -2782,7 +2849,9 @@ def build_app(model_module) -> FastAPI:
             except Exception as e:
                 sync_out = {"error": str(e)}
 
-            # Читаем кэш один раз
+            # Читаем кэш один раз для тестов 4 и 5
+            # IS_SIMPLE: для анализа проплешин и симуляции используем котировки
+            #   конкретного инструмента из global_rates, но сигналы из общего кеша.
             cache_signals: dict = {}
             try:
                 async with s.engine_vlad.connect() as conn:
@@ -2817,7 +2886,7 @@ def build_app(model_module) -> FastAPI:
                     runs   = np.where(diffs == -1)[0] - np.where(diffs == 1)[0]
                     hole   = int(np.max(runs)) if len(runs) > 0 else 0
 
-                _, mod, lot_div = (0.0002, 100_000.0, 50_000.0) if s.IS_SIMPLE else _PAIR_CFG.get(pair_id, (0.0002, 100_000.0, 50_000.0))
+                _, mod, lot_div = _PAIR_CFG.get(pair_id, (0.0002, 100_000.0, 50_000.0))
                 equity = 10_000.0
                 total_profit = total_dropdown = 0.0
                 wins = trades = 0
