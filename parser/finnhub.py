@@ -1,7 +1,7 @@
 """
 Описание: Данные о курсе акций и рыночной капитализации
            для NVDA, AAPL, MSFT, AMZN, GOOGL из Finnhub API
-Запуск:   python finnhub.py <table_name> [host] [port] [user] [password] [database]
+Запуск:   python finnhub.py <table_name> [host] [port] [user] [password] [database] [TSLA,META, ...]
 Ограничение: 60 запросов/минуту
 Строка в .env FINNHUB_API_KEY=
 """
@@ -9,6 +9,7 @@
 # ── 1. ИМПОРТЫ ─────────────────────────────────────────────────────────────────
 import os
 import sys
+import json
 import argparse
 import traceback
 import requests
@@ -46,16 +47,40 @@ def send_error_trace(exc: Exception, script_name: str = "finnhub.py"):
 # ── 4. АРГУМЕНТЫ ──────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser(description="Finnhub Stock Parser → MySQL")
 parser.add_argument("table_name",  help="Имя целевой таблицы в БД")
-parser.add_argument("host",        nargs="?", default=os.getenv("DB_HOST"))
-parser.add_argument("port",        nargs="?", default=os.getenv("DB_PORT", "3306"))
-parser.add_argument("user",        nargs="?", default=os.getenv("DB_USER"))
-parser.add_argument("password",    nargs="?", default=os.getenv("DB_PASSWORD"))
-parser.add_argument("database",    nargs="?", default=os.getenv("DB_NAME"))
 parser.add_argument(
-    "--tickers",
-    help="Новые тикеры через запятую (например: TSLA,META,AMD)"
+    "extra",
+    nargs="*",
+    help='После table_name можно передать host port user password database, а последним JSON-массив тикеров'
 )
 args = parser.parse_args()
+
+raw_extra = args.extra
+args.tickers = None
+
+db_tokens = raw_extra
+if raw_extra and raw_extra[-1].strip().startswith("["):
+    args.tickers = raw_extra[-1]
+    db_tokens = raw_extra[:-1]
+
+if any(token.strip().startswith("[") for token in db_tokens):
+    print("❌ Ошибка: JSON-массив тикеров должен быть последним аргументом")
+    print("   Ожидается: [host] [port] [user] [password] [database] [tickers_json]")
+    sys.exit(1)
+
+if len(db_tokens) not in (0, 5):
+    print("❌ Ошибка: параметры БД нужно передавать либо все 5, либо не передавать вовсе")
+    print("   Формат 1: <table_name> [host] [port] [user] [password] [database] [tickers_json]")
+    print("   Формат 2: <table_name> [tickers_json]  (если DB_* уже заданы в .env)")
+    sys.exit(1)
+
+if len(db_tokens) == 5:
+    args.host, args.port, args.user, args.password, args.database = db_tokens
+else:
+    args.host = os.getenv("DB_HOST")
+    args.port = os.getenv("DB_PORT", "3306")
+    args.user = os.getenv("DB_USER")
+    args.password = os.getenv("DB_PASSWORD")
+    args.database = os.getenv("DB_NAME")
 
 if not all([args.host, args.user, args.password, args.database]):
     print("❌ Ошибка: не указаны параметры подключения к БД")
@@ -146,20 +171,42 @@ def apply_saved_symbols_to_all_tables():
 
 def add_symbols_from_argument(table_name: str, tickers_arg: str, limit: int = 40):
     """
-    Добавляет новые тикеры (через запятую) в symbols для указанной таблицы.
+    Добавляет новые тикеры (JSON-массив строк) в symbols для указанной таблицы.
     Если итоговое количество тикеров > limit, ничего не добавляет.
     """
     if not tickers_arg:
         return
 
+    tickers_json = None
+    try:
+        tickers_json = json.loads(tickers_arg)
+    except json.JSONDecodeError:
+        # PowerShell может передать массив как [TSLA,META] без кавычек.
+        raw = tickers_arg.strip()
+        if raw.startswith("[") and raw.endswith("]"):
+            inner = raw[1:-1].strip()
+            if inner:
+                tickers_json = [token.strip() for token in inner.split(",")]
+            else:
+                tickers_json = []
+        else:
+            print('❌ Аргумент тикеров должен быть JSON-массивом, например: ["TSLA","META"]')
+            return
+
+    if not isinstance(tickers_json, list):
+        print("❌ Аргумент тикеров должен быть JSON-массивом строк")
+        return
+
     parsed = []
-    for token in tickers_arg.split(","):
+    for token in tickers_json:
+        if not isinstance(token, str):
+            continue
         symbol = token.strip().upper()
         if symbol:
             parsed.append(symbol)
 
     if not parsed:
-        print("⚠️  Параметр --tickers передан, но тикеры не распознаны")
+        print("⚠️  JSON-массив тикеров передан, но валидные тикеры не распознаны")
         return
 
     current_symbols = DATASETS[table_name].get("symbols", [])
