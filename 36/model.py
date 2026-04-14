@@ -21,6 +21,10 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 import bisect
 
+
+def _dt_to_ts(dt: datetime) -> int:
+    return int(dt.timestamp())
+
 # ══════════════════════════════════════════════════════════════════════════════
 # КОНФИГ ФРЕЙМВОРКА
 # ══════════════════════════════════════════════════════════════════════════════
@@ -92,27 +96,61 @@ def model(
     if not rates or not dataset:
         return {}
 
-    # Lookup котировок — rates передаётся уже отсортированным (bisect-срез из global_rates)
-    rates_t1    = {r["date"]: float((r.get("close") or 0) - (r.get("open") or 0))
-                   for r in rates}
-    rates_range = {r["date"]: float((r.get("max") or 0) - (r.get("min") or 0))
-                   for r in rates}
-    avg_range   = sum(rates_range.values()) / len(rates_range) if rates_range else 0.0
 
-    # Локальные экстремумы — rates уже отсортирован, не сортируем повторно
-    ext_max: set = set()
-    ext_min: set = set()
-    for i in range(1, len(rates) - 1):
-        h = float(rates[i].get("max") or 0)
-        l = float(rates[i].get("min") or 0)
-        if h > float(rates[i-1].get("max") or 0) and h > float(rates[i+1].get("max") or 0):
-            ext_max.add(rates[i]["date"])
-        if l < float(rates[i-1].get("min") or 0) and l < float(rates[i+1].get("min") or 0):
-            ext_min.add(rates[i]["date"])
+    # Numpy-массивы котировок — передаются фреймворком, строятся один раз
+    _np = dataset_index.get("np_rates") if dataset_index else None
 
-    last    = rates[-1] if rates else None
-    is_bull = (float(last.get("close") or 0) > float(last.get("open") or 0)) if last else True
-    ext_set = ext_max if is_bull else ext_min
+    if _np is not None:
+        # ── Быстрый numpy-путь ────────────────────────────────────────────
+        import numpy as _np_mod
+        _dates_ns = _np["dates_ns"]
+        _t1_arr   = _np["t1"]
+        _rng_arr  = _np["ranges"]
+        avg_range = float(_np["avg_range"])
+        # Срез до date
+        _cut = int(_np_mod.searchsorted(_dates_ns, _dt_to_ts(date), side='right'))
+        _dates_ns_cut = _dates_ns[:_cut]
+        _t1_cut   = _t1_arr[:_cut]
+        _rng_cut  = _rng_arr[:_cut]
+        _ext_max_cut = _np["ext_max"][:_cut]
+        _ext_min_cut = _np["ext_min"][:_cut]
+        # Последняя свеча — bull/bear
+        if _cut > 0:
+            is_bull = float(_np["close"][_cut - 1]) > float(_np["open"][_cut - 1])
+        else:
+            is_bull = True
+        _ext_cut = _ext_max_cut if is_bull else _ext_min_cut
+        # Вспомогательные функции для numpy-пути
+        def _get_t1_for_dates(ts_arr):
+            idx = _np_mod.searchsorted(_dates_ns_cut, ts_arr, side='left')
+            mask = (idx < _cut) & (_dates_ns_cut[idx.clip(0, _cut-1)] == ts_arr)
+            return _t1_cut[idx[mask]], mask
+        def _get_rng_for_dates(ts_arr):
+            idx = _np_mod.searchsorted(_dates_ns_cut, ts_arr, side='left')
+            mask = (idx < _cut) & (_dates_ns_cut[idx.clip(0, _cut-1)] == ts_arr)
+            return _rng_cut[idx[mask]], mask
+        rates_t1    = None   # не строим dict — используем numpy
+        rates_range = None
+        ext_set     = None
+    else:
+        # ── Fallback: Python-путь (без np_rates) ─────────────────────────
+        rates_t1    = {r["date"]: float((r.get("close") or 0) - (r.get("open") or 0))
+                       for r in rates}
+        rates_range = {r["date"]: float((r.get("max") or 0) - (r.get("min") or 0))
+                       for r in rates}
+        avg_range   = sum(rates_range.values()) / len(rates_range) if rates_range else 0.0
+        ext_max2: set = set()
+        ext_min2: set = set()
+        for i in range(1, len(rates) - 1):
+            h = float(rates[i].get("max") or 0)
+            l = float(rates[i].get("min") or 0)
+            if h > float(rates[i-1].get("max") or 0) and h > float(rates[i+1].get("max") or 0):
+                ext_max2.add(rates[i]["date"])
+            if l < float(rates[i-1].get("min") or 0) and l < float(rates[i+1].get("min") or 0):
+                ext_min2.add(rates[i]["date"])
+        last    = rates[-1] if rates else None
+        is_bull = (float(last.get("close") or 0) > float(last.get("open") or 0)) if last else True
+        ext_set = ext_max2 if is_bull else ext_min2
 
     # Индекс датасета — строится фреймворком один раз при загрузке, передаётся сюда
     _ds_dates        = dataset_index["dates"]     if dataset_index else [e["date"] for e in dataset]
@@ -158,59 +196,102 @@ def model(
 
         # Проекция: исторические даты + shift часов
         _shift_td = timedelta(hours=shift)
-        t_dates = [td for h in historical
-                   if (td := h["date"] + _shift_td) < date
-                   and td in rates_t1]
-        if not t_dates:
-            continue
 
         # Модификаторы вариаций
         severity = 1.0 + min(float(event.get("avg_deaths") or 0) / 10.0, 2.0)
         fear     = (1.0 + float(event.get("civilian_ratio") or 0)) * \
                    min(float(event.get("high_estimate_ratio") or 1), 3.0)
 
-        # ── T1 (mode=0) ───────────────────────────────────────────────────────
-        if type in (0, 1):
-            if var == 0:
-                t1 = sum(rates_t1[d] for d in t_dates)
-            elif var == 1:
-                t1 = sum(rates_t1[d] for d in t_dates) * severity
-            elif var == 2:
-                t1 = sum(rates_t1[d] for d in t_dates if rates_range.get(d, 0) > avg_range)
-            elif var == 3:
-                t1 = sum(rates_t1[d] for d in t_dates) * fear
-            elif var == 4:
-                t1 = sum((v := rates_t1[d]) * abs(v) for d in t_dates)
-            elif var == 5:
-                t1 = sum(rates_range[d] - avg_range for d in t_dates
-                         if rates_range.get(d, 0) > avg_range)
-            else:
-                t1 = 0.0
+        if _np is not None:
+            # ── Numpy-путь ────────────────────────────────────────────────
+            import numpy as _np_mod
+            _date_ts = _dt_to_ts(date)
+            proj_ts  = _np_mod.array(
+                [_dt_to_ts(h["date"]) + shift * 3600 for h in historical],
+                dtype=_np_mod.int64)
+            proj_ts  = proj_ts[proj_ts < _date_ts]
+            if len(proj_ts) == 0:
+                continue
+            # Lookup в numpy-массивах котировок
+            idx      = _np_mod.searchsorted(_dates_ns_cut, proj_ts, side='left')
+            in_b     = idx < _cut
+            exact    = _np_mod.zeros(len(proj_ts), dtype=bool)
+            if _np_mod.any(in_b):
+                exact[in_b] = _dates_ns_cut[idx[in_b]] == proj_ts[in_b]
+            if not _np_mod.any(exact):
+                continue
+            t1_vals  = _t1_cut[idx[exact]]
+            rng_vals = _rng_cut[idx[exact]]
+            ext_hits = _ext_cut[idx[exact]]
 
-            if t1 != 0.0:
-                wc = f"{ctx_id}_0_{shift}"
-                result[wc] = result.get(wc, 0.0) + t1
+            if type in (0, 1):
+                large_mask = rng_vals > avg_range
+                if var == 0:   t1 = float(_np_mod.sum(t1_vals))
+                elif var == 1: t1 = float(_np_mod.sum(t1_vals)) * severity
+                elif var == 2: t1 = float(_np_mod.sum(t1_vals[large_mask]))
+                elif var == 3: t1 = float(_np_mod.sum(t1_vals)) * fear
+                elif var == 4: t1 = float(_np_mod.sum(t1_vals * _np_mod.abs(t1_vals)))
+                elif var == 5: t1 = float(_np_mod.sum((rng_vals - avg_range)[large_mask]))
+                else:          t1 = 0.0
+                if t1 != 0.0:
+                    wc = f"{ctx_id}_0_{shift}"
+                    result[wc] = result.get(wc, 0.0) + t1
 
-        # ── Extremum (mode=1) ─────────────────────────────────────────────────
-        if type in (0, 2):
-            ext = _ext_base(t_dates, ext_set, total_hist)
-            if ext is not None:
-                if var == 1:
-                    ext *= severity
-                elif var == 2:
-                    large = [d for d in t_dates if rates_range.get(d, 0) > avg_range]
-                    ext   = _ext_base(large, ext_set, total_hist) if large else None
-                elif var == 3:
-                    ext *= fear
-                elif var == 4:
-                    ext = ext * abs(ext)
-                elif var == 5:
-                    hits = [d for d in t_dates if d in ext_set and rates_range.get(d, 0) > avg_range]
-                    ext  = sum(rates_range[d] - avg_range for d in hits) / total_hist if hits else None
+            if type in (0, 2):
+                n_ext = int(_np_mod.count_nonzero(ext_hits))
+                val   = (n_ext / total_hist) * 2 - 1
+                ext   = val if val != 0 else None
+                if ext is not None:
+                    large_mask = rng_vals > avg_range
+                    if var == 1:   ext *= severity
+                    elif var == 2:
+                        n2 = int(_np_mod.count_nonzero(ext_hits[large_mask]))
+                        v2 = (n2 / total_hist) * 2 - 1
+                        ext = v2 if v2 != 0 else None
+                    elif var == 3: ext *= fear
+                    elif var == 4: ext = ext * abs(ext)
+                    elif var == 5:
+                        hits_mask = ext_hits & large_mask
+                        ext = float(_np_mod.sum((rng_vals - avg_range)[hits_mask])) / total_hist if _np_mod.any(hits_mask) else None
+                if ext is not None:
+                    wc = f"{ctx_id}_1_{shift}"
+                    result[wc] = result.get(wc, 0.0) + ext
 
-            if ext is not None:
-                wc = f"{ctx_id}_1_{shift}"
-                result[wc] = result.get(wc, 0.0) + ext
+        else:
+            # ── Python-fallback (без np_rates) ────────────────────────────
+            t_dates = [td for h in historical
+                       if (td := h["date"] + _shift_td) < date
+                       and td in rates_t1]
+            if not t_dates:
+                continue
+
+            if type in (0, 1):
+                if var == 0:   t1 = sum(rates_t1[d] for d in t_dates)
+                elif var == 1: t1 = sum(rates_t1[d] for d in t_dates) * severity
+                elif var == 2: t1 = sum(rates_t1[d] for d in t_dates if rates_range.get(d, 0) > avg_range)
+                elif var == 3: t1 = sum(rates_t1[d] for d in t_dates) * fear
+                elif var == 4: t1 = sum((v := rates_t1[d]) * abs(v) for d in t_dates)
+                elif var == 5: t1 = sum(rates_range[d] - avg_range for d in t_dates if rates_range.get(d, 0) > avg_range)
+                else:          t1 = 0.0
+                if t1 != 0.0:
+                    wc = f"{ctx_id}_0_{shift}"
+                    result[wc] = result.get(wc, 0.0) + t1
+
+            if type in (0, 2):
+                ext = _ext_base(t_dates, ext_set, total_hist)
+                if ext is not None:
+                    if var == 1:   ext *= severity
+                    elif var == 2:
+                        large = [d for d in t_dates if rates_range.get(d, 0) > avg_range]
+                        ext   = _ext_base(large, ext_set, total_hist) if large else None
+                    elif var == 3: ext *= fear
+                    elif var == 4: ext = ext * abs(ext)
+                    elif var == 5:
+                        hits = [d for d in t_dates if d in ext_set and rates_range.get(d, 0) > avg_range]
+                        ext  = sum(rates_range[d] - avg_range for d in hits) / total_hist if hits else None
+                if ext is not None:
+                    wc = f"{ctx_id}_1_{shift}"
+                    result[wc] = result.get(wc, 0.0) + ext
 
     return {k: round(v, 6) for k, v in result.items() if v != 0}
 
