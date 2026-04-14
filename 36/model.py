@@ -19,6 +19,7 @@ VAR-СТРАТЕГИИ:
 
 from __future__ import annotations
 from datetime import datetime, timedelta
+import bisect
 
 # ══════════════════════════════════════════════════════════════════════════════
 # КОНФИГ ФРЕЙМВОРКА
@@ -65,6 +66,7 @@ DATASET_QUERY = """
 """
 
 WEIGHTS_TABLE    = "vlad_ucdp_weights_table"
+DATASET_KEY      = "ctx_id"   # поле группировки — фреймворк строит индекс по нему
 VAR_RANGE        = [0, 1, 2, 3, 4, 5]
 CACHE_DATE_FROM  = "2025-01-15"
 REBUILD_INTERVAL = 86400  # раз в сутки (датасет меняется редко)
@@ -82,42 +84,58 @@ def model(
     dataset: list[dict],
     date:    datetime,
     *,
-    type:  int = 0,
-    var:   int = 0,
-    param: str = "",
+    type:           int        = 0,
+    var:            int        = 0,
+    param:          str        = "",
+    dataset_index:  dict|None  = None,
 ) -> dict[str, float]:
     if not rates or not dataset:
         return {}
 
-    # Lookup котировок
+    # Lookup котировок — rates передаётся уже отсортированным (bisect-срез из global_rates)
     rates_t1    = {r["date"]: float((r.get("close") or 0) - (r.get("open") or 0))
                    for r in rates}
     rates_range = {r["date"]: float((r.get("max") or 0) - (r.get("min") or 0))
                    for r in rates}
     avg_range   = sum(rates_range.values()) / len(rates_range) if rates_range else 0.0
 
-    # Локальные экстремумы
-    sr = sorted(rates, key=lambda r: r["date"])
+    # Локальные экстремумы — rates уже отсортирован, не сортируем повторно
     ext_max: set = set()
     ext_min: set = set()
-    for i in range(1, len(sr) - 1):
-        h = float(sr[i].get("max") or 0)
-        l = float(sr[i].get("min") or 0)
-        if h > float(sr[i-1].get("max") or 0) and h > float(sr[i+1].get("max") or 0):
-            ext_max.add(sr[i]["date"])
-        if l < float(sr[i-1].get("min") or 0) and l < float(sr[i+1].get("min") or 0):
-            ext_min.add(sr[i]["date"])
+    for i in range(1, len(rates) - 1):
+        h = float(rates[i].get("max") or 0)
+        l = float(rates[i].get("min") or 0)
+        if h > float(rates[i-1].get("max") or 0) and h > float(rates[i+1].get("max") or 0):
+            ext_max.add(rates[i]["date"])
+        if l < float(rates[i-1].get("min") or 0) and l < float(rates[i+1].get("min") or 0):
+            ext_min.add(rates[i]["date"])
 
-    last = sr[-1] if sr else None
+    last    = rates[-1] if rates else None
     is_bull = (float(last.get("close") or 0) > float(last.get("open") or 0)) if last else True
     ext_set = ext_max if is_bull else ext_min
 
-    # Недавние события в окне [date - SHIFT_WINDOW, date]
+    # Индекс датасета — строится фреймворком один раз при загрузке, передаётся сюда
+    _ds_dates        = dataset_index["dates"]     if dataset_index else [e["date"] for e in dataset]
+    _by_ctx          = dataset_index["by_key"]    if dataset_index else {}
+    _ctx_dates_cache = dataset_index["key_dates"] if dataset_index else {}
+
+    # Недавние события в окне [date - SHIFT_WINDOW, date] — bisect вместо O(N) filter
     window_start = date - timedelta(hours=_SHIFT_WINDOW)
-    recent = [e for e in dataset
-              if e.get("date") is not None and window_start <= e["date"] <= date]
+    _i_left  = bisect.bisect_left(_ds_dates, window_start)
+    _i_right = bisect.bisect_right(_ds_dates, date)
+    recent   = [e for e in dataset[_i_left:_i_right] if e.get("ctx_id") is not None]
     if not recent:
         return {}
+
+    # Дедупликация по (ctx_id, shift): один ctx_id+shift → один weight code
+    _seen: set = set()
+    recent_dedup: list = []
+    for e in recent:
+        _k = (e.get("ctx_id"), int((date - e["date"]).total_seconds() / 3600))
+        if _k not in _seen:
+            _seen.add(_k)
+            recent_dedup.append(e)
+    recent = recent_dedup
 
     result: dict[str, float] = {}
 
@@ -128,19 +146,20 @@ def model(
 
         shift = max(0, min(int((date - event["date"]).total_seconds() / 3600), _SHIFT_WINDOW))
 
-        # История — прошлые события того же типа ДО текущего
-        historical = [e for e in dataset
-                      if e.get("ctx_id") == ctx_id
-                      and e.get("date") is not None
-                      and e["date"] < event["date"]]
+        # История — bisect по закешированным датам группы
+        ctx_events = _by_ctx.get(ctx_id, [])
+        _ctx_dates = _ctx_dates_cache.get(ctx_id, [])
+        _hi        = bisect.bisect_left(_ctx_dates, event["date"])
+        historical = ctx_events[:_hi]
         if len(historical) < _MIN_HISTORY:
             continue
 
         total_hist = len(historical)
 
         # Проекция: исторические даты + shift часов
+        _shift_td = timedelta(hours=shift)
         t_dates = [td for h in historical
-                   if (td := h["date"] + timedelta(hours=shift)) < date
+                   if (td := h["date"] + _shift_td) < date
                    and td in rates_t1]
         if not t_dates:
             continue
