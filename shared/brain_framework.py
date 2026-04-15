@@ -2582,7 +2582,7 @@ def build_app(model_module) -> FastAPI:
                 for v in vars_to_run:
                     try:
                         all_results[key][f"var={v}"] = await _backtest(
-                            bt_pair, bt_day, tier, {"type": type, "var": v}, df, dt)
+                            bt_pair, bt_day, tier, {"type": type, "var": v, "param": ""}, df, dt)
                     except Exception as e:
                         all_results[key][f"var={v}"] = {"error": str(e)}
                 try:
