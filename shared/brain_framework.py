@@ -48,7 +48,7 @@ def _dt_to_ts(dt: datetime) -> int:
     return int(dt.timestamp())
 
 
-def _build_np_rates_for_table(rates, candle_ranges, extremums):
+def _build_np_rates_for_table(rates, candle_ranges, extremums, global_rates_list=None):
     if not rates:
         return None
     sorted_dates = sorted(rates.keys())
@@ -60,9 +60,20 @@ def _build_np_rates_for_table(rates, candle_ranges, extremums):
     ext_max_set = extremums.get("max", set())
     ext_min_arr = np.fromiter((d in ext_min_set for d in sorted_dates), dtype=bool, count=n)
     ext_max_arr = np.fromiter((d in ext_max_set for d in sorted_dates), dtype=bool, count=n)
+    # close/open из global_rates_list если доступен
+    if global_rates_list:
+        _gr_map = {r["date"]: r for r in global_rates_list}
+        close_arr = np.array([float(_gr_map[d]["close"]) if d in _gr_map else 0.0
+                              for d in sorted_dates], dtype=np.float64)
+        open_arr  = np.array([float(_gr_map[d]["open"])  if d in _gr_map else 0.0
+                              for d in sorted_dates], dtype=np.float64)
+    else:
+        close_arr = np.zeros(n, dtype=np.float64)
+        open_arr  = np.zeros(n, dtype=np.float64)
     return {
         "dates_ns": dates_ns, "t1": t1_arr, "ranges": ranges_arr,
         "ext_min": ext_min_arr, "ext_max": ext_max_arr,
+        "close": close_arr, "open": open_arr,
     }
 
 
@@ -541,6 +552,7 @@ def _rebuild_np_rates(s: _State) -> None:
             s.rates.get(table, {}),
             s.candle_ranges.get(table, {}),
             s.extremums.get(table, {}),
+            s.global_rates.get(table, []),
         )
         if np_r is not None:
             np_r["avg_range"] = s.avg_range.get(table, 0.0)
@@ -556,7 +568,7 @@ def _rebuild_np_sorted_dates(s: _State) -> None:
         s.np_sorted_dates_ns = np.empty(0, dtype=np.int64)
 
 
-def _append_np_rates_row(table, dt, t1, rng, s: _State) -> None:
+def _append_np_rates_row(table, dt, t1, rng, s: _State, close=0.0, open_=0.0) -> None:
     np_r = s.np_rates.get(table)
     if np_r is None:
         return
@@ -566,6 +578,8 @@ def _append_np_rates_row(table, dt, t1, rng, s: _State) -> None:
     np_r["ranges"]   = np.append(np_r["ranges"],   np.float64(rng))
     np_r["ext_min"]  = np.append(np_r["ext_min"],  False)
     np_r["ext_max"]  = np.append(np_r["ext_max"],  False)
+    np_r["close"]    = np.append(np_r["close"],    np.float64(close))
+    np_r["open"]     = np.append(np_r["open"],     np.float64(open_))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -654,7 +668,9 @@ async def _refresh_rates(table: str, s: _State):
                     "min":   float(r["min"]   or 0), "max": float(r["max"] or 0),
                 })
                 if s.np_built:
-                    _append_np_rates_row(table, dt, t1, rng, s)
+                    _append_np_rates_row(table, dt, t1, rng, s,
+                                         close=float(r["close"] or 0),
+                                         open_=float(r["open"]  or 0))
                 n += 1
             if n > 0:
                 log(f"  📥 +{n} candle(s) {table}", s.NODE_NAME)
@@ -1849,7 +1865,11 @@ def build_app(model_module) -> FastAPI:
                                 )
                                 res, _ = _extract_detail(res)
                                 return res or {}
-                            except Exception:
+                            except Exception as _e:
+                                import traceback as _tb
+                                log(f"  ❌ _sync_simple_pd {td} t={_ct} v={_v}: "
+                                    f"{_e}\n{_tb.format_exc()}",
+                                    s.NODE_NAME, level="error", force=True)
                                 return None
 
                         results = await asyncio.to_thread(
