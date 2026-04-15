@@ -2,18 +2,6 @@
 brain_framework.py v11 — полная поддержка backtest в IS_SIMPLE режиме.
 С патчем: per-service таблицы кеша (vlad_values_cache_svc{PORT}).
 
-Автодетекция режима по наличию RATES_TABLE в model.py:
-  IS_SIMPLE = True  → сервисы 36+ (одна таблица, без pair/day/ctx)
-  IS_SIMPLE = False → сервисы 33-35 (пары, дни, ctx, numpy)
-
-Изменения v11 (относительно v10):
-  - _fill_worker: кэш для IS_SIMPLE пишется с pair=0, day_flag=0
-  - _fill_worker: авто-бэктест после fill_cache в IS_SIMPLE
-  - _backtest: адаптирован для IS_SIMPLE (simple_rates, кэш с pair=0/day=0)
-  - /backtest: убран guard IS_SIMPLE, теперь работает для простых сервисов
-  - /summary: убран guard IS_SIMPLE
-  - /posttest: убран guard, добавлена ветка для IS_SIMPLE
-
 server.py для всех сервисов одинаковый:
     from brain_framework import build_app
 """
@@ -1642,10 +1630,14 @@ def build_app(model_module) -> FastAPI:
             _build_sorted_arrays(s)
             return_new_keys = len(new_keys)
         else:
+            # IS_SIMPLE: перезагружаем датасет — build_index мог записать новые строки
+            await _load_dataset(s)
             return_new_keys = 0
 
         s.last_rebuild = datetime.now()
-        log(f"✅ rebuild done: weights={len(s.weight_codes)}", s.NODE_NAME, force=True)
+        log(f"✅ rebuild done: weights={len(s.weight_codes)}"
+            + (f" dataset={len(s.dataset)}" if s.IS_SIMPLE else ""),
+            s.NODE_NAME, force=True)
 
         return {
             **stats,
@@ -1663,14 +1655,21 @@ def build_app(model_module) -> FastAPI:
             await asyncio.sleep(s.RELOAD_INTERVAL)
             try:
                 if s.IS_SIMPLE:
+                    # Каждый тик (RELOAD_INTERVAL): обновляем котировки
                     await _refresh_simple_rates(s)
                     for _tbl_bg in _RATES_TABLES:
                         await _refresh_rates(_tbl_bg, s)
-                    if (s.REBUILD_INTERVAL > 0
+
+                    # Rebuild по отдельному интервалу (REBUILD_INTERVAL).
+                    # _do_rebuild() сам перезагружает датасет и веса после записи.
+                    if (s.index_builder_fn is not None
+                            and s.REBUILD_INTERVAL > 0
                             and (s.last_rebuild is None or
                                  (datetime.now() - s.last_rebuild).total_seconds()
                                  >= s.REBUILD_INTERVAL)):
+                        log("🔁 IS_SIMPLE auto-rebuild...", s.NODE_NAME, force=True)
                         await _do_rebuild()
+
                     s.last_reload = datetime.now()
                     continue
 
@@ -2567,7 +2566,9 @@ def build_app(model_module) -> FastAPI:
         # ══════════════════════════════════════════════════════════════════
         # Тест 2: структура dict[str, float] на одной дате
         # Тест 3: по КАЖДОМУ из 6 инструментов (EUR/BTC/ETH × hour/day):
-        #   - 10 дат равномерно из второй половины котировок инструмента
+        #   - date_start берётся из brain.brain_models WHERE id=SERVICE_ID (поле date)
+        #     фолбэк: 2025-01-15 если таблица недоступна или запись не найдена
+        #   - 10 случайных дат >= date_start из котировок инструмента
         #   - 90% вызовов model() должны давать непустой dict
         # IS_SIMPLE и full: одинаковая логика — global_rates загружен для обоих.
         # ══════════════════════════════════════════════════════════════════
@@ -2649,18 +2650,37 @@ def build_app(model_module) -> FastAPI:
             s.NODE_NAME, force=True)
 
         # ── Тест 3: по каждому из 6 инструментов ────────────────────────
-        # Даты берём из пересечения котировок инструмента и датасета/событий.
-        # Все вызовы model_fn запускаются параллельно через to_thread+gather.
-        if s.IS_SIMPLE:
-            _ds_with_date = sorted(e["date"] for e in s.dataset if e.get("date") is not None)
-            _anchor_pool  = _ds_with_date
-        else:
-            _anchor_pool = s.sorted_dates  # даты событий ctx-индекса
+        # Дата старта: из brain.brain_models WHERE id = SERVICE_ID, поле date.
+        # Фолбэк: 2025-01-15.
+        # Берём 10 случайных дат >= date_start из котировок каждого инструмента.
+        # 90% вызовов model() должны давать непустой dict.
+        _pt3_date_start: datetime = datetime(2025, 1, 15)
+        try:
+            async with s.engine_brain.connect() as _conn_pt3:
+                _row_pt3 = (await _conn_pt3.execute(
+                    text("SELECT `date` FROM `brain_models` WHERE `id` = :sid LIMIT 1"),
+                    {"sid": s.SERVICE_ID}
+                )).fetchone()
+                if _row_pt3 and _row_pt3[0] is not None:
+                    _val_pt3 = _row_pt3[0]
+                    if isinstance(_val_pt3, datetime):
+                        _pt3_date_start = _val_pt3
+                    else:
+                        # date object → datetime
+                        _pt3_date_start = datetime(_val_pt3.year, _val_pt3.month, _val_pt3.day)
+                    log(f"  [Тест 3] date_start из brain_models: {_pt3_date_start.date()}",
+                        s.NODE_NAME, force=True)
+                else:
+                    log(f"  [Тест 3] brain_models нет записи для SERVICE_ID={s.SERVICE_ID}, "
+                        f"фолбэк 2025-01-15", s.NODE_NAME, force=True)
+        except Exception as _e_pt3:
+            log(f"  [Тест 3] brain_models недоступна ({_e_pt3}), фолбэк 2025-01-15",
+                s.NODE_NAME, level="warning", force=True)
 
         _failures3: list = []
 
         # Собираем задачи для всех инструментов
-        _tasks3: list = []   # (pid, tf, tbl, day, sample) — метаданные
+        _tasks3: list = []   # (pid, tf, tbl, day, td) — метаданные
         _coros3: list = []   # coroutine для каждого вызова model_fn
 
         for _pid3, _tfs3 in _INSTRUMENTS.items():
@@ -2673,25 +2693,18 @@ def build_app(model_module) -> FastAPI:
                 _day3  = 1 if _tf3 == "day" else 0
                 _rows3 = s.global_rates.get(_tbl3, [])
 
-                # 20 дат равномерно из пересечения котировок и датасета
-                # Датасет может начинаться позже/раньше котировок — берём overlap
-                if _anchor_pool:
-                    _ds_min = _anchor_pool[0]
-                    _ds_max = _anchor_pool[-1]
-                    _overlap = [d for d in _dts3 if _ds_min <= d <= _ds_max]
-                else:
-                    _overlap = _dts3
-                if not _overlap:
-                    _failures3.append(f"pair{_pid3}/{_tf3}: нет пересечения котировок и датасета")
-                    continue
-                # Берём из второй половины overlap (больше истории = стабильнее результат)
-                _n3      = len(_overlap)
-                _start3  = _n3 // 2
-                _avail3  = _n3 - _start3
-                _st3     = max(1, _avail3 // 20)
-                _sample3 = [_overlap[_start3 + _ii3 * _st3]
-                             for _ii3 in range(min(20, _avail3 // max(_st3, 1)))]
-                log(f"  [Тест 3] pair{_pid3}/{_tf3}: {len(_sample3)} дат...",
+                # 10 случайных дат >= _pt3_date_start из котировок инструмента
+                _pool3 = [d for d in _dts3 if d >= _pt3_date_start]
+                if not _pool3:
+                    # Фолбэк: берём из всего диапазона котировок
+                    _pool3 = _dts3
+                    log(f"  [Тест 3] pair{_pid3}/{_tf3}: нет дат >= {_pt3_date_start.date()}, "
+                        f"используем весь диапазон", s.NODE_NAME, force=True)
+                _sample3 = random.sample(_pool3, min(10, len(_pool3)))
+                _sample3.sort()
+                log(f"  [Тест 3] pair{_pid3}/{_tf3}: {len(_sample3)} дат "
+                    f"(от {_sample3[0].date() if _sample3 else '—'} "
+                    f"до {_sample3[-1].date() if _sample3 else '—'})...",
                     s.NODE_NAME, force=True)
 
                 for _td3 in _sample3:
