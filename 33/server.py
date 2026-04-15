@@ -56,7 +56,7 @@ SHIFT_WINDOW        = int(os.getenv("SHIFT_WINDOW",          "12"))
 RECURRING_MIN_COUNT = 2
 SKIP_EVENT_TYPES    = {2}
 
-#  Глобальные данные 
+# ── Глобальные данные ─────────────────────────────────────────────────────────
 GLOBAL_CAL_CTX_INDEX = {}
 GLOBAL_CAL_CTX_HIST  = {}
 GLOBAL_CAL_BY_DT     = {}
@@ -75,7 +75,7 @@ _CAL_SORTED_DATES = []   # список datetime
 _CAL_SORTED_DATA  = []   # список списков ключей, соответствующих датам
 
 
-#  Вспомогательные функции 
+# ── Вспомогательные функции ───────────────────────────────────────────────────
 
 def get_rates_table_name(pair_id: int, day_flag: int) -> str:
     return {1: "brain_rates_eur_usd", 3: "brain_rates_btc_usd",
@@ -166,7 +166,7 @@ def decode_weight_code(code: str) -> dict | None:
         return None
 
 
-#  Текстовый нарратив details (массив строк) 
+# ── Текстовый нарратив details (массив строк) ─────────────────────────────────
 
 def _pluralize_events(n: int) -> str:
     if 11 <= n % 100 <= 19:
@@ -305,7 +305,7 @@ def build_details_lines(
     return lines
 
 
-#  Расчётные функции 
+# ── Расчётные функции ─────────────────────────────────────────────────────────
 
 def compute_t1_value(t_dates, calc_var, ram_rates, candle_ranges, avg_range):
     need_filter = calc_var in (1, 3, 4)
@@ -341,11 +341,11 @@ def compute_extremum_value(t_dates, calc_var, ext_set, candle_ranges, avg_range,
     return val if val != 0 else None
 
 
-#  Загрузка данных при старте 
+# ── Загрузка данных при старте ────────────────────────────────────────────────
 
 async def preload_all_data():
     global SERVICE_URL, LAST_RELOAD_TIME, _CAL_SORTED_DATES, _CAL_SORTED_DATA
-    log(" CALENDAR FULL DATA RELOAD STARTED", NODE_NAME, force=True)
+    log("🔄 CALENDAR FULL DATA RELOAD STARTED", NODE_NAME, force=True)
 
     GLOBAL_WEIGHT_CODES.clear()
     GLOBAL_CAL_CTX_INDEX.clear()
@@ -366,7 +366,7 @@ async def preload_all_data():
             GLOBAL_WEIGHT_CODES.extend(r[0] for r in res.fetchall())
             log(f"  weight_codes: {len(GLOBAL_WEIGHT_CODES)}", NODE_NAME)
         except Exception as e:
-            log(f" weight_codes error: {e}", NODE_NAME, level="error")
+            log(f"❌ weight_codes error: {e}", NODE_NAME, level="error")
 
         try:
             res = await conn.execute(text("""
@@ -380,7 +380,7 @@ async def preload_all_data():
                 GLOBAL_CAL_CTX_INDEX[key] = {"occurrence_count": r["occurrence_count"] or 0}
             log(f"  ctx_index: {len(GLOBAL_CAL_CTX_INDEX)}", NODE_NAME)
         except Exception as e:
-            log(f" ctx_index error: {e}", NODE_NAME, level="error")
+            log(f"❌ ctx_index error: {e}", NODE_NAME, level="error")
 
     # url → event_id — используем engine_vlad (там есть колонка EventId)
     url_to_event_id = {}
@@ -396,7 +396,7 @@ async def preload_all_data():
                 url_to_event_id[r[0]] = r[1]
         log(f"  url→event_id map: {len(url_to_event_id)} entries", NODE_NAME)
     except Exception as e:
-        log(f" url→event_id map error: {e}", NODE_NAME, level="error")
+        log(f"❌ url→event_id map error: {e}", NODE_NAME, level="error")
 
     # event_names — используем engine_vlad (там есть EventId и EventName)
     try:
@@ -411,7 +411,7 @@ async def preload_all_data():
                 GLOBAL_EVENT_NAMES[r[0]] = r[1]
         log(f"  event_names: {len(GLOBAL_EVENT_NAMES)} entries", NODE_NAME)
     except Exception as e:
-        log(f"  event_names load error: {e}", NODE_NAME, level="warning")
+        log(f"⚠️  event_names load error: {e}", NODE_NAME, level="warning")
 
     # Загрузка календарных событий из engine_brain
     try:
@@ -478,7 +478,7 @@ async def preload_all_data():
             log(f"  skipped (not in ctx_index): {skipped_no_index}", NODE_NAME)
 
     except Exception as e:
-        log(f" brain_calendar (from engine_brain) error: {e}", NODE_NAME, level="error")
+        log(f"❌ brain_calendar (from engine_brain) error: {e}", NODE_NAME, level="error")
 
     # Построение отсортированных структур для поиска по интервалу
     if GLOBAL_CAL_BY_DT:
@@ -533,27 +533,27 @@ async def preload_all_data():
                     }
             log(f"  {table}: {len(GLOBAL_RATES[table])} candles", NODE_NAME)
         except Exception as e:
-            log(f" {table}: {e}", NODE_NAME, level="error")
+            log(f"❌ {table}: {e}", NODE_NAME, level="error")
 
     # Загрузка SERVICE_URL
     try:
         SERVICE_URL = await load_service_url(engine_super, SERVICE_ID)
         log(f"  SERVICE_URL loaded: {SERVICE_URL}", NODE_NAME)
     except OperationalError as e:
-        log(f" Failed to load service URL (OperationalError): {e}",
+        log(f"❌ Failed to load service URL (OperationalError): {e}",
             NODE_NAME, level="error", force=True)
         SERVICE_URL = ""
     except Exception as e:
-        log(f" Failed to load service URL: {e}", NODE_NAME, level="error", force=True)
+        log(f"❌ Failed to load service URL: {e}", NODE_NAME, level="error", force=True)
         SERVICE_URL = ""
 
     try:
         await ensure_cache_table(engine_vlad)
     except Exception as e:
-        log(f" Failed to ensure cache table: {e}", NODE_NAME, level="error")
+        log(f"❌ Failed to ensure cache table: {e}", NODE_NAME, level="error")
 
     LAST_RELOAD_TIME = datetime.now()
-    log(" CALENDAR FULL DATA RELOAD COMPLETED", NODE_NAME, force=True)
+    log("✅ CALENDAR FULL DATA RELOAD COMPLETED", NODE_NAME, force=True)
 
 
 async def background_reload_data():
@@ -562,7 +562,7 @@ async def background_reload_data():
         try:
             await preload_all_data()
         except Exception as e:
-            log(f" Background reload error: {e}", NODE_NAME, level="error", force=True)
+            log(f"❌ Background reload error: {e}", NODE_NAME, level="error", force=True)
             send_error_trace(e, NODE_NAME, "calendar_background_reload")
 
 
@@ -571,7 +571,7 @@ async def lifespan(app: FastAPI):
     try:
         await preload_all_data()
     except Exception as e:
-        log(f" Initial data load failed, but server will continue: {e}",
+        log(f"❌ Initial data load failed, but server will continue: {e}",
             NODE_NAME, level="error", force=True)
 
     task = asyncio.create_task(background_reload_data())
@@ -592,7 +592,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
-#  Подгрузка свежих свечей из БД 
+# ── Подгрузка свежих свечей из БД ────────────────────────────────────────────
 
 _LAST_RATES_REFRESH: dict[str, datetime] = {}
 
@@ -626,9 +626,9 @@ async def _refresh_rates_if_needed(rates_table: str):
                     cl.append((dt, (r["close"] or 0) > (r["open"] or 0)))
                 n += 1
             if n > 0:
-                log(f"   Refreshed {n} candle(s) for {rates_table}", NODE_NAME)
+                log(f"  📥 Refreshed {n} candle(s) for {rates_table}", NODE_NAME)
     except Exception as e:
-        log(f"   Rates refresh error ({rates_table}): {e}", NODE_NAME, level="warning")
+        log(f"  ⚠️ Rates refresh error ({rates_table}): {e}", NODE_NAME, level="warning")
 
 
 async def calculate_pure_memory(
@@ -709,7 +709,7 @@ async def calculate_pure_memory(
     return {k: round(v, 6) for k, v in result.items() if v != 0}
 
 
-#  Роуты 
+# ── Роуты ─────────────────────────────────────────────────────────────────────
 
 @app.get("/")
 async def get_metadata():
@@ -870,7 +870,7 @@ async def get_values(
             node         = NODE_NAME,
         )
 
-        #  Подготовка данных для нарратива 
+        #  Подготовка данных для нарратива
         payload = response.get("payLoad") or {}
         raw_details: list[dict] = []
         for wc, value in payload.items():
@@ -884,7 +884,7 @@ async def get_values(
             raw_details.append({
                 "weight_code":      wc,
                 "event_id":         eid,
-                "event_name":       GLOBAL_EVENT_NAMES.get(eid),
+                "event_name":       GLOBAL_EVENT_NAMES.get(eid),  # fallback, перезапишем ниже
                 "currency_code":    dec["currency_code"],
                 "importance":       dec["importance"],
                 "forecast_dir":     dec["forecast_dir"],
@@ -895,6 +895,30 @@ async def get_values(
                 "occurrence_count": ctx_info.get("occurrence_count"),
                 "value":            value,
             })
+
+        # Добираем имена событий прямо из БД для event_id без имени
+        missing_ids = {d["event_id"] for d in raw_details if not d["event_name"]}
+        if missing_ids:
+            try:
+                async with engine_vlad.connect() as conn:
+                    res = await conn.execute(
+                        text("""
+                            SELECT EventId, EventName
+                            FROM brain_calendar
+                            WHERE EventId IN :ids
+                              AND EventName IS NOT NULL AND EventName != ''
+                            GROUP BY EventId, EventName
+                        """),
+                        {"ids": tuple(missing_ids)},
+                    )
+                    db_names = {r[0]: r[1] for r in res.fetchall()}
+                # Обновляем global-кэш и raw_details
+                GLOBAL_EVENT_NAMES.update(db_names)
+                for d in raw_details:
+                    if not d["event_name"]:
+                        d["event_name"] = db_names.get(d["event_id"])
+            except Exception as e:
+                log(f"event_names fallback query failed: {e}", NODE_NAME, level="warning")
 
         response["details"] = build_details_lines(raw_details, date, calc_type=type, day=day)
         return response
@@ -937,7 +961,7 @@ async def patch_service():
     return {"status": "ok", "from_version": old, "to_version": new}
 
 
-#  Точка входа 
+# ── Точка входа ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import asyncio as _asyncio
