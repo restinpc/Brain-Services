@@ -2577,7 +2577,7 @@ def build_app(model_module) -> FastAPI:
 
         for bt_pair in pl:
             for bt_day in dl:
-                key = 'simple' if s.IS_SIMPLE else f"pair={bt_pair} day={'d' if bt_day else 'h'}"
+                key = f"pair={bt_pair} day={'d' if bt_day else 'h'}"
                 all_results[key] = {}
                 for v in vars_to_run:
                     try:
