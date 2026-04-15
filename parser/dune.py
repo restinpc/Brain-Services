@@ -4,7 +4,7 @@
 Строка в .env: DUNE_API_KEY=
 """
 
-# ── 1. ИМПОРТЫ ─────────────────────────────────────────────────────────────────
+#  1. ИМПОРТЫ 
 import os
 import sys
 import argparse
@@ -15,7 +15,7 @@ import time
 from dotenv import load_dotenv
 from datetime import datetime
 
-# ── 2. КОНФИГ ─────────────────────────────────────────────────────────────────
+#  2. КОНФИГ 
 load_dotenv()
 
 # Windows-консоль может быть не в UTF-8; не падаем на emoji.
@@ -32,10 +32,10 @@ EMAIL      = os.getenv("ALERT_EMAIL", "samuray150305@gmail.com")
 DUNE_API_KEY = os.getenv("DUNE_API_KEY")
 
 if not DUNE_API_KEY:
-    print("❌ Ошибка: DUNE_API_KEY не найден в .env")
+    print(" Ошибка: DUNE_API_KEY не найден в .env")
     sys.exit(1)
 
-# ── 3. ТРАССИРОВКА ОШИБОК ─────────────────────────────────────────────────────
+#  3. ТРАССИРОВКА ОШИБОК 
 def send_error_trace(exc: Exception, script_name: str = "dune.py"):
     import threading
     logs = f"Node: {NODE_NAME}\nScript: {script_name}\nException: {repr(exc)}\n\nTraceback:\n{traceback.format_exc()}"
@@ -47,7 +47,7 @@ def send_error_trace(exc: Exception, script_name: str = "dune.py"):
             pass
     threading.Thread(target=_send, daemon=True).start()
 
-# ── 4. АРГУМЕНТЫ ──────────────────────────────────────────────────────────────
+#  4. АРГУМЕНТЫ 
 parser = argparse.ArgumentParser(description="Dune Analytics on-chain parser → MySQL")
 parser.add_argument("table_name",  help="Имя целевой таблицы в БД")
 parser.add_argument("host",        nargs="?", default=os.getenv("DB_HOST"))
@@ -58,7 +58,7 @@ parser.add_argument("database",    nargs="?", default=os.getenv("DB_NAME"))
 args = parser.parse_args()
 
 if not all([args.host, args.user, args.password, args.database]):
-    print("❌ Ошибка: не указаны параметры подключения к БД")
+    print(" Ошибка: не указаны параметры подключения к БД")
     sys.exit(1)
 
 DB_CONFIG = {
@@ -69,7 +69,7 @@ DB_CONFIG = {
     "database": args.database,
 }
 
-# ── 5. ТАБЛИЦЫ + SQL-запросы к Dune ───────────────────────────────────────────
+#  5. ТАБЛИЦЫ + SQL-запросы к Dune 
 DATASETS = {
     "sasha_btc_daily_tx_count": {
         "description": "BTC — Daily Transaction Count(количество транзакций в день)",
@@ -207,7 +207,7 @@ DATASETS = {
     },
 }
 
-# ── 6. СОЗДАНИЕ ТАБЛИЦЫ ────────────────────────────────────────────────────────
+#  6. СОЗДАНИЕ ТАБЛИЦЫ 
 def ensure_table(table_name: str):
     conn = mysql.connector.connect(**DB_CONFIG)
     c = conn.cursor()
@@ -226,7 +226,7 @@ def ensure_table(table_name: str):
     c.close()
     conn.close()
 
-# ── 7. ПОСЛЕДНЯЯ ДАТА В БД ────────────────────────────────────────────────────
+#  7. ПОСЛЕДНЯЯ ДАТА В БД 
 def get_latest_date(table_name: str):
     try:
         conn = mysql.connector.connect(**DB_CONFIG)
@@ -239,7 +239,7 @@ def get_latest_date(table_name: str):
     except:
         return None
 
-# ── 8. ЗАПРОС К DUNE API (execute + poll) ─────────────────────────────────────
+#  8. ЗАПРОС К DUNE API (execute + poll) 
 def fetch_dune_data(sql: str) -> list:
     headers = {
         "X-DUNE-API-KEY": DUNE_API_KEY,
@@ -256,7 +256,7 @@ def fetch_dune_data(sql: str) -> list:
         resp.raise_for_status()
         execution_id = resp.json()["execution_id"]
     except Exception as e:
-        print(f"❌ Ошибка запуска Dune query: {e}")
+        print(f" Ошибка запуска Dune query: {e}")
         return []
 
     for _ in range(120):
@@ -274,7 +274,7 @@ def fetch_dune_data(sql: str) -> list:
                 # В редких случаях API может вернуть служебный/ошибочный payload без state.
                 # Не падаем по KeyError, пробуем подождать и повторить.
                 msg = status_json.get("error") or status_json.get("message") or str(status_json)
-                print(f"⚠️ Неожиданный ответ статуса Dune: {msg}")
+                print(f" Неожиданный ответ статуса Dune: {msg}")
                 time.sleep(2)
                 continue
 
@@ -286,10 +286,10 @@ def fetch_dune_data(sql: str) -> list:
             if state == "QUERY_STATE_COMPLETED":
                 break
             if state in ("QUERY_STATE_FAILED", "QUERY_STATE_CANCELLED"):
-                print(f"❌ Dune query failed: {state}")
+                print(f" Dune query failed: {state}")
                 return []
         except Exception as e:
-            print(f"❌ Ошибка статуса: {e}")
+            print(f" Ошибка статуса: {e}")
             return []
         time.sleep(2)
 
@@ -303,13 +303,13 @@ def fetch_dune_data(sql: str) -> list:
         data = result_resp.json()
         return data.get("result", {}).get("rows", [])
     except Exception as e:
-        print(f"❌ Ошибка получения результатов: {e}")
+        print(f" Ошибка получения результатов: {e}")
         return []
 
-# ── 9. ЗАПИСЬ В БД ────────────────────────────────────────────────────────────
+#  9. ЗАПИСЬ В БД 
 def save_rows(table_name: str, rows: list):
     if not rows:
-        print("⚠️  Нет новых данных")
+        print("  Нет новых данных")
         return
 
     conn = mysql.connector.connect(**DB_CONFIG)
@@ -322,23 +322,23 @@ def save_rows(table_name: str, rows: list):
     c.executemany(sql, rows)
     conn.commit()
 
-    print(f"✅ Записано {c.rowcount} новых строк")
+    print(f" Записано {c.rowcount} новых строк")
     c.close()
     conn.close()
 
-# ── 10. ОСНОВНАЯ ЛОГИКА ───────────────────────────────────────────────────────
+#  10. ОСНОВНАЯ ЛОГИКА 
 def process(table_name: str):
     config = DATASETS[table_name]
 
     ensure_table(table_name)
 
     latest = get_latest_date(table_name)
-    print(f"📅 Последняя дата в БД: {latest or 'таблица пуста'}")
+    print(f" Последняя дата в БД: {latest or 'таблица пуста'}")
 
-    print("🔄 Выполняем SQL-запрос в Dune...")
+    print(" Выполняем SQL-запрос в Dune...")
     raw = fetch_dune_data(config["sql"])
     if not raw:
-        print("⚠️  Данных не получено")
+        print("  Данных не получено")
         return
 
     rows = []
@@ -362,18 +362,18 @@ def process(table_name: str):
         except (ValueError, TypeError):
             continue
 
-    print(f"🆕 Новых строк: {len(rows)}")
+    print(f" Новых строк: {len(rows)}")
     save_rows(table_name, rows)
 
-# ── 11. ТОЧКА ВХОДА ────────────────────────────────────────────────────────────
+#  11. ТОЧКА ВХОДА 
 def main():
     if args.table_name not in DATASETS:
-        print(f"❌ Неизвестная таблица '{args.table_name}'. Допустимые:")
+        print(f" Неизвестная таблица '{args.table_name}'. Допустимые:")
         for name, cfg in DATASETS.items():
             print(f"  - {name} → {cfg['description']}")
         sys.exit(1)
 
-    print(f"🚀 Dune On-Chain Parser")
+    print(f" Dune On-Chain Parser")
     print(f"   База: {args.host}:{args.port}/{args.database}")
     print(f"   Таблица: {args.table_name} — {DATASETS[args.table_name]['description']}")
     print("=" * 70)
@@ -381,7 +381,7 @@ def main():
     process(args.table_name)
 
     print("=" * 70)
-    print("🏁 ГОТОВО")
+    print(" ГОТОВО")
 
 
 if __name__ == "__main__":
@@ -390,9 +390,9 @@ if __name__ == "__main__":
     except SystemExit:
         raise
     except KeyboardInterrupt:
-        print("\n🛑 Прервано")
+        print("\n Прервано")
         sys.exit(1)
     except Exception as e:
-        print(f"\n❌ Критическая ошибка: {e!r}")
+        print(f"\n Критическая ошибка: {e!r}")
         send_error_trace(e)
         sys.exit(1)

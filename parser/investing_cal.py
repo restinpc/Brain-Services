@@ -34,13 +34,13 @@ def send_error_trace(exc: Exception, script_name: str = "investing_cal.py"):
         "email": EMAIL,
         "logs": logs,
     }
-    print(f"\n📤 [POST] Отправляем отчёт об ошибке на {TRACE_URL}")
+    print(f"\n [POST] Отправляем отчёт об ошибке на {TRACE_URL}")
     try:
         import requests
         response = requests.post(TRACE_URL, data=payload, timeout=10)
-        print(f"✅ [POST] Успешно отправлено! Статус: {response.status_code}")
+        print(f" [POST] Успешно отправлено! Статус: {response.status_code}")
     except Exception as e:
-        print(f"⚠️ [POST] Не удалось отправить отчёт: {e}")
+        print(f" [POST] Не удалось отправить отчёт: {e}")
 
 
 # === Аргументы командной строки ===
@@ -54,7 +54,7 @@ parser.add_argument("database", nargs="?", default=os.getenv("DB_NAME"), help="�
 args = parser.parse_args()
 
 if not all([args.host, args.user, args.password, args.database]):
-    print("❌ Ошибка: не указаны все параметры подключения к БД")
+    print(" Ошибка: не указаны все параметры подключения к БД")
     sys.exit(1)
 
 DB_CONFIG = {
@@ -409,8 +409,8 @@ if __name__ == "__main__":
     except SystemExit:
         pass
     except KeyboardInterrupt:
-        print("\n🛑 Прервано пользователем")
+        print("\n Прервано пользователем")
     except Exception as e:
-        print(f"\n❌ Критическая ошибка: {e!r}")
+        print(f"\n Критическая ошибка: {e!r}")
         send_error_trace(e)
         sys.exit(1)

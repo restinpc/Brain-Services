@@ -20,9 +20,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 # КОНФИГУРАЦИЯ
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 
 CTX_TABLE   = os.getenv("CTX_TABLE",  "vlad_news_context_idx")
 MAP_TABLE   = "vlad_news_ctx_map"
@@ -61,9 +61,9 @@ FEED_CAT_MAP = {
 log = logging.getLogger("news_updater")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 # DB СОЕДИНЕНИЯ
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 
 def get_brain_conn():
     """
@@ -99,9 +99,9 @@ def get_vlad_conn():
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 # УТИЛИТЫ 
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 
 def get_feed_cat(feed: str) -> str:
     """
@@ -171,9 +171,9 @@ def make_weight_code(ctx_id: int, mode: int, shift: int) -> str:
     return f"NW{ctx_id}_{mode}_{shift}"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 # ШАГ 1: НАЙТИ НОВЫЕ NEWS_ID
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 
 def find_new_news_ids(brain_conn, vlad_conn) -> set:
     """
@@ -207,9 +207,9 @@ def find_new_news_ids(brain_conn, vlad_conn) -> set:
     return new_ids
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 # ШАГ 2: ЗАГРУЗИТЬ NER ДЛЯ НОВЫХ NEWS_ID
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 
 def load_ner_for_new_ids(brain_conn, new_ids: set) -> dict:
     """
@@ -249,9 +249,9 @@ def load_ner_for_new_ids(brain_conn, new_ids: set) -> dict:
     return dict(by_news)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 # ШАГ 3: ПОСТРОИТЬ FINGERPRINTS
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 
 def build_fp_records(ner_by_news: dict) -> list:
     """
@@ -284,9 +284,9 @@ def build_fp_records(ner_by_news: dict) -> list:
     return result
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 # ШАГ 4: UPSERT В vlad_news_context_idx
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 
 def upsert_context_idx(vlad_conn, fp_records: list) -> dict:
     """
@@ -360,9 +360,9 @@ def upsert_context_idx(vlad_conn, fp_records: list) -> dict:
     return fp_to_id
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 # ШАГ 5: ДОБАВИТЬ СТРОКИ В vlad_news_ctx_map
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 
 def insert_ctx_map(vlad_conn, fp_records: list, fp_to_id: dict):
     """
@@ -394,9 +394,9 @@ def insert_ctx_map(vlad_conn, fp_records: list, fp_to_id: dict):
     log.info(f"  ctx_map: +{len(fp_records) - skipped} строк добавлено, {skipped} пропущено (нет ctx_id)")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 # ШАГ 6: ДОПОЛНИТЬ vlad_news_weights_table
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 
 def update_weight_codes(vlad_conn):
     """
@@ -462,9 +462,9 @@ def update_weight_codes(vlad_conn):
     log.info(f"  weights: +{new_codes} новых (shift=0), +{upgraded} upgraded (shift 1..{SHIFT_MAX} для recurring)")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 # ГЛАВНАЯ ФУНКЦИЯ
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 
 def run_incremental_update(
     brain_conn=None,
@@ -526,9 +526,9 @@ def run_incremental_update(
             except Exception:
                 pass
 
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 # ТОЧКА ВХОДА
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 
 if __name__ == "__main__":
     import sys

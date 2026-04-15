@@ -36,7 +36,7 @@ parser.add_argument("database", nargs="?", default=os.getenv("DB_NAME"))
 args = parser.parse_args()
 
 if not all([args.host, args.user, args.password, args.database]):
-    print("❌ Ошибка: не указаны параметры подключения"); sys.exit(1)
+    print(" Ошибка: не указаны параметры подключения"); sys.exit(1)
 
 DB_CONFIG = {'host': args.host, 'port': int(args.port), 'user': args.user, 'password': args.password, 'database': args.database}
 DATASETS = {"vlad_wm_military_flights": {"description": "Military ADS-B flights with classification"}}
@@ -57,7 +57,7 @@ def wm_get(session, path, params=None, timeout=30):
             resp = session.get(url, params=params, timeout=timeout)
             if resp.status_code == 429: time.sleep(int(resp.headers.get("Retry-After", 10))); continue
             resp.raise_for_status(); return resp.json()
-        except Exception as e: print(f"   ⚠️ {path}: {e}")
+        except Exception as e: print(f"    {path}: {e}")
     return None
 
 def _sf(v):
@@ -116,7 +116,7 @@ class MilitaryFlightsCollector:
 
         data = wm_get(self.session, "/api/military-flights")
         if not data:
-            print("   ⚠️ Нет данных military flights")
+            print("    Нет данных military flights")
             return
 
         flights = data.get("flights", [])
@@ -125,10 +125,10 @@ class MilitaryFlightsCollector:
         audit = data.get("classificationAudit", {})
 
         if not flights:
-            print("   ⚠️ Нет полётов в ответе")
+            print("    Нет полётов в ответе")
             return
 
-        print(f"   ✈️ Получено {len(flights)} военных полётов")
+        print(f"    Получено {len(flights)} военных полётов")
         if stats:
             print(f"      Stats: {json.dumps(stats, default=str)[:200]}")
 
@@ -171,31 +171,31 @@ class MilitaryFlightsCollector:
         inserted = c.rowcount
         c.close(); conn.close()
 
-        print(f"   ✅ Записано {len(rows)} полётов")
+        print(f"    Записано {len(rows)} полётов")
 
         # Статистика по типам миссий
         mission_counts = {}
         for f in flights:
             mt = f.get("missionType", f.get("mission", f.get("classification", "unknown")))
             mission_counts[mt] = mission_counts.get(mt, 0) + 1
-        print("   📊 По типам миссий:")
+        print("    По типам миссий:")
         for mt, cnt in sorted(mission_counts.items(), key=lambda x: -x[1]):
             print(f"      {mt:15s}: {cnt}")
 
 
 def main():
     if args.table_name not in DATASETS:
-        print(f"❌ Неизвестная таблица. Допустимые:")
+        print(f" Неизвестная таблица. Допустимые:")
         for n in DATASETS: print(f"  - {n}")
         sys.exit(1)
-    print(f"🚀 WorldMonitor Military Flights Collector (ADS-B)")
+    print(f" WorldMonitor Military Flights Collector (ADS-B)")
     print(f"База: {args.host}:{args.port}/{args.database}")
-    print(f"🎯 Таблица: {args.table_name}"); print("=" * 60)
+    print(f" Таблица: {args.table_name}"); print("=" * 60)
     MilitaryFlightsCollector(args.table_name).process()
-    print("=" * 60); print("🏁 ЗАГРУЗКА ЗАВЕРШЕНА")
+    print("=" * 60); print(" ЗАГРУЗКА ЗАВЕРШЕНА")
 
 if __name__ == "__main__":
     try: main()
     except SystemExit: raise
-    except KeyboardInterrupt: print("\n🛑 Прервано"); sys.exit(1)
-    except Exception as e: print(f"\n❌ Критическая ошибка: {e!r}"); send_error_trace(e); sys.exit(1)
+    except KeyboardInterrupt: print("\n Прервано"); sys.exit(1)
+    except Exception as e: print(f"\n Критическая ошибка: {e!r}"); send_error_trace(e); sys.exit(1)

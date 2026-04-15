@@ -10,11 +10,11 @@ import threading
 import traceback
 import requests
 
-# ── Режим запуска ─────────────────────────────────────────────────────────────
+#  Режим запуска 
 MODE   = os.getenv("MODE", "dev").lower()   # "dev" | "prod"
 IS_DEV = MODE == "dev"
 
-# ── Трассировка ошибок ────────────────────────────────────────────────────────
+#  Трассировка ошибок 
 _HANDLER  = os.getenv("HANDLER", "https://server.brain-project.online").rstrip("/")
 TRACE_URL = f"{_HANDLER}/trace.php"
 EMAIL     = os.getenv("ALERT_EMAIL", "vladyurjevitch@yandex.ru")
@@ -32,22 +32,22 @@ def send_error_trace(exc: Exception, node: str, script: str = "server.py") -> No
 
     def _send() -> None:
         try:
-            log(f"📤 Sending error trace to {TRACE_URL}", node, force=True)
+            log(f" Sending error trace to {TRACE_URL}", node, force=True)
             r = requests.post(
                 TRACE_URL,
                 data={"url": "fastapi_microservice", "node": node,
                       "email": EMAIL, "logs": logs},
                 timeout=10,
             )
-            log(f"✅ Trace sent, status={r.status_code}", node, force=True)
+            log(f" Trace sent, status={r.status_code}", node, force=True)
         except Exception as e:
-            log(f"⚠️  Failed to send trace: {e}", node, force=True)
+            log(f"  Failed to send trace: {e}", node, force=True)
 
     # daemon=True — поток умрёт вместе с процессом, не задержит shutdown
     threading.Thread(target=_send, daemon=True).start()
 
 
-# ── Логирование ───────────────────────────────────────────────────────────────
+#  Логирование 
 def log(msg: str, node: str = "", level: str = "info", force: bool = False) -> None:
     """
     DEV  — печатает всё.
@@ -58,7 +58,7 @@ def log(msg: str, node: str = "", level: str = "info", force: bool = False) -> N
         print(f"{prefix}{msg}")
 
 
-# ── Стандартные ответы ────────────────────────────────────────────────────────
+#  Стандартные ответы 
 def ok_response(payload: dict | list) -> dict:
     """{"status": "ok", "payLoad": payload}"""
     return {"status": "ok", "payLoad": payload}
@@ -82,7 +82,7 @@ def err_response(
     return {"status": "error", "error": message, "payLoad": {}}
 
 
-# ── Engine builder ────────────────────────────────────────────────────────────
+#  Engine builder 
 def build_engines():
     """
     Создаёт три AsyncEngine из переменных окружения:
@@ -155,7 +155,7 @@ def build_engines():
     return engine_vlad, engine_brain, engine_super
 
 
-# ── Workers ───────────────────────────────────────────────────────────────────
+#  Workers 
 async def resolve_workers(engine_super, service_id: int, default: int = 1) -> int:
     """
     Приоритет:
@@ -188,5 +188,5 @@ async def resolve_workers(engine_super, service_id: int, default: int = 1) -> in
             if row2 and row2[0]:
                 return max(1, int(row2[0]))
     except Exception as e:
-        print(f"⚠️  resolve_workers error: {e}")
+        print(f"  resolve_workers error: {e}")
     return default

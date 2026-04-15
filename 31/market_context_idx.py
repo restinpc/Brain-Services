@@ -1,4 +1,4 @@
-﻿import os
+import os
 from collections import defaultdict
 
 import mysql.connector
@@ -137,7 +137,7 @@ def main():
             """)
             raw = cur.fetchall()
             if not raw:
-                print(f"  ⚠️  Нет данных для {instrument}, пропускаем.")
+                print(f"    Нет данных для {instrument}, пропускаем.")
                 continue
 
             series = [(dt, float(v)) for dt, v in raw]
@@ -211,7 +211,7 @@ def main():
         (table_cnt,) = cur.fetchone()
         print(f"\nOK: inserted={total_inserted}, table_rows={table_cnt}")
 
-        print(f"\n── Топ-20 контекстов по числу наблюдений ──────────────────────")
+        print(f"\n Топ-20 контекстов по числу наблюдений ")
         cur.execute(f"""
             SELECT instrument, rate_change_dir, trend_dir, momentum_dir,
                    occurrence_count
@@ -221,11 +221,11 @@ def main():
         """)
         rows = cur.fetchall()
         print(f"  {'instr':<8} {'change':<8} {'trend':<8} {'momentum':<10} {'count':>8}")
-        print("  " + "─" * 46)
+        print("  " + "" * 46)
         for instr, rcd, td, md, cnt in rows:
             print(f"  {instr:<8} {rcd:<8} {td:<8} {md:<10} {cnt:>8}")
 
-        print(f"\n── Распределение по инструментам ───────────────────────────────")
+        print(f"\n Распределение по инструментам ")
         cur.execute(f"""
             SELECT instrument,
                    COUNT(*) AS distinct_contexts,

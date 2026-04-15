@@ -27,7 +27,7 @@ load_dotenv()
 # Создаём рабочую директорию в домашней папке
 WORK_DIR = os.path.join(os.path.expanduser("~"), ".ecb_parser")
 os.makedirs(WORK_DIR, exist_ok=True)
-print(f"📁 Рабочая директория: {WORK_DIR}")
+print(f" Рабочая директория: {WORK_DIR}")
 
 TRACE_URL = "https://server.brain-project.online/trace.php"
 NODE_NAME = os.getenv("NODE_NAME", "ecb_parser")
@@ -78,7 +78,7 @@ def download_and_read_zip_csv(url):
                 df = pd.read_csv(csv_file)
 
         num_rows = df.shape[0]
-        print(f"   ✅ CSV загружен, строк: {num_rows}")
+        print(f"    CSV загружен, строк: {num_rows}")
         print(f"   Последняя дата: {df['Date'].max()}")
 
         if df['Date'].max() < '2026-01-01':
@@ -87,13 +87,13 @@ def download_and_read_zip_csv(url):
         return df
 
     except requests.exceptions.RequestException as e:
-        print(f"❌ Ошибка при скачивании: {e}")
+        print(f" Ошибка при скачивании: {e}")
         raise
     except zipfile.BadZipFile:
-        print("❌ Ошибка: скачанный файл не является ZIP архивом или повреждён.")
+        print(" Ошибка: скачанный файл не является ZIP архивом или повреждён.")
         raise
     except Exception as e:
-        print(f"❌ Произошла ошибка: {e}")
+        print(f" Произошла ошибка: {e}")
         raise
 
 
@@ -121,7 +121,7 @@ def download_and_read_zip_csv_memory(url):
                 df = pd.read_csv(csv_file)
 
         num_rows = df.shape[0]
-        print(f"   ✅ CSV загружен, строк: {num_rows}")
+        print(f"    CSV загружен, строк: {num_rows}")
         print(f"   Последняя дата: {df['Date'].max()}")
 
         if df['Date'].max() < '2026-01-01':
@@ -130,13 +130,13 @@ def download_and_read_zip_csv_memory(url):
         return df
 
     except requests.exceptions.RequestException as e:
-        print(f"❌ Ошибка при скачивании: {e}")
+        print(f" Ошибка при скачивании: {e}")
         raise
     except zipfile.BadZipFile:
-        print("❌ Ошибка: скачанный файл не является ZIP архивом или повреждён.")
+        print(" Ошибка: скачанный файл не является ZIP архивом или повреждён.")
         raise
     except Exception as e:
-        print(f"❌ Произошла ошибка: {e}")
+        print(f" Произошла ошибка: {e}")
         raise
 
 
@@ -245,10 +245,10 @@ class ECBParser:
                 print(f"   → Таблица {self.items_table} (с автоинкрементом id)")
 
             conn.commit()
-            print(f"✅ Таблицы готовы (режим {self.mode})")
+            print(f" Таблицы готовы (режим {self.mode})")
 
     def run_rates(self):
-        print("\n📊 Скачиваем полную историю курсов из eurofxref-hist.zip...")
+        print("\n Скачиваем полную историю курсов из eurofxref-hist.zip...")
         try:
             df = download_and_read_zip_csv(ZIP_URL)
 
@@ -289,15 +289,15 @@ class ECBParser:
                     total_inserted += len(batch)
                     print(f"      Загружено {total_inserted:,} / {len(df_melted):,} записей...")
 
-            print(f"\n✅ Успешно загружено {total_inserted:,} записей в {self.rates_table}")
+            print(f"\n Успешно загружено {total_inserted:,} записей в {self.rates_table}")
 
         except Exception as e:
-            print(f"❌ Ошибка в run_rates: {e}")
+            print(f" Ошибка в run_rates: {e}")
             traceback.print_exc()
             raise
 
     def fetch_rss_feeds(self):
-        print(f"\n📡 Сканируем RSS-страницу → {BASE_URL_RSS}")
+        print(f"\n Сканируем RSS-страницу → {BASE_URL_RSS}")
         resp = self.session.get(BASE_URL_RSS, timeout=30)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
@@ -337,7 +337,7 @@ class ECBParser:
         return feeds
 
     def run_items(self):
-        print("\n📰 Собираем RSS-статьи...")
+        print("\n Собираем RSS-статьи...")
         feeds = self.fetch_rss_feeds()
         count_new = 0
 
@@ -425,13 +425,13 @@ class ECBParser:
                             continue
 
                     conn.commit()
-                    print(f"      ✅ Обработано {len(d.entries)} записей")
+                    print(f"       Обработано {len(d.entries)} записей")
 
             except Exception as e:
-                print(f"      ❌ Ошибка: {e}")
+                print(f"       Ошибка: {e}")
             time.sleep(1.5)
 
-        print(f"\n✅ Добавлено/обновлено {count_new} статей в {self.items_table}")
+        print(f"\n Добавлено/обновлено {count_new} статей в {self.items_table}")
 
     def _get_feed_type(self, url: str) -> str:
         u = url.lower()
@@ -443,18 +443,18 @@ class ECBParser:
         return 'other'
 
     def run(self):
-        print(f"\n🚀 ECB Parser запущен | префикс: {self.prefix} | режим: {self.mode.upper()}")
+        print(f"\n ECB Parser запущен | префикс: {self.prefix} | режим: {self.mode.upper()}")
         if self.mode in ("all", "rates"):
             self.run_rates()
         if self.mode in ("all", "items"):
             self.run_items()
-        print("\n🏁 Завершено!")
+        print("\n Завершено!")
 
 
 if __name__ == "__main__":
     try:
         ECBParser(args.table_name).run()
     except Exception as e:
-        print(f"❌ Критическая ошибка: {e}")
+        print(f" Критическая ошибка: {e}")
         send_error_trace(e)
         sys.exit(1)

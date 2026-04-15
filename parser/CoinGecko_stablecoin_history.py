@@ -46,7 +46,7 @@ parser.add_argument("database", nargs="?", default=os.getenv("DB_NAME"))
 args = parser.parse_args()
 
 if not all([args.host, args.user, args.password, args.database]):
-    print("❌ Ошибка: не указаны параметры подключения"); sys.exit(1)
+    print(" Ошибка: не указаны параметры подключения"); sys.exit(1)
 
 DB_CONFIG = {'host': args.host, 'port': int(args.port), 'user': args.user, 'password': args.password, 'database': args.database}
 DATASETS = {"vlad_coingecko_stablecoin_history": {"description": "CoinGecko stablecoin peg history"}}
@@ -116,7 +116,7 @@ class CoinGeckoCollector:
                 resp.raise_for_status()
                 return resp.json()
             except Exception as e:
-                print(f"   ⚠️ Попытка {attempt+1}: {e}")
+                print(f"    Попытка {attempt+1}: {e}")
                 time.sleep(5 * (attempt + 1))
         return None
 
@@ -150,11 +150,11 @@ class CoinGeckoCollector:
             from_ts = start.timestamp()
             to_ts = now.timestamp()
 
-            print(f"\n   {'📦' if mode == 'BACKFILL' else '🔄'} {symbol} ({coin_id}): {mode} {start.date()} → {now.date()}")
+            print(f"\n   {'' if mode == 'BACKFILL' else ''} {symbol} ({coin_id}): {mode} {start.date()} → {now.date()}")
 
             data = self.fetch_market_chart(coin_id, from_ts, to_ts)
             if not data or "prices" not in data:
-                print(f"      ⚠️ Нет данных для {symbol}")
+                print(f"       Нет данных для {symbol}")
                 time.sleep(random.uniform(5, 10))
                 continue
 
@@ -184,27 +184,27 @@ class CoinGeckoCollector:
 
             n = self.insert_rows(rows)
             total_inserted += n
-            print(f"      ✅ {n} новых из {len(prices)} точек")
+            print(f"       {n} новых из {len(prices)} точек")
 
             # CoinGecko rate limit: 10-30 req/min
             time.sleep(random.uniform(3, 6))
 
-        print(f"\n📊 Всего вставлено: {total_inserted}")
+        print(f"\n Всего вставлено: {total_inserted}")
 
 
 def main():
     if args.table_name not in DATASETS:
-        print(f"❌ Неизвестная таблица. Допустимые:")
+        print(f" Неизвестная таблица. Допустимые:")
         for n in DATASETS: print(f"  - {n}")
         sys.exit(1)
-    print(f"🚀 CoinGecko Stablecoin History (backfill + incremental)")
+    print(f" CoinGecko Stablecoin History (backfill + incremental)")
     print(f"База: {args.host}:{args.port}/{args.database}")
-    print(f"🎯 {args.table_name}"); print("=" * 60)
+    print(f" {args.table_name}"); print("=" * 60)
     CoinGeckoCollector(args.table_name).process()
-    print("=" * 60); print("🏁 ЗАГРУЗКА ЗАВЕРШЕНА")
+    print("=" * 60); print(" ЗАГРУЗКА ЗАВЕРШЕНА")
 
 if __name__ == "__main__":
     try: main()
     except SystemExit: raise
-    except KeyboardInterrupt: print("\n🛑 Прервано"); sys.exit(1)
-    except Exception as e: print(f"\n❌ Критическая ошибка: {e!r}"); send_error_trace(e); sys.exit(1)
+    except KeyboardInterrupt: print("\n Прервано"); sys.exit(1)
+    except Exception as e: print(f"\n Критическая ошибка: {e!r}"); send_error_trace(e); sys.exit(1)

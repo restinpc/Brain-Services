@@ -33,7 +33,7 @@ engine_vlad, engine_brain, engine_super = build_engines()
 log(f"MODE={MODE}", NODE_NAME, force=True)
 log(f"engines built via build_engines()", NODE_NAME)
 
-# ── VAR конфиги ───────────────────────────────────────────────────────────────
+#  VAR конфиги 
 VAR_CONFIGS = {
     0: (-12, 12,  50,   "bayes", 10),
     1: (-12, 12,  75,   "bayes", 10),
@@ -50,7 +50,7 @@ def confidence_none(count, prior=0):
 
 CONFIDENCE_FUNCS = {"bayes": confidence_bayes, "none": confidence_none}
 
-# ── Глобальные данные ─────────────────────────────────────────────────────────
+#  Глобальные данные 
 GLOBAL_EXTREMUMS        = {}
 GLOBAL_RATES            = {}
 GLOBAL_CALENDAR         = {}
@@ -92,7 +92,7 @@ def find_prev_candle_trend(table, target_date):
 
 async def preload_all_data():
     global SERVICE_URL, LAST_RELOAD_TIME
-    log("🔄 FULL DATA RELOAD STARTED", NODE_NAME, force=True)
+    log(" FULL DATA RELOAD STARTED", NODE_NAME, force=True)
 
     async with engine_vlad.connect() as conn:
         res = await conn.execute(text("SELECT weight_code FROM vlad_investing_weights_table"))
@@ -104,7 +104,7 @@ async def preload_all_data():
         for r in res.mappings().all():
             GLOBAL_EVENT_TYPES[r["event_id"]] = 1 if (r["occurrence_count"] or 0) > 1 else 0
 
-    # ── Календарь событий — читается из Brain ──
+    #  Календарь событий — читается из Brain 
     async with engine_brain.connect() as conn:
         res = await conn.execute(text("""
             SELECT c.event_id, c.occurrence_time_utc, c.importance
@@ -117,7 +117,7 @@ async def preload_all_data():
             GLOBAL_CALENDAR.setdefault(dt, []).append({"EventId": eid, "Importance": imp, "event_date": dt})
         log(f"  calendar: {sum(len(v) for v in GLOBAL_CALENDAR.values())} events", NODE_NAME)
 
-    # ── bisect: перестройка отсортированных списков ──
+    #  bisect: перестройка отсортированных списков 
     if GLOBAL_CALENDAR:
         _si = sorted(GLOBAL_CALENDAR.items())
         _CAL_SORTED_DATES[:] = [x[0] for x in _si]
@@ -169,14 +169,14 @@ async def preload_all_data():
         SERVICE_URL = await load_service_url(engine_super, SERVICE_ID)
         log(f"  SERVICE_URL loaded", NODE_NAME)
     except (OperationalError, Exception) as e:
-        log(f"❌ load_service_url failed: {e}", NODE_NAME, level="error", force=True)
+        log(f" load_service_url failed: {e}", NODE_NAME, level="error", force=True)
         SERVICE_URL = ""
     try:
         await ensure_cache_table(engine_vlad)
     except Exception as e:
-        log(f"❌ ensure_cache_table failed: {e}", NODE_NAME, level="error")
+        log(f" ensure_cache_table failed: {e}", NODE_NAME, level="error")
     LAST_RELOAD_TIME = datetime.now()
-    log("✅ FULL DATA RELOAD COMPLETED", NODE_NAME, force=True)
+    log(" FULL DATA RELOAD COMPLETED", NODE_NAME, force=True)
 
 
 async def background_reload_data():
@@ -185,7 +185,7 @@ async def background_reload_data():
         try:
             await preload_all_data()
         except Exception as e:
-            log(f"❌ Background reload error: {e}", NODE_NAME, level="error", force=True)
+            log(f" Background reload error: {e}", NODE_NAME, level="error", force=True)
             send_error_trace(e, NODE_NAME, "server_background_reload")
 
 
@@ -194,7 +194,7 @@ async def lifespan(app: FastAPI):
     try:
         await preload_all_data()
     except Exception as e:
-        log(f"❌ Initial data load failed, server continues: {e}",
+        log(f" Initial data load failed, server continues: {e}",
             NODE_NAME, level="error", force=True)
 
     task = asyncio.create_task(background_reload_data())
@@ -212,7 +212,7 @@ app = FastAPI(lifespan=lifespan)
 
 
 
-# ── Подгрузка свежих свечей из БД ─────────────────────────────────────────
+#  Подгрузка свежих свечей из БД 
 _LAST_RATES_REFRESH = {}
 
 async def _refresh_rates_if_needed(rates_table):
@@ -243,9 +243,9 @@ async def _refresh_rates_if_needed(rates_table):
                     cl.append((dt, (r["close"] or 0) > (r["open"] or 0)))
                 n += 1
             if n > 0:
-                log(f"  📥 Refreshed {n} candle(s) for {rates_table}", NODE_NAME)
+                log(f"   Refreshed {n} candle(s) for {rates_table}", NODE_NAME)
     except Exception as e:
-        log(f"  ⚠️ Rates refresh error ({rates_table}): {e}", NODE_NAME, level="warning")
+        log(f"   Rates refresh error ({rates_table}): {e}", NODE_NAME, level="warning")
 
 async def calculate_pure_memory(pair, day, date_str, type_=0, var=0) -> dict | None:
     target_date = parse_date_string(date_str)

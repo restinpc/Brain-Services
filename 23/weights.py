@@ -1,4 +1,4 @@
-﻿import re
+import re
 import csv
 import os
 
@@ -32,10 +32,10 @@ def parse_sql_values(value_str):
 
 
 def parse_index_table(filename):
-    print(f"📂 Чтение файла: {filename}")
+    print(f" Чтение файла: {filename}")
 
     if not os.path.exists(filename):
-        print(f"❌ Файл {filename} не найден")
+        print(f" Файл {filename} не найден")
         return []
 
     with open(filename, 'r', encoding='utf-8') as f:
@@ -45,7 +45,7 @@ def parse_index_table(filename):
     match = re.search(r"INSERT INTO `brain_calendar_event_index` VALUES\s+(.*?);", content, re.DOTALL | re.IGNORECASE)
 
     if not match:
-        print("❌ Блок INSERT не найден")
+        print(" Блок INSERT не найден")
         return []
 
     values_block = match.group(1)
@@ -79,7 +79,7 @@ def parse_index_table(filename):
             except ValueError:
                 continue
 
-    print(f"✅ Найдено событий: {len(events)}")
+    print(f" Найдено событий: {len(events)}")
     return events
 
 
@@ -128,7 +128,7 @@ if __name__ == "__main__":
             for code in codes:
                 writer.writerow([code])
 
-        print(f"💾 Успешно сохранено {len(codes)} кодов в {output_file}")
+        print(f" Успешно сохранено {len(codes)} кодов в {output_file}")
 
         # Проверка (выводим первые 10, чтобы убедиться в формате)
         print("\n--- Примеры сгенерированных кодов ---")

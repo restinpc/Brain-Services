@@ -56,7 +56,7 @@ INSTRUMENT_COLUMNS = {
     "DXY": "DXY_Close", "GOLD": "Gold_Close", "OIL": "Oil_Close",
 }
 
-# ── Глобальные данные ─────────────────────────────────────────────────────────
+#  Глобальные данные 
 GLOBAL_MKT_BY_INSTR  = {}
 GLOBAL_MKT_CONTEXT   = {}
 GLOBAL_MKT_OBS_DTS   = defaultdict(set)
@@ -72,7 +72,7 @@ GLOBAL_LAST_CANDLES  = {}
 SERVICE_URL          = ""
 LAST_RELOAD_TIME     = None
 
-# ── NumPy-ускоренные структуры (строятся в preload, используются в _compute_cpu_only) ──
+#  NumPy-ускоренные структуры (строятся в preload, используются в _compute_cpu_only) 
 # Для каждой rates-таблицы: отсортированный массив дат, t1, ranges, ext_min, ext_max
 # Для каждого ctx_key: отсортированный int64-массив unix-timestamp (секунды)
 NP_RATES:    dict = {}   # table → {"dates_ns": int64[], "t1": float64[], "ranges": float64[], "ext_min": bool[], "ext_max": bool[]}
@@ -175,7 +175,7 @@ def _build_numpy_arrays():
     """
     global NP_CTX_HIST_BUILT
 
-    # ── rates таблицы ─────────────────────────────────────────────────────────
+    #  rates таблицы 
     for table, rates_dict in GLOBAL_RATES.items():
         if not rates_dict:
             NP_RATES[table] = None
@@ -204,7 +204,7 @@ def _build_numpy_arrays():
         }
         log(f"  NP {table}: {n} записей", NODE_NAME)
 
-    # ── ctx history ──────────────────────────────────────────────────────────
+    #  ctx history 
     for ctx_key, dates_list in GLOBAL_MKT_CTX_HIST.items():
         if dates_list:
             NP_CTX_HIST[ctx_key] = np.array(
@@ -219,7 +219,7 @@ def _build_numpy_arrays():
 
 async def preload_all_data():
     global SERVICE_URL, LAST_RELOAD_TIME
-    log("🔄 MARKET FULL DATA RELOAD STARTED", NODE_NAME, force=True)
+    log(" MARKET FULL DATA RELOAD STARTED", NODE_NAME, force=True)
 
     GLOBAL_WEIGHT_CODES.clear(); GLOBAL_CTX_INDEX.clear()
     GLOBAL_MKT_BY_INSTR.clear(); GLOBAL_MKT_CONTEXT.clear()
@@ -233,7 +233,7 @@ async def preload_all_data():
             GLOBAL_WEIGHT_CODES.extend(r[0] for r in res.fetchall())
             log(f"  weight_codes: {len(GLOBAL_WEIGHT_CODES)}", NODE_NAME)
         except Exception as e:
-            log(f"❌ weight_codes: {e}", NODE_NAME, level="error")
+            log(f" weight_codes: {e}", NODE_NAME, level="error")
 
         try:
             res = await conn.execute(text(
@@ -244,9 +244,9 @@ async def preload_all_data():
                 GLOBAL_CTX_INDEX[key] = {"occurrence_count": r["occurrence_count"] or 0}
             log(f"  ctx_index: {len(GLOBAL_CTX_INDEX)}", NODE_NAME)
         except Exception as e:
-            log(f"❌ ctx_index: {e}", NODE_NAME, level="error")
+            log(f" ctx_index: {e}", NODE_NAME, level="error")
 
-    # ── market_history читается из engine_brain ───────────────────────────────
+    #  market_history читается из engine_brain 
     try:
         col_list = ", ".join(f"`{col}`" for col in INSTRUMENT_COLUMNS.values())
         async with engine_brain.connect() as conn:
@@ -280,9 +280,9 @@ async def preload_all_data():
         log(f"  instruments: {len(GLOBAL_MKT_BY_INSTR)}, contexts: {len(GLOBAL_MKT_CONTEXT)}",
             NODE_NAME)
     except Exception as e:
-        log(f"❌ market_history: {e}", NODE_NAME, level="error")
+        log(f" market_history: {e}", NODE_NAME, level="error")
 
-    # ── bisect: отсортированный список дат market ──
+    #  bisect: отсортированный список дат market 
     _MKT_SORTED_DATES[:] = sorted(GLOBAL_MKT_OBS_DTS.keys())
 
     for table in ["brain_rates_eur_usd", "brain_rates_eur_usd_day",
@@ -317,26 +317,26 @@ async def preload_all_data():
                     GLOBAL_EXTREMUMS[table][typ] = {r["date"] for r in res_ext.mappings().all()}
             log(f"  {table}: {len(GLOBAL_RATES[table])} candles", NODE_NAME)
         except Exception as e:
-            log(f"❌ {table}: {e}", NODE_NAME, level="error")
+            log(f" {table}: {e}", NODE_NAME, level="error")
 
     try:
         SERVICE_URL = await load_service_url(engine_super, SERVICE_ID)
         log(f"  SERVICE_URL loaded", NODE_NAME)
     except (OperationalError, Exception) as e:
-        log(f"❌ load_service_url failed: {e}", NODE_NAME, level="error", force=True)
+        log(f" load_service_url failed: {e}", NODE_NAME, level="error", force=True)
         SERVICE_URL = ""
     try:
         await ensure_cache_table(engine_vlad)
     except Exception as e:
-        log(f"❌ ensure_cache_table failed: {e}", NODE_NAME, level="error")
+        log(f" ensure_cache_table failed: {e}", NODE_NAME, level="error")
     # Строим NumPy-ускоренные массивы после загрузки всех данных
     try:
         _build_numpy_arrays()
     except Exception as e:
-        log(f"❌ _build_numpy_arrays: {e}", NODE_NAME, level="error")
+        log(f" _build_numpy_arrays: {e}", NODE_NAME, level="error")
 
     LAST_RELOAD_TIME = datetime.now()
-    log("✅ MARKET FULL DATA RELOAD COMPLETED", NODE_NAME, force=True)
+    log(" MARKET FULL DATA RELOAD COMPLETED", NODE_NAME, force=True)
 
 
 async def background_reload_data():
@@ -345,7 +345,7 @@ async def background_reload_data():
         try:
             await preload_all_data()
         except Exception as e:
-            log(f"❌ Background reload error: {e}", NODE_NAME, level="error", force=True)
+            log(f" Background reload error: {e}", NODE_NAME, level="error", force=True)
             send_error_trace(e, NODE_NAME, "market_background_reload")
 
 
@@ -354,7 +354,7 @@ async def lifespan(app: FastAPI):
     try:
         await preload_all_data()
     except Exception as e:
-        log(f"❌ Initial data load failed, server continues: {e}",
+        log(f" Initial data load failed, server continues: {e}",
             NODE_NAME, level="error", force=True)
 
     task = asyncio.create_task(background_reload_data())
@@ -372,7 +372,7 @@ app = FastAPI(lifespan=lifespan)
 
 
 
-# ── Подгрузка свежих свечей из БД ─────────────────────────────────────────
+#  Подгрузка свежих свечей из БД 
 _LAST_RATES_REFRESH = {}
 
 _BRAIN_SEM: asyncio.Semaphore | None = None
@@ -433,16 +433,16 @@ async def _refresh_rates_if_needed(rates_table):
                             cl.append((dt, (r["close"] or 0) > (r["open"] or 0)))
                         n += 1
                     if n > 0:
-                        log(f"  📥 Refreshed {n} candle(s) for {rates_table}", NODE_NAME)
+                        log(f"   Refreshed {n} candle(s) for {rates_table}", NODE_NAME)
                     return
 
                 except (SAInternalError, DBAPIError) as e:
                     await _safe_brain_invalidate(conn)
                     if attempt == 0:
-                        log(f"  ⚠️ Rates refresh InternalError, retry ({rates_table}): {e}",
+                        log(f"   Rates refresh InternalError, retry ({rates_table}): {e}",
                             NODE_NAME, level="warning")
                         continue
-                    log(f"  ⚠️ Rates refresh retry failed, skipping ({rates_table}): {e}",
+                    log(f"   Rates refresh retry failed, skipping ({rates_table}): {e}",
                         NODE_NAME, level="warning")
                     return
 
@@ -451,10 +451,10 @@ async def _refresh_rates_if_needed(rates_table):
                         await conn.close()
                     except Exception:
                         pass
-                    log(f"  ⚠️ Rates refresh error ({rates_table}): {e}", NODE_NAME, level="warning")
+                    log(f"   Rates refresh error ({rates_table}): {e}", NODE_NAME, level="warning")
                     return
     except Exception as e:
-        log(f"  ⚠️ Rates refresh outer error ({rates_table}): {e}", NODE_NAME, level="warning")
+        log(f"   Rates refresh outer error ({rates_table}): {e}", NODE_NAME, level="warning")
 
 
 def _compute_cpu_only(
@@ -503,7 +503,7 @@ def _compute_cpu_only(
     use_square = calc_var in (2, 3)
     use_range = calc_var == 4
 
-    # ── Шаг 1: собираем уникальные сдвиги по ctx_key ─────────────────────────
+    #  Шаг 1: собираем уникальные сдвиги по ctx_key 
     # Используем dict вместо list — автоматически дедуплицирует сдвиги.
     # Структура: ctx_key → {shift: is_recurring}
     ctx_shifts: dict[tuple, dict[int, bool]] = {}
@@ -541,7 +541,7 @@ def _compute_cpu_only(
     result: dict[str, float] = {}
     len_dates = len(dates_ns)
 
-    # ── Шаг 2: матричный расчёт для каждого ctx_key ──────────────────────────
+    #  Шаг 2: матричный расчёт для каждого ctx_key 
     for ctx_key, shift_map in ctx_shifts.items():
         ctx_ts = NP_CTX_HIST.get(ctx_key)
         if ctx_ts is None or len(ctx_ts) == 0:
@@ -565,7 +565,7 @@ def _compute_cpu_only(
         )  # (n_shifts,)
         n_shifts = len(shifts_sec)
 
-        # ── Матрица сдвинутых timestamps (n_valid, n_shifts) ─────────────────
+        #  Матрица сдвинутых timestamps (n_valid, n_shifts) 
         # Каждая строка: один исторический момент + все сдвиги
         t_ts_mat = valid_ts[:, np.newaxis] + shifts_sec[np.newaxis, :]
         # (n_valid, n_shifts), int64
@@ -573,7 +573,7 @@ def _compute_cpu_only(
         # Фильтр: timestamp должен быть < target
         lt_mask = t_ts_mat < target_ts  # (n_valid, n_shifts), bool
 
-        # ── ОДИН вызов searchsorted на весь ctx_key ───────────────────────────
+        #  ОДИН вызов searchsorted на весь ctx_key 
         flat_ts = t_ts_mat.ravel()  # (n_valid*n_shifts,)
         ri_flat = np.searchsorted(dates_ns, flat_ts, side="left")
 
@@ -587,7 +587,7 @@ def _compute_cpu_only(
         hit_mat = (exact & lt_mask.ravel()).reshape(n_valid, n_shifts)
         ri_mat = ri_flat.reshape(n_valid, n_shifts)
 
-        # ── Обрабатываем каждый столбец (один сдвиг) ─────────────────────────
+        #  Обрабатываем каждый столбец (один сдвиг) 
         for col, (shift, is_recurring) in enumerate(shifts_items):
             col_hit = hit_mat[:, col]
             if not np.any(col_hit):
@@ -597,7 +597,7 @@ def _compute_cpu_only(
             rng_vals = ranges_arr[ri]
             shift_arg = shift if is_recurring else None
 
-            # ── T1 ────────────────────────────────────────────────────────────
+            #  T1 
             if calc_type in (0, 1):
                 if need_filter:
                     fm = rng_vals > avg_range
@@ -620,7 +620,7 @@ def _compute_cpu_only(
                         wc = make_weight_code(instr, rcd, td, md, 0, shift_arg)
                         result[wc] = result.get(wc, 0.0) + t1_v
 
-            # ── Extremum ──────────────────────────────────────────────────────
+            #  Extremum 
             if calc_type in (0, 2) and ext_arr is not None and total_hist:
                 if need_filter:
                     fm = rng_vals > avg_range
@@ -925,7 +925,7 @@ async def compute_batch(
             )
             return date_str, (result if result is not None else {})
         except Exception as e:
-            log(f"  ⚠️ compute_batch error {date_str}: {e}", NODE_NAME, level="warning")
+            log(f"   compute_batch error {date_str}: {e}", NODE_NAME, level="warning")
             return date_str, {}
 
     results = await asyncio.gather(*[_one(d) for d in dates])

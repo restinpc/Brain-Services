@@ -1,16 +1,16 @@
-﻿import os
+import os
 import mysql.connector
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── Конфигурация ──────────────────────────────────────────────────────────────
+#  Конфигурация 
 CTX_TABLE = os.getenv("CTX_TABLE", "vlad_ecb_rate_context_idx")
 OUT_TABLE = os.getenv("OUT_TABLE", "vlad_ecb_rate_weights")
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "5000"))
 TRUNCATE_OUT = os.getenv("TRUNCATE_OUT", "1") == "1"
 
-# ── Словари кодировки ─────────────────────────
+#  Словари кодировки 
 
 RATE_CHANGE_MAP = {
     "UNKNOWN": "X",  # X = eXception/неопределено
@@ -38,7 +38,7 @@ RATE_CHANGE_MAP_REV = {v: k for k, v in RATE_CHANGE_MAP.items()}
 TREND_MAP_REV = {v: k for k, v in TREND_MAP.items()}
 MOMENTUM_MAP_REV = {v: k for k, v in MOMENTUM_MAP.items()}
 
-# ── Окно сдвига (ECB — дневные данные, не часовые) ───────────────────────────
+#  Окно сдвига (ECB — дневные данные, не часовые) 
 SHIFT_MIN = -12
 SHIFT_MAX = 12
 
@@ -296,13 +296,13 @@ def main():
 
         print(f"\n{'weight_code':<40} {'ccy':<5} {'change':<8} "
               f"{'trend':<8} {'mom':<8} {'mode':>4} {'shift':>6} {'occ':>5}")
-        print("─" * 95)
+        print("" * 95)
         for wc, ccy, rcd, td, md, mv, ds, oc in rows:
             print(f"{wc:<40} {ccy:<5} {rcd:<8} "
                   f"{td:<8} {md:<8} {mv:>4} {str(ds):>6} {str(oc):>5}")
 
         # Пример декодирования
-        print(f"\n── Пример декодирования weight_code ─────────────────────────")
+        print(f"\n Пример декодирования weight_code ")
         if rows:
             sample_code = rows[0][0]
             decoded = decode_weight_code(sample_code)

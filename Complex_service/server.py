@@ -73,7 +73,7 @@ async def _compute_composite(pair, day, date, param_dict, state) -> dict | None:
             for key, val in res.items():
                 combined[f"{model_id}_{key}"] = round(val * k, 6)
         except Exception as e:
-            log(f"❌ Child model {model_id} error: {e}", NODE_NAME, level="error", force=True)
+            log(f" Child model {model_id} error: {e}", NODE_NAME, level="error", force=True)
             return None
     return combined
 
@@ -135,7 +135,7 @@ async def lifespan(app: FastAPI):
                 setattr(app.state, attr, w)
                 log(f"Pre-loaded {len(w)} weights for model {model_id}", NODE_NAME, force=True)
             except Exception as e:
-                log(f"⚠️  Pre-load weights model {model_id}: {e}", NODE_NAME,
+                log(f"  Pre-load weights model {model_id}: {e}", NODE_NAME,
                     level="error", force=True)
                 send_error_trace(e, NODE_NAME)
 

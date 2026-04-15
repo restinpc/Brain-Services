@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 import os
 import sys
@@ -93,7 +93,7 @@ parser.add_argument("--max-clicks", type=int, default=None,
 args = parser.parse_args()
 
 if not all([args.host, args.user, args.password, args.database]):
-    print("❌ Ошибка: не указаны параметры подключения к БД")
+    print(" Ошибка: не указаны параметры подключения к БД")
     sys.exit(1)
 
 # ----------------------------------------------------------------------
@@ -118,9 +118,9 @@ async def parse_and_save_incrementally(table_name, max_clicks=None):
         with engine.connect() as conn:
             existing = pd.read_sql(f"SELECT link FROM {table_name}", conn)
             existing_links = set(existing['link'].tolist()) if not existing.empty else set()
-        print(f" ✓ В БД уже есть {len(existing_links)} новостей")
+        print(f"  В БД уже есть {len(existing_links)} новостей")
     except Exception as e:
-        print(f" ⚠️ Ошибка при получении существующих ссылок: {e}")
+        print(f"  Ошибка при получении существующих ссылок: {e}")
         existing_links = set()
 
     async with async_playwright() as p:
@@ -156,10 +156,10 @@ async def parse_and_save_incrementally(table_name, max_clicks=None):
         MAX_CONSECUTIVE_FAILURES = 10
 
         try:
-            print(f"\n📄 Загрузка главной страницы: {BASE_URL}")
+            print(f"\n Загрузка главной страницы: {BASE_URL}")
             # Ждём только загрузки DOM, не всех ресурсов (это быстро)
             await page.goto(BASE_URL, wait_until='domcontentloaded', timeout=120000)
-            print(" ✓ DOM загружен. Ожидаем 30 секунд для подгрузки динамического контента...")
+            print("  DOM загружен. Ожидаем 30 секунд для подгрузки динамического контента...")
             await asyncio.sleep(30)
 
             # Закрываем cookie-баннер если есть
@@ -167,7 +167,7 @@ async def parse_and_save_incrementally(table_name, max_clicks=None):
                 accept_btn = page.locator(SELECTORS['cookie_accept'])
                 if await accept_btn.is_visible(timeout=3000):
                     await accept_btn.click()
-                    print(" ✓ Cookie-баннер закрыт")
+                    print("  Cookie-баннер закрыт")
                     await asyncio.sleep(1)
             except:
                 pass
@@ -218,7 +218,7 @@ async def parse_and_save_incrementally(table_name, max_clicks=None):
                             'published_at': published_at.strip()
                         })
                     except Exception as e:
-                        print(f" ⚠️ Ошибка парсинга элемента {idx}: {e}")
+                        print(f"  Ошибка парсинга элемента {idx}: {e}")
                         continue
 
                 # Сохраняем новые записи в БД
@@ -237,11 +237,11 @@ async def parse_and_save_incrementally(table_name, max_clicks=None):
                             )
                             existing_links.update(df_new['link'].tolist())
                             total_added += len(df_new)
-                            print(f" ✅ Добавлено в БД: {len(df_new)} из {len(page_news)} (новые) на клике {click_num}")
+                            print(f"  Добавлено в БД: {len(df_new)} из {len(page_news)} (новые) на клике {click_num}")
                         except Exception as e:
-                            print(f" ❌ Ошибка записи в БД: {e}")
+                            print(f"  Ошибка записи в БД: {e}")
                     else:
-                        print(f" ℹ️ Все {len(page_news)} новостей уже есть в БД на клике {click_num}")
+                        print(f" ℹ Все {len(page_news)} новостей уже есть в БД на клике {click_num}")
                     total_parsed += len(page_news)
                     consecutive_failures = 0
 
@@ -250,7 +250,7 @@ async def parse_and_save_incrementally(table_name, max_clicks=None):
                     load_more_btn = page.locator(SELECTORS['more_button'])
                     # Проверяем видимость кнопки
                     if not await load_more_btn.is_visible(timeout=5000):
-                        print(" ℹ️ Кнопка 'More Stories' больше не видна. Остановка.")
+                        print(" ℹ Кнопка 'More Stories' больше не видна. Остановка.")
                         break
                     await load_more_btn.click()
 
@@ -258,17 +258,17 @@ async def parse_and_save_incrementally(table_name, max_clicks=None):
                     await asyncio.sleep(5)
 
                     click_num += 1
-                    print(f" ✓ Клик на 'More Stories' {click_num}/{max_limit}")
+                    print(f"  Клик на 'More Stories' {click_num}/{max_limit}")
                 except Exception as e:
                     consecutive_failures += 1
-                    print(f" ⚠️ Ошибка клика (неудача {consecutive_failures}/{MAX_CONSECUTIVE_FAILURES}): {e}")
+                    print(f"  Ошибка клика (неудача {consecutive_failures}/{MAX_CONSECUTIVE_FAILURES}): {e}")
                     # Делаем скриншот при ошибке клика
                     await page.screenshot(path=f"error_click_{click_num}.png")
                     await asyncio.sleep(2)
                     continue
 
         except Exception as e:
-            print(f" ❌ Критическая ошибка в цикле: {e}")
+            print(f"  Критическая ошибка в цикле: {e}")
             await page.screenshot(path="critical_error.png")
             send_error_trace(e)
 
@@ -277,19 +277,19 @@ async def parse_and_save_incrementally(table_name, max_clicks=None):
         # Итоговая статистика
         print(f"\n{'=' * 60}")
         if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-            print(f"⚠️ Остановлено: {MAX_CONSECUTIVE_FAILURES} последовательных неудач")
+            print(f" Остановлено: {MAX_CONSECUTIVE_FAILURES} последовательных неудач")
         elif click_num >= max_limit:
-            print(f"ℹ️ Достигнут лимит кликов: {max_limit}")
+            print(f"ℹ Достигнут лимит кликов: {max_limit}")
         else:
-            print(f"✅ Все новости загружены")
-        print(f"📄 Обработано кликов: {click_num}")
-        print(f"📊 Спарсено новостей: {total_parsed}")
-        print(f"💾 Добавлено в БД: {total_added}")
+            print(f" Все новости загружены")
+        print(f" Обработано кликов: {click_num}")
+        print(f" Спарсено новостей: {total_parsed}")
+        print(f" Добавлено в БД: {total_added}")
         try:
             with engine.connect() as conn:
                 result = conn.execute(text(f"SELECT MAX(id) FROM {table_name}"))
                 max_id = result.scalar()
-                print(f"🔢 Последний ID в таблице: {max_id}")
+                print(f" Последний ID в таблице: {max_id}")
         except:
             pass
         return total_added
@@ -324,7 +324,7 @@ def ensure_table_exists(table_name):
         with engine.connect() as conn:
             conn.execute(create_query)
             conn.commit()
-        print(f"✅ Таблица '{table_name}' создана с автоинкрементом")
+        print(f" Таблица '{table_name}' создана с автоинкрементом")
     else:
         with engine.connect() as conn:
             result = conn.execute(text(f"""
@@ -336,7 +336,7 @@ def ensure_table_exists(table_name):
             """))
             has_unique = result.scalar() > 0
         if not has_unique:
-            print(f"⚠️ Внимание: в таблице '{table_name}' нет уникального индекса на поле link")
+            print(f" Внимание: в таблице '{table_name}' нет уникального индекса на поле link")
             print("Рекомендуется добавить уникальный индекс командой:")
             print(f"ALTER TABLE {table_name} MODIFY link VARCHAR(500), ADD UNIQUE INDEX unique_link (link);")
 
@@ -345,23 +345,23 @@ def ensure_table_exists(table_name):
 # Основная логика
 # ----------------------------------------------------------------------
 def main():
-    print(f"🚀 Загрузчик новостей CoinDesk.com (крипто)")
+    print(f" Загрузчик новостей CoinDesk.com (крипто)")
     print(f"База: {args.host}:{args.port}/{args.database}")
-    print(f"🎯 Целевая таблица: {args.table_name}")
+    print(f" Целевая таблица: {args.table_name}")
     if args.max_clicks:
-        print(f"📄 Лимит кликов: {args.max_clicks}")
+        print(f" Лимит кликов: {args.max_clicks}")
     else:
-        print(f"📄 Лимит кликов: все доступные (макс. {MAX_CLICKS})")
+        print(f" Лимит кликов: все доступные (макс. {MAX_CLICKS})")
     print("=" * 60)
     total_added = asyncio.run(
         parse_and_save_incrementally(args.table_name, max_clicks=args.max_clicks)
     )
     print("=" * 60)
-    print("🏁 Загрузка завершена")
+    print(" Загрузка завершена")
     if total_added == 0:
-        print("ℹ️ Все новости уже были в БД")
+        print("ℹ Все новости уже были в БД")
     else:
-        print(f"✨ Успешно добавлено {total_added} новых записей")
+        print(f" Успешно добавлено {total_added} новых записей")
 
 
 if __name__ == "__main__":
@@ -370,9 +370,9 @@ if __name__ == "__main__":
     except SystemExit:
         raise
     except KeyboardInterrupt:
-        print("\n🛑 Прервано пользователем")
+        print("\n Прервано пользователем")
         sys.exit(1)
     except Exception as e:
-        print(f"\n❌ Критическая ошибка: {e!r}")
+        print(f"\n Критическая ошибка: {e!r}")
         send_error_trace(e)
         sys.exit(1)

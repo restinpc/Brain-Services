@@ -35,7 +35,7 @@ parser.add_argument("database", nargs="?", default=os.getenv("DB_NAME"))
 args = parser.parse_args()
 
 if not all([args.host, args.user, args.password, args.database]):
-    print("❌ Ошибка: не указаны параметры подключения"); sys.exit(1)
+    print(" Ошибка: не указаны параметры подключения"); sys.exit(1)
 
 DB_CONFIG = {'host': args.host, 'port': int(args.port), 'user': args.user, 'password': args.password, 'database': args.database}
 DATASETS = {"vlad_gdelt_geo_events": {"description": "GDELT geo-located events"}}
@@ -113,13 +113,13 @@ class GDELTCollector:
                 "TIMESPAN": "1440",
                 "MAXROWS": "2500"          # ← ВЕРНУЛИ ПОЛНЫЙ ОБЪЁМ
             }
-            print(f"   🌍 GDELT GKG v1 [{q['query']}] → {q['category']}...", end=" ", flush=True)
+            print(f"    GDELT GKG v1 [{q['query']}] → {q['category']}...", end=" ", flush=True)
 
             try:
                 resp = self.session.get(url, params=params, timeout=40)
                 if resp.status_code != 200:
                     print(f"HTTP {resp.status_code}")
-                    print(f"   🔗 {resp.url}")
+                    print(f"    {resp.url}")
                     continue
 
                 data = resp.json()
@@ -155,7 +155,7 @@ class GDELTCollector:
             time.sleep(random.uniform(1.5, 3))
 
         if not all_rows:
-            print("   ⚠️ Нет данных")
+            print("    Нет данных")
             return
 
         conn = self.get_db_connection(); c = conn.cursor()
@@ -166,7 +166,7 @@ class GDELTCollector:
         c.executemany(sql, all_rows)
         conn.commit(); n = c.rowcount; c.close(); conn.close()
 
-        print(f"   ✅ Записано {n} уникальных событий")
+        print(f"    Записано {n} уникальных событий")
         cats = {}
         for r in all_rows:
             cats[r[2]] = cats.get(r[2], 0) + 1
@@ -176,15 +176,15 @@ class GDELTCollector:
 
 def main():
     if args.table_name not in DATASETS:
-        print(f"❌ Неизвестная таблица."); sys.exit(1)
-    print(f"🚀 GDELT GEO Events Direct Collector (GKG v1 + MAXROWS=2500)")
+        print(f" Неизвестная таблица."); sys.exit(1)
+    print(f" GDELT GEO Events Direct Collector (GKG v1 + MAXROWS=2500)")
     print(f"База: {args.host}:{args.port}/{args.database}")
-    print(f"🎯 Таблица: {args.table_name}"); print("=" * 60)
+    print(f" Таблица: {args.table_name}"); print("=" * 60)
     GDELTCollector(args.table_name).process()
-    print("=" * 60); print("🏁 ЗАГРУЗКА ЗАВЕРШЕНА")
+    print("=" * 60); print(" ЗАГРУЗКА ЗАВЕРШЕНА")
 
 if __name__ == "__main__":
     try: main()
     except SystemExit: raise
-    except KeyboardInterrupt: print("\n🛑 Прервано"); sys.exit(1)
-    except Exception as e: print(f"\n❌ {e!r}"); send_error_trace(e); sys.exit(1)
+    except KeyboardInterrupt: print("\n Прервано"); sys.exit(1)
+    except Exception as e: print(f"\n {e!r}"); send_error_trace(e); sys.exit(1)

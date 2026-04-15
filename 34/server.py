@@ -44,7 +44,7 @@ engine_vlad, engine_brain, engine_super = build_engines()
 log(f"MODE={MODE}", NODE_NAME, force=True)
 log(f"engines built via build_engines()", NODE_NAME)
 
-# ── Параметры ─────────────────────────────────────────────────────────────────
+#  Параметры 
 SMA_SHORT    = int(os.getenv("SMA_SHORT",    "24"))
 SMA_LONG     = int(os.getenv("SMA_LONG",     "168"))
 BB_PERIOD    = int(os.getenv("BB_PERIOD",    "20"))
@@ -67,7 +67,7 @@ INSTRUMENT_COLUMNS = {
     "OIL":    ("Oil_Close",    "Oil_Volume"),
 }
 
-# ── Числовые карты (совпадают с market_weights.py) ────────────────────────────
+#  Числовые карты (совпадают с market_weights.py) 
 INSTRUMENT_MAP = {
     "EURUSD": 1, "BTC": 3, "ETH": 4,
     "DXY": 5, "GOLD": 6, "OIL": 7,
@@ -78,7 +78,7 @@ MOMENTUM_MAP    = {"UNKNOWN": 0, "UP": 1, "DOWN": 2, "FLAT": 3}
 VOL_MAP         = {"UNKNOWN": 0, "HIGH": 1, "LOW": 2}
 BB_MAP          = {"UNKNOWN": 0, "UPPER": 1, "MID": 2, "LOWER": 3}
 
-# ── Глобальные данные в RAM ───────────────────────────────────────────────────
+#  Глобальные данные в RAM 
 GLOBAL_MKT_BY_INSTR  = {}
 GLOBAL_MKT_CONTEXT   = {}
 GLOBAL_MKT_OBS_DTS   = defaultdict(set)
@@ -94,13 +94,13 @@ GLOBAL_LAST_CANDLES  = {}
 SERVICE_URL          = ""
 LAST_RELOAD_TIME     = None
 
-# ── NumPy-ускоренные структуры (строятся в preload, используются в _compute_cpu_only) ──
+#  NumPy-ускоренные структуры (строятся в preload, используются в _compute_cpu_only) 
 NP_RATES:    dict = {}   # table → {"dates_ns": int64[], "t1": float64[], "ranges": float64[], "ext_min": bool[], "ext_max": bool[]}
 NP_CTX_HIST: dict = {}   # ctx_key → int64[] (unix timestamps, sorted)
 NP_CTX_HIST_BUILT: bool = False
 
 
-# ── Вспомогательные функции ───────────────────────────────────────────────────
+#  Вспомогательные функции 
 
 def get_rates_table_name(pair_id: int, day_flag: int) -> str:
     return {1: "brain_rates_eur_usd", 3: "brain_rates_btc_usd",
@@ -130,7 +130,7 @@ def find_prev_candle_trend(table: str, target_date: datetime):
     return candles[idx - 1] if idx > 0 else None
 
 
-# ── Классификаторы ────────────────────────────────────────────────────────────
+#  Классификаторы 
 
 def _direction_label(a, b, threshold, up="UP", down="DOWN", flat="FLAT") -> str:
     if a is None or b is None or b == 0:
@@ -205,7 +205,7 @@ def classify_market_observations(close_series: list,
     return results
 
 
-# ── Числовой weight_code ──────────────────────────────────────────────────────
+#  Числовой weight_code 
 
 def make_weight_code(instrument: str, rcd: str, td: str, md: str,
                      vol: str, bb: str,
@@ -220,7 +220,7 @@ def make_weight_code(instrument: str, rcd: str, td: str, md: str,
     return base if hour_shift is None else f"{base}_{hour_shift}"
 
 
-# ── T1 / Extremum ─────────────────────────────────────────────────────────────
+#  T1 / Extremum 
 
 def compute_t1_value(t_dates, calc_var, ram_rates, candle_ranges, avg_range) -> float:
     need_filter = calc_var in (1, 3, 4)
@@ -264,7 +264,7 @@ async def preload_all_data():
     global GLOBAL_AVG_RANGE, GLOBAL_LAST_CANDLES, SERVICE_URL, LAST_RELOAD_TIME
     global NP_RATES, NP_CTX_HIST, NP_CTX_HIST_BUILT
 
-    log("🔄 MARKET-TECH FULL DATA RELOAD START", NODE_NAME, force=True)
+    log(" MARKET-TECH FULL DATA RELOAD START", NODE_NAME, force=True)
 
     # Очищаем старые данные
     GLOBAL_MKT_BY_INSTR.clear()
@@ -277,7 +277,7 @@ async def preload_all_data():
     NP_RATES.clear()
     NP_CTX_HIST_BUILT = False
 
-    # ── vlad DB: weights и context_idx ────────────────────────────────────────
+    #  vlad DB: weights и context_idx 
     try:
         async with engine_vlad.connect() as conn:
             # Веса
@@ -312,9 +312,9 @@ async def preload_all_data():
         log(f"  Market weights: {len(GLOBAL_WEIGHT_CODES)}, contexts: {len(GLOBAL_CTX_INDEX)}",
             NODE_NAME)
     except Exception as e:
-        log(f"❌ Market weights/contexts from vlad: {e}", NODE_NAME, level="error", force=True)
+        log(f" Market weights/contexts from vlad: {e}", NODE_NAME, level="error", force=True)
 
-    # ── brain DB: market_history ──────────────────────────────────────────────
+    #  brain DB: market_history 
     try:
         instruments = list(INSTRUMENT_COLUMNS.keys())
         if instruments:
@@ -366,12 +366,12 @@ async def preload_all_data():
                 log(f"  instruments: {len(GLOBAL_MKT_BY_INSTR)}, "
                     f"contexts: {len(GLOBAL_MKT_CONTEXT)}, obs: {total_obs}", NODE_NAME)
     except Exception as e:
-        log(f"❌ market_history (brain): {e}", NODE_NAME, level="error")
+        log(f" market_history (brain): {e}", NODE_NAME, level="error")
 
-    # ── bisect: отсортированный список дат market ──
+    #  bisect: отсортированный список дат market 
     _MKT_SORTED_DATES[:] = sorted(GLOBAL_MKT_OBS_DTS.keys())
 
-    # ── brain DB: brain_rates_* (остается без изменений) ────────────────────────
+    #  brain DB: brain_rates_* (остается без изменений) 
     async with engine_brain.connect() as conn:
         for table in ["brain_rates_eur_usd", "brain_rates_eur_usd_day",
                       "brain_rates_btc_usd", "brain_rates_btc_usd_day",
@@ -411,21 +411,21 @@ async def preload_all_data():
 
                 log(f"  {table}: {len(GLOBAL_RATES[table])} candles", NODE_NAME)
             except Exception as e:
-                log(f"❌ {table}: {e}", NODE_NAME, level="error")
+                log(f" {table}: {e}", NODE_NAME, level="error")
 
     try:
         SERVICE_URL = await load_service_url(engine_super, SERVICE_ID)
         log(f"  SERVICE_URL loaded", NODE_NAME)
     except Exception as e:
-        log(f"⚠️  load_service_url skipped: {e}", NODE_NAME, level="warn")
+        log(f"  load_service_url skipped: {e}", NODE_NAME, level="warn")
 
     try:
         await ensure_cache_table(engine_vlad)
     except Exception as e:
-        log(f"⚠️  ensure_cache_table skipped: {e}", NODE_NAME, level="warn")
+        log(f"  ensure_cache_table skipped: {e}", NODE_NAME, level="warn")
 
     LAST_RELOAD_TIME = datetime.now()
-    log("✅ MARKET-TECH FULL DATA RELOAD COMPLETED", NODE_NAME, force=True)
+    log(" MARKET-TECH FULL DATA RELOAD COMPLETED", NODE_NAME, force=True)
 
 
 async def background_reload_data():
@@ -434,7 +434,7 @@ async def background_reload_data():
         try:
             await preload_all_data()
         except Exception as e:
-            log(f"❌ Background reload error: {e}", NODE_NAME, level="error", force=True)
+            log(f" Background reload error: {e}", NODE_NAME, level="error", force=True)
             send_error_trace(e, NODE_NAME, "market_tech_background_reload")
 
 
@@ -443,7 +443,7 @@ async def lifespan(app: FastAPI):
     try:
         await preload_all_data()
     except Exception as e:
-        log(f"❌ Initial data load failed, server continues: {e}",
+        log(f" Initial data load failed, server continues: {e}",
             NODE_NAME, level="error", force=True)
 
     task = asyncio.create_task(background_reload_data())
@@ -460,7 +460,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
-# ── Подгрузка свежих свечей из БД ─────────────────────────────────────────
+#  Подгрузка свежих свечей из БД 
 _LAST_RATES_REFRESH = {}
 
 async def _refresh_rates_if_needed(rates_table):
@@ -493,9 +493,9 @@ async def _refresh_rates_if_needed(rates_table):
                     cl.append((dt, (r["close"] or 0) > (r["open"] or 0)))
                 n += 1
             if n > 0:
-                log(f"  📥 Refreshed {n} candle(s) for {rates_table}", NODE_NAME)
+                log(f"   Refreshed {n} candle(s) for {rates_table}", NODE_NAME)
     except Exception as e:
-        log(f"  ⚠️ Rates refresh error ({rates_table}): {e}", NODE_NAME, level="warning")
+        log(f"   Rates refresh error ({rates_table}): {e}", NODE_NAME, level="warning")
 
 
 def _compute_cpu_only(pair: int, day: int, date_str: str,
@@ -595,7 +595,7 @@ async def calculate_pure_memory(pair: int, day: int, date_str: str,
     return result if result is not None else {}
 
 
-# ── Endpoints ─────────────────────────────────────────────────────────────────
+#  Endpoints 
 
 @app.get("/")
 async def get_metadata():
@@ -745,7 +745,7 @@ async def compute_batch(
             )
             return date_str, (result if result is not None else {})
         except Exception as e:
-            log(f"  ⚠️ compute_batch error {date_str}: {e}", NODE_NAME, level="warning")
+            log(f"   compute_batch error {date_str}: {e}", NODE_NAME, level="warning")
             return date_str, {}
 
     results = await asyncio.gather(*[_one(d) for d in dates])
@@ -772,7 +772,7 @@ async def patch_service():
     return {"status": "ok", "from_version": old, "to_version": new}
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+#  Entry point 
 
 if __name__ == "__main__":
     import asyncio as _asyncio
@@ -780,7 +780,7 @@ if __name__ == "__main__":
         try:
             return await resolve_workers(engine_super, SERVICE_ID, default=1)
         except Exception as _e:
-            log(f"⚠️  resolve_workers unavailable ({_e}), using 1 worker", NODE_NAME, force=True)
+            log(f"  resolve_workers unavailable ({_e}), using 1 worker", NODE_NAME, force=True)
             return 1
     _workers = _asyncio.run(_get_workers())
     log(f"Starting with {_workers} worker(s) in {MODE} mode", NODE_NAME, force=True)

@@ -1,4 +1,4 @@
-﻿import os
+import os
 import mysql.connector
 from dotenv import load_dotenv
 
@@ -13,7 +13,7 @@ SHIFT_MIN = int(os.getenv("SHIFT_MIN", "-12"))
 SHIFT_MAX = int(os.getenv("SHIFT_MAX",  "12"))
 
 
-# ── Однобуквенное кодирование ─────────────────────────────────────────────────
+#  Однобуквенное кодирование 
 
 RATE_CHANGE_MAP = {
     "UNKNOWN": "X",
@@ -42,7 +42,7 @@ TREND_MAP_REV       = {v: k for k, v in TREND_MAP.items()}
 MOMENTUM_MAP_REV    = {v: k for k, v in MOMENTUM_MAP.items()}
 
 
-# ── DDL ───────────────────────────────────────────────────────────────────────
+#  DDL 
 
 DDL = f"""
 CREATE TABLE IF NOT EXISTS `{OUT_TABLE}` (
@@ -66,7 +66,7 @@ CREATE TABLE IF NOT EXISTS `{OUT_TABLE}` (
 """
 
 
-# ── Подключение ───────────────────────────────────────────────────────────────
+#  Подключение 
 
 def get_db_connection():
     return mysql.connector.connect(
@@ -79,7 +79,7 @@ def get_db_connection():
     )
 
 
-# ── Кодирование / декодирование ───────────────────────────────────────────────
+#  Кодирование / декодирование 
 
 def encode(value: str, direction_type: str) -> str:
     maps = {
@@ -134,7 +134,7 @@ def decode_weight_code(code: str) -> dict:
     }
 
 
-# ── Генерация строк ───────────────────────────────────────────────────────────
+#  Генерация строк 
 
 def generate_rows(instrument: str, rcd: str, td: str, md: str, occ: int):
     """
@@ -161,7 +161,7 @@ def generate_rows(instrument: str, rcd: str, td: str, md: str, occ: int):
                 )
 
 
-# ── Вставка ───────────────────────────────────────────────────────────────────
+#  Вставка 
 
 def insert_rows(cur, rows):
     sql = f"""
@@ -187,7 +187,7 @@ def insert_rows(cur, rows):
     return total
 
 
-# ── main ──────────────────────────────────────────────────────────────────────
+#  main 
 
 def main():
     conn = get_db_connection()
@@ -238,7 +238,7 @@ def main():
         print(f"\nOK: contexts={len(ctx_rows)}, inserted={written}, table_rows={cnt}")
 
         # Распределение по инструментам
-        print(f"\n── Строк по инструментам ───────────────────────────────────────")
+        print(f"\n Строк по инструментам ")
         cur.execute(f"""
             SELECT instrument,
                    SUM(hour_shift IS NULL) AS base_rows,
@@ -249,12 +249,12 @@ def main():
             ORDER BY instrument
         """)
         print(f"  {'instr':<10} {'base':>8} {'shifted':>10} {'total':>8}")
-        print("  " + "─" * 40)
+        print("  " + "" * 40)
         for instr, base, shifted, total in cur.fetchall():
             print(f"  {instr:<10} {base:>8} {shifted:>10} {total:>8}")
 
         # Первые 20 строк
-        print(f"\n── Первые 20 weight_codes ──────────────────────────────────────")
+        print(f"\n Первые 20 weight_codes ")
         cur.execute(f"""
             SELECT weight_code, instrument,
                    rate_change_dir, trend_dir, momentum_dir,
@@ -267,7 +267,7 @@ def main():
         rows = cur.fetchall()
         print(f"  {'weight_code':<35} {'instr':<8} {'chg':<6} {'trd':<8} "
               f"{'mom':<8} {'mode':>4} {'shift':>6} {'occ':>5}")
-        print("  " + "─" * 85)
+        print("  " + "" * 85)
         for wc, instr, rcd, td, md, mv, ds, oc in rows:
             print(f"  {wc:<35} {instr:<8} {rcd:<6} {td:<8} "
                   f"{md:<8} {mv:>4} {str(ds):>6} {str(oc):>5}")
@@ -275,7 +275,7 @@ def main():
         # Пример декодирования
         if rows:
             sample = rows[0][0]
-            print(f"\n── Пример декодирования ────────────────────────────────────────")
+            print(f"\n Пример декодирования ")
             print(f"  Код: {sample}")
             print(f"  Расшифровка: {decode_weight_code(sample)}")
 

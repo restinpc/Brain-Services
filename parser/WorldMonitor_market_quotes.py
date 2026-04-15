@@ -36,7 +36,7 @@ parser.add_argument("database", nargs="?", default=os.getenv("DB_NAME"))
 args = parser.parse_args()
 
 if not all([args.host, args.user, args.password, args.database]):
-    print("❌ Ошибка: не указаны все параметры подключения к БД"); sys.exit(1)
+    print(" Ошибка: не указаны все параметры подключения к БД"); sys.exit(1)
 
 DB_CONFIG = {'host': args.host, 'port': int(args.port), 'user': args.user, 'password': args.password, 'database': args.database}
 
@@ -73,9 +73,9 @@ def wm_get(session, path, params=None, timeout=30):
             resp.raise_for_status()
             return resp.json()
         except requests.exceptions.HTTPError:
-            print(f"   ⚠️ HTTP {resp.status_code} для {path}")
+            print(f"    HTTP {resp.status_code} для {path}")
         except Exception as e:
-            print(f"   ⚠️ {e}")
+            print(f"    {e}")
     return None
 
 
@@ -122,11 +122,11 @@ class QuotesCollector:
 
         for batch in SYMBOL_BATCHES:
             symbols_str = ",".join(batch)
-            print(f"   📊 Запрос: {symbols_str[:60]}...")
+            print(f"    Запрос: {symbols_str[:60]}...")
             data = wm_get(self.session, "/api/market/v1/list-market-quotes", params={"symbols": symbols_str})
 
             if not data:
-                print(f"   ⚠️ Нет ответа для батча")
+                print(f"    Нет ответа для батча")
                 continue
 
             quotes = data.get("quotes", [])
@@ -138,16 +138,16 @@ class QuotesCollector:
                 time.sleep(15)
 
             if skipped:
-                print(f"   ⚠️ Пропущены (Finnhub): {skipped}")
+                print(f"    Пропущены (Finnhub): {skipped}")
 
             all_quotes.extend(quotes)
             time.sleep(random.uniform(1.0, 2.0))  # Между батчами
 
         if not all_quotes:
-            print("   ⚠️ Нет котировок")
+            print("    Нет котировок")
             return
 
-        print(f"   📈 Получено {len(all_quotes)} котировок")
+        print(f"    Получено {len(all_quotes)} котировок")
 
         conn = self.get_db_connection(); c = conn.cursor()
         sql = f"""INSERT IGNORE INTO `{self.table_name}`
@@ -179,7 +179,7 @@ class QuotesCollector:
         inserted = c.rowcount
         c.close(); conn.close()
 
-        print(f"   ✅ Записано {inserted} котировок")
+        print(f"    Записано {inserted} котировок")
         # Показать топ-5
         for q in all_quotes[:5]:
             sym = q.get("symbol", q.get("ticker", "?"))
@@ -201,23 +201,23 @@ def _si(v):
 
 def main():
     if args.table_name not in DATASETS:
-        print(f"❌ Неизвестная таблица '{args.table_name}'. Допустимые:")
+        print(f" Неизвестная таблица '{args.table_name}'. Допустимые:")
         for n in DATASETS: print(f"  - {n}")
         sys.exit(1)
 
-    print(f"🚀 WorldMonitor Market Quotes Collector (Finnhub)")
+    print(f" WorldMonitor Market Quotes Collector (Finnhub)")
     print(f"База: {args.host}:{args.port}/{args.database}")
-    print(f"🎯 Таблица: {args.table_name}")
+    print(f" Таблица: {args.table_name}")
     print("=" * 60)
 
     QuotesCollector(args.table_name).process()
 
     print("=" * 60)
-    print("🏁 ЗАГРУЗКА ЗАВЕРШЕНА")
+    print(" ЗАГРУЗКА ЗАВЕРШЕНА")
 
 
 if __name__ == "__main__":
     try: main()
     except SystemExit: raise
-    except KeyboardInterrupt: print("\n🛑 Прервано пользователем"); sys.exit(1)
-    except Exception as e: print(f"\n❌ Критическая ошибка: {e!r}"); send_error_trace(e); sys.exit(1)
+    except KeyboardInterrupt: print("\n Прервано пользователем"); sys.exit(1)
+    except Exception as e: print(f"\n Критическая ошибка: {e!r}"); send_error_trace(e); sys.exit(1)

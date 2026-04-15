@@ -22,9 +22,9 @@ from typing import Callable
 
 import numpy as np
 
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 # Константы инструментов
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 
 INSTRUMENTS: dict[int, dict[str, str]] = {
     1: {"hour": "brain_rates_eur_usd", "day": "brain_rates_eur_usd_day"},
@@ -37,9 +37,9 @@ PAIR_LABELS = {1: "EURUSD", 3: "BTCUSD", 4: "ETHUSD"}
 _MODEL_PATH = os.path.join(os.path.dirname(__file__), "model.py")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 # Вспомогательные функции
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 
 def _reload_model():
     """Перезагружает модуль model.py и возвращает функцию model()."""
@@ -71,9 +71,9 @@ def _filter_dataset_lte(dataset: list[dict], date: datetime) -> list[dict]:
     return [e for e in dataset if e.get("date") is not None and e["date"] <= date]
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 # PRETEST — 3 теста
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 
 def _pt1_syntax() -> tuple[bool, str]:
     """
@@ -228,12 +228,12 @@ async def run_pretest(
     Запускает 3 теста последовательно. При первой же ошибке → {status: error}.
     """
 
-    # ── Тест 1: синтаксис ─────────────────────────────────────────────────────
+    #  Тест 1: синтаксис 
     ok, msg = _pt1_syntax()
     if not ok:
         return {"status": "error", "error": f"[Тест 1 — Синтаксис] {msg}"}
 
-    # ── Тест 2: структура выхода ──────────────────────────────────────────────
+    #  Тест 2: структура выхода 
     sample_result = None
     for pair_id, tfs in INSTRUMENTS.items():
         table = tfs["hour"]
@@ -264,7 +264,7 @@ async def run_pretest(
     if not ok:
         return {"status": "error", "error": f"[Тест 2 — Структура] {msg}"}
 
-    # ── Тест 3: покрытие 90% ──────────────────────────────────────────────────
+    #  Тест 3: покрытие 90% 
     ok, msg = await asyncio.to_thread(
         _pt3_coverage_sync,
         global_rates,
@@ -277,11 +277,11 @@ async def run_pretest(
     return {"status": "ok"}
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 # POSTTEST — 5 тестов
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 
-# ── Тест 1: статистика весов (NumPy-оптимизация) ─────────────────────────────
+#  Тест 1: статистика весов (NumPy-оптимизация) 
 
 def _post1_stats(history: list[tuple[datetime, dict]]) -> dict:
     """
@@ -299,7 +299,7 @@ def _post1_stats(history: list[tuple[datetime, dict]]) -> dict:
     }
 
 
-# ── Тест 2: анализ знаков значений (NumPy-оптимизация) ───────────────────────
+#  Тест 2: анализ знаков значений (NumPy-оптимизация) 
 
 def _post2_signs(history: list[tuple[datetime, dict]]) -> dict:
     """
@@ -321,7 +321,7 @@ def _post2_signs(history: list[tuple[datetime, dict]]) -> dict:
     }
 
 
-# ── Тест 3: синхронный запрос с актуальной датой ─────────────────────────────
+#  Тест 3: синхронный запрос с актуальной датой 
 
 async def _post3_sync(
     pair_id: int, day_flag: int, calculate_fn: Callable
@@ -338,7 +338,7 @@ async def _post3_sync(
         return {"error": str(e)}
 
 
-# ── Тест 4: поиск «проплешин» в кеше (NumPy-оптимизация) ─────────────────────
+#  Тест 4: поиск «проплешин» в кеше (NumPy-оптимизация) 
 
 def _post4_holes(history: list[tuple[datetime, dict]]) -> int:
     """
@@ -368,7 +368,7 @@ def _post4_holes(history: list[tuple[datetime, dict]]) -> int:
     return int(np.max(runs)) if len(runs) > 0 else 0
 
 
-# ── Тест 5: симуляция торговли (NumPy-оптимизация) ────────────────────────────
+#  Тест 5: симуляция торговли (NumPy-оптимизация) 
 
 def _post5_simulation(
     history: list[tuple[datetime, dict]],
@@ -418,7 +418,7 @@ def _post5_simulation(
         if op == 0:
             continue
 
-        # ── Закрытие текущей позиции ─────────────────────────────────────────
+        #  Закрытие текущей позиции 
         # Закрываем если: сигнал = 0, или сигнал сменил направление
         if position is not None:
             direction, entry_price = position
@@ -440,13 +440,13 @@ def _post5_simulation(
                     total_dropdown += abs(pnl)
                 position = None
 
-        # ── Открытие новой позиции ────────────────────────────────────────────
+        #  Открытие новой позиции 
         # Открываем только при ненулевом сигнале (позиция уже точно закрыта выше)
         if signal != 0.0 and position is None:
             direction = 1.0 if signal > 0 else -1.0
             position  = (direction, op)
 
-    # ── Принудительное закрытие в конце истории ───────────────────────────────
+    #  Принудительное закрытие в конце истории 
     if position is not None and rates_rows:
         direction, entry_price = position
         last_price = rates_rows[-1]["close"]
@@ -472,7 +472,7 @@ def _post5_simulation(
     }
 
 
-# ── Вычисление полной истории model() по одной таблице ───────────────────────
+#  Вычисление полной истории model() по одной таблице 
 
 def _build_history(
     table: str,
@@ -514,7 +514,7 @@ def _build_history(
     return history
 
 
-# ── Точка входа posttest ──────────────────────────────────────────────────────
+#  Точка входа posttest 
 
 async def run_posttest(
     global_rates: dict[str, list[dict]],

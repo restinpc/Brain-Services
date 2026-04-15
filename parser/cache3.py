@@ -21,7 +21,7 @@ from sqlalchemy import text
 
 load_dotenv()
 
-# ── ID моделей и маппинг на папки сервисов ────────────────────────────────────
+#  ID моделей и маппинг на папки сервисов 
 # model_id → абсолютный путь к папке сервиса (где лежит server.py и model.py)
 MODEL_IDS = [34]
 
@@ -30,19 +30,19 @@ SERVICE_FOLDER_MAP: dict[int, str] = {
     # 31: "/brain/Brain-Server/31",
 }
 
-# ── Параллельность ────────────────────────────────────────────────────────────
+#  Параллельность 
 SLOT_CONCURRENCY = 3    # параллельных вычислений на один слот
 SLOT_BATCH_SIZE  = 100   # свечей в батче (локальный вызов быстрее HTTP, можно больше)
 
-# ── Стратегия retry: collect-then-retry ──────────────────────────────────────
+#  Стратегия retry: collect-then-retry 
 # Основной проход — не останавливается на ошибках, собирает все упавшие.
 # После — до RETRY_PASSES перепрогонов по упавшим.
 # Между перепрогонами — пауза (даёт время восстановиться если БД или модель)
 RETRY_PASSES      = 3
 RETRY_PASS_DELAYS = [10, 30, 60]   # сек; локальные вызовы восстанавливаются быстрее
 
-# ── Логирование ────────────────────────────────────────────────────────────────
-# ── Режим отладки — включить чтобы видеть [DEBUG] логи ───────────────────────
+#  Логирование 
+#  Режим отладки — включить чтобы видеть [DEBUG] логи 
 # Переключи на True когда нужно диагностировать проблемы с кешем.
 # В обычном режиме держи False — DEBUG-логи очень многословны.
 DEBUG_MODE = True
@@ -54,7 +54,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── Трассировка ───────────────────────────────────────────────────────────────
+#  Трассировка 
 _HANDLER    = os.getenv("HANDLER", "https://server.brain-project.online").rstrip("/")
 TRACE_URL   = f"{_HANDLER}/trace.php"
 NODE_NAME   = os.getenv("NODE_NAME",   "cache_runner")
@@ -71,9 +71,9 @@ def send_trace(subject: str, body: str, is_error: bool = False) -> None:
                   "email": ALERT_EMAIL, "logs": full_body},
             timeout=10,
         )
-        log.info(f"📤 Трассировка отправлена: {subject}")
+        log.info(f" Трассировка отправлена: {subject}")
     except Exception as e:
-        log.warning(f"⚠️  Не удалось отправить трассировку: {e}")
+        log.warning(f"  Не удалось отправить трассировку: {e}")
 
 
 def send_error_trace(exc: Exception, context: str = "") -> None:
@@ -82,10 +82,10 @@ def send_error_trace(exc: Exception, context: str = "") -> None:
         f"Exception: {repr(exc)}\n\n"
         f"Traceback:\n{traceback.format_exc()}"
     )
-    send_trace(f"❌ Ошибка: {type(exc).__name__}", body, is_error=True)
+    send_trace(f" Ошибка: {type(exc).__name__}", body, is_error=True)
 
 
-# ── Торговые константы ─────────────────────────────────────────────────────────
+#  Торговые константы 
 INITIAL_BALANCE = 10_000.0
 MIN_LOT         = 0.01
 
@@ -112,7 +112,7 @@ def _slot_label(pair: int, day: int) -> str:
     return f"{PAIR_NAMES.get(pair, f'pair{pair}')}-{'day' if day else 'hour'}"
 
 
-# ── DDL ────────────────────────────────────────────────────────────────────────
+#  DDL 
 DDL_CACHE = """
 CREATE TABLE IF NOT EXISTS vlad_values_cache (
     id          BIGINT       NOT NULL AUTO_INCREMENT,
@@ -205,9 +205,9 @@ class Deadline:
         return f"{h}h {m}m {s}s"
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 # ЗАГРУЗКА СЕРВИСА — динамический импорт server.py из папки
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 
 class ServiceRunner:
     """
@@ -287,7 +287,7 @@ class ServiceRunner:
         else:
             self._style = "unknown"
             fn = None
-            log.warning(f"  [model{self.model_id}] ⚠️  не найдена ни calculate(), ни calculate_pure_memory()")
+            log.warning(f"  [model{self.model_id}]   не найдена ни calculate(), ни calculate_pure_memory()")
 
         # Определяем синхронная или асинхронная функция расчёта
         self._calc_is_async = inspect.iscoroutinefunction(fn) if fn else False
@@ -346,7 +346,7 @@ class ServiceRunner:
 
         if not has_data:
             log.warning(
-                f"  ⚠️  [model{self.model_id}] GLOBAL_RATES пуст — "
+                f"    [model{self.model_id}] GLOBAL_RATES пуст — "
                 f"все расчёты вернут пустой результат"
             )
 
@@ -458,7 +458,7 @@ class ServiceRunner:
         return result, None
 
 
-# ── Кеш SERVICE_RUNNERS: один экземпляр на model_id ──────────────────────────
+#  Кеш SERVICE_RUNNERS: один экземпляр на model_id 
 _SERVICE_RUNNERS: dict[int, ServiceRunner] = {}
 
 
@@ -478,9 +478,9 @@ async def get_service_runner(model_id: int) -> ServiceRunner:
     return _SERVICE_RUNNERS[model_id]
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 # Вспомогательные функции
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 
 def get_service_url_from_db(sync_engine, model_id: int) -> str:
     with sync_engine.connect() as conn:
@@ -501,7 +501,7 @@ def discover_param_combos(sync_engine, model_id: int) -> list[dict]:
         try:
             desc = conn.execute(sa_text(f"DESCRIBE `{table}`")).fetchall()
         except Exception:
-            log.warning(f"  ⚠️  Таблица {table} не найдена — одна комбинация {{}}")
+            log.warning(f"    Таблица {table} не найдена — одна комбинация {{}}")
             return [{}]
 
         available  = {row[0] for row in desc}
@@ -519,7 +519,7 @@ def discover_param_combos(sync_engine, model_id: int) -> list[dict]:
                 )
             ).fetchall()
         except Exception as e:
-            log.warning(f"  ⚠️  Ошибка чтения {table}: {e} → одна комбинация")
+            log.warning(f"    Ошибка чтения {table}: {e} → одна комбинация")
             return [{}]
 
     combos = [
@@ -557,9 +557,9 @@ def _compute_signal(values: dict, tier: int) -> int:
     return 1 if total > 0 else (-1 if total < 0 else 0)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 # ВЫЧИСЛЕНИЕ ОДНОЙ СВЕЧИ — замена HTTP на прямой вызов
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 
 async def _fetch_and_store_one(
     candle: dict,
@@ -620,7 +620,7 @@ async def _fetch_and_store_one(
     return "ok", date_str, None
 
 
-# ── Один проход по списку свечей ──────────────────────────────────────────────
+#  Один проход по списку свечей 
 
 FailedItem = dict  # {"candle": candle, "reason": str}
 
@@ -699,7 +699,7 @@ def _log_error_details(prefix: str, failed: list[FailedItem], pass_label: str) -
     if not failed:
         return
 
-    log.warning(f"{prefix} ── Детали ошибок [{pass_label}] ({'─' * 40})")
+    log.warning(f"{prefix}  Детали ошибок [{pass_label}] ({'' * 40})")
 
     # Группируем по первой строке reason (тип ошибки)
     by_type: dict[str, list[FailedItem]] = {}
@@ -722,7 +722,7 @@ def _log_error_details(prefix: str, failed: list[FailedItem], pass_label: str) -
                 if line.strip():
                     log.warning(f"{prefix}          {line}")
 
-    log.warning(f"{prefix} {'─' * 50}")
+    log.warning(f"{prefix} {'' * 50}")
 
 
 def _error_summary(failed: list[FailedItem]) -> list[tuple[str, int]]:
@@ -734,9 +734,9 @@ def _error_summary(failed: list[FailedItem]) -> list[tuple[str, int]]:
     return sorted(counts.items(), key=lambda x: -x[1])[:10]
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 # fill_cache — основной проход + collect-then-retry
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 
 async def fill_cache(
     engine_vlad,
@@ -784,23 +784,23 @@ async def fill_cache(
         return {"done": total, "total": total, "errors": 0,
                 "skipped": skipped, "new": 0, "error_summary": [], "failed_jobs": []}
 
-    # ── Основной проход ────────────────────────────────────────────────────────
+    #  Основной проход 
     ok, failed = await _run_pass(
         to_fetch, runner, pair, day, extra_params, p_hash,
-        sem, engine_vlad, deadline, prefix, pass_label="▶ Основной",
+        sem, engine_vlad, deadline, prefix, pass_label=" Основной",
     )
 
     if failed:
         _log_error_details(prefix, failed, "Основной проход")
 
-    # ── Retry-проходы по упавшим ───────────────────────────────────────────────
+    #  Retry-проходы по упавшим 
     for pass_num in range(1, RETRY_PASSES + 1):
         if not failed or deadline.exceeded():
             break
 
         delay = RETRY_PASS_DELAYS[min(pass_num - 1, len(RETRY_PASS_DELAYS) - 1)]
         log.info(
-            f"{prefix} 🔄 Retry-проход {pass_num}/{RETRY_PASSES}: "
+            f"{prefix}  Retry-проход {pass_num}/{RETRY_PASSES}: "
             f"{len(failed)} дат, пауза {delay}s..."
         )
         await asyncio.sleep(delay)
@@ -809,7 +809,7 @@ async def fill_cache(
         ok_retry, failed = await _run_pass(
             retry_candles, runner, pair, day, extra_params, p_hash,
             sem, engine_vlad, deadline, prefix,
-            pass_label=f"♻ Retry {pass_num}/{RETRY_PASSES}",
+            pass_label=f" Retry {pass_num}/{RETRY_PASSES}",
         )
         ok += ok_retry
 
@@ -820,7 +820,7 @@ async def fill_cache(
                 f"восстановлено={ok_retry}  осталось={len(failed)}"
             )
         else:
-            log.info(f"{prefix} ✅ Retry {pass_num}: все ошибки устранены")
+            log.info(f"{prefix}  Retry {pass_num}: все ошибки устранены")
 
     errors  = len(failed)
     new_cnt = ok
@@ -829,12 +829,12 @@ async def fill_cache(
 
     if errors == 0:
         log.info(
-            f"{prefix} ✅ Готово: total={total}  new={new_cnt}  "
+            f"{prefix}  Готово: total={total}  new={new_cnt}  "
             f"skip={skipped}  err=0"
         )
     else:
         log.warning(
-            f"{prefix} ⚠️  Готово с ошибками: total={total}  new={new_cnt}  "
+            f"{prefix}   Готово с ошибками: total={total}  new={new_cnt}  "
             f"skip={skipped}  err={errors}"
         )
         # Остаточные ошибки — финальный детальный лог
@@ -851,9 +851,9 @@ async def fill_cache(
     }
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 # fetch_candles
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 
 async def fetch_candles(
     engine_brain, pair: int, day: int,
@@ -874,9 +874,9 @@ async def fetch_candles(
         ]
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 # run_slot_cache
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 
 async def run_slot_cache(
     pair: int, day: int,
@@ -894,10 +894,10 @@ async def run_slot_cache(
     timed_out = False
 
     if not candles:
-        log.warning(f"{label} ⚠️  Нет свечей — пропускаем слот")
+        log.warning(f"{label}   Нет свечей — пропускаем слот")
         return {"pair": pair, "day": day, "slot": slot, "cache": stats, "timed_out": False}
 
-    log.info(f"{label} ▶  Кеш: {len(candles)} свечей, {len(param_combos)} комбинаций")
+    log.info(f"{label}   Кеш: {len(candles)} свечей, {len(param_combos)} комбинаций")
 
     if not args.skip_fill:
         for idx, combo in enumerate(param_combos, 1):
@@ -906,7 +906,7 @@ async def run_slot_cache(
                 break
 
             combo_str = json.dumps(combo) if combo else "{}"
-            log.info(f"{label} 📥 Кеш [{idx}/{len(param_combos)}] params={combo_str}")
+            log.info(f"{label}  Кеш [{idx}/{len(param_combos)}] params={combo_str}")
 
             r = await fill_cache(
                 engine_vlad, candles, runner, pair, day,
@@ -922,7 +922,7 @@ async def run_slot_cache(
                     for reason, cnt in r.get("error_summary", [])
                 )
                 send_trace(
-                    f"⚠️  Ошибки кеша — {slot} params={combo_str}",
+                    f"  Ошибки кеша — {slot} params={combo_str}",
                     f"model={runner.model_id}  pair={PAIR_NAMES.get(pair)}  "
                     f"day={DAY_NAMES.get(day)}\nparams={combo_str}\n\n"
                     f"Ошибок после всех retry: {r['errors']} из {r['total']}\n\n"
@@ -934,20 +934,20 @@ async def run_slot_cache(
 
         if not timed_out:
             log.info(
-                f"{label} ✅ Кеш завершён: "
+                f"{label}  Кеш завершён: "
                 f"new={stats['new']}  skip={stats['skipped']}  err={stats['errors']}"
             )
         else:
             log.warning(f"{label} ⏰ Кеш прерван по таймауту")
     else:
-        log.info(f"{label} ⏭️  Кеш пропущен (--skip-fill)")
+        log.info(f"{label} ⏭  Кеш пропущен (--skip-fill)")
 
     return {"pair": pair, "day": day, "slot": slot, "cache": stats, "timed_out": timed_out}
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 # run_slot_backtest
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 
 async def run_backtest(
     engine_vlad, candles: list[dict],
@@ -1073,7 +1073,7 @@ async def run_backtest(
                 "tc": trade_count, "wc": win_count, "acc": result["accuracy"],
             })
     except Exception as e:
-        log.warning(f"{prefix} ⚠️  Не удалось сохранить бэктест: {e}")
+        log.warning(f"{prefix}   Не удалось сохранить бэктест: {e}")
 
     return result
 
@@ -1153,7 +1153,7 @@ async def run_slot_backtest(
             timed_out = True
             break
 
-        log.info(f"{label} 🧪 Бэктест tier={tier} ({len(param_combos)} комбинаций)")
+        log.info(f"{label}  Бэктест tier={tier} ({len(param_combos)} комбинаций)")
         results = []
 
         for idx, combo in enumerate(param_combos, 1):
@@ -1176,14 +1176,14 @@ async def run_slot_backtest(
             elif "error" in r:
                 stats["failed"] += 1
                 log.info(
-                    f"{label} [{idx}/{len(param_combos)}] tier={tier} ✗ "
+                    f"{label} [{idx}/{len(param_combos)}] tier={tier}  "
                     f"{r['error']} (trades={r.get('trade_count', 0)})"
                 )
             else:
                 stats["done"] += 1
                 results.append(r)
                 log.info(
-                    f"{label} [{idx}/{len(param_combos)}] tier={tier} ✓ "
+                    f"{label} [{idx}/{len(param_combos)}] tier={tier}  "
                     f"score={r['value_score']:>10.2f}  acc={r['accuracy']:.3f}  "
                     f"trades={r['trade_count']}  params={combo_str}"
                 )
@@ -1191,13 +1191,13 @@ async def run_slot_backtest(
         await upsert_summary(engine_vlad, runner, pair, day, tier, date_from, date_to)
 
         log.info(
-            f"{label} 📊 tier={tier}: done={len(results)}  "
+            f"{label}  tier={tier}: done={len(results)}  "
             f"skip={stats['skipped']}  fail={stats['failed']}"
         )
         if results:
             best = max(results, key=lambda x: x["value_score"])
             log.info(
-                f"{label} 🏆 tier={tier} лучший: "
+                f"{label}  tier={tier} лучший: "
                 f"score={best['value_score']}  acc={best['accuracy']}  "
                 f"trades={best['trade_count']}  params={best['params']}"
             )
@@ -1205,9 +1205,9 @@ async def run_slot_backtest(
     return {"slot": slot, "backtest": stats, "timed_out": timed_out}
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 # run_model
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 
 async def run_model(
     model_id: int, param_combos: list[dict],
@@ -1223,14 +1223,14 @@ async def run_model(
 
     log.info(
         f"\n{'#'*60}\n"
-        f"  🤖 model_id={model_id}  local={runner.folder}\n"
+        f"   model_id={model_id}  local={runner.folder}\n"
         f"  Слотов: {n_slots}  Комбинаций: {len(param_combos)}\n"
         f"  SLOT_CONCURRENCY={SLOT_CONCURRENCY}  SLOT_BATCH_SIZE={SLOT_BATCH_SIZE}\n"
         f"  Retry: passes={RETRY_PASSES}  delays={RETRY_PASS_DELAYS}s\n"
         f"{'#'*60}"
     )
 
-    log.info("  📊 Загружаем свечи для всех слотов параллельно...")
+    log.info("   Загружаем свечи для всех слотов параллельно...")
     candles_list = await asyncio.gather(*[
         fetch_candles(engine_brain, p, d, date_from, date_to)
         for p, d in slots
@@ -1240,7 +1240,7 @@ async def run_model(
         log.info(f"  [{_slot_label(p, d)}] свечей: {len(cc)}")
 
     # Фаза 1: кеш (параллельно по слотам)
-    log.info(f"\n  🚀 Запускаем {n_slots} слотов параллельно...")
+    log.info(f"\n   Запускаем {n_slots} слотов параллельно...")
     slot_cache_results = await asyncio.gather(*[
         run_slot_cache(
             pair=p, day=d, candles=candles_map[(p, d)],
@@ -1257,7 +1257,7 @@ async def run_model(
 
     for res in slot_cache_results:
         if isinstance(res, Exception):
-            log.error(f"  ❌ Исключение в слоте кеша: {res!r}")
+            log.error(f"   Исключение в слоте кеша: {res!r}")
             send_error_trace(res, f"run_slot_cache model={model_id}")
             continue
         sl = res["slot"]
@@ -1275,7 +1275,7 @@ async def run_model(
     # Фаза 2: бэктест
     sb = {"done": 0, "skipped": 0, "failed": 0}
     if not args.only_fill and not timed_out and not deadline.exceeded():
-        log.info("\n  🧪 Запуск бэктеста (параллельно по слотам)...")
+        log.info("\n   Запуск бэктеста (параллельно по слотам)...")
         slot_back_results = await asyncio.gather(*[
             run_slot_backtest(
                 pair=p, day=d, candles=candles_map[(p, d)],
@@ -1289,7 +1289,7 @@ async def run_model(
 
         for res in slot_back_results:
             if isinstance(res, Exception):
-                log.error(f"  ❌ Исключение в бэктесте: {res!r}")
+                log.error(f"   Исключение в бэктесте: {res!r}")
                 send_error_trace(res, f"run_slot_backtest model={model_id}")
                 continue
             b = res["backtest"]
@@ -1302,9 +1302,9 @@ async def run_model(
     return sc, sb, timed_out
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 # run / main
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 
 async def run(args) -> None:
     deadline = Deadline(hours=args.timeout_hours)
@@ -1339,7 +1339,7 @@ async def run(args) -> None:
                       f"@{super_host}:{super_port}/{super_name}")
 
     log.info("=" * 60)
-    log.info(f"🚀 models={MODEL_IDS}  SLOT_CONCURRENCY={SLOT_CONCURRENCY}")
+    log.info(f" models={MODEL_IDS}  SLOT_CONCURRENCY={SLOT_CONCURRENCY}")
     log.info(f"   vlad  DB : {vlad_user}@{vlad_host}:{vlad_port}/{vlad_database}")
     log.info(f"   brain DB : {brain_user}@{brain_host}:{brain_port}/{brain_name}")
     log.info("=" * 60)
@@ -1355,16 +1355,16 @@ async def run(args) -> None:
                 param_combos = discover_param_combos(sync_engine, model_id)
                 model_configs.append((model_id, param_combos))
             except Exception as e:
-                log.error(f"❌ Модель {model_id}: {e}")
+                log.error(f" Модель {model_id}: {e}")
                 send_error_trace(e, f"discover_params model={model_id}")
         sync_engine.dispose()
     except Exception as e:
-        log.critical(f"❌ super DB: {e}")
+        log.critical(f" super DB: {e}")
         send_error_trace(e, "sync_engine_connect")
         sys.exit(1)
 
     if not model_configs:
-        log.critical("❌ Ни одна модель не загружена.")
+        log.critical(" Ни одна модель не загружена.")
         sys.exit(1)
 
     n_slots   = len(args.pairs) * len(args.days)
@@ -1379,9 +1379,9 @@ async def run(args) -> None:
         async with engine_vlad.begin() as conn:
             for ddl in (DDL_CACHE, DDL_BACKTEST, DDL_SUMMARY):
                 await conn.execute(text(ddl))
-        log.info("✅ Таблицы проверены/созданы")
+        log.info(" Таблицы проверены/созданы")
     except Exception as e:
-        log.critical(f"❌ Ошибка DDL: {e}")
+        log.critical(f" Ошибка DDL: {e}")
         send_error_trace(e, "ensure_tables")
         sys.exit(1)
 
@@ -1433,9 +1433,9 @@ async def run(args) -> None:
                 send_trace(f"⏰ Таймаут — model={model_id}", msg)
                 break
             else:
-                msg = f"✅ Модель {model_id}.\nПрошло: {elapsed}\n\n{body_stats}"
+                msg = f" Модель {model_id}.\nПрошло: {elapsed}\n\n{body_stats}"
                 log.info(f"\n{'='*55}\n{msg}\n{'='*55}")
-                send_trace(f"✅ Готово — model={model_id}", msg)
+                send_trace(f" Готово — model={model_id}", msg)
 
         elapsed   = deadline.elapsed_str()
         completed = [m[0] for m in model_configs]
@@ -1446,12 +1446,12 @@ async def run(args) -> None:
             log.warning(f"\n{final}")
             send_trace(f"⏰ Таймаут — models={MODEL_IDS}", final)
         else:
-            final = f"✅ Все модели завершены.\nПрошло: {elapsed}\nМодели: {completed}"
+            final = f" Все модели завершены.\nПрошло: {elapsed}\nМодели: {completed}"
             log.info(f"\n{'='*55}\n{final}\n{'='*55}")
-            send_trace(f"✅ Готово — {MODEL_IDS}", final)
+            send_trace(f" Готово — {MODEL_IDS}", final)
 
     except Exception as e:
-        log.critical(f"❌ Критическая ошибка: {e!r}")
+        log.critical(f" Критическая ошибка: {e!r}")
         send_error_trace(e, "main_loop")
         raise
     finally:
@@ -1491,7 +1491,7 @@ def parse_args():
 
     args, unknown = parser.parse_known_args()
     if unknown:
-        log.warning(f"⚠️  Игнорируем неизвестные аргументы: {unknown}")
+        log.warning(f"  Игнорируем неизвестные аргументы: {unknown}")
     return args
 
 
@@ -1501,7 +1501,7 @@ def main():
     slots   = [_slot_label(p, d) for p in args.pairs for d in args.days]
 
     log.info("=" * 60)
-    log.info("⚙️  Параметры запуска")
+    log.info("  Параметры запуска")
     log.info(f"   models            : {MODEL_IDS}")
     log.info(f"   date_from         : {args.date_from or '2025-01-15 (default)'}")
     log.info(f"   date_to           : {args.date_to   or 'today (default)'}")
@@ -1521,10 +1521,10 @@ def main():
     try:
         asyncio.run(run(args))
     except KeyboardInterrupt:
-        log.info("🛑 Прервано пользователем (Ctrl+C)")
+        log.info(" Прервано пользователем (Ctrl+C)")
         sys.exit(0)
     except Exception as e:
-        log.critical(f"❌ Завершено с ошибкой: {e!r}")
+        log.critical(f" Завершено с ошибкой: {e!r}")
         send_error_trace(e, "main")
         sys.exit(1)
 

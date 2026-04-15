@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 import os
 import sys
@@ -37,14 +37,14 @@ parser.add_argument("database", nargs="?", default=os.getenv("DB_NAME"))
 args = parser.parse_args()
 
 if not all([args.host, args.user, args.password, args.database]):
-    print("❌ Ошибка: не указаны параметры подключения к БД")
+    print(" Ошибка: не указаны параметры подключения к БД")
     sys.exit(1)
 
 BEA_API_KEY = os.getenv("BEA_API_KEY")
 BASE_API_URL = "https://apps.bea.gov/api/data"
 DB_CONNECTION_STR = f"mysql+mysqlconnector://{args.user}:{args.password}@{args.host}:{args.port}/{args.database}"
 
-# ✅ ИСПРАВЛЕННЫЕ конфигурации
+#  ИСПРАВЛЕННЫЕ конфигурации
 DATASETS = {
     "vlad_macro_usa_pce_inflation": {
         "Dataset": "NIPA",
@@ -59,8 +59,8 @@ DATASETS = {
         "Description": "US Real Gross Domestic Product (GDP)"
     },
     "vlad_macro_usa_trade_balance": {
-        "Dataset": "NIPA",  # ✅ Используем NIPA, а не ITA
-        "Params": {"TableName": "T10101", "Frequency": "Q", "Year": "ALL"},  # ✅ Правильная таблица GDP с Net Exports
+        "Dataset": "NIPA",  #  Используем NIPA, а не ITA
+        "Params": {"TableName": "T10101", "Frequency": "Q", "Year": "ALL"},  #  Правильная таблица GDP с Net Exports
         "FilterFunc": lambda df: df[df['LineDescription'].str.contains("Net exports", case=False, na=False)],
         "Description": "US Net Exports of Goods and Services (из T10101)"
     }
@@ -68,7 +68,7 @@ DATASETS = {
 
 
 def fetch_bea_data(config):
-    print(f"🚀 Скачивание данных из BEA API...")
+    print(f" Скачивание данных из BEA API...")
     params = {
         "UserID": BEA_API_KEY,
         "method": "GetData",
@@ -77,36 +77,36 @@ def fetch_bea_data(config):
     }
     params.update(config["Params"])
 
-    # 🔍 DEBUG: показываем точные параметры
-    print(f"📋 Параметры запроса: {params}")
+    #  DEBUG: показываем точные параметры
+    print(f" Параметры запроса: {params}")
 
     try:
         response = requests.get(BASE_API_URL, params=params, timeout=30)
-        print(f"📡 HTTP статус: {response.status_code}")
+        print(f" HTTP статус: {response.status_code}")
 
         if response.status_code != 200:
-            print(f"⚠️ HTTP Error: {response.status_code}")
-            print(f"🔍 Ответ: {response.text[:500]}")
+            print(f" HTTP Error: {response.status_code}")
+            print(f" Ответ: {response.text[:500]}")
             return None
 
         data = response.json()
         if "Error" in data.get("BEAAPI", {}):
             err = data['BEAAPI']['Error']
             error_msg = err.get('APIErrorDescription', str(err))
-            print(f"⚠️ Ошибка API BEA: {error_msg}")
+            print(f" Ошибка API BEA: {error_msg}")
             return None
 
         results = data.get('BEAAPI', {}).get('Results', {})
         if 'Data' in results:
             raw_data = results['Data']
-            print(f"✓ Получено строк: {len(raw_data)}")
+            print(f" Получено строк: {len(raw_data)}")
             return raw_data
         else:
-            print("⚠️ Данные пусты")
-            print(f"🔍 Results: {results}")
+            print(" Данные пусты")
+            print(f" Results: {results}")
             return None
     except Exception as e:
-        print(f"❌ Ошибка соединения: {e}")
+        print(f" Ошибка соединения: {e}")
         return None
 
 
@@ -116,26 +116,26 @@ def prepare_dataframe(df, config):
 
     df = df.copy()
 
-    # ✅ Применяем фильтр
+    #  Применяем фильтр
     if "LineFilter" in config:
         df = df[df['LineNumber'] == config["LineFilter"]]
-        print(f"🔍 После LineFilter: {len(df)} строк")
+        print(f" После LineFilter: {len(df)} строк")
     elif "FilterFunc" in config:
         before = len(df)
         df = config["FilterFunc"](df)
-        print(f"🔍 После текстового фильтра: {len(df)} строк (было {before})")
+        print(f" После текстового фильтра: {len(df)} строк (было {before})")
 
     if df.empty:
-        print("⚠️ Нет данных после фильтрации")
+        print(" Нет данных после фильтрации")
         return df
 
-    # ✅ Очистка значений
+    #  Очистка значений
     if 'DataValue' in df.columns:
         df['value_clean'] = (df['DataValue'].astype(str)
                              .str.replace(',', '')
                              .str.replace('$', '')
                              .apply(pd.to_numeric, errors='coerce'))
-        print(f"📊 Диапазон value_clean: {df['value_clean'].min():.0f} .. {df['value_clean'].max():.0f}")
+        print(f" Диапазон value_clean: {df['value_clean'].min():.0f} .. {df['value_clean'].max():.0f}")
 
     def parse_date(row):
         tp = str(row.get('TimePeriod', ''))
@@ -152,15 +152,15 @@ def prepare_dataframe(df, config):
 
     if 'TimePeriod' in df.columns:
         df['date_iso'] = df.apply(parse_date, axis=1)
-        print(f"📅 Диапазон дат: {df['date_iso'].min()} .. {df['date_iso'].max()}")
+        print(f" Диапазон дат: {df['date_iso'].min()} .. {df['date_iso'].max()}")
 
-    # ✅ Сохраняем нужные колонки
+    #  Сохраняем нужные колонки
     cols_to_keep = ['date_iso', 'value_clean', 'LineDescription', 'SeriesCode', 'TimePeriod']
     df_final = df[[c for c in cols_to_keep if c in df.columns]].copy()
     df_final = df_final.dropna(subset=['date_iso', 'value_clean'])
     df_final['loaded_at'] = datetime.now()
 
-    print(f"✅ Финальный DataFrame: {len(df_final)} строк")
+    print(f" Финальный DataFrame: {len(df_final)} строк")
     return df_final
 
 
@@ -178,17 +178,17 @@ def get_latest_date_from_db(table_name, engine):
 
 
 def process_and_load_incremental(table_name, config):
-    print(f"\n📊 Обработка ТОЛЬКО таблицы: {table_name}")
+    print(f"\n Обработка ТОЛЬКО таблицы: {table_name}")
     raw_data = fetch_bea_data(config)
     if not raw_data:
-        print("⚠️ Не удалось получить данные")
+        print(" Не удалось получить данные")
         return
 
     df = pd.DataFrame(raw_data)
 
-    # 🔥 СПЕЦИАЛЬНАЯ ЛОГИКА для trade_balance
+    #  СПЕЦИАЛЬНАЯ ЛОГИКА для trade_balance
     if table_name == "vlad_macro_usa_trade_balance":
-        print("🔄 Вычисляем Net Exports = Exports - Imports...")
+        print(" Вычисляем Net Exports = Exports - Imports...")
 
         def parse_date(tp):
             tp = str(tp)
@@ -204,10 +204,10 @@ def process_and_load_incremental(table_name, config):
         exports = df[df['LineDescription'].str.contains('exports', case=False, na=False)].copy()
         imports_ = df[df['LineDescription'].str.contains('imports', case=False, na=False)].copy()
 
-        print(f"📊 Exports строк: {len(exports)}, Imports строк: {len(imports_)}")
+        print(f" Exports строк: {len(exports)}, Imports строк: {len(imports_)}")
 
         if exports.empty or imports_.empty:
-            print("⚠️ Не найдены exports/imports")
+            print(" Не найдены exports/imports")
             return
 
         # Парсим DataValue
@@ -236,16 +236,16 @@ def process_and_load_incremental(table_name, config):
         df_new = merged[['date_iso', 'value_clean', 'LineDescription', 'SeriesCode', 'TimePeriod']].copy()
         df_new = df_new.dropna(subset=['date_iso', 'value_clean'])
 
-        print(f"✅ Trade Balance: {len(df_new)} кварталов")
-        print(f"📊 Диапазон: {df_new['date_iso'].min()} .. {df_new['date_iso'].max()}")
-        print(f"💰 Мин/Макс: {df_new['value_clean'].min():.0f} .. {df_new['value_clean'].max():.0f}")
+        print(f" Trade Balance: {len(df_new)} кварталов")
+        print(f" Диапазон: {df_new['date_iso'].min()} .. {df_new['date_iso'].max()}")
+        print(f" Мин/Макс: {df_new['value_clean'].min():.0f} .. {df_new['value_clean'].max():.0f}")
 
     else:
         # Обычная логика для PCE/GDP
         df_new = prepare_dataframe(df, config)
 
     if df_new.empty:
-        print("⚠️ Нет данных после обработки")
+        print(" Нет данных после обработки")
         return
 
     # Загрузка в БД (без изменений)
@@ -253,15 +253,15 @@ def process_and_load_incremental(table_name, config):
     latest_date_in_db = get_latest_date_from_db(table_name, engine)
 
     if latest_date_in_db:
-        print(f"📅 Последняя дата в БД: {latest_date_in_db}")
+        print(f" Последняя дата в БД: {latest_date_in_db}")
         df_to_load = df_new[df_new['date_iso'] > latest_date_in_db].copy()
         if df_to_load.empty:
-            print("✅ Новых данных нет")
+            print(" Новых данных нет")
             engine.dispose()
             return
-        print(f"🔄 Найдено {len(df_to_load)} новых строк")
+        print(f" Найдено {len(df_to_load)} новых строк")
     else:
-        print("📝 Таблица не существует — создаём новую")
+        print(" Таблица не существует — создаём новую")
         df_to_load = df_new
 
     try:
@@ -275,9 +275,9 @@ def process_and_load_incremental(table_name, config):
             safe_comment = config.get('Description', '').replace("'", "''")
             conn.execute(text(f"ALTER TABLE `{table_name}` COMMENT = '{safe_comment}'"))
             conn.commit()
-        print(f"✅ Загружено {len(df_to_load)} строк в '{table_name}'")
+        print(f" Загружено {len(df_to_load)} строк в '{table_name}'")
     except Exception as e:
-        print(f"❌ Ошибка записи: {e}")
+        print(f" Ошибка записи: {e}")
         traceback.print_exc()
     finally:
         engine.dispose()
@@ -285,25 +285,25 @@ def process_and_load_incremental(table_name, config):
 
 def main():
     if args.table_name not in DATASETS:
-        print(f"❌ Ошибка: неизвестная таблица '{args.table_name}'. Допустимые:")
+        print(f" Ошибка: неизвестная таблица '{args.table_name}'. Допустимые:")
         for name in DATASETS.keys():
             print(f"  - {name}")
         sys.exit(1)
 
     if not BEA_API_KEY:
-        print("❌ Ошибка: не указан BEA_API_KEY в .env")
+        print(" Ошибка: не указан BEA_API_KEY в .env")
         sys.exit(1)
 
-    print(f"🚀 BEA COLLECTOR (ТОЛЬКО: {args.table_name})")
+    print(f" BEA COLLECTOR (ТОЛЬКО: {args.table_name})")
     print(f"База: {args.host}:{args.port}/{args.database}")
-    print(f"🎯 ЦЕЛЕВАЯ ТАБЛИЦА: {args.table_name}")
+    print(f" ЦЕЛЕВАЯ ТАБЛИЦА: {args.table_name}")
     print("=" * 60)
 
     config = DATASETS[args.table_name]
     process_and_load_incremental(args.table_name, config)
 
     print("=" * 60)
-    print("🏁 ЗАГРУЗКА ЗАВЕРШЕНА (только одна таблица обработана)")
+    print(" ЗАГРУЗКА ЗАВЕРШЕНА (только одна таблица обработана)")
 
 
 if __name__ == "__main__":
@@ -312,9 +312,9 @@ if __name__ == "__main__":
     except SystemExit:
         raise
     except KeyboardInterrupt:
-        print("\n🛑 Прервано пользователем")
+        print("\n Прервано пользователем")
         sys.exit(1)
     except Exception as e:
-        print(f"\n❌ Критическая ошибка: {e!r}")
+        print(f"\n Критическая ошибка: {e!r}")
         send_error_trace(e)
         sys.exit(1)

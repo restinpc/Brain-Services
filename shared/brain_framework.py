@@ -40,9 +40,9 @@ from common import (
 from cache_helper import ensure_cache_table, load_service_url, cached_values
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── NUMPY-УТИЛИТЫ ─────────────────────────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
+# 
+#  NUMPY-УТИЛИТЫ 
+# 
 
 def _dt_to_ts(dt: datetime) -> int:
     return int(dt.timestamp())
@@ -66,9 +66,9 @@ def _build_np_rates_for_table(rates, candle_ranges, extremums):
     }
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── ВЫЧИСЛИТЕЛЬНЫЕ УТИЛИТЫ (Python-fallback) ──────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
+# 
+#  ВЫЧИСЛИТЕЛЬНЫЕ УТИЛИТЫ (Python-fallback) 
+# 
 
 def _compute_t1(t_dates, ram_rates, candle_ranges, avg_range):
     return sum(ram_rates.get(d, 0.0) for d in t_dates)
@@ -81,9 +81,9 @@ def _compute_extremum(t_dates, ext_set, candle_ranges, avg_range, modification, 
     return val if val != 0 else None
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── ПУБЛИЧНЫЕ ХЕЛПЕРЫ ДЛЯ rebuild_index() ─────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
+# 
+#  ПУБЛИЧНЫЕ ХЕЛПЕРЫ ДЛЯ rebuild_index() 
+# 
 
 async def ensure_ctx_table(engine, table: str, extra_columns: str = "") -> None:
     async with engine.begin() as conn:
@@ -209,9 +209,9 @@ async def insert_events(engine, table, events: list[dict]) -> int:
     return added
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── ModelContext ───────────────────────────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
+# 
+#  ModelContext 
+# 
 
 class _ModelContext:
     def __init__(self, table, pair_id, day_flag, target_date, state):
@@ -349,9 +349,9 @@ class _ModelContext:
                                  self.avg_range, self.modification, total_hist)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── STATE ──────────────────────────────────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
+# 
+#  STATE 
+# 
 
 class _State:
     # Критичные переменные — читаются из ENV, переопределяются model.py
@@ -460,9 +460,9 @@ class _State:
         return self._cache_table
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── КОНСТАНТЫ ──────────────────────────────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
+# 
+#  КОНСТАНТЫ 
+# 
 
 _RATES_TABLES = [
     "brain_rates_eur_usd", "brain_rates_eur_usd_day",
@@ -481,9 +481,9 @@ _PAIR_CFG = {
 }
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ───────────────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
+# 
+#  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ 
+# 
 
 def _parse_date(s: str) -> datetime | None:
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f",
@@ -529,9 +529,9 @@ def _filter_dataset_lte(date: datetime, s: _State) -> list[dict]:
             if e.get("date") is not None and e["date"] <= date]
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── NUMPY: BUILD / REBUILD / APPEND ───────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
+# 
+#  NUMPY: BUILD / REBUILD / APPEND 
+# 
 
 def _rebuild_np_rates(s: _State) -> None:
     s.np_built = False
@@ -568,9 +568,9 @@ def _append_np_rates_row(table, dt, t1, rng, s: _State) -> None:
     np_r["ext_max"]  = np.append(np_r["ext_max"],  False)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── ЗАГРУЗКА ДАННЫХ ───────────────────────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
+# 
+#  ЗАГРУЗКА ДАННЫХ 
+# 
 
 async def _load_rates(s: _State):
     for table in _RATES_TABLES:
@@ -614,13 +614,13 @@ async def _load_rates(s: _State):
                     s.extremums[table][typ] = {r["date"] for r in res_ext.mappings().all()}
             log(f"  {table}: {len(s.rates[table])} candles", s.NODE_NAME)
         except Exception as e:
-            log(f"  ❌ {table}: {e}", s.NODE_NAME, level="error")
+            log(f"   {table}: {e}", s.NODE_NAME, level="error")
     try:
         _rebuild_np_rates(s)
-        log(f"  ✅ NP_RATES built: {sum(1 for v in s.np_rates.values() if v)} tables",
+        log(f"   NP_RATES built: {sum(1 for v in s.np_rates.values() if v)} tables",
             s.NODE_NAME)
     except Exception as e:
-        log(f"  ❌ NP_RATES build failed: {e}", s.NODE_NAME, level="error")
+        log(f"   NP_RATES build failed: {e}", s.NODE_NAME, level="error")
 
 
 async def _refresh_rates(table: str, s: _State):
@@ -657,12 +657,12 @@ async def _refresh_rates(table: str, s: _State):
                     _append_np_rates_row(table, dt, t1, rng, s)
                 n += 1
             if n > 0:
-                log(f"  📥 +{n} candle(s) {table}", s.NODE_NAME)
+                log(f"   +{n} candle(s) {table}", s.NODE_NAME)
     except Exception as e:
-        log(f"  ⚠️ refresh {table}: {e}", s.NODE_NAME, level="warning")
+        log(f"   refresh {table}: {e}", s.NODE_NAME, level="warning")
 
 
-# ── IS_SIMPLE: загрузка одной таблицы котировок ───────────────────────────────
+#  IS_SIMPLE: загрузка одной таблицы котировок 
 def _build_np_simple_rates(s: _State) -> None:
     """Строит numpy-массивы для simple_rates — аналог np_rates для IS_SIMPLE."""
     if not s.simple_rates:
@@ -718,7 +718,7 @@ async def _load_simple_rates(s: _State) -> None:
         _build_np_simple_rates(s)
         log(f"  simple_rates: {len(s.simple_rates)} candles from {table}", s.NODE_NAME)
     except Exception as e:
-        log(f"  ❌ simple_rates: {e}", s.NODE_NAME, level="error")
+        log(f"   simple_rates: {e}", s.NODE_NAME, level="error")
         s.simple_rates, s.simple_rates_dates = [], []
         s.np_simple_rates = None
 
@@ -745,9 +745,9 @@ async def _refresh_simple_rates(s: _State) -> None:
         if new_rows:
             s.last_simple_rate_dt = s.simple_rates_dates[-1]
             _build_np_simple_rates(s)
-            log(f"  📥 +{len(new_rows)} candle(s) {table}", s.NODE_NAME)
+            log(f"   +{len(new_rows)} candle(s) {table}", s.NODE_NAME)
     except Exception as e:
-        log(f"  ⚠️ refresh simple_rates: {e}", s.NODE_NAME, level="warning")
+        log(f"   refresh simple_rates: {e}", s.NODE_NAME, level="warning")
 
 
 def _simple_rates_lte(date: datetime, s: _State) -> list:
@@ -768,7 +768,7 @@ async def _load_weight_codes(s: _State):
         log(f"  weight_codes: {len(s.weight_codes)}", s.NODE_NAME)
     except Exception as e:
         s.weight_codes = []
-        log(f"  ❌ weight_codes: {e}", s.NODE_NAME, level="error")
+        log(f"   weight_codes: {e}", s.NODE_NAME, level="error")
 
 
 async def _load_ctx_index(s: _State):
@@ -787,7 +787,7 @@ async def _load_ctx_index(s: _State):
         log(f"  ctx_index: {s.ctx_row_count}", s.NODE_NAME)
     except Exception as e:
         s.ctx_index = {}
-        log(f"  ❌ ctx_index: {e}", s.NODE_NAME, level="error")
+        log(f"   ctx_index: {e}", s.NODE_NAME, level="error")
 
 
 async def _load_ctx_index_incremental(s: _State) -> list:
@@ -805,9 +805,9 @@ async def _load_ctx_index_incremental(s: _State) -> list:
                 s.ctx_index[key] = dict(r)
             s.ctx_row_count = len(s.ctx_index)
         if new_keys:
-            log(f"  🆕 ctx_index: +{len(new_keys)} ключей", s.NODE_NAME, force=True)
+            log(f"   ctx_index: +{len(new_keys)} ключей", s.NODE_NAME, force=True)
     except Exception as e:
-        log(f"  ❌ ctx_index incremental: {e}", s.NODE_NAME, level="error")
+        log(f"   ctx_index incremental: {e}", s.NODE_NAME, level="error")
     return new_keys
 
 
@@ -834,7 +834,7 @@ async def _load_dataset(s: _State):
         log(f"  dataset: {len(s.dataset)} rows", s.NODE_NAME)
     except Exception as e:
         s.dataset = []
-        log(f"  ❌ dataset: {e}", s.NODE_NAME, level="error")
+        log(f"   dataset: {e}", s.NODE_NAME, level="error")
 
 
 def _build_dataset_index(s: _State) -> None:
@@ -902,7 +902,7 @@ async def _load_events_append(since_dt: datetime | None, s: _State):
                     skipped += 1
             log(f"  events(custom): +{loaded} skip={skipped}", s.NODE_NAME)
         except Exception as e:
-            log(f"  ❌ load_events: {e}", s.NODE_NAME, level="error")
+            log(f"   load_events: {e}", s.NODE_NAME, level="error")
         return
 
     if s.EVENTS_TABLE and since_dt is not None:
@@ -938,7 +938,7 @@ async def _load_events_append(since_dt: datetime | None, s: _State):
         sfx = f" since={since_dt}" if since_dt else ""
         log(f"  events{sfx}: +{loaded} dup={dup} skip={skipped}", s.NODE_NAME)
     except Exception as e:
-        log(f"  ❌ events: {e}", s.NODE_NAME, level="error")
+        log(f"   events: {e}", s.NODE_NAME, level="error")
 
 
 async def _load_events_full(s: _State):
@@ -965,13 +965,13 @@ async def _check_data_changed(s: _State) -> tuple[bool, bool]:
                 if cnt != s.weights_row_count:
                     wgt_ch = True
     except Exception as e:
-        log(f"  ⚠️ check_changed: {e}", s.NODE_NAME, level="warning")
+        log(f"   check_changed: {e}", s.NODE_NAME, level="warning")
     return ctx_ch, wgt_ch
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── DDL BACKTEST ───────────────────────────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
+# 
+#  DDL BACKTEST 
+# 
 
 _DDL_BT_RESULTS = """
 CREATE TABLE IF NOT EXISTS vlad_backtest_results (
@@ -1013,9 +1013,9 @@ CREATE TABLE IF NOT EXISTS vlad_backtest_summary (
 """
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── _universal_rebuild ────────────────────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
+# 
+#  _universal_rebuild 
+# 
 
 async def _universal_rebuild(s: _State) -> dict:
     if not s.CTX_TABLE or not s.WEIGHTS_TABLE:
@@ -1176,9 +1176,9 @@ async def _universal_rebuild(s: _State) -> dict:
     }
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── __detail__ УТИЛИТЫ ────────────────────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
+# 
+#  __detail__ УТИЛИТЫ 
+# 
 
 _DETAIL_KEY = "__detail__"
 
@@ -1208,9 +1208,9 @@ def _make_detail_serializable(detail) -> any:
     return str(detail)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── УНИВЕРСАЛЬНЫЙ ПОСТРОИТЕЛЬ НАРРАТИВА ───────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
+# 
+#  УНИВЕРСАЛЬНЫЙ ПОСТРОИТЕЛЬ НАРРАТИВА 
+# 
 
 def _pluralize_n(n: int, forms: tuple[str, str, str]) -> str:
     abs_n = abs(n)
@@ -1345,9 +1345,9 @@ def build_detail_narrative(
     return lines
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── build_app ──────────────────────────────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
+# 
+#  build_app 
+# 
 
 def _discover_builders(model_module):
     import importlib.util as _ilu
@@ -1367,11 +1367,11 @@ def _discover_builders(model_module):
             spec.loader.exec_module(module)
             fn = getattr(module, fn_name, None)
             if fn is None:
-                log(f"  ⚠️ {filename} найден, но {fn_name}() отсутствует",
+                log(f"   {filename} найден, но {fn_name}() отсутствует",
                     "brain-framework", level="warning")
             return fn
         except Exception as e:
-            log(f"  ❌ ошибка импорта {filename}: {e}",
+            log(f"   ошибка импорта {filename}: {e}",
                 "brain-framework", level="error")
             return None
 
@@ -1379,9 +1379,9 @@ def _discover_builders(model_module):
     build_weights_fn = _load("weights.py",     "build_weights")
 
     if build_index_fn:
-        log("  ✅ context_idx.py (build_index)", "brain-framework", force=True)
+        log("   context_idx.py (build_index)", "brain-framework", force=True)
     if build_weights_fn:
-        log("  ✅ weights.py (build_weights)", "brain-framework", force=True)
+        log("   weights.py (build_weights)", "brain-framework", force=True)
 
     return build_index_fn, build_weights_fn
 
@@ -1392,13 +1392,13 @@ def build_app(model_module) -> FastAPI:
     def _g(attr, default):
         return getattr(model_module, attr, default)
 
-    # ── Критичные переменные: ENV → переопределение из model.py ───────────────
+    #  Критичные переменные: ENV → переопределение из model.py 
     s.SERVICE_ID   = _g("SERVICE_ID",   int(os.getenv("SERVICE_ID",   "0")))
     s.PORT         = _g("PORT",         int(os.getenv("PORT",         "9000")))
     s.NODE_NAME    = _g("NODE_NAME",    os.getenv("NODE_NAME",    "brain-svc"))
     s.SERVICE_TEXT = _g("SERVICE_TEXT", os.getenv("SERVICE_TEXT", "Brain microservice"))
 
-    # ── Опциональные таблицы и настройки ─────────────────────────────────────
+    #  Опциональные таблицы и настройки 
     s.WEIGHTS_TABLE          = _g("WEIGHTS_TABLE",          None)
     s.WEIGHTS_CODE_COLUMN    = _g("WEIGHTS_CODE_COLUMN",    "weight_code")
     s.CTX_TABLE              = _g("CTX_TABLE",              None)
@@ -1454,7 +1454,7 @@ def build_app(model_module) -> FastAPI:
 
     s.engine_vlad, s.engine_brain, s.engine_super = build_engines()
 
-    # ── _call_model (IS_SIMPLE + полный режим) ─────────────────────────────────
+    #  _call_model (IS_SIMPLE + полный режим) 
 
     async def _call_model(pair, day, date_str, calc_type=0, calc_var=0, param=""):
         target_date = _parse_date(date_str)
@@ -1518,10 +1518,10 @@ def build_app(model_module) -> FastAPI:
         result, detail = _extract_detail(result)
         return result, _make_detail_serializable(detail)
 
-    # ── _preload (IS_SIMPLE + полный режим) ────────────────────────────────────
+    #  _preload (IS_SIMPLE + полный режим) 
 
     async def _preload():
-        log("🔄 FULL DATA RELOAD", s.NODE_NAME, force=True)
+        log(" FULL DATA RELOAD", s.NODE_NAME, force=True)
         s.np_built = False
         s.weight_codes.clear()
         s.ctx_index.clear()
@@ -1540,10 +1540,10 @@ def build_app(model_module) -> FastAPI:
                     await conn.execute(text(_DDL_BT_RESULTS))
                     await conn.execute(text(_DDL_BT_SUMMARY))
             except Exception as e:
-                log(f"  ❌ tables: {e}", s.NODE_NAME, level="error")
+                log(f"   tables: {e}", s.NODE_NAME, level="error")
             s.last_reload = datetime.now()
             global_rates_total = sum(len(v) for v in s.global_rates.values())
-            log(f"✅ RELOAD DONE (simple): rates={len(s.simple_rates)} "
+            log(f" RELOAD DONE (simple): rates={len(s.simple_rates)} "
                 f"global_rates={global_rates_total} "
                 f"dataset={len(s.dataset)} weights={len(s.weight_codes)}",
                 s.NODE_NAME, force=True)
@@ -1566,13 +1566,13 @@ def build_app(model_module) -> FastAPI:
                 await conn.execute(text(_DDL_BT_RESULTS))
                 await conn.execute(text(_DDL_BT_SUMMARY))
         except Exception as e:
-            log(f"  ❌ tables: {e}", s.NODE_NAME, level="error")
+            log(f"   tables: {e}", s.NODE_NAME, level="error")
         s.last_reload = datetime.now()
-        log(f"✅ RELOAD DONE: weights={len(s.weight_codes)} ctx={len(s.ctx_index)} "
+        log(f" RELOAD DONE: weights={len(s.weight_codes)} ctx={len(s.ctx_index)} "
             f"events={len(s.events_by_dt)} dataset={len(s.dataset)} "
             f"np_built={s.np_built}", s.NODE_NAME, force=True)
 
-    # ── _do_rebuild (с поддержкой IS_SIMPLE) ───────────────────────────────────
+    #  _do_rebuild (с поддержкой IS_SIMPLE) 
 
     async def _do_rebuild() -> dict:
         stats = {}
@@ -1581,9 +1581,9 @@ def build_app(model_module) -> FastAPI:
             try:
                 index_stats = await s.index_builder_fn(s.engine_vlad, s.engine_brain)
                 stats["index"] = index_stats or {}
-                log(f"  ✅ build_index: {index_stats}", s.NODE_NAME, force=True)
+                log(f"   build_index: {index_stats}", s.NODE_NAME, force=True)
             except Exception as e:
-                log(f"  ❌ build_index: {e}", s.NODE_NAME, level="error")
+                log(f"   build_index: {e}", s.NODE_NAME, level="error")
                 send_error_trace(e, s.NODE_NAME, "build_index")
                 stats["index"] = {"error": str(e)}
 
@@ -1591,9 +1591,9 @@ def build_app(model_module) -> FastAPI:
             try:
                 weight_stats = await s.weight_builder_fn(s.engine_vlad)
                 stats["weights"] = weight_stats or {}
-                log(f"  ✅ build_weights: {weight_stats}", s.NODE_NAME, force=True)
+                log(f"   build_weights: {weight_stats}", s.NODE_NAME, force=True)
             except Exception as e:
-                log(f"  ❌ build_weights: {e}", s.NODE_NAME, level="error")
+                log(f"   build_weights: {e}", s.NODE_NAME, level="error")
                 send_error_trace(e, s.NODE_NAME, "build_weights")
                 stats["weights"] = {"error": str(e)}
 
@@ -1603,7 +1603,7 @@ def build_app(model_module) -> FastAPI:
                     s.engine_vlad, s.engine_brain, s.engine_super)
                 stats["legacy_rebuild"] = legacy or {}
             except Exception as e:
-                log(f"  ❌ rebuild_index (legacy): {e}", s.NODE_NAME, level="error")
+                log(f"   rebuild_index (legacy): {e}", s.NODE_NAME, level="error")
                 send_error_trace(e, s.NODE_NAME, "rebuild_index")
                 return {"error": str(e)}
 
@@ -1613,7 +1613,7 @@ def build_app(model_module) -> FastAPI:
             try:
                 stats["universal_rebuild"] = await _universal_rebuild(s)
             except Exception as e:
-                log(f"  ❌ universal_rebuild: {e}", s.NODE_NAME, level="error")
+                log(f"   universal_rebuild: {e}", s.NODE_NAME, level="error")
                 send_error_trace(e, s.NODE_NAME, "universal_rebuild")
                 return {"error": str(e)}
 
@@ -1635,7 +1635,7 @@ def build_app(model_module) -> FastAPI:
             return_new_keys = 0
 
         s.last_rebuild = datetime.now()
-        log(f"✅ rebuild done: weights={len(s.weight_codes)}"
+        log(f" rebuild done: weights={len(s.weight_codes)}"
             + (f" dataset={len(s.dataset)}" if s.IS_SIMPLE else ""),
             s.NODE_NAME, force=True)
 
@@ -1648,7 +1648,7 @@ def build_app(model_module) -> FastAPI:
             "rebuilt_at":    s.last_rebuild.isoformat(),
         }
 
-    # ── _bg_reload (IS_SIMPLE + полный) ───────────────────────────────────────
+    #  _bg_reload (IS_SIMPLE + полный) 
 
     async def _bg_reload():
         while True:
@@ -1667,7 +1667,7 @@ def build_app(model_module) -> FastAPI:
                             and (s.last_rebuild is None or
                                  (datetime.now() - s.last_rebuild).total_seconds()
                                  >= s.REBUILD_INTERVAL)):
-                        log("🔁 IS_SIMPLE auto-rebuild...", s.NODE_NAME, force=True)
+                        log(" IS_SIMPLE auto-rebuild...", s.NODE_NAME, force=True)
                         await _do_rebuild()
 
                     s.last_reload = datetime.now()
@@ -1700,10 +1700,10 @@ def build_app(model_module) -> FastAPI:
                     _build_sorted_arrays(s)
                 s.last_reload = datetime.now()
             except Exception as e:
-                log(f"❌ bg reload: {e}", s.NODE_NAME, level="error", force=True)
+                log(f" bg reload: {e}", s.NODE_NAME, level="error", force=True)
                 send_error_trace(e, s.NODE_NAME, "bg_reload")
 
-    # ── fill_cache helpers ────────────────────────────────────────────────────
+    #  fill_cache helpers 
 
     async def _bulk_insert(rows: list[dict]) -> int:
         if not rows:
@@ -1719,7 +1719,7 @@ def build_app(model_module) -> FastAPI:
                 """), rows)
                 return r.rowcount
         except Exception as e:
-            log(f"  ⚠️ bulk insert: {e}", s.NODE_NAME, level="warning")
+            log(f"   bulk insert: {e}", s.NODE_NAME, level="warning")
             return 0
 
     async def _cached_dates(pair, day, p_hash) -> set:
@@ -1740,7 +1740,7 @@ def build_app(model_module) -> FastAPI:
         dt_from = _parse_date(date_from_str) if date_from_str else None
         dt_to   = _parse_date(date_to_str)   if date_to_str   else None
 
-        # ── IS_SIMPLE: игнорируем pairs/days ──────────────────────────────────
+        #  IS_SIMPLE: игнорируем pairs/days 
         if s.IS_SIMPLE:
             slots = [(tp, var) for tp in types for var in s.VAR_RANGE]
             candles = [r for r in s.simple_rates
@@ -1751,7 +1751,7 @@ def build_app(model_module) -> FastAPI:
             s.fill_status = {"state": "running", "total": total, "done": 0,
                              "skipped": 0, "errors": 0,
                              "started_at": datetime.now().isoformat()}
-            log(f"🚀 fill_cache (simple): {len(candles)} candles × {len(slots)} slots",
+            log(f" fill_cache (simple): {len(candles)} candles × {len(slots)} slots",
                 s.NODE_NAME, force=True)
 
             for calc_type, var in slots:
@@ -1817,7 +1817,7 @@ def build_app(model_module) -> FastAPI:
                                     VALUES (:url, 0, 0, :dv, :ph, :pj, :rj)
                                 """), insert_rows)
                         except Exception as e:
-                            log(f"  ⚠️ bulk insert: {e}", s.NODE_NAME, level="warning")
+                            log(f"   bulk insert: {e}", s.NODE_NAME, level="warning")
                     done += len(batch)
                     s.fill_status.update({"done": done, "skipped": skipped, "errors": errors})
                     log(f"  [simple {calc_type}/{var}] {done}/{total} err={errors}",
@@ -1825,12 +1825,12 @@ def build_app(model_module) -> FastAPI:
 
             state = "stopped" if s.fill_cancel.is_set() else "done"
             s.fill_status.update({"state": state, "finished_at": datetime.now().isoformat()})
-            log(f"✅ fill_cache (simple) {state}: done={done} skip={skipped} err={errors}",
+            log(f" fill_cache (simple) {state}: done={done} skip={skipped} err={errors}",
                 s.NODE_NAME, force=True)
 
-            # ── Авто-бэктест после заполнения кэша (IS_SIMPLE) ────────────────
+            #  Авто-бэктест после заполнения кэша (IS_SIMPLE) 
             if not s.fill_cancel.is_set():
-                log("🔁 auto-backtest после fill_cache (simple)...", s.NODE_NAME, force=True)
+                log(" auto-backtest после fill_cache (simple)...", s.NODE_NAME, force=True)
                 bt_date_from = _parse_date(date_from_str) if date_from_str else datetime(2025, 1, 1)
                 bt_date_to   = _parse_date(date_to_str)   if date_to_str   else datetime.now()
                 for bt_type, bt_var in slots:
@@ -1842,26 +1842,26 @@ def build_app(model_module) -> FastAPI:
                         )
                         label = f"type={bt_type} var={bt_var}"
                         if "error" in bt_result:
-                            log(f"  ⚠️ backtest [{label}]: {bt_result['error']}",
+                            log(f"   backtest [{label}]: {bt_result['error']}",
                                 s.NODE_NAME, force=True)
                         else:
-                            log(f"  ✅ backtest [{label}]: "
+                            log(f"   backtest [{label}]: "
                                 f"score={bt_result.get('value_score')} "
                                 f"acc={bt_result.get('accuracy')} "
                                 f"trades={bt_result.get('trade_count')}",
                                 s.NODE_NAME, force=True)
                     except Exception as e:
-                        log(f"  ❌ backtest error type={bt_type} var={bt_var}: {e}",
+                        log(f"   backtest error type={bt_type} var={bt_var}: {e}",
                             s.NODE_NAME, level="error")
                 try:
                     await _upsert_summary(0, 0, tier=0, df=bt_date_from, dt=bt_date_to)
                 except Exception as e:
-                    log(f"  ⚠️ summary (simple): {e}", s.NODE_NAME, level="warning")
+                    log(f"   summary (simple): {e}", s.NODE_NAME, level="warning")
                 s.fill_status["auto_backtest"] = "done"
-                log("✅ auto-backtest (simple) завершён", s.NODE_NAME, force=True)
+                log(" auto-backtest (simple) завершён", s.NODE_NAME, force=True)
             return
 
-        # ── Полный режим (старый код) ────────────────────────────────────────
+        #  Полный режим (старый код) 
         slots   = [(pair, day, tp, var)
                    for pair in pairs for day in days
                    for tp in types for var in s.VAR_RANGE]
@@ -1880,7 +1880,7 @@ def build_app(model_module) -> FastAPI:
             "overall_skipped": 0, "errors": 0,
             "current_slot": None, "started_at": datetime.now().isoformat(),
         }
-        log(f"🚀 fill_cache: {len(slots)} слотов, ~{total_dates} дат, batch={batch_size}",
+        log(f" fill_cache: {len(slots)} слотов, ~{total_dates} дат, batch={batch_size}",
             s.NODE_NAME, force=True)
         overall_done = overall_skipped = errors = 0
 
@@ -1959,12 +1959,12 @@ def build_app(model_module) -> FastAPI:
                     s.NODE_NAME, force=True)
             s.fill_status["slots_done"] = slot_idx + 1
         s.fill_status.update({"state": "done", "finished_at": datetime.now().isoformat()})
-        log(f"✅ fill done: done={overall_done} skip={overall_skipped} err={errors}",
+        log(f" fill done: done={overall_done} skip={overall_skipped} err={errors}",
             s.NODE_NAME, force=True)
 
-        # ── Авто-бэктест после заполнения кэша (только для полного режима) ────
+        #  Авто-бэктест после заполнения кэша (только для полного режима) 
         if not s.IS_SIMPLE:
-            log("🔁 auto-backtest после fill_cache...", s.NODE_NAME, force=True)
+            log(" auto-backtest после fill_cache...", s.NODE_NAME, force=True)
             bt_date_from = _parse_date(date_from_str) if date_from_str else datetime(2025, 1, 1)
             bt_date_to   = _parse_date(date_to_str)   if date_to_str   else datetime.now()
             for bt_pair in pairs:
@@ -1979,27 +1979,27 @@ def build_app(model_module) -> FastAPI:
                                 )
                                 label = f"pair={bt_pair} day={'d' if bt_day else 'h'} type={bt_type} var={bt_var}"
                                 if "error" in bt_result:
-                                    log(f"  ⚠️ backtest [{label}]: {bt_result['error']}",
+                                    log(f"   backtest [{label}]: {bt_result['error']}",
                                         s.NODE_NAME, force=True)
                                 else:
-                                    log(f"  ✅ backtest [{label}]: "
+                                    log(f"   backtest [{label}]: "
                                         f"score={bt_result.get('value_score')} "
                                         f"acc={bt_result.get('accuracy')} "
                                         f"trades={bt_result.get('trade_count')}",
                                         s.NODE_NAME, force=True)
                             except Exception as e:
-                                log(f"  ❌ backtest error pair={bt_pair} day={bt_day} type={bt_type} var={bt_var}: {e}",
+                                log(f"   backtest error pair={bt_pair} day={bt_day} type={bt_type} var={bt_var}: {e}",
                                     s.NODE_NAME, level="error")
                     try:
                         await _upsert_summary(bt_pair, bt_day, tier=0,
                                               df=bt_date_from, dt=bt_date_to)
                     except Exception as e:
-                        log(f"  ⚠️ summary pair={bt_pair} day={bt_day}: {e}",
+                        log(f"   summary pair={bt_pair} day={bt_day}: {e}",
                             s.NODE_NAME, level="warning")
             s.fill_status["auto_backtest"] = "done"
-            log("✅ auto-backtest завершён", s.NODE_NAME, force=True)
+            log(" auto-backtest завершён", s.NODE_NAME, force=True)
 
-    # ── _backtest (адаптирован для IS_SIMPLE) ─────────────────────────────────
+    #  _backtest (адаптирован для IS_SIMPLE) 
 
     async def _backtest(pair, day, tier, extra_params, df, dt) -> dict:
         p_hash = _params_hash(extra_params)
@@ -2103,7 +2103,7 @@ def build_app(model_module) -> FastAPI:
                     "tc": trade_count, "wc": win_count, "acc": result["accuracy"],
                 })
         except Exception as e:
-            log(f"  ⚠️ backtest save: {e}", s.NODE_NAME, level="warning")
+            log(f"   backtest save: {e}", s.NODE_NAME, level="warning")
         return result
 
     async def _upsert_summary(pair, day, tier, df, dt):
@@ -2144,14 +2144,14 @@ def build_app(model_module) -> FastAPI:
                 "ba": float(row[3] or 0), "aa": float(row[4] or 0), "bpj": row[5],
             })
 
-    # ── FastAPI (эндпоинты) ────────────────────────────────────────────────────
+    #  FastAPI (эндпоинты) 
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         try:
             await _preload()
         except Exception as e:
-            log(f"❌ initial load: {e}", s.NODE_NAME, level="error", force=True)
+            log(f" initial load: {e}", s.NODE_NAME, level="error", force=True)
         task = asyncio.create_task(_bg_reload())
         yield
         task.cancel()
@@ -2495,7 +2495,7 @@ def build_app(model_module) -> FastAPI:
                 try:
                     await _upsert_summary(bt_pair, bt_day, tier, df, dt)
                 except Exception as e:
-                    log(f"  ⚠️ summary pair={bt_pair} day={bt_day}: {e}",
+                    log(f"   summary pair={bt_pair} day={bt_day}: {e}",
                         s.NODE_NAME, level="warning")
 
         return ok_response({
@@ -2547,11 +2547,11 @@ def build_app(model_module) -> FastAPI:
 
     @app.get("/pretest")
     async def ep_pretest():
-        log("🔍 PRETEST START", s.NODE_NAME, force=True)
+        log(" PRETEST START", s.NODE_NAME, force=True)
         model_path = os.path.join(os.path.dirname(os.path.abspath(
             sys.modules[model_module.__name__].__file__)), "model.py")
 
-        # ── Тест 1: синтаксис model.py ────────────────────────────────────
+        #  Тест 1: синтаксис model.py 
         try:
             import ast as _ast
             with open(model_path, "r", encoding="utf-8") as f:
@@ -2561,9 +2561,9 @@ def build_app(model_module) -> FastAPI:
                     "error": f"[Тест 1 — Синтаксис] строка {e.lineno}: {e.msg}"}
         except OSError:
             pass
-        log("  ✅ Тест 1: синтаксис model.py OK", s.NODE_NAME, force=True)
+        log("   Тест 1: синтаксис model.py OK", s.NODE_NAME, force=True)
 
-        # ══════════════════════════════════════════════════════════════════
+        # 
         # Тест 2: структура dict[str, float] на одной дате
         # Тест 3: по КАЖДОМУ из 6 инструментов (EUR/BTC/ETH × hour/day):
         #   - date_start берётся из brain.brain_models WHERE id=SERVICE_ID (поле date)
@@ -2571,7 +2571,7 @@ def build_app(model_module) -> FastAPI:
         #   - 10 случайных дат >= date_start из котировок инструмента
         #   - 90% вызовов model() должны давать непустой dict
         # IS_SIMPLE и full: одинаковая логика — global_rates загружен для обоих.
-        # ══════════════════════════════════════════════════════════════════
+        # 
 
         # Загружаем даты всех 6 инструментов из global_rates (одинаково для IS_SIMPLE и full).
         _instr_dates: dict[str, list] = {}
@@ -2579,7 +2579,7 @@ def build_app(model_module) -> FastAPI:
             _rr_pt = s.global_rates.get(_tbl_pt, [])
             _instr_dates[_tbl_pt] = [r["date"] for r in _rr_pt]
 
-        # ── Тест 2: проверяем структуру model() ──────────────────────────
+        #  Тест 2: проверяем структуру model() 
         if s.IS_SIMPLE:
             if not s.simple_rates:
                 return {"status": "error",
@@ -2646,10 +2646,10 @@ def build_app(model_module) -> FastAPI:
             if not isinstance(_v2, (int, float)) or _v2 != _v2 or abs(_v2) == float("inf"):
                 return {"status": "error",
                         "error": f"[Тест 2 — Структура] значение '{_k2}' не конечный float"}
-        log(f"  ✅ Тест 2: структура model() OK — {len(_res2)} ключей",
+        log(f"   Тест 2: структура model() OK — {len(_res2)} ключей",
             s.NODE_NAME, force=True)
 
-        # ── Тест 3: по каждому из 6 инструментов ────────────────────────
+        #  Тест 3: по каждому из 6 инструментов 
         # Дата старта: из brain.brain_models WHERE id = SERVICE_ID, поле date.
         # Фолбэк: 2025-01-15.
         # Берём 10 случайных дат >= date_start из котировок каждого инструмента.
@@ -2740,7 +2740,7 @@ def build_app(model_module) -> FastAPI:
                 _instr_counts[key] = [0, 0]
             _instr_counts[key][1] += 1
             if isinstance(_r3, Exception):
-                log(f"    ⚠️ pair{_pid3}/{_tf3} {_td3}: {_r3}", s.NODE_NAME, level="warning")
+                log(f"     pair{_pid3}/{_tf3} {_td3}: {_r3}", s.NODE_NAME, level="warning")
             elif _r3:
                 _instr_counts[key][0] += 1
 
@@ -2756,11 +2756,11 @@ def build_app(model_module) -> FastAPI:
                     f"pair{_pid3}/{_tf3}: {_ne3}/{_tot3} ({_cov3:.0%}) < 90%")
 
         if _failures3:
-            log(f"❌ PRETEST FAILED: {_failures3}", s.NODE_NAME, force=True)
+            log(f" PRETEST FAILED: {_failures3}", s.NODE_NAME, force=True)
             return {"status": "error",
                     "error": f"[Тест 3 — Покрытие] {' | '.join(_failures3)}"}
 
-        log("✅ PRETEST PASSED", s.NODE_NAME, force=True)
+        log(" PRETEST PASSED", s.NODE_NAME, force=True)
         return {"status": "ok", "var_range": s.VAR_RANGE,
                 "model_has_ctx": s.model_needs_ctx,
                 "is_simple": s.IS_SIMPLE,
@@ -2877,7 +2877,7 @@ def build_app(model_module) -> FastAPI:
                         data_stats = {"min": float(row[0]), "max": float(row[1]),
                                       "avg": round(float(row[2]), 4)}
             except Exception as e:
-                log(f"  ⚠️ posttest t1 {pair_id}/{tf_name}: {e}", s.NODE_NAME, level="warning")
+                log(f"   posttest t1 {pair_id}/{tf_name}: {e}", s.NODE_NAME, level="warning")
 
             # Тест 2: подсчёт знаков
             values_stats = {"plus": 0, "minus": 0}
@@ -2900,7 +2900,7 @@ def build_app(model_module) -> FastAPI:
                             pass
                     values_stats = {"plus": plus_cnt, "minus": minus_cnt}
             except Exception as e:
-                log(f"  ⚠️ posttest t2 {pair_id}/{tf_name}: {e}", s.NODE_NAME, level="warning")
+                log(f"   posttest t2 {pair_id}/{tf_name}: {e}", s.NODE_NAME, level="warning")
 
             # Тест 3: живой вызов с актуальной датой
             # IS_SIMPLE: _call_model использует simple_rates (корректно для model())
@@ -2932,7 +2932,7 @@ def build_app(model_module) -> FastAPI:
                         except Exception:
                             cache_signals[dt_val] = (False, 0.0)
             except Exception as e:
-                log(f"  ⚠️ posttest cache {pair_id}/{tf_name}: {e}", s.NODE_NAME, level="warning")
+                log(f"   posttest cache {pair_id}/{tf_name}: {e}", s.NODE_NAME, level="warning")
 
             def _compute_hole_and_sim():
                 non_empty = np.array(

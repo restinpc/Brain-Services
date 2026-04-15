@@ -21,12 +21,12 @@ from common import (
 )
 from cache_helper import ensure_cache_table, load_service_url, cached_values
 
-# ── Идентификаторы ─────────────────────────────────────────────────────────────
+#  Идентификаторы 
 SERVICE_ID = 23
 NODE_NAME = os.getenv("NODE_NAME", "brain-weights-microservice")
 PORT = 8888
 
-# ── Конфигурация БД ───────────────────────────────────────────────────────────
+#  Конфигурация БД 
 load_dotenv()
 
 engine_vlad, engine_brain, engine_super = build_engines()
@@ -38,7 +38,7 @@ log(f"brain: {os.getenv('MASTER_USER')}@{os.getenv('MASTER_HOST')}:{os.getenv('M
 log(f"super: {os.getenv('SUPER_USER')}@{os.getenv('SUPER_HOST')}:{os.getenv('SUPER_PORT')}/{os.getenv('SUPER_NAME')}",
     NODE_NAME)
 
-# ── Глобальные данные ─────────────────────────────────────────────────────────
+#  Глобальные данные 
 GLOBAL_EXTREMUMS = {}
 GLOBAL_RATES = {}
 GLOBAL_CALENDAR = {}
@@ -136,7 +136,7 @@ async def preload_all_data():
                 matched += 1
         log(f"  Matched calendar entries: {matched}", NODE_NAME)
 
-    # ── bisect: перестройка отсортированных списков ──
+    #  bisect: перестройка отсортированных списков 
     if GLOBAL_CALENDAR:
         _si = sorted(GLOBAL_CALENDAR.items())
         _CAL_SORTED_DATES[:] = [x[0] for x in _si]
@@ -145,7 +145,7 @@ async def preload_all_data():
         _CAL_SORTED_DATES.clear()
         _CAL_SORTED_DATA.clear()
 
-    # ── Загрузка свечных данных ──
+    #  Загрузка свечных данных 
     tables = [
         "brain_rates_eur_usd", "brain_rates_eur_usd_day",
         "brain_rates_btc_usd", "brain_rates_btc_usd_day",
@@ -182,21 +182,21 @@ async def preload_all_data():
             send_error_trace(e, NODE_NAME, f"preload_rates_{table}")
             raise
 
-    # ── Загружаем URL сервиса через супер-ноду и создаём таблицу кеша ─────────
+    #  Загружаем URL сервиса через супер-ноду и создаём таблицу кеша 
     try:
         SERVICE_URL = await load_service_url(engine_super, SERVICE_ID)
         SUPER_DB_AVAILABLE = True
-        log("✅ Super DB connection successful", NODE_NAME, force=True)
+        log(" Super DB connection successful", NODE_NAME, force=True)
     except (OperationalError, OSError, Exception) as e:
         SUPER_DB_AVAILABLE = False
-        log(f"⚠️ Super DB unavailable, using default values: {e}", NODE_NAME, level="warning", force=True)
+        log(f" Super DB unavailable, using default values: {e}", NODE_NAME, level="warning", force=True)
         SERVICE_URL = ""  # используем пустой URL, кэширование будет работать в автономном режиме
 
     # Создаём таблицу кеша даже если super БД недоступна
     try:
         await ensure_cache_table(engine_vlad)
     except Exception as e:
-        log(f"⚠️ Cache table creation warning: {e}", NODE_NAME, level="warning", force=True)
+        log(f" Cache table creation warning: {e}", NODE_NAME, level="warning", force=True)
 
     log("SERVER READY. ALL DATA PRELOADED.", NODE_NAME, force=True)
 
@@ -205,11 +205,11 @@ async def background_reload_data():
     while True:
         await asyncio.sleep(3600)
         try:
-            log("🔄 Background reload started…", NODE_NAME, force=True)
+            log(" Background reload started…", NODE_NAME, force=True)
             await preload_all_data()
-            log("✅ Background reload completed", NODE_NAME, force=True)
+            log(" Background reload completed", NODE_NAME, force=True)
         except Exception as e:
-            log(f"❌ Background reload error: {e}", NODE_NAME, level="error", force=True)
+            log(f" Background reload error: {e}", NODE_NAME, level="error", force=True)
             send_error_trace(e, NODE_NAME, "background_reload")
 
 
@@ -218,7 +218,7 @@ async def lifespan(app: FastAPI):
     try:
         await preload_all_data()
     except Exception as e:
-        log(f"⚠️ Preload error, but continuing: {e}", NODE_NAME, level="warning", force=True)
+        log(f" Preload error, but continuing: {e}", NODE_NAME, level="warning", force=True)
         # Продолжаем работу даже если preload частично не удался
 
     task = asyncio.create_task(background_reload_data())
@@ -229,14 +229,14 @@ async def lifespan(app: FastAPI):
     try:
         await engine_super.dispose()
     except Exception as e:
-        log(f"⚠️ Error disposing super engine: {e}", NODE_NAME, level="warning")
+        log(f" Error disposing super engine: {e}", NODE_NAME, level="warning")
 
 
 app = FastAPI(lifespan=lifespan)
 
 
 
-# ── Подгрузка свежих свечей из БД ─────────────────────────────────────────
+#  Подгрузка свежих свечей из БД 
 _LAST_RATES_REFRESH = {}
 
 async def _refresh_rates_if_needed(rates_table):
@@ -267,9 +267,9 @@ async def _refresh_rates_if_needed(rates_table):
                     cl.append((dt, (r["close"] or 0) > (r["open"] or 0)))
                 n += 1
             if n > 0:
-                log(f"  📥 Refreshed {n} candle(s) for {rates_table}", NODE_NAME)
+                log(f"   Refreshed {n} candle(s) for {rates_table}", NODE_NAME)
     except Exception as e:
-        log(f"  ⚠️ Rates refresh error ({rates_table}): {e}", NODE_NAME, level="warning")
+        log(f"   Rates refresh error ({rates_table}): {e}", NODE_NAME, level="warning")
 
 async def calculate_pure_memory(pair: int, day: int, date_str: str) -> dict | None:
     target_date = parse_date_string(date_str)
@@ -344,7 +344,7 @@ async def calculate_pure_memory(pair: int, day: int, date_str: str) -> dict | No
     return {k: round(v, 6) for k, v in raw_result.items() if v != 0}
 
 
-# ── Endpoints ─────────────────────────────────────────────────────────────────
+#  Endpoints 
 @app.get("/")
 async def get_metadata():
     vlad_tables = ["vlad_weight_codes", "vlad_brain_calendar_event_index", "version_microservice"]
@@ -374,7 +374,7 @@ async def get_metadata():
                 row = res.fetchone()
                 version = row[0] if row else 0
         except Exception as e:
-            log(f"⚠️ Could not get version from DB: {e}", NODE_NAME, level="warning")
+            log(f" Could not get version from DB: {e}", NODE_NAME, level="warning")
 
     return {
         "status": "ok", "version": f"1.{version}.6", "name": NODE_NAME, "mode": MODE,
@@ -495,7 +495,7 @@ if __name__ == "__main__":
     try:
         _workers = _asyncio.run(resolve_workers(engine_super, SERVICE_ID, default=4))
     except (OperationalError, OSError, Exception) as e:
-        log(f"⚠️ Could not get workers from super DB, using default=4: {e}", NODE_NAME, level="warning", force=True)
+        log(f" Could not get workers from super DB, using default=4: {e}", NODE_NAME, level="warning", force=True)
 
     log(f"Starting with {_workers} worker(s) in {MODE} mode", NODE_NAME, force=True)
     try:

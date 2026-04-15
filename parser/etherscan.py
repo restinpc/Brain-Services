@@ -13,7 +13,7 @@ import mysql.connector
 from dotenv import load_dotenv
 from datetime import datetime
 
-# ── 1. КОНФИГ ─────────────────────────────────────────────────────────────────
+#  1. КОНФИГ 
 load_dotenv()
 
 try:
@@ -29,10 +29,10 @@ EMAIL      = os.getenv("ALERT_EMAIL", "samuray150305@gmail.com")
 
 ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY")
 if not ETHERSCAN_API_KEY:
-    print("❌ Ошибка: ETHERSCAN_API_KEY не указан в .env файле")
+    print(" Ошибка: ETHERSCAN_API_KEY не указан в .env файле")
     sys.exit(1)
 
-# ── 2. ТРАССИРОВКА ОШИБОК ─────────────────────────────────────────────────────
+#  2. ТРАССИРОВКА ОШИБОК 
 def send_error_trace(exc: Exception, script_name: str = "etherscan.py"):
     import threading
     logs = f"Node: {NODE_NAME}\nScript: {script_name}\nException: {repr(exc)}\n\nTraceback:\n{traceback.format_exc()}"
@@ -44,7 +44,7 @@ def send_error_trace(exc: Exception, script_name: str = "etherscan.py"):
             pass
     threading.Thread(target=_send, daemon=True).start()
 
-# ── 3. АРГУМЕНТЫ ──────────────────────────────────────────────────────────────
+#  3. АРГУМЕНТЫ 
 parser = argparse.ArgumentParser(description="Сетевые on-chain метрики Etherscan используя бесплатный API")
 parser.add_argument("table_name",  help="Имя целевой таблицы в БД")
 parser.add_argument("host",        nargs="?", default=os.getenv("DB_HOST"))
@@ -55,7 +55,7 @@ parser.add_argument("database",    nargs="?", default=os.getenv("DB_NAME"))
 args = parser.parse_args()
 
 if not all([args.host, args.user, args.password, args.database]):
-    print("❌ Ошибка: не указаны параметры подключения к БД")
+    print(" Ошибка: не указаны параметры подключения к БД")
     sys.exit(1)
 
 DB_CONFIG = {
@@ -66,7 +66,7 @@ DB_CONFIG = {
     "database": args.database,
 }
 
-# ── 4. ДОСТУПНЫЕ МЕТРИКИ ─────────────────
+#  4. ДОСТУПНЫЕ МЕТРИКИ 
 DATASETS = {
     "sasha_eth_gas_safe_daily": {
         "description": "Safe (Low) Gas Price в Gwei",
@@ -112,7 +112,7 @@ DATASETS = {
     },
 }
 
-# ── 5. СОЗДАНИЕ ТАБЛИЦЫ ────────────────────────────────────────────────────────
+#  5. СОЗДАНИЕ ТАБЛИЦЫ 
 def ensure_table(table_name: str):
     conn = mysql.connector.connect(**DB_CONFIG)
     c = conn.cursor()
@@ -131,7 +131,7 @@ def ensure_table(table_name: str):
     c.close()
     conn.close()
 
-# ── 6. ПОСЛЕДНЯЯ ДАТА В БД ─────────────────────────────────────────────────────
+#  6. ПОСЛЕДНЯЯ ДАТА В БД 
 def get_latest_date(table_name: str):
     try:
         conn = mysql.connector.connect(**DB_CONFIG)
@@ -142,10 +142,10 @@ def get_latest_date(table_name: str):
         conn.close()
         return row[0] if row and row[0] else None
     except Exception as e:
-        print(f"⚠️ Не удалось получить последнюю дату: {e}")
+        print(f" Не удалось получить последнюю дату: {e}")
         return None
 
-# ── 7. ЗАПРОС К ETHERSCAN API ─────────────────────────────────────────────────
+#  7. ЗАПРОС К ETHERSCAN API 
 def fetch_data(config: dict):
     try:
         params = {
@@ -158,7 +158,7 @@ def fetch_data(config: dict):
         response = requests.get("https://api.etherscan.io/v2/api", params=params, timeout=25)
 
         if response.status_code != 200:
-            print(f"❌ HTTP ошибка: {response.status_code}")
+            print(f" HTTP ошибка: {response.status_code}")
             return None
 
         data = response.json()
@@ -168,16 +168,16 @@ def fetch_data(config: dict):
             return data.get("result")
 
         if data.get("status") != "1":
-            print(f"❌ Etherscan API ошибка: {data.get('message', 'Unknown')} | {data.get('result', '')}")
+            print(f" Etherscan API ошибка: {data.get('message', 'Unknown')} | {data.get('result', '')}")
             return None
 
         return data.get("result")
 
     except Exception as e:
-        print(f"❌ Ошибка при запросе к Etherscan: {e}")
+        print(f" Ошибка при запросе к Etherscan: {e}")
         return None
 
-# ── 8. ОБРАБОТКА И СОХРАНЕНИЕ ─────────────────────────────────────────────────
+#  8. ОБРАБОТКА И СОХРАНЕНИЕ 
 def process(table_name: str):
     config = DATASETS[table_name]
     ensure_table(table_name)
@@ -186,12 +186,12 @@ def process(table_name: str):
     today = datetime.now().date().isoformat()
 
     if latest and today <= str(latest):
-        print(f"⏭️  Данные за {today} уже существуют в таблице")
+        print(f"⏭  Данные за {today} уже существуют в таблице")
         return
 
     result = fetch_data(config)
     if not result:
-        print("⚠️  Данные от Etherscan не получены")
+        print("  Данные от Etherscan не получены")
         return
 
     # Извлекаем конкретное поле из result, если API вернул словарь.
@@ -204,7 +204,7 @@ def process(table_name: str):
             # Для ehsupply2 в качестве базовой метрики берем общий supply.
             raw_value = result.get("EthSupply")
         else:
-            print(f"❌ Неизвестно, какое поле извлекать из ответа: {result}")
+            print(f" Неизвестно, какое поле извлекать из ответа: {result}")
             return
 
     # Конвертация значения в число
@@ -214,7 +214,7 @@ def process(table_name: str):
         else:
             value = float(raw_value)                   # для supply2, gas, price и т.д.
     except (ValueError, TypeError) as e:
-        print(f"❌ Не удалось преобразовать значение в число: {e}")
+        print(f" Не удалось преобразовать значение в число: {e}")
         print(f"   Получено: {raw_value}")
         return
 
@@ -227,34 +227,34 @@ def process(table_name: str):
     c.close()
     conn.close()
 
-    print(f"✅ Успешно записано")
+    print(f" Успешно записано")
 
 
-# ── 9. MAIN ───────────────────────────────────────────────────────────────────
+#  9. MAIN 
 def main():
     if args.table_name not in DATASETS:
-        print(f"❌ Неизвестная таблица: {args.table_name}")
+        print(f" Неизвестная таблица: {args.table_name}")
         print("\nДоступные таблицы:")
         for name, cfg in DATASETS.items():
             print(f"   • {name}  →  {cfg['description']}")
         sys.exit(1)
 
-    print(f"🚀 Etherscan Network Metrics Parser (free API)")
+    print(f" Etherscan Network Metrics Parser (free API)")
     print(f"   Таблица: {args.table_name}")
     print(f"   База: {args.host}:{args.port}/{args.database}")
 
     process(args.table_name)
 
-    print("🏁 Парсер завершил работу")
+    print(" Парсер завершил работу")
 
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\n🛑 Прервано пользователем")
+        print("\n Прервано пользователем")
         sys.exit(1)
     except Exception as e:
-        print(f"\n❌ Критическая ошибка: {e!r}")
+        print(f"\n Критическая ошибка: {e!r}")
         send_error_trace(e)
         sys.exit(1)

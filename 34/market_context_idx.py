@@ -61,7 +61,7 @@ CREATE TABLE IF NOT EXISTS `{CTX_TABLE}` (
 """.replace("{CTX_TABLE}", CTX_TABLE)
 
 
-# ── Два соединения ────────────────────────────────────────────────────────────
+#  Два соединения 
 
 def get_brain_connection():
     """Читаем vlad_market_history из БД brain (MASTER_* в .env)."""
@@ -87,7 +87,7 @@ def get_vlad_connection():
     )
 
 
-# ── Вычислители ───────────────────────────────────────────────────────────────
+#  Вычислители 
 
 def direction_label(a, b, threshold, up_label="UP", down_label="DOWN", flat_label="FLAT"):
     if a is None or b is None or b == 0:
@@ -157,7 +157,7 @@ def classify_observations(close_series, volume_series, threshold):
     return results
 
 
-# ── main ──────────────────────────────────────────────────────────────────────
+#  main 
 
 def main():
     brain_conn = get_brain_connection()
@@ -185,7 +185,7 @@ def main():
             """)
             raw = brain_cur.fetchall()
             if not raw:
-                print(f"  ⚠️  Нет данных для {instrument}, пропускаем.")
+                print(f"    Нет данных для {instrument}, пропускаем.")
                 continue
 
             close_series  = [(row[0], float(row[1])) for row in raw]
@@ -254,19 +254,19 @@ def main():
         (table_cnt,) = vlad_cur.fetchone()
         print(f"\nOK: inserted={total_inserted}, table_rows={table_cnt}")
 
-        # ── Статистика ────────────────────────────────────────────────────────
-        print(f"\n── Топ-20 контекстов по числу наблюдений ──")
+        #  Статистика 
+        print(f"\n Топ-20 контекстов по числу наблюдений ")
         vlad_cur.execute(f"""
             SELECT instrument, rate_change_dir, trend_dir, momentum_dir,
                    vol_zone, bb_zone, occurrence_count
             FROM `{CTX_TABLE}` ORDER BY occurrence_count DESC LIMIT 20
         """)
         print(f"  {'instr':<8} {'chg':<8} {'trend':<8} {'mom':<8} {'vol':<6} {'bb':<8} {'count':>8}")
-        print("  " + "─" * 60)
+        print("  " + "" * 60)
         for instr, rcd, td, md, vol, bb, cnt in vlad_cur.fetchall():
             print(f"  {instr:<8} {rcd:<8} {td:<8} {md:<8} {vol:<6} {bb:<8} {cnt:>8}")
 
-        print(f"\n── По инструментам ──")
+        print(f"\n По инструментам ")
         vlad_cur.execute(f"""
             SELECT instrument, COUNT(*) AS ctx, SUM(occurrence_count) AS obs
             FROM `{CTX_TABLE}` GROUP BY instrument ORDER BY instrument
@@ -274,7 +274,7 @@ def main():
         for instr, ctx_cnt, obs in vlad_cur.fetchall():
             print(f"  {instr:<8}  contexts={ctx_cnt:<5}  observations={obs}")
 
-        print(f"\n── По vol_zone ──")
+        print(f"\n По vol_zone ")
         vlad_cur.execute(f"""
             SELECT vol_zone, COUNT(*) AS ctx, SUM(occurrence_count) AS obs
             FROM `{CTX_TABLE}` GROUP BY vol_zone ORDER BY obs DESC
@@ -282,7 +282,7 @@ def main():
         for vol, ctx_cnt, obs in vlad_cur.fetchall():
             print(f"  {vol:<8}  contexts={ctx_cnt:<5}  observations={obs}")
 
-        print(f"\n── По bb_zone ──")
+        print(f"\n По bb_zone ")
         vlad_cur.execute(f"""
             SELECT bb_zone, COUNT(*) AS ctx, SUM(occurrence_count) AS obs
             FROM `{CTX_TABLE}` GROUP BY bb_zone ORDER BY obs DESC

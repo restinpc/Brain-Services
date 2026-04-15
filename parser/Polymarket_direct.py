@@ -30,9 +30,9 @@ def send_error_trace(exc, script_name="Polymarket_direct.py"):
     except:
         pass
 
-# ────────────────────────────────────────────────
+# 
 # Аргументы
-# ────────────────────────────────────────────────
+# 
 
 parser = argparse.ArgumentParser(description="Polymarket History → MySQL")
 parser.add_argument("table_name", help="Имя таблицы (например: vlad_polymarket)")
@@ -45,7 +45,7 @@ parser.add_argument("database", nargs="?", default=os.getenv("DB_NAME"))
 args = parser.parse_args()
 
 if not all([args.host, args.user, args.password, args.database]):
-    print("❌ Не указаны параметры подключения к базе")
+    print(" Не указаны параметры подключения к базе")
     sys.exit(1)
 
 DB_CONFIG = {
@@ -58,9 +58,9 @@ DB_CONFIG = {
 
 TODAY = date.today()
 
-# ────────────────────────────────────────────────
+# 
 # Утилиты
-# ────────────────────────────────────────────────
+# 
 
 def _sf(v):
     if v is None or v == "":
@@ -98,9 +98,9 @@ def build_session():
     })
     return s
 
-# ────────────────────────────────────────────────
+# 
 # Класс коллектора
-# ────────────────────────────────────────────────
+# 
 
 class PolymarketHistoryCollector:
     def __init__(self, table_name):
@@ -191,7 +191,7 @@ class PolymarketHistoryCollector:
         all_markets = []
 
         # Активные
-        print(" 📡 Gamma API → активные рынки...")
+        print("  Gamma API → активные рынки...")
         offset = 0
         while True:
             try:
@@ -217,10 +217,10 @@ class PolymarketHistoryCollector:
                 if len(markets) < 100: break
                 time.sleep(random.uniform(1.2, 2.2))
             except Exception as e:
-                print(f"\n ⚠️ Ошибка активных: {e}")
+                print(f"\n  Ошибка активных: {e}")
                 break
 
-        print(f"\n 📡 Gamma API → закрытые рынки (volume ≥ $50K, liquidity ≥ $500, срок ≥ 7 дней)...")
+        print(f"\n  Gamma API → закрытые рынки (volume ≥ $50K, liquidity ≥ $500, срок ≥ 7 дней)...")
         offset = 0
         closed_fetched = 0
         closed_passed  = 0
@@ -287,10 +287,10 @@ class PolymarketHistoryCollector:
                 if len(markets) < 100: break
                 time.sleep(random.uniform(1.2, 2.2))
             except Exception as e:
-                print(f"\n ⚠️ Ошибка закрытых: {e}")
+                print(f"\n  Ошибка закрытых: {e}")
                 break
 
-        print(f"\n 📋 Всего рынков: {len(all_markets):,}")
+        print(f"\n  Всего рынков: {len(all_markets):,}")
         return all_markets
 
     def fetch_price_history(self, token_id, start_ts=None):
@@ -318,14 +318,14 @@ class PolymarketHistoryCollector:
 
         tid = yes_p = no_p = None
 
-        # ── token_id + outcome_yes/no из tokens[] ──────────────────────────
+        #  token_id + outcome_yes/no из tokens[] 
         if isinstance(tokens, list) and tokens:
             tid   = tokens[0].get("token_id", "")
             yes_p = _sf(tokens[0].get("price"))
             if len(tokens) >= 2:
                 no_p = _sf(tokens[1].get("price"))
 
-        # ── fallback token_id из clobTokenIds ─────────────────────────────
+        #  fallback token_id из clobTokenIds 
         if not tid and clob_raw:
             if isinstance(clob_raw, str):
                 try:
@@ -340,7 +340,7 @@ class PolymarketHistoryCollector:
         if not tid:
             return None
 
-        # ── outcome_yes/no: fallback через outcomePrices ───────────────────
+        #  outcome_yes/no: fallback через outcomePrices 
         outcomes = m.get("outcomePrices", [])
         if isinstance(outcomes, list):
             if len(outcomes) >= 1 and yes_p is None:
@@ -348,12 +348,12 @@ class PolymarketHistoryCollector:
             if len(outcomes) >= 2 and no_p is None:
                 no_p = _sf(outcomes[1])
 
-        # ── spread ─────────────────────────────────────────────────────────
+        #  spread 
         best_bid = _sf(m.get("bestBid"))
         best_ask = _sf(m.get("bestAsk"))
         spread = round(best_ask - best_bid, 4) if best_bid is not None and best_ask is not None else None
 
-        # ── tags ───────────────────────────────────────────────────────────
+        #  tags 
         tags_raw = m.get("tags", [])
         if isinstance(tags_raw, list):
             parts = []
@@ -365,7 +365,7 @@ class PolymarketHistoryCollector:
         else:
             tags_str = str(tags_raw) if tags_raw else ""
 
-        # ── num_outcomes: ИСПРАВЛЕНО ───────────────────────────────────────
+        #  num_outcomes: ИСПРАВЛЕНО 
         # Было: len(tokens) когда tokens=[] давало 0
         # Теперь: tokens → clob_ids → дефолт 2 (все рынки в таблице бинарные)
         if isinstance(tokens, list) and len(tokens) > 0:
@@ -375,7 +375,7 @@ class PolymarketHistoryCollector:
         else:
             num_outcomes = 2
 
-        # ── active: ИСПРАВЛЕНО ─────────────────────────────────────────────
+        #  active: ИСПРАВЛЕНО 
         # Было: берётся из API-флага, который "замерзает" на момент загрузки
         # Теперь: пересчитывается по end_date — закрытый = end_date < сегодня
         end_date = _parse_end_date(
@@ -405,15 +405,15 @@ class PolymarketHistoryCollector:
     def process(self):
         self.ensure_table()
 
-        print(" 📡 Загрузка списка рынков...")
+        print("  Загрузка списка рынков...")
         markets = self.fetch_all_markets()
         if not markets:
-            print(" ⚠️ Не удалось загрузить рынки")
+            print("  Не удалось загрузить рынки")
             return
 
         market_metas = [meta for m in markets if (meta := self.extract_market_meta(m))]
 
-        print(f" 🎯 Рынков с token_id: {len(market_metas):,}")
+        print(f"  Рынков с token_id: {len(market_metas):,}")
 
         if not market_metas:
             print("   → нет рынков с валидным token_id")
@@ -508,7 +508,7 @@ class PolymarketHistoryCollector:
             conn.commit()
 
         except Exception as e:
-            print(f"\n❌ Критическая ошибка: {e}")
+            print(f"\n Критическая ошибка: {e}")
             conn.rollback()
             raise
 
@@ -517,14 +517,14 @@ class PolymarketHistoryCollector:
             conn.close()
 
         # affected: 1=новая, 2=обновлена → новые ≈ total_updated если только INSERT
-        print(f"\n\n ✅ Завершено: строк обработано {total_points:,}  affected rows {total_updated:,}")
+        print(f"\n\n  Завершено: строк обработано {total_points:,}  affected rows {total_updated:,}")
 
-# ────────────────────────────────────────────────
+# 
 # Запуск
-# ────────────────────────────────────────────────
+# 
 
 def main():
-    print(f"🚀 Polymarket History Collector")
+    print(f" Polymarket History Collector")
     print(f"База: {args.host}:{args.port}/{args.database}")
     print(f"Таблица: {args.table_name}")
     print("=" * 70)
@@ -533,15 +533,15 @@ def main():
     collector.process()
 
     print("=" * 70)
-    print("🏁 Завершено")
+    print(" Завершено")
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\n🛑 Прервано пользователем")
+        print("\n Прервано пользователем")
         sys.exit(0)
     except Exception as e:
-        print(f"\n❌ Критическая ошибка: {e}")
+        print(f"\n Критическая ошибка: {e}")
         send_error_trace(e)
         sys.exit(1)

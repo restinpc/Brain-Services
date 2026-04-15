@@ -66,7 +66,7 @@ parser.add_argument("--max-pages", type=int, default=None)
 args = parser.parse_args()
 
 if not all([args.host, args.user, args.password, args.database]):
-    print("❌ Ошибка: параметры БД"); sys.exit(1)
+    print(" Ошибка: параметры БД"); sys.exit(1)
 
 SQLALCHEMY_URL = f"mysql+mysqlconnector://{args.user}:{args.password}@{args.host}:{args.port}/{args.database}"
 engine = create_engine(SQLALCHEMY_URL, pool_recycle=3600)
@@ -93,7 +93,7 @@ def ensure_table_exists(table_name):
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
             """))
             conn.commit()
-            print(f"✅ Таблица '{table_name}' создана")
+            print(f" Таблица '{table_name}' создана")
 
 
 async def human_like_behavior(page):
@@ -147,7 +147,7 @@ async def parse_and_save_incrementally(table_name, max_pages=None):
         with engine.connect() as conn:
             existing = pd.read_sql(f"SELECT link FROM {table_name}", conn)
             existing_links = set(existing['link'].tolist()) if not existing.empty else set()
-        print(f"   ✓ В БД уже есть {len(existing_links)} новостей")
+        print(f"    В БД уже есть {len(existing_links)} новостей")
     except:
         existing_links = set()
 
@@ -178,14 +178,14 @@ async def parse_and_save_incrementally(table_name, max_pages=None):
                 # Обновляем context каждые N страниц (сброс cookies, fingerprint)
                 if page_num > 1 and (page_num - 1) % CONTEXT_REFRESH_EVERY == 0:
                     await context.close()
-                    print(f"   🔄 Обновление browser context (каждые {CONTEXT_REFRESH_EVERY} стр)")
+                    print(f"    Обновление browser context (каждые {CONTEXT_REFRESH_EVERY} стр)")
                     await asyncio.sleep(random.uniform(3, 6))
                     context, page = await create_context(browser)
 
                 url = BASE_URL if page_num == 1 else f"{BASE_URL}/{page_num}"
-                print(f"\n📄 Страница {page_num}: {url}")
+                print(f"\n Страница {page_num}: {url}")
 
-                # ── FIX #1: domcontentloaded вместо load/networkidle ──
+                #  FIX #1: domcontentloaded вместо load/networkidle 
                 # networkidle ждёт пока ВСЕ сетевые запросы завершатся — 
                 # на Investing.com это часто не происходит из-за рекламных скриптов,
                 # tracking pixels, websocket connections → timeout 30 сек.
@@ -197,7 +197,7 @@ async def parse_and_save_incrementally(table_name, max_pages=None):
                 if response and response.status >= 400:
                     consecutive_failures += 1
                     status = response.status
-                    print(f"   ⚠️ HTTP {status} (неудача {consecutive_failures}/{MAX_CONSECUTIVE_FAILURES})")
+                    print(f"    HTTP {status} (неудача {consecutive_failures}/{MAX_CONSECUTIVE_FAILURES})")
 
                     # При 403 — это Cloudflare блокировка. Новый context + retry ту же страницу
                     if status == 403 or status == 429 or status == 503:
@@ -206,7 +206,7 @@ async def parse_and_save_incrementally(table_name, max_pages=None):
                         except:
                             pass
                         wait = random.uniform(15, 30) if status == 403 else random.uniform(30, 60)
-                        print(f"   🔄 Cloudflare блок — новый context, пауза {wait:.0f}с...")
+                        print(f"    Cloudflare блок — новый context, пауза {wait:.0f}с...")
                         await asyncio.sleep(wait)
                         context, page = await create_context(browser)
                         # НЕ увеличиваем page_num — retry ту же страницу
@@ -216,13 +216,13 @@ async def parse_and_save_incrementally(table_name, max_pages=None):
                         await asyncio.sleep(random.uniform(5, 10))
                         continue
 
-                # ── FIX #2: ждём появления статей, не networkidle ──
+                #  FIX #2: ждём появления статей, не networkidle 
                 try:
                     await page.wait_for_selector('article[data-test="article-item"], article', timeout=10000)
                 except:
                     pass  # Может не быть — проверим ниже
 
-                # ── FIX #3: Human-like behavior ──
+                #  FIX #3: Human-like behavior 
                 await human_like_behavior(page)
                 await asyncio.sleep(random.uniform(1, 2))
 
@@ -249,7 +249,7 @@ async def parse_and_save_incrementally(table_name, max_pages=None):
 
                 if count == 0:
                     consecutive_failures += 1
-                    print(f"   ⚠️ Новости не найдены (неудача {consecutive_failures}/{MAX_CONSECUTIVE_FAILURES})")
+                    print(f"    Новости не найдены (неудача {consecutive_failures}/{MAX_CONSECUTIVE_FAILURES})")
 
                     # Проверяем: может это Cloudflare challenge page?
                     page_content = await page.content()
@@ -261,7 +261,7 @@ async def parse_and_save_incrementally(table_name, max_pages=None):
                         except:
                             pass
                         wait = random.uniform(20, 40)
-                        print(f"   🔄 {'Cloudflare challenge' if is_cf_block else 'Серия неудач'} — пауза {wait:.0f}с + новый context")
+                        print(f"    {'Cloudflare challenge' if is_cf_block else 'Серия неудач'} — пауза {wait:.0f}с + новый context")
                         await asyncio.sleep(wait)
                         context, page = await create_context(browser)
                         # Retry ту же страницу
@@ -272,7 +272,7 @@ async def parse_and_save_incrementally(table_name, max_pages=None):
                     continue
 
                 # Успех — сбрасываем failures
-                print(f"   ✓ Найдено новостей: {count}")
+                print(f"    Найдено новостей: {count}")
                 consecutive_failures = 0
 
                 news_items = await page.locator(selector).all()
@@ -342,11 +342,11 @@ async def parse_and_save_incrementally(table_name, max_pages=None):
                             df_new.to_sql(name=table_name, con=engine, if_exists='append', index=False, chunksize=100, method='multi')
                             existing_links.update(df_new['link'].tolist())
                             total_added += len(df_new)
-                            print(f"   ✅ Добавлено: {len(df_new)} из {len(page_news)} (новые)")
+                            print(f"    Добавлено: {len(df_new)} из {len(page_news)} (новые)")
                         except Exception as e:
-                            print(f"   ❌ Ошибка записи: {e}")
+                            print(f"    Ошибка записи: {e}")
                     else:
-                        print(f"   ℹ️ Все {len(page_news)} уже в БД")
+                        print(f"   ℹ Все {len(page_news)} уже в БД")
                         # Если 3 страницы подряд без новых — мы догнали до existing данных
                         # Можно остановиться если нужен только incremental
 
@@ -354,13 +354,13 @@ async def parse_and_save_incrementally(table_name, max_pages=None):
 
                 page_num += 1
 
-                # ── FIX #5: рандомная пауза 3–7 сек (не 2) ──
+                #  FIX #5: рандомная пауза 3–7 сек (не 2) 
                 await asyncio.sleep(random.uniform(3, 7))
 
             except Exception as e:
                 consecutive_failures += 1
                 err_short = str(e)[:80]
-                print(f"   ❌ Ошибка: {err_short} (неудача {consecutive_failures}/{MAX_CONSECUTIVE_FAILURES})")
+                print(f"    Ошибка: {err_short} (неудача {consecutive_failures}/{MAX_CONSECUTIVE_FAILURES})")
 
                 # При timeout — пауза + новый context
                 if "timeout" in str(e).lower() or "Timeout" in str(e):
@@ -371,7 +371,7 @@ async def parse_and_save_incrementally(table_name, max_pages=None):
                         except:
                             pass
                         context, page = await create_context(browser)
-                        print(f"   🔄 Новый context после timeout")
+                        print(f"    Новый context после timeout")
 
                 page_num += 1
                 continue
@@ -380,15 +380,15 @@ async def parse_and_save_incrementally(table_name, max_pages=None):
 
         print(f"\n{'=' * 60}")
         if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-            print(f"⚠️ Остановлено: {MAX_CONSECUTIVE_FAILURES} неудач подряд")
-        print(f"📄 Обработано страниц: {page_num - 1}")
-        print(f"📊 Спарсено новостей: {total_parsed}")
-        print(f"💾 Добавлено в БД: {total_added}")
+            print(f" Остановлено: {MAX_CONSECUTIVE_FAILURES} неудач подряд")
+        print(f" Обработано страниц: {page_num - 1}")
+        print(f" Спарсено новостей: {total_parsed}")
+        print(f" Добавлено в БД: {total_added}")
 
         try:
             with engine.connect() as conn:
                 max_id = conn.execute(text(f"SELECT MAX(id) FROM {table_name}")).scalar()
-                print(f"🔢 Последний ID: {max_id}")
+                print(f" Последний ID: {max_id}")
         except:
             pass
 
@@ -396,20 +396,20 @@ async def parse_and_save_incrementally(table_name, max_pages=None):
 
 
 def main():
-    print(f"🚀 Investing.com Crypto News (v2 — anti-detect)")
+    print(f" Investing.com Crypto News (v2 — anti-detect)")
     print(f"База: {args.host}:{args.port}/{args.database}")
-    print(f"🎯 Таблица: {args.table_name}")
-    print(f"📄 Лимит: {args.max_pages or MAX_PAGES} страниц")
+    print(f" Таблица: {args.table_name}")
+    print(f" Лимит: {args.max_pages or MAX_PAGES} страниц")
     print("=" * 60)
 
     total = asyncio.run(parse_and_save_incrementally(args.table_name, max_pages=args.max_pages))
 
     print("=" * 60)
-    print("🏁 Завершено")
+    print(" Завершено")
     if total == 0:
-        print("ℹ️ Все новости уже в БД")
+        print("ℹ Все новости уже в БД")
     else:
-        print(f"✨ Добавлено {total} новых")
+        print(f" Добавлено {total} новых")
 
 
 if __name__ == "__main__":
@@ -418,9 +418,9 @@ if __name__ == "__main__":
     except SystemExit:
         raise
     except KeyboardInterrupt:
-        print("\n🛑 Прервано")
+        print("\n Прервано")
         sys.exit(1)
     except Exception as e:
-        print(f"\n❌ {e!r}")
+        print(f"\n {e!r}")
         send_error_trace(e)
         sys.exit(1)

@@ -6,7 +6,7 @@
 Строка в .env FINNHUB_API_KEY=
 """
 
-# ── 1. ИМПОРТЫ ─────────────────────────────────────────────────────────────────
+#  1. ИМПОРТЫ 
 import os
 import sys
 import json
@@ -17,7 +17,7 @@ import mysql.connector
 from dotenv import load_dotenv
 from datetime import datetime
 
-# ── 2. КОНФИГ ─────────────────────────────────────────────────────────────────
+#  2. КОНФИГ 
 load_dotenv()
 
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
@@ -28,7 +28,7 @@ NODE_NAME  = os.getenv("NODE_NAME", "finnhub")
 EMAIL      = os.getenv("ALERT_EMAIL", "samuray150305@gmail.com")
 TICKERS_TABLE_NAME = "sasha_add_tikers_for_finnhub"
 
-# ── 3. ТРАССИРОВКА ОШИБОК ─────────────────────────────────────────────────────
+#  3. ТРАССИРОВКА ОШИБОК 
 def send_error_trace(exc: Exception, script_name: str = "finnhub.py"):
     """
     Отправляет трассировку в фоновом потоке — не блокирует основной процесс.
@@ -44,7 +44,7 @@ def send_error_trace(exc: Exception, script_name: str = "finnhub.py"):
 
     threading.Thread(target=_send, daemon=True).start()
 
-# ── 4. АРГУМЕНТЫ ──────────────────────────────────────────────────────────────
+#  4. АРГУМЕНТЫ 
 parser = argparse.ArgumentParser(description="Finnhub Stock Parser → MySQL")
 parser.add_argument("table_name",  help="Имя целевой таблицы в БД")
 parser.add_argument(
@@ -63,12 +63,12 @@ if raw_extra and raw_extra[-1].strip().startswith("["):
     db_tokens = raw_extra[:-1]
 
 if any(token.strip().startswith("[") for token in db_tokens):
-    print("❌ Ошибка: JSON-массив тикеров должен быть последним аргументом")
+    print(" Ошибка: JSON-массив тикеров должен быть последним аргументом")
     print("   Ожидается: [host] [port] [user] [password] [database] [tickers_json]")
     sys.exit(1)
 
 if len(db_tokens) not in (0, 5):
-    print("❌ Ошибка: параметры БД нужно передавать либо все 5, либо не передавать вовсе")
+    print(" Ошибка: параметры БД нужно передавать либо все 5, либо не передавать вовсе")
     print("   Формат 1: <table_name> [host] [port] [user] [password] [database] [tickers_json]")
     print("   Формат 2: <table_name> [tickers_json]  (если DB_* уже заданы в .env)")
     sys.exit(1)
@@ -83,11 +83,11 @@ else:
     args.database = os.getenv("DB_NAME")
 
 if not all([args.host, args.user, args.password, args.database]):
-    print("❌ Ошибка: не указаны параметры подключения к БД")
+    print(" Ошибка: не указаны параметры подключения к БД")
     sys.exit(1)
 
 if not FINNHUB_API_KEY:
-    print("❌ Ошибка: FINNHUB_API_KEY не указан в .env")
+    print(" Ошибка: FINNHUB_API_KEY не указан в .env")
     sys.exit(1)
 
 DB_CONFIG = {
@@ -98,7 +98,7 @@ DB_CONFIG = {
     "database": args.database,
 }
 
-# ── 5. ТАБЛИЦЫ (table_name → конфиг запроса) ─────────────────────────────────
+#  5. ТАБЛИЦЫ (table_name → конфиг запроса) 
 DATASETS = {
     "sasha_finnhub_stock_prices": {
         "description": "Дневной курс акций (поле value = текущая цена)",
@@ -112,7 +112,7 @@ DATASETS = {
     },
 }
 
-# ── 6. УПРАВЛЕНИЕ СПИСКОМ ТИКЕРОВ ──────────────────────────────────────────────
+#  6. УПРАВЛЕНИЕ СПИСКОМ ТИКЕРОВ 
 def ensure_tickers_table():
     """
     Создаёт таблицу для хранения дополнительных тикеров, если её ещё нет.
@@ -190,11 +190,11 @@ def add_symbols_from_argument(table_name: str, tickers_arg: str, limit: int = 40
             else:
                 tickers_json = []
         else:
-            print('❌ Аргумент тикеров должен быть JSON-массивом, например: ["TSLA","META"]')
+            print(' Аргумент тикеров должен быть JSON-массивом, например: ["TSLA","META"]')
             return
 
     if not isinstance(tickers_json, list):
-        print("❌ Аргумент тикеров должен быть JSON-массивом строк")
+        print(" Аргумент тикеров должен быть JSON-массивом строк")
         return
 
     parsed = []
@@ -206,7 +206,7 @@ def add_symbols_from_argument(table_name: str, tickers_arg: str, limit: int = 40
             parsed.append(symbol)
 
     if not parsed:
-        print("⚠️  JSON-массив тикеров передан, но валидные тикеры не распознаны")
+        print("  JSON-массив тикеров передан, но валидные тикеры не распознаны")
         return
 
     current_symbols = DATASETS[table_name].get("symbols", [])
@@ -224,12 +224,12 @@ def add_symbols_from_argument(table_name: str, tickers_arg: str, limit: int = 40
         seen_new.add(symbol)
 
     if not new_unique:
-        print("ℹ️  Все переданные тикеры уже есть в списке")
+        print("ℹ  Все переданные тикеры уже есть в списке")
         return
 
     total_after_add = len(current_symbols) + len(new_unique)
     if total_after_add > limit:
-        print(f"❌ Нельзя добавить тикеры: будет {total_after_add}, лимит {limit}")
+        print(f" Нельзя добавить тикеры: будет {total_after_add}, лимит {limit}")
         print(f"   Текущее количество: {len(current_symbols)}")
         return
 
@@ -264,7 +264,7 @@ def add_symbols_from_argument(table_name: str, tickers_arg: str, limit: int = 40
                 seen.add(symbol)
         DATASETS[dataset_name]["symbols"] = merged
 
-# ── 7. СОЗДАНИЕ ТАБЛИЦЫ ────────────────────────────────────────────────────────
+#  7. СОЗДАНИЕ ТАБЛИЦЫ 
 def ensure_table(table_name: str):
     conn = mysql.connector.connect(**DB_CONFIG)
     c = conn.cursor()
@@ -285,7 +285,7 @@ def ensure_table(table_name: str):
     c.close()
     conn.close()
 
-# ── 8. ПОСЛЕДНЯЯ ДАТА В БД (для логов) ───────────────────────────────────────
+#  8. ПОСЛЕДНЯЯ ДАТА В БД (для логов) 
 def get_latest_date(table_name: str):
     """
     Возвращает максимальную дату из таблицы или None если таблица пуста.
@@ -301,7 +301,7 @@ def get_latest_date(table_name: str):
     except:
         return None
 
-# ── 9. ПОЛУЧЕНИЕ ДАННЫХ ───────────────────────────────────────────────────────
+#  9. ПОЛУЧЕНИЕ ДАННЫХ 
 def fetch_data(config: dict) -> list:
     """
     Запрос к Finnhub. Возвращает список готовых кортежей:
@@ -319,12 +319,12 @@ def fetch_data(config: dict) -> list:
                 url = f"https://finnhub.io/api/v1/quote?symbol={symbol}&token={FINNHUB_API_KEY}"
                 response = requests.get(url, timeout=30)
                 if response.status_code != 200:
-                    print(f"❌ {symbol} quote HTTP {response.status_code}")
+                    print(f" {symbol} quote HTTP {response.status_code}")
                     continue
                 data = response.json()
                 price = data.get("c")  # текущая цена
                 if price is None or price <= 0:
-                    print(f"⚠️  {symbol} — некорректная цена")
+                    print(f"  {symbol} — некорректная цена")
                     continue
                 rows.append((today, symbol, float(price)))
 
@@ -333,25 +333,25 @@ def fetch_data(config: dict) -> list:
                 url = f"https://finnhub.io/api/v1/stock/profile2?symbol={symbol}&token={FINNHUB_API_KEY}"
                 response = requests.get(url, timeout=30)
                 if response.status_code != 200:
-                    print(f"❌ {symbol} profile2 HTTP {response.status_code}")
+                    print(f" {symbol} profile2 HTTP {response.status_code}")
                     continue
                 data = response.json()
                 mcap = data.get("marketCapitalization")
                 if mcap is None or mcap <= 0:
-                    print(f"⚠️  {symbol} — некорректная капитализация")
+                    print(f"  {symbol} — некорректная капитализация")
                     continue
                 rows.append((today, symbol, float(mcap)))
 
         except Exception as e:
-            print(f"❌ Ошибка запроса для {symbol}: {e}")
+            print(f" Ошибка запроса для {symbol}: {e}")
             continue
 
     return rows
 
-# ── 10. ЗАПИСЬ В БД ───────────────────────────────────────────────────────────
+#  10. ЗАПИСЬ В БД 
 def save_rows(table_name: str, rows: list):
     if not rows:
-        print("⚠️  Нет данных для записи")
+        print("  Нет данных для записи")
         return
 
     conn = mysql.connector.connect(**DB_CONFIG)
@@ -365,47 +365,47 @@ def save_rows(table_name: str, rows: list):
     c.executemany(sql, rows)
     conn.commit()
 
-    print(f"✅ Записано {c.rowcount} новых строк из {len(rows)} total")
+    print(f" Записано {c.rowcount} новых строк из {len(rows)} total")
     c.close()
     conn.close()
 
-# ── 11. ОСНОВНАЯ ЛОГИКА ───────────────────────────────────────────────────────
+#  11. ОСНОВНАЯ ЛОГИКА 
 def process(table_name: str):
     config = DATASETS[table_name]
 
     ensure_table(table_name)
 
     latest = get_latest_date(table_name)
-    print(f"📅 Последняя дата в БД: {latest or 'таблица пуста'}")
+    print(f" Последняя дата в БД: {latest or 'таблица пуста'}")
 
     raw = fetch_data(config)
     if not raw:
-        print("⚠️  Данных нет")
+        print("  Данных нет")
         return
 
     rows = raw
-    print(f"🆕 Строк для записи: {len(rows)}")
+    print(f" Строк для записи: {len(rows)}")
     save_rows(table_name, rows)
 
-# ── 12. ТОЧКА ВХОДА ───────────────────────────────────────────────────────────
+#  12. ТОЧКА ВХОДА 
 def main():
     if args.table_name not in DATASETS:
-        print(f"❌ Неизвестная таблица '{args.table_name}'. Допустимые:")
+        print(f" Неизвестная таблица '{args.table_name}'. Допустимые:")
         for name in DATASETS:
             print(f"  - {name}")
         sys.exit(1)
 
-    print(f"🚀 Finnhub Parser")
+    print(f" Finnhub Parser")
     print(f"   База: {args.host}:{args.port}/{args.database}")
     print(f"   Таблица: {args.table_name}")
-    print(f"   API-ключ: {'✅ есть' if FINNHUB_API_KEY else '❌ нет'}")
+    print(f"   API-ключ: {' есть' if FINNHUB_API_KEY else ' нет'}")
 
     ensure_tickers_table()
     apply_saved_symbols_to_all_tables()
     add_symbols_from_argument(args.table_name, args.tickers)
     process(args.table_name)
 
-    print("🏁 ГОТОВО")
+    print(" ГОТОВО")
 
 
 if __name__ == "__main__":
@@ -414,9 +414,9 @@ if __name__ == "__main__":
     except SystemExit:
         raise
     except KeyboardInterrupt:
-        print("\n🛑 Прервано")
+        print("\n Прервано")
         sys.exit(1)
     except Exception as e:
-        print(f"\n❌ Критическая ошибка: {e!r}")
+        print(f"\n Критическая ошибка: {e!r}")
         send_error_trace(e)
         sys.exit(1)

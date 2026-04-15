@@ -68,9 +68,9 @@ def _dt_to_ts(dt: datetime) -> int:
     return int(dt.timestamp())
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 # КОНФИГ ФРЕЙМВОРКА
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 
 # Наличие RATES_TABLE → IS_SIMPLE = True (нет ctx, нет pair/day)
 RATES_TABLE = "brain_rates_eur_usd"
@@ -107,9 +107,9 @@ _MIN_HISTORY   = 2    # минимум исторических аналогов
 _TAX_MONTHS = {1, 3, 4, 6, 9, 12}  # April, June, Sep, Dec, Mar, Jan
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 # model()
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 
 def model(
     rates:         list[dict],
@@ -137,7 +137,7 @@ def model(
     if not rates or not dataset:
         return {}
 
-    # ── numpy-путь ────────────────────────────────────────────────────────────
+    #  numpy-путь 
     _np = dataset_index.get("np_rates") if dataset_index else None
 
     if _np is not None:
@@ -178,12 +178,12 @@ def model(
         is_bull = (float(last.get("close") or 0) > float(last.get("open") or 0)) if last else True
         ext_set = ext_max2 if is_bull else ext_min2
 
-    # ── индекс датасета ───────────────────────────────────────────────────────
+    #  индекс датасета 
     _ds_dates        = dataset_index["dates"]     if dataset_index else [e["date"] for e in dataset]
     _by_ctx          = dataset_index["by_key"]    if dataset_index else {}
     _ctx_dates_cache = dataset_index["key_dates"] if dataset_index else {}
 
-    # ── события в окне [date - 72ч, date] ────────────────────────────────────
+    #  события в окне [date - 72ч, date] 
     window_start = date - timedelta(hours=_SHIFT_WINDOW)
     _i_left  = bisect.bisect_left(_ds_dates,  window_start)
     _i_right = bisect.bisect_right(_ds_dates, date)
@@ -221,7 +221,7 @@ def model(
         total_hist = len(historical)
         _shift_td  = timedelta(hours=shift)
 
-        # ── VAR-модификаторы ─────────────────────────────────────────────────
+        #  VAR-модификаторы 
 
         debt_regime   = str(event.get("debt_regime")      or "normal")
         tga_level     = str(event.get("tga_level_class")  or "adequate")
@@ -257,7 +257,7 @@ def model(
         # var=4: Tax Season Precision
         is_tax_season = (cal_month in _TAX_MONTHS and tax_ratio >= 0.4)
 
-        # ── numpy-путь ───────────────────────────────────────────────────────
+        #  numpy-путь 
         if _np is not None:
             import numpy as _np_i
             _date_ts = _dt_to_ts(date)
@@ -310,7 +310,7 @@ def model(
                     result[wc] = result.get(wc, 0.0) + ext
 
         else:
-            # ── Python-fallback ───────────────────────────────────────────────
+            #  Python-fallback 
             t_dates = [td for h in historical
                        if (td := h["date"] + _shift_td) < date
                        and td in rates_t1]

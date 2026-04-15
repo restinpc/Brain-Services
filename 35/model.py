@@ -19,9 +19,9 @@ model.py — Сервис 35: Веса новостей на основе NER-к
 
 from __future__ import annotations
 
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 # КОНФИГ ДЛЯ ФРЕЙМВОРКА
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 
 WEIGHTS_TABLE   = "vlad_news_weights_table"
 CTX_TABLE       = "vlad_news_context_idx"
@@ -43,7 +43,7 @@ FILTER_FUTURE_EVENTS = True
 
 REBUILD_INTERVAL = 3600   # секунд между автоматическими вызовами rebuild
 
-# ── Вариации ─────────────────────────────────────────────────────────────────
+#  Вариации 
 #
 #   var=0  простая сумма T1 / базовый экстремум
 #   var=1  только крупные свечи (range > avg_range)
@@ -54,9 +54,9 @@ REBUILD_INTERVAL = 3600   # секунд между автоматическим
 VAR_RANGE = [0, 1, 2, 3, 4]
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 # model() — ОСНОВНАЯ ФУНКЦИЯ
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 
 def model(rates, dataset, date, *, type=0, var=0, param="", ctx):
     """
@@ -101,7 +101,7 @@ def model(rates, dataset, date, *, type=0, var=0, param="", ctx):
 
         ctx_id = event_key[0]
 
-        # ── T1 (type=0 или type=1) ────────────────────────────────────────────
+        #  T1 (type=0 или type=1) 
         if type in (0, 1):
             if var == 0:
                 t1 = ctx.compute_t1(t_dates)
@@ -134,7 +134,7 @@ def model(rates, dataset, date, *, type=0, var=0, param="", ctx):
                 wc = f"NW{ctx_id}_0_{shift}"
                 result[wc] = result.get(wc, 0.0) + t1
 
-        # ── Extremum (type=0 или type=2) ──────────────────────────────────────
+        #  Extremum (type=0 или type=2) 
         if type in (0, 2) and prev is not None:
             _, is_bull = prev
             ext_set    = ctx.extremums["max" if is_bull else "min"]

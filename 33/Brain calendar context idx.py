@@ -1,4 +1,4 @@
-﻿import os
+import os
 from collections import defaultdict
 
 import mysql.connector
@@ -51,7 +51,7 @@ CREATE TABLE IF NOT EXISTS `{CTX_TABLE}` (
 """
 
 
-# ── DB ────────────────────────────────────────────────────────────────────────
+#  DB 
 
 def get_db_connection():
     return mysql.connector.connect(
@@ -64,7 +64,7 @@ def get_db_connection():
     )
 
 
-# ── Классификаторы ────────────────────────────────────────────────────────────
+#  Классификаторы 
 
 def _rel_direction(actual, reference, threshold,
                    up_label="UP", down_label="DOWN", flat_label="FLAT"):
@@ -116,7 +116,7 @@ def classify_event(forecast, previous, old_previous, actual, threshold):
     return fcd, scd, rcd
 
 
-# ── main ──────────────────────────────────────────────────────────────────────
+#  main 
 
 def main():
     conn = get_db_connection()
@@ -230,7 +230,7 @@ def main():
         (table_cnt,) = cur.fetchone()
         print(f"\nOK: inserted={total_inserted}, table_rows={table_cnt}")
 
-        print(f"\n── Топ-20 контекстов по числу наблюдений ──────────────────────")
+        print(f"\n Топ-20 контекстов по числу наблюдений ")
         cur.execute(f"""
             SELECT event_id, currency_code, importance,
                    forecast_dir, surprise_dir, revision_dir,
@@ -242,11 +242,11 @@ def main():
         rows = cur.fetchall()
         hdr = f"  {'evt_id':>7} {'curr':<5} {'imp':<8} {'fcast':<8} {'surp':<8} {'rev':<8} {'count':>6}"
         print(hdr)
-        print("  " + "─" * 56)
+        print("  " + "" * 56)
         for eid, cur_code, imp, fcd, scd, rcd, cnt in rows:
             print(f"  {eid:>7} {cur_code:<5} {imp:<8} {fcd:<8} {scd:<8} {rcd:<8} {cnt:>6}")
 
-        print(f"\n── Распределение по валютам ────────────────────────────────────")
+        print(f"\n Распределение по валютам ")
         cur.execute(f"""
             SELECT currency_code,
                    COUNT(*)              AS distinct_contexts,
@@ -259,7 +259,7 @@ def main():
         for cur_code, ctx_cnt, obs in cur.fetchall():
             print(f"  {cur_code:<6}  contexts={ctx_cnt:<5}  observations={obs}")
 
-        print(f"\n── Распределение по важности ───────────────────────────────────")
+        print(f"\n Распределение по важности ")
         cur.execute(f"""
             SELECT importance,
                    COUNT(*)              AS distinct_contexts,

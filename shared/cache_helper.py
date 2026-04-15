@@ -21,7 +21,7 @@ from sqlalchemy.exc import InternalError, OperationalError
 
 log = logging.getLogger(__name__)
 
-# ── Семафор ───────────────────────────────────────────────────────────────────
+#  Семафор 
 _DB_SEM: asyncio.Semaphore | None = None
 _DB_SEM_LOCK: asyncio.Lock | None = None
 
@@ -46,7 +46,7 @@ async def get_db_sem() -> asyncio.Semaphore:
     return _DB_SEM
 
 
-# ── DDL ────────────────────────────────────────────────────────────────────────
+#  DDL 
 
 def _ddl_for_table(table: str) -> str:
     """Генерирует DDL для таблицы кеша с произвольным именем."""
@@ -123,7 +123,7 @@ async def ensure_cache_table(
     if not exists:
         async with engine_vlad.begin() as conn:
             await conn.execute(text(_ddl_for_table(table_name)))
-        log.info(f"✅ {table_name} создана")
+        log.info(f" {table_name} создана")
     else:
         log.debug(f"{table_name} уже существует")
 
@@ -294,14 +294,14 @@ async def cached_values(
 
     p_hash = cache_hash(extra_params)
 
-    # ── 1. Cache HIT ──────────────────────────────────────────────────────────
+    #  1. Cache HIT 
     cached = await _cache_get(engine_vlad, service_url, pair, day, date_val, p_hash,
                               table_name=table_name)
     if cached is not None:
         log.debug(f"HIT  pair={pair} day={day} date={date} params={extra_params}")
         return ok_response(cached)
 
-    # ── 2. Вычисляем ──────────────────────────────────────────────────────────
+    #  2. Вычисляем 
     log.debug(f"MISS pair={pair} day={day} date={date} params={extra_params}")
 
     callable_result = compute_fn()
@@ -318,7 +318,7 @@ async def cached_values(
             f"Computation failed (check date or params): date={date!r} params={extra_params}"
         )
 
-    # ── 3. INSERT IGNORE — атомарная защита от гонки и дублей ────────────────
+    #  3. INSERT IGNORE — атомарная защита от гонки и дублей 
     await _cache_set(engine_vlad, service_url, pair, day, date_val,
                      extra_params, p_hash, result, table_name=table_name)
 

@@ -38,7 +38,7 @@ parser.add_argument("database", nargs="?", default=os.getenv("DB_NAME"))
 args = parser.parse_args()
 
 if not all([args.host, args.user, args.password, args.database]):
-    print("❌ Ошибка: не указаны параметры подключения"); sys.exit(1)
+    print(" Ошибка: не указаны параметры подключения"); sys.exit(1)
 
 DB_CONFIG = {'host': args.host, 'port': int(args.port), 'user': args.user, 'password': args.password, 'database': args.database}
 DATASETS = {"vlad_openmeteo_climate": {"description": "Open-Meteo ERA5 climate anomalies (15 conflict zones)"}}
@@ -114,7 +114,7 @@ class ClimateCollector:
 
         rows = []
         for zone in ZONES:
-            print(f"   🌡️ {zone['name']:20s}", end=" ", flush=True)
+            print(f"    {zone['name']:20s}", end=" ", flush=True)
             try:
                 resp = self.session.get(
                     "https://archive-api.open-meteo.com/v1/era5",
@@ -170,7 +170,7 @@ class ClimateCollector:
                     snapshot_hour, snapshot_at,
                 ))
 
-                icon = "🔴" if severity == "extreme" else ("🟡" if severity == "moderate" else "🟢")
+                icon = "" if severity == "extreme" else ("" if severity == "moderate" else "")
                 dev_str = f"{temp_dev:+.1f}°C" if temp_dev else "N/A"
                 print(f"{icon} {dev_str} ({severity})")
 
@@ -179,7 +179,7 @@ class ClimateCollector:
             time.sleep(random.uniform(0.5, 1.5))
 
         if not rows:
-            print("   ⚠️ Нет данных"); return
+            print("    Нет данных"); return
 
         conn = self.get_db_connection(); c = conn.cursor()
         sql = f"""INSERT IGNORE INTO `{self.table_name}`
@@ -188,20 +188,20 @@ class ClimateCollector:
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"""
         c.executemany(sql, rows)
         conn.commit(); n = c.rowcount; c.close(); conn.close()
-        print(f"   ✅ Записано {n} зон")
+        print(f"    Записано {n} зон")
 
 
 def main():
     if args.table_name not in DATASETS:
-        print(f"❌ Неизвестная таблица."); sys.exit(1)
-    print(f"🚀 Open-Meteo ERA5 Climate Anomaly Collector (15 zones)")
+        print(f" Неизвестная таблица."); sys.exit(1)
+    print(f" Open-Meteo ERA5 Climate Anomaly Collector (15 zones)")
     print(f"База: {args.host}:{args.port}/{args.database}")
-    print(f"🎯 Таблица: {args.table_name}"); print("=" * 60)
+    print(f" Таблица: {args.table_name}"); print("=" * 60)
     ClimateCollector(args.table_name).process()
-    print("=" * 60); print("🏁 ЗАГРУЗКА ЗАВЕРШЕНА")
+    print("=" * 60); print(" ЗАГРУЗКА ЗАВЕРШЕНА")
 
 if __name__ == "__main__":
     try: main()
     except SystemExit: raise
-    except KeyboardInterrupt: print("\n🛑 Прервано"); sys.exit(1)
-    except Exception as e: print(f"\n❌ {e!r}"); send_error_trace(e); sys.exit(1)
+    except KeyboardInterrupt: print("\n Прервано"); sys.exit(1)
+    except Exception as e: print(f"\n {e!r}"); send_error_trace(e); sys.exit(1)

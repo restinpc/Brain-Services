@@ -49,9 +49,9 @@ COMMENT='DTS Treasury weight codes'
 """
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 # ОБЩАЯ ЛОГИКА
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 
 def _make_code(ctx_id: int, mode: int, shift: int) -> str:
     return f"{ctx_id}_{mode}_{shift}"
@@ -66,9 +66,9 @@ def _generate_codes(ctx_id: int, occ: int) -> list[str]:
     ]
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 # РЕЖИМ 1: вызов фреймворком (async, инкрементальный)
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 
 async def build_weights(engine_vlad) -> dict:
     """
@@ -140,9 +140,9 @@ async def build_weights(engine_vlad) -> dict:
     }
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 # РЕЖИМ 2: самостоятельный скрипт (полная пересборка)
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 
 def main():
     # Проверяем переменные окружения
@@ -150,7 +150,7 @@ def main():
     missing = [var for var in required_vars if not os.getenv(var)]
 
     if missing:
-        print(f"\n❌ Ошибка: Не найдены переменные окружения: {', '.join(missing)}")
+        print(f"\n Ошибка: Не найдены переменные окружения: {', '.join(missing)}")
         print(f"Текущая директория: {os.getcwd()}")
         print(f"Путь к .env: {os.path.join(os.path.dirname(__file__), '..', '.env')}")
         print("\nПроверьте наличие файла .env в корне проекта с переменными:")
@@ -174,9 +174,9 @@ def main():
             autocommit=False,
             connection_timeout=10,
         )
-        print("✓ Подключено к vlad\n")
+        print(" Подключено к vlad\n")
     except Exception as e:
-        print(f"❌ Ошибка подключения к vlad: {e}")
+        print(f" Ошибка подключения к vlad: {e}")
         sys.exit(1)
 
     try:
@@ -185,17 +185,17 @@ def main():
         print(f"Создание таблицы `{WEIGHTS_TABLE}` в vlad...")
         cur.execute(_DDL_WEIGHTS)
         vlad.commit()
-        print("  ✓ Таблица создана")
+        print("   Таблица создана")
 
         print(f"Загрузка контекстов из `{CTX_TABLE}`...")
         cur.execute(f"SELECT id, occurrence_count FROM `{CTX_TABLE}` ORDER BY id")
         contexts = [(int(r[0]), int(r[1])) for r in cur.fetchall()]
 
         if not contexts:
-            print(f"  ⚠ Таблица `{CTX_TABLE}` пуста — сначала запусти context_idx.py")
+            print(f"   Таблица `{CTX_TABLE}` пуста — сначала запусти context_idx.py")
             return
 
-        print(f"  ✓ Контекстов: {len(contexts)}")
+        print(f"   Контекстов: {len(contexts)}")
 
         all_codes: list[str] = []
         recurring = one_shot = 0
@@ -216,7 +216,7 @@ def main():
         print("Очистка таблицы (TRUNCATE)...")
         cur.execute(f"TRUNCATE TABLE `{WEIGHTS_TABLE}`")
         vlad.commit()
-        print("  ✓ Таблица очищена")
+        print("   Таблица очищена")
 
         print("Запись батчами...")
         sql   = f"INSERT IGNORE INTO `{WEIGHTS_TABLE}` (weight_code) VALUES (%s)"
@@ -232,7 +232,7 @@ def main():
             print(f"  {pct:>3}%  ({min(i + BATCH_SIZE, total_codes)}/{total_codes})",
                   end="\r")
 
-        print(f"\n  ✓ Записано строк: {added}")
+        print(f"\n   Записано строк: {added}")
 
         # Примеры
         print("\n-- Примеры кодов --")
@@ -250,17 +250,17 @@ def main():
             ORDER BY ctx_id
         """)
         print(f"  {'ctx_id':>8} {'codes':>8} {'status':>10}")
-        print("  " + "─" * 28)
+        print("  " + "" * 28)
         for r in cur.fetchall():
             ctx_id, codes = r[0], r[1]
             expected_codes = (SHIFT_MAX + 1) * len(MODES)
-            status = "✓ full" if codes == expected_codes else "⚠ partial"
+            status = " full" if codes == expected_codes else " partial"
             print(f"  {ctx_id:>8} {codes:>8} {status:>10}")
 
-        print(f"\n✅ Готово. Всего кодов: {added}")
+        print(f"\n Готово. Всего кодов: {added}")
 
     except Exception as e:
-        print(f"\n❌ Ошибка: {e}")
+        print(f"\n Ошибка: {e}")
         vlad.rollback()
         raise
     finally:

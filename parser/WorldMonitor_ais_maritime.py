@@ -36,7 +36,7 @@ parser.add_argument("database", nargs="?", default=os.getenv("DB_NAME"))
 args = parser.parse_args()
 
 if not all([args.host, args.user, args.password, args.database]):
-    print("❌ Ошибка: не указаны параметры подключения"); sys.exit(1)
+    print(" Ошибка: не указаны параметры подключения"); sys.exit(1)
 
 DB_CONFIG = {'host': args.host, 'port': int(args.port), 'user': args.user, 'password': args.password, 'database': args.database}
 DATASETS = {"vlad_wm_ais_snapshot": {"description": "AIS maritime snapshot: disruptions + chokepoints + naval"}}
@@ -57,7 +57,7 @@ def wm_get(session, path, params=None, timeout=30):
             resp = session.get(url, params=params, timeout=timeout)
             if resp.status_code == 429: time.sleep(int(resp.headers.get("Retry-After", 10))); continue
             resp.raise_for_status(); return resp.json()
-        except Exception as e: print(f"   ⚠️ {path}: {e}")
+        except Exception as e: print(f"    {path}: {e}")
     return None
 
 def _sf(v):
@@ -108,7 +108,7 @@ class AISCollector:
 
         data = wm_get(self.session, "/api/ais-snapshot")
         if not data:
-            print("   ⚠️ Нет данных от AIS snapshot")
+            print("    Нет данных от AIS snapshot")
             return
 
         # Ответ: {sequence, timestamp, status, disruptions, density, candidateReports}
@@ -156,7 +156,7 @@ class AISCollector:
         c.execute(sql, row)
         conn.commit(); c.close(); conn.close()
 
-        print(f"   ✅ AIS snapshot записан:")
+        print(f"    AIS snapshot записан:")
         print(f"      Sequence: {data.get('sequence')}")
         print(f"      Status: {data.get('status')}")
         print(f"      Disruptions: {len(disruptions) if isinstance(disruptions, list) else '?'}")
@@ -167,22 +167,22 @@ class AISCollector:
             for d in disruptions[:5]:
                 name = d.get("chokepoint", d.get("name", d.get("region", "?")))
                 score = d.get("severity", d.get("score", d.get("level", "?")))
-                print(f"      🚢 {name}: severity={score}")
+                print(f"       {name}: severity={score}")
 
 
 def main():
     if args.table_name not in DATASETS:
-        print(f"❌ Неизвестная таблица. Допустимые:")
+        print(f" Неизвестная таблица. Допустимые:")
         for n in DATASETS: print(f"  - {n}")
         sys.exit(1)
-    print(f"🚀 WorldMonitor AIS Maritime Collector")
+    print(f" WorldMonitor AIS Maritime Collector")
     print(f"База: {args.host}:{args.port}/{args.database}")
-    print(f"🎯 Таблица: {args.table_name}"); print("=" * 60)
+    print(f" Таблица: {args.table_name}"); print("=" * 60)
     AISCollector(args.table_name).process()
-    print("=" * 60); print("🏁 ЗАГРУЗКА ЗАВЕРШЕНА")
+    print("=" * 60); print(" ЗАГРУЗКА ЗАВЕРШЕНА")
 
 if __name__ == "__main__":
     try: main()
     except SystemExit: raise
-    except KeyboardInterrupt: print("\n🛑 Прервано"); sys.exit(1)
-    except Exception as e: print(f"\n❌ Критическая ошибка: {e!r}"); send_error_trace(e); sys.exit(1)
+    except KeyboardInterrupt: print("\n Прервано"); sys.exit(1)
+    except Exception as e: print(f"\n Критическая ошибка: {e!r}"); send_error_trace(e); sys.exit(1)

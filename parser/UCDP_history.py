@@ -48,7 +48,7 @@ DB_PASSWORD = args.password or os.getenv("DB_PASSWORD")
 DB_DATABASE = args.database or os.getenv("DB_NAME")
 
 if not all([DB_HOST, DB_USER, DB_PASSWORD, DB_DATABASE]):
-    print("❌ Ошибка: не указаны параметры подключения")
+    print(" Ошибка: не указаны параметры подключения")
     print("\nИспользование:")
     print("  python UCDP_history.py host port user password database")
     print("\nИли через .env файл:")
@@ -60,7 +60,7 @@ if not all([DB_HOST, DB_USER, DB_PASSWORD, DB_DATABASE]):
     sys.exit(1)
 
 if not UCDP_TOKEN:
-    print("❌ Ошибка: не указан UCDP_TOKEN в .env")
+    print(" Ошибка: не указан UCDP_TOKEN в .env")
     print("   Получить: https://ucdp.uu.se/apidocs/")
     sys.exit(1)
 
@@ -119,8 +119,8 @@ class UCDPCollector:
                     if attempt == MAX_PAGE_RETRIES:
                         raise
                     wait = RETRY_BACKOFF_BASE * (2 ** (attempt - 1)) + random.uniform(2, 8)
-                    print(f"\n⚠️ Сетевой сбой на стр.{page+1} (попытка {attempt}/{MAX_PAGE_RETRIES}): {e!r}")
-                    print(f"🔄 Пересоздаём сессию, ждём {wait:.0f}с...")
+                    print(f"\n Сетевой сбой на стр.{page+1} (попытка {attempt}/{MAX_PAGE_RETRIES}): {e!r}")
+                    print(f" Пересоздаём сессию, ждём {wait:.0f}с...")
                     self.session = self._make_session()
                     time.sleep(wait)
 
@@ -132,14 +132,14 @@ class UCDPCollector:
             all_events.extend(valid_events)
 
             current_page = data.get("CurrentPage", page)
-            print(f"📥 Стр. {current_page+1}/{total_pages}: +{len(valid_events)}, всего {len(all_events)}/{total_count} ", end="\r")
+            print(f" Стр. {current_page+1}/{total_pages}: +{len(valid_events)}, всего {len(all_events)}/{total_count} ", end="\r")
 
             if current_page + 1 >= total_pages:
                 break
             page += 1
             time.sleep(random.uniform(0.3, 0.8))
 
-        print(f"\n✅ Загружено {len(all_events)} событий")
+        print(f"\n Загружено {len(all_events)} событий")
         return all_events
 
     def ensure_table(self):
@@ -151,9 +151,9 @@ class UCDPCollector:
         if c.fetchone():
             c.execute(f"SHOW COLUMNS FROM `{self.table_name}` LIKE 'iso3'")
             if c.fetchone():
-                print(f"⚠️ Обнаружена старая таблица с полем iso3. Удаляем...")
+                print(f" Обнаружена старая таблица с полем iso3. Удаляем...")
                 c.execute(f"DROP TABLE IF EXISTS `{self.table_name}`")
-                print(f"✅ Старая таблица удалена")
+                print(f" Старая таблица удалена")
         
         c.execute(f"""
             CREATE TABLE IF NOT EXISTS `{self.table_name}` (
@@ -313,54 +313,54 @@ class UCDPCollector:
 
         if last_year is None:
             # === BACKFILL: весь датасет одним проходом ===
-            print(f"\n📦 BACKFILL MODE: UCDP GED v{UCDP_GED_VERSION} (1989–2024)")
+            print(f"\n BACKFILL MODE: UCDP GED v{UCDP_GED_VERSION} (1989–2024)")
             print("   Скачиваем весь датасет за один проход...\n")
             events = self.fetch_all_events(UCDP_GED_VERSION)
             n = self.insert_events(events)
-            print(f"\n🏁 BACKFILL завершён: вставлено {n} записей")
+            print(f"\n BACKFILL завершён: вставлено {n} записей")
 
             # Candidate
-            print(f"\n📦 Загрузка Candidate v{UCDP_CANDIDATE_VERSION}")
+            print(f"\n Загрузка Candidate v{UCDP_CANDIDATE_VERSION}")
             events = self.fetch_all_events(UCDP_CANDIDATE_VERSION)
             n = self.insert_events(events)
-            print(f"   ✅ Candidate: {n} записей")
+            print(f"    Candidate: {n} записей")
         else:
             # === INCREMENTAL ===
-            print(f"\n🔄 INCREMENTAL MODE")
+            print(f"\n INCREMENTAL MODE")
             print(f"   Последний год в БД: {last_year}")
             print(f"   Текущих записей: {current_count}\n")
             
             current_year = date.today().year
             for year in range(max(last_year - 1, 1989), 2025):
-                print(f"   📥 GED v{UCDP_GED_VERSION}, год {year}...")
+                print(f"    GED v{UCDP_GED_VERSION}, год {year}...")
                 events = self.fetch_all_events(UCDP_GED_VERSION, year_filter=year)
                 n = self.insert_events(events)
                 if n > 0:
                     print(f"      +{n} новых")
                 time.sleep(random.uniform(0.5, 1.5))
 
-            print(f"   📥 Candidate v{UCDP_CANDIDATE_VERSION}...")
+            print(f"    Candidate v{UCDP_CANDIDATE_VERSION}...")
             events = self.fetch_all_events(UCDP_CANDIDATE_VERSION)
             n = self.insert_events(events)
             print(f"      +{n} новых из candidate")
 
         final_count = self.get_row_count()
-        print(f"\n📊 ИТОГО в таблице {self.table_name}: {final_count} записей")
+        print(f"\n ИТОГО в таблице {self.table_name}: {final_count} записей")
 
 def main():
-    print(f"🚀 UCDP GED Collector")
+    print(f" UCDP GED Collector")
     print(f"База: {DB_HOST}:{DB_PORT}/{DB_DATABASE}")
-    print(f"🎯 Таблица: {TABLE_NAME}")
+    print(f" Таблица: {TABLE_NAME}")
     print("=" * 60)
     UCDPCollector().process()
     print("=" * 60)
-    print("🏁 ЗАГРУЗКА ЗАВЕРШЕНА")
+    print(" ЗАГРУЗКА ЗАВЕРШЕНА")
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        print(f"\n❌ Критическая ошибка: {e!r}")
+        print(f"\n Критическая ошибка: {e!r}")
         traceback.print_exc()
         send_error_trace(e)
         sys.exit(1)

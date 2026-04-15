@@ -182,9 +182,9 @@ _AGGREGATE_SQL = """
 _TAX_MONTHS = {1, 3, 4, 6, 9, 12}
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 # КЛАССИФИКАТОРЫ — используются и в standalone, и в async
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 
 def _debt_regime(headroom) -> str:
     """suspended / stress / normal — та же логика что в DATASET_QUERY JOIN."""
@@ -208,9 +208,9 @@ def _tga_level(tga_closing) -> str:
     return "elevated"
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 # АГРЕГАЦИЯ СТРОК В ГРУППЫ (общая логика для обоих режимов)
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 
 def _aggregate_rows(raw_rows) -> dict:
     """
@@ -309,9 +309,9 @@ _UPSERT_SQL = f"""
 """
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 # РЕЖИМ 1: вызов фреймворком (async, UPSERT)
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 
 async def build_index(engine_vlad, engine_brain) -> dict:
     """
@@ -336,7 +336,7 @@ async def build_index(engine_vlad, engine_brain) -> dict:
 
     groups = _aggregate_rows(rows)
 
-    # ── Шаг 1: UPSERT в vlad_tr_context_idx ──────────────────────────────────
+    #  Шаг 1: UPSERT в vlad_tr_context_idx 
     upserted = 0
     async with engine_vlad.begin() as conn:
         for (dr, tlc), g in groups.items():
@@ -350,7 +350,7 @@ async def build_index(engine_vlad, engine_brain) -> dict:
         for r in res.mappings().all():
             ctx_map[(r["debt_regime"], r["tga_level_class"])] = dict(r)
 
-    # ── Шаг 2: перезаписываем vlad_tr_dts_dataset ────────────────────────────
+    #  Шаг 2: перезаписываем vlad_tr_dts_dataset 
     # Строим строки: одна на день, ctx_id проставлен через классификацию
     dataset_rows = []
     prev_tga: float | None = None
@@ -433,9 +433,9 @@ async def build_index(engine_vlad, engine_brain) -> dict:
     }
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 # РЕЖИМ 2: самостоятельный скрипт (полная пересборка, TRUNCATE + INSERT)
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 
 def main():
     required_vars = {
@@ -455,10 +455,10 @@ def main():
         if not value:
             missing.append(env_key)
         else:
-            print(f"✓ {env_key}: {value}")
+            print(f" {env_key}: {value}")
 
     if missing:
-        print(f"\n❌ Ошибка: Не найдены переменные окружения: {', '.join(missing)}")
+        print(f"\n Ошибка: Не найдены переменные окружения: {', '.join(missing)}")
         sys.exit(1)
 
     print("\nПодключение к базам данных...")
@@ -475,9 +475,9 @@ def main():
             autocommit=False,
             connection_timeout=10,
         )
-        print("✓ Подключено к brain")
+        print(" Подключено к brain")
     except Exception as e:
-        print(f"❌ Ошибка подключения к brain: {e}")
+        print(f" Ошибка подключения к brain: {e}")
         sys.exit(1)
 
     try:
@@ -492,9 +492,9 @@ def main():
             autocommit=False,
             connection_timeout=10,
         )
-        print("✓ Подключено к vlad\n")
+        print(" Подключено к vlad\n")
     except Exception as e:
-        print(f"❌ Ошибка подключения к vlad: {e}")
+        print(f" Ошибка подключения к vlad: {e}")
         brain.close()
         sys.exit(1)
 
@@ -502,31 +502,31 @@ def main():
         bc = brain.cursor()
         vc = vlad.cursor()
 
-        # ── Создаём таблицы ───────────────────────────────────────────────────
+        #  Создаём таблицы 
         print(f"Создание таблицы `{CTX_TABLE}` в vlad...")
         vc.execute(_DDL)
         vlad.commit()
-        print("  ✓ Таблица создана")
+        print("   Таблица создана")
 
         print(f"Создание таблицы `{DATASET_TABLE}` в vlad...")
         vc.execute(_DDL_DATASET)
         vlad.commit()
-        print("  ✓ Таблица создана")
+        print("   Таблица создана")
 
-        # ── Агрегация из brain ────────────────────────────────────────────────
+        #  Агрегация из brain 
         print("Агрегация из brain.vlad_tr_daily_treasury_statement_all...")
         bc.execute(_AGGREGATE_SQL)
         rows = bc.fetchall()
-        print(f"  ✓ Дней обработано: {len(rows)}")
+        print(f"   Дней обработано: {len(rows)}")
 
         if not rows:
-            print("  ⚠ Нет данных — проверь подключение к brain и фильтры SQL")
+            print("   Нет данных — проверь подключение к brain и фильтры SQL")
             return
 
         groups = _aggregate_rows(rows)
-        print(f"  ✓ Типов найдено: {len(groups)}")
+        print(f"   Типов найдено: {len(groups)}")
 
-        # ── TRUNCATE + INSERT в vlad_tr_context_idx ───────────────────────────
+        #  TRUNCATE + INSERT в vlad_tr_context_idx 
         print("Пересборка vlad_tr_context_idx (TRUNCATE + INSERT)...")
         vc.execute(f"TRUNCATE TABLE `{CTX_TABLE}`")
         vlad.commit()
@@ -551,7 +551,7 @@ def main():
             ))
             inserted_ctx += 1
         vlad.commit()
-        print(f"  ✓ Записано типов: {inserted_ctx}")
+        print(f"   Записано типов: {inserted_ctx}")
 
         # Читаем ctx_id после вставки
         vc.execute(f"SELECT id, debt_regime, tga_level_class, "
@@ -567,7 +567,7 @@ def main():
                 "avg_headroom": r[8], "tax_month_ratio": r[9],
             }
 
-        # ── TRUNCATE + INSERT в vlad_tr_dts_dataset ───────────────────────────
+        #  TRUNCATE + INSERT в vlad_tr_dts_dataset 
         print("Пересборка vlad_tr_dts_dataset (TRUNCATE + INSERT)...")
         vc.execute(f"TRUNCATE TABLE `{DATASET_TABLE}`")
         vlad.commit()
@@ -630,9 +630,9 @@ def main():
                 vlad.commit()
 
         vlad.commit()
-        print(f"  ✓ Записано строк датасета: {inserted_ds}")
+        print(f"   Записано строк датасета: {inserted_ds}")
 
-        # ── Итоговая таблица ctx_index ────────────────────────────────────────
+        #  Итоговая таблица ctx_index 
         vc.execute(f"""
             SELECT id, debt_regime, tga_level_class,
                    occurrence_count,
@@ -648,7 +648,7 @@ def main():
         print(f"\n{'id':>3} {'regime':<12} {'level':<10} {'cnt':>6} "
               f"{'tga_B$':>8} {'dΔ_B$':>7} {'ftd_B$':>7} "
               f"{'h_B$':>8} {'tax_r':>6} {'first':>12} {'last':>12}")
-        print("─" * 95)
+        print("" * 95)
         for r in vc.fetchall():
             h_str = f"{r[7]:>8.0f}" if r[7] else "    N/A "
             print(f"{r[0]:>3} {r[1]:<12} {r[2]:<10} {r[3]:>6} "
@@ -656,10 +656,10 @@ def main():
                   f"{h_str} {r[8] or 0:>6.2f} "
                   f"{str(r[9] or ''):>12} {str(r[10] or ''):>12}")
 
-        print(f"\n✅ Готово. ctx={inserted_ctx} dataset={inserted_ds}")
+        print(f"\n Готово. ctx={inserted_ctx} dataset={inserted_ds}")
 
     except Exception as e:
-        print(f"\n❌ Ошибка: {e}")
+        print(f"\n Ошибка: {e}")
         vlad.rollback()
         raise
     finally:

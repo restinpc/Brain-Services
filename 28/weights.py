@@ -1,4 +1,4 @@
-﻿import os
+import os
 import mysql.connector
 from dotenv import load_dotenv
 
@@ -172,7 +172,7 @@ def main():
             LIMIT 10
         """)
         print(f"\n{'weight_code':<55} {'eid':>6} {'fdir':<10} {'sdir':<8} {'adir':<8} {'mode':>4} {'hour':>5} {'occ':>5}")
-        print("─" * 110)
+        print("" * 110)
         for row in cur.fetchall():
             wc, eid, fd, sd, ad, mv, hs, oc = row
             print(f"{wc:<55} {eid:>6} {fd:<10} {sd:<8} {ad:<8} {mv:>4} {str(hs):>5} {str(oc):>5}")

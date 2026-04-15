@@ -1,4 +1,4 @@
-﻿import os
+import os
 import mysql.connector
 from dotenv import load_dotenv
 from collections import defaultdict
@@ -213,7 +213,7 @@ def main():
         (table_cnt,) = cur.fetchone()
         print(f"\nOK: inserted={total}, table_rows={table_cnt}")
 
-        print(f"\n── Распределение по контекстам ──────────────────────────────")
+        print(f"\n Распределение по контекстам ")
         cur.execute(f"""
             SELECT rate_change_dir, trend_dir, momentum_dir,
                    COUNT(*)              AS distinct_ccys,
@@ -226,7 +226,7 @@ def main():
         rows = cur.fetchall()
         print(f"  {'change_dir':<12} {'trend_dir':<10} {'momentum':<10} "
               f"{'ccys':>6} {'observations':>14}")
-        print("  " + "─" * 56)
+        print("  " + "" * 56)
         for rcd, td, md, ccys, obs in rows:
             print(f"  {rcd:<12} {td:<10} {md:<10} {ccys:>6} {obs:>14}")
 
