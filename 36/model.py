@@ -97,7 +97,7 @@ CTX_KEY_COLUMNS   = ["id"]
 DATASET_KEY       = "ctx_id"    # фреймворк строит by_key индекс по этому полю
 
 VAR_RANGE         = [0, 1, 2, 3, 4, 5]
-CACHE_DATE_FROM   = "2008-01-01"
+CACHE_DATE_FROM   = "2025-01-15"
 RELOAD_INTERVAL  = 3600
 REBUILD_INTERVAL  = 4000
 
