@@ -419,6 +419,7 @@ async def preload_all_data():
             res = await conn.execute(text("""
                 SELECT
                     Url,
+                    EventName,
                     CurrencyCode,
                     Importance,
                     ForecastValue,
@@ -439,14 +440,15 @@ async def preload_all_data():
             skipped_no_index    = 0
             for row in rows:
                 url        = row[0]
-                currency   = row[1]
-                importance = row[2]
-                forecast   = row[3]
-                previous   = row[4]
-                old_prev   = row[5]
-                actual     = row[6]
-                full_date  = row[7]
-                event_type = row[8]
+                event_name = row[1]
+                currency   = row[2]
+                importance = row[3]
+                forecast   = row[4]
+                previous   = row[5]
+                old_prev   = row[6]
+                actual     = row[7]
+                full_date  = row[8]
+                event_type = row[9]
 
                 if event_type in SKIP_EVENT_TYPES or currency is None:
                     continue
@@ -455,6 +457,10 @@ async def preload_all_data():
                 if event_id is None:
                     skipped_no_event_id += 1
                     continue
+
+                # Заполняем GLOBAL_EVENT_NAMES из engine_brain (там всегда есть EventName)
+                if event_name and event_id not in GLOBAL_EVENT_NAMES:
+                    GLOBAL_EVENT_NAMES[event_id] = event_name
 
                 fcd, scd, rcd = classify_event(
                     forecast, previous, old_prev, actual, DIRECTION_THRESHOLD
@@ -900,16 +906,19 @@ async def get_values(
         missing_ids = {d["event_id"] for d in raw_details if not d["event_name"]}
         if missing_ids:
             try:
-                async with engine_vlad.connect() as conn:
+                ids_list     = list(missing_ids)
+                placeholders = ", ".join(f":id{i}" for i in range(len(ids_list)))
+                params       = {f"id{i}": eid for i, eid in enumerate(ids_list)}
+                async with engine_brain.connect() as conn:
                     res = await conn.execute(
-                        text("""
+                        text(f"""
                             SELECT EventId, EventName
                             FROM brain_calendar
-                            WHERE EventId IN :ids
+                            WHERE EventId IN ({placeholders})
                               AND EventName IS NOT NULL AND EventName != ''
                             GROUP BY EventId, EventName
                         """),
-                        {"ids": tuple(missing_ids)},
+                        params,
                     )
                     db_names = {r[0]: r[1] for r in res.fetchall()}
                 # Обновляем global-кэш и raw_details
