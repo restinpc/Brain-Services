@@ -96,6 +96,19 @@ CTX_TABLE         = "vlad_tr_context_idx"
 CTX_KEY_COLUMNS   = ["id"]
 DATASET_KEY       = "ctx_id"    # фреймворк строит by_key индекс по этому полю
 
+# CTX_QUERY добавляет вычисляемое поле `name`, которое подхватывается
+# фреймворком в _build_narrative через info.get("name").
+# Формат: "stress_critical", "normal_adequate", "suspended_elevated" и т.д.
+CTX_QUERY = """
+    SELECT
+        id,
+        CONCAT(debt_regime, '_', tga_level_class) AS name,
+        occurrence_count,
+        debt_regime,
+        tga_level_class
+    FROM vlad_tr_context_idx
+"""
+
 VAR_RANGE         = [4, 5]
 CACHE_DATE_FROM   = "2025-01-15"
 RELOAD_INTERVAL  = 3600
