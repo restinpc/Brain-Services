@@ -109,7 +109,7 @@ CTX_QUERY = """
     FROM vlad_tr_context_idx
 """
 
-VAR_RANGE         = [4, 5]
+VAR_RANGE         = [0, 1, 2, 3, 4, 5]
 CACHE_DATE_FROM   = "2025-01-15"
 RELOAD_INTERVAL  = 3600
 REBUILD_INTERVAL  = 4000
