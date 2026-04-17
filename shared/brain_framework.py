@@ -466,6 +466,13 @@ class _State:
         # Устанавливается в _preload() после определения service_url.
         self._cache_table: str = "vlad_values_cache"
 
+        # Кеш меток для _build_narrative: ctx_id (int) → human-readable label (str).
+        # Заполняется в _load_label_cache() при каждом reload.
+        # Универсален: строит label из любых колонок CTX_TABLE по приоритету:
+        #   person_token > ctx_key > event_name > name >
+        #   debt_regime+tga_level_class > maturity_bucket+accepted > ctx_id=N
+        self._label_cache: dict = {}
+
     @property
     def cache_table(self) -> str:
         return self._cache_table
@@ -825,6 +832,48 @@ async def _load_ctx_index_incremental(s: _State) -> list:
     except Exception as e:
         log(f"  ❌ ctx_index incremental: {e}", s.NODE_NAME, level="error")
     return new_keys
+
+
+def _build_label_from_row(info: dict, ctx_id: int) -> str:
+    """Универсальная сборка человекочитаемого label из строки CTX_TABLE."""
+    label = (info.get("person_token") or
+             info.get("ctx_key") or
+             info.get("event_name") or
+             info.get("name"))
+    if not label:
+        dr  = info.get("debt_regime")
+        tga = info.get("tga_level_class")
+        mb  = info.get("maturity_bucket")
+        acc = info.get("accepted")
+        if dr and tga:
+            label = f"{dr}_{tga}"
+        elif mb is not None and acc is not None:
+            label = f"{mb}_{'accepted' if int(acc) else 'rejected'}"
+    return label or f"ctx_id={ctx_id}"
+
+
+async def _load_label_cache(s: _State):
+    """Заполняет s._label_cache напрямую из CTX_TABLE.
+    Вызывается при каждом reload независимо от ctx_index.
+    Работает для любого сервиса у которого задан CTX_TABLE.
+    """
+    if not s.CTX_TABLE:
+        return
+    try:
+        async with s.engine_vlad.connect() as conn:
+            res = await conn.execute(
+                text(f"SELECT * FROM `{s.CTX_TABLE}`")
+            )
+            s._label_cache = {}
+            for r in res.mappings().all():
+                info   = dict(r)
+                ctx_id = info.get("id")
+                if ctx_id is None:
+                    continue
+                s._label_cache[int(ctx_id)] = _build_label_from_row(info, int(ctx_id))
+        log(f"  label_cache: {len(s._label_cache)}", s.NODE_NAME)
+    except Exception as e:
+        log(f"  ⚠️ label_cache: {e}", s.NODE_NAME, level="warning")
 
 
 async def _load_dataset(s: _State):
@@ -1552,6 +1601,8 @@ def build_app(model_module) -> FastAPI:
             await _load_rates(s)
             await _load_dataset(s)
             await _load_weight_codes(s)
+            await _load_ctx_index(s)
+            await _load_label_cache(s)
             s.service_url = f"http://localhost:{s.PORT}"
             s._cache_table = f"vlad_values_cache_svc{s.PORT}"
             try:
@@ -1572,6 +1623,7 @@ def build_app(model_module) -> FastAPI:
         # Полный режим (сервисы 33-35)
         await _load_weight_codes(s)
         await _load_ctx_index(s)
+        await _load_label_cache(s)
         await _load_events_full(s)
         _build_sorted_arrays(s)
         await _load_rates(s)
@@ -2333,59 +2385,22 @@ def build_app(model_module) -> FastAPI:
             shift  = int(m.group(3))
             gk = (ctx_id, shift)
             if gk not in groups:
+                # Приоритет 1: LABEL_FN из model.py
                 label = None
                 if s.LABEL_FN:
                     try:
                         label = s.LABEL_FN((ctx_id,))
                     except Exception:
                         pass
+                # Приоритет 2: _label_cache (заполняется при reload из CTX_TABLE)
+                if not label:
+                    label = s._label_cache.get(ctx_id)
+                # Приоритет 3: перебор ctx_index (старый путь, для совместимости)
                 if not label:
                     for key, info in s.ctx_index.items():
                         if key[0] == ctx_id:
-                            label = (info.get("person_token") or
-                                     info.get("ctx_key") or
-                                     info.get("event_name") or
-                                     info.get("name"))
-                            if not label:
-                                # Fallback: собираем label из типовых колонок ctx-таблиц
-                                dr  = info.get("debt_regime")
-                                tga = info.get("tga_level_class")
-                                mb  = info.get("maturity_bucket")
-                                acc = info.get("accepted")
-                                if dr and tga:
-                                    label = f"{dr}_{tga}"
-                                elif mb is not None and acc is not None:
-                                    label = f"{mb}_{'accepted' if int(acc) else 'rejected'}"
-                            if label:
-                                break
-                # Последний резерв: прямой синхронный запрос к CTX_TABLE
-                if not label and s.CTX_TABLE:
-                    try:
-                        with s.engine_vlad.sync_engine.connect() as _conn:
-                            _row = _conn.execute(
-                                text(f"SELECT * FROM `{s.CTX_TABLE}` WHERE id = :cid LIMIT 1"),
-                                {"cid": ctx_id}
-                            ).mappings().fetchone()
-                            if _row:
-                                _info = dict(_row)
-                                label = (
-                                    _info.get("person_token") or
-                                    _info.get("ctx_key") or
-                                    _info.get("event_name") or
-                                    _info.get("name")
-                                )
-                                if not label:
-                                    _dr  = _info.get("debt_regime")
-                                    _tga = _info.get("tga_level_class")
-                                    _mb  = _info.get("maturity_bucket")
-                                    _acc = _info.get("accepted")
-                                    if _dr and _tga:
-                                        label = f"{_dr}_{_tga}"
-                                    elif _mb is not None and _acc is not None:
-                                        label = f"{_mb}_{'accepted' if int(_acc) else 'rejected'}"
-                    except Exception:
-                        pass
-
+                            label = _build_label_from_row(info, ctx_id)
+                            break
                 if not label:
                     label = f"ctx_id={ctx_id}"
 
@@ -2394,18 +2409,6 @@ def build_app(model_module) -> FastAPI:
                     if key[0] == ctx_id:
                         occ = info.get("occurrence_count", 0)
                         break
-                # Также пробуем получить occ прямо из БД если ctx_index пустой
-                if occ == 0 and not s.ctx_index and s.CTX_TABLE:
-                    try:
-                        with s.engine_vlad.sync_engine.connect() as _conn:
-                            _row = _conn.execute(
-                                text(f"SELECT occurrence_count FROM `{s.CTX_TABLE}` WHERE id = :cid LIMIT 1"),
-                                {"cid": ctx_id}
-                            ).fetchone()
-                            if _row:
-                                occ = _row[0] or 0
-                    except Exception:
-                        pass
 
                 groups[gk] = {
                     "ctx_id": ctx_id,
