@@ -2346,6 +2346,16 @@ def build_app(model_module) -> FastAPI:
                                      info.get("ctx_key") or
                                      info.get("event_name") or
                                      info.get("name"))
+                            if not label:
+                                # Fallback: собираем label из типовых колонок ctx-таблиц
+                                dr  = info.get("debt_regime")
+                                tga = info.get("tga_level_class")
+                                mb  = info.get("maturity_bucket")
+                                acc = info.get("accepted")
+                                if dr and tga:
+                                    label = f"{dr}_{tga}"
+                                elif mb is not None and acc is not None:
+                                    label = f"{mb}_{'accepted' if int(acc) else 'rejected'}"
                             if label:
                                 break
                 if not label:
