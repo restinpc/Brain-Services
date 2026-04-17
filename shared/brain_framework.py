@@ -2358,6 +2358,34 @@ def build_app(model_module) -> FastAPI:
                                     label = f"{mb}_{'accepted' if int(acc) else 'rejected'}"
                             if label:
                                 break
+                # Последний резерв: прямой синхронный запрос к CTX_TABLE
+                if not label and s.CTX_TABLE:
+                    try:
+                        with s.engine_vlad.sync_engine.connect() as _conn:
+                            _row = _conn.execute(
+                                text(f"SELECT * FROM `{s.CTX_TABLE}` WHERE id = :cid LIMIT 1"),
+                                {"cid": ctx_id}
+                            ).mappings().fetchone()
+                            if _row:
+                                _info = dict(_row)
+                                label = (
+                                    _info.get("person_token") or
+                                    _info.get("ctx_key") or
+                                    _info.get("event_name") or
+                                    _info.get("name")
+                                )
+                                if not label:
+                                    _dr  = _info.get("debt_regime")
+                                    _tga = _info.get("tga_level_class")
+                                    _mb  = _info.get("maturity_bucket")
+                                    _acc = _info.get("accepted")
+                                    if _dr and _tga:
+                                        label = f"{_dr}_{_tga}"
+                                    elif _mb is not None and _acc is not None:
+                                        label = f"{_mb}_{'accepted' if int(_acc) else 'rejected'}"
+                    except Exception:
+                        pass
+
                 if not label:
                     label = f"ctx_id={ctx_id}"
 
@@ -2366,6 +2394,18 @@ def build_app(model_module) -> FastAPI:
                     if key[0] == ctx_id:
                         occ = info.get("occurrence_count", 0)
                         break
+                # Также пробуем получить occ прямо из БД если ctx_index пустой
+                if occ == 0 and not s.ctx_index and s.CTX_TABLE:
+                    try:
+                        with s.engine_vlad.sync_engine.connect() as _conn:
+                            _row = _conn.execute(
+                                text(f"SELECT occurrence_count FROM `{s.CTX_TABLE}` WHERE id = :cid LIMIT 1"),
+                                {"cid": ctx_id}
+                            ).fetchone()
+                            if _row:
+                                occ = _row[0] or 0
+                    except Exception:
+                        pass
 
                 groups[gk] = {
                     "ctx_id": ctx_id,
