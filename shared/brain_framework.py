@@ -1546,11 +1546,11 @@ def build_app(model_module) -> FastAPI:
             ctx = _ModelContext(table, pair, day, target_date, s)
             result = s.model_fn(rates=rates_filtered, dataset=dataset_filtered,
                                 date=target_date, type=calc_type, var=calc_var,
-                                param=param, ctx=ctx, dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field, "np_rates": s.np_rates.get(table)} if s.model_needs_index else None))
+                                param=param, ctx=ctx, dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field, "np_rates": s.np_rates.get(table), "ctx_index": s.ctx_index} if s.model_needs_index else None))
         else:
             result = s.model_fn(rates=rates_filtered, dataset=dataset_filtered,
                                 date=target_date, type=calc_type, var=calc_var,
-                                param=param, dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field, "np_rates": s.np_rates.get(table)} if s.model_needs_index else None))
+                                param=param, dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field, "np_rates": s.np_rates.get(table), "ctx_index": s.ctx_index} if s.model_needs_index else None))
         result, _ = _extract_detail(result)
         return result
 
@@ -1579,11 +1579,11 @@ def build_app(model_module) -> FastAPI:
             ctx = _ModelContext(table, pair, day, target_date, s)
             result = s.model_fn(rates=rates_filtered, dataset=dataset_f,
                                 date=target_date, type=calc_type,
-                                var=calc_var, param=param, ctx=ctx, dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field, "np_rates": s.np_rates.get(table)} if s.model_needs_index else None))
+                                var=calc_var, param=param, ctx=ctx, dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field, "np_rates": s.np_rates.get(table), "ctx_index": s.ctx_index} if s.model_needs_index else None))
         else:
             result = s.model_fn(rates=rates_filtered, dataset=dataset_f,
                                 date=target_date, type=calc_type,
-                                var=calc_var, param=param, dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field, "np_rates": s.np_rates.get(table)} if s.model_needs_index else None))
+                                var=calc_var, param=param, dataset_index=({"dates": s.dataset_dates, "by_key": s.dataset_by_key, "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field, "np_rates": s.np_rates.get(table), "ctx_index": s.ctx_index} if s.model_needs_index else None))
         result, detail = _extract_detail(result)
         return result, _make_detail_serializable(detail)
 
