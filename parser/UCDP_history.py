@@ -1,7 +1,7 @@
 """
 UCDP GED Collector — загружает все события 1989–2024 + candidate.
 Таблица: vlad_ucdp
-Запуск: python UCDP_history.py [database] [host] [port] [user] [password]
+Запуск: python UCDP_history.py brain
 """
 
 import os, sys, argparse, time, random, traceback
@@ -32,14 +32,22 @@ def send_error_trace(exc, script_name="UCDP_history.py"):
     except:
         pass
 
-# Аргументы командной строки (позиционные, все опциональные)
+# Аргументы командной строки - positional args
 parser = argparse.ArgumentParser(description="UCDP GED Events → MySQL")
-parser.add_argument("database", nargs="?", default=None, help="MySQL database name")
-parser.add_argument("host", nargs="?", default=None, help="MySQL host")
-parser.add_argument("port", nargs="?", default=None, help="MySQL port")
-parser.add_argument("user", nargs="?", default=None, help="MySQL user")
-parser.add_argument("password", nargs="?", default=None, help="MySQL password")
+parser.add_argument("database", action="store", nargs="?", default=None, help="MySQL database name")
+parser.add_argument("host", action="store", nargs="?", default=None, help="MySQL host")
+parser.add_argument("port", action="store", nargs="?", default=None, help="MySQL port")
+parser.add_argument("user", action="store", nargs="?", default=None, help="MySQL user")
+parser.add_argument("password", action="store", nargs="?", default=None, help="MySQL password")
 args = parser.parse_args()
+
+# Отладка: выводим полученные аргументы
+print("DEBUG: Получены аргументы:")
+print(f"  database = {args.database}")
+print(f"  host = {args.host}")
+print(f"  port = {args.port}")
+print(f"  user = {args.user}")
+print(f"  password = {args.password}")
 
 # Берём из аргументов, если не указаны — из .env
 DB_HOST = args.host or os.getenv("DB_HOST")
@@ -53,7 +61,6 @@ if not all([DB_HOST, DB_USER, DB_PASSWORD, DB_DATABASE]):
     print("\nИспользование:")
     print("  python UCDP_history.py brain")
     print("  python UCDP_history.py brain 127.0.0.1 3306 root password")
-    print("  python UCDP_history.py 127.0.0.1 3306 root password brain")
     print("\nИли через .env файл:")
     print("  DB_HOST=127.0.0.1")
     print("  DB_PORT=3306")
