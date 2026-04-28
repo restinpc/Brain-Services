@@ -2,10 +2,13 @@
 model.py — Сервис: Daily Treasury Statement (DTS)
 ==================================================
 
+Фреймворк: brain_framework v12.
+Rebuild:   context_idx.py (build_index) + weights.py (build_weights) —
+           обнаруживаются автоматически рядом с model.py.
+
 Датасет: vlad_tr_dts_dataset JOIN vlad_tr_context_idx (через engine_vlad).
   vlad видит оба источника — JOIN без промежуточной таблицы.
 
-IS_SIMPLE режим (задан RATES_TABLE).
 Код веса: {ctx_id}_{mode}_{shift},  mode=0 → T1,  mode=1 → Extremum,  shift 0..72 ч
 
 DATASET_QUERY берёт агрегированные DTS-данные из vlad_tr_dts_dataset
@@ -69,15 +72,15 @@ def _dt_to_ts(dt: datetime) -> int:
 # КОНФИГ ФРЕЙМВОРКА
 # ──────────────────────────────────────────────────────────────
 
-RATES_TABLE = "brain_rates_eur_usd"   # IS_SIMPLE = True
+RATES_TABLE = "brain_rates_eur_usd"
 
 # DATASET_ENGINE="vlad": фреймворк выполняет запрос через engine_vlad.
 #
 # Запрос берёт агрегированный DTS из vlad_tr_dts_dataset и JOIN-ит
 # с vlad_tr_context_idx чтобы получить ctx_id.
 #
-# КРИТИЧНО: CASE-выражения debt_regime и tga_level_class в vlad_tr_dts_dataset
-# должны совпадать с логикой в context_idx.py.
+# КРИТИЧНО: значения debt_regime/tga_level_class в vlad_tr_dts_dataset должны
+# совпадать с классификацией в context_idx.py. Расхождение → ctx_id = NULL.
 DATASET_ENGINE         = "vlad"
 FILTER_DATASET_BY_DATE = True
 DATASET_KEY            = "ctx_id"
@@ -118,8 +121,10 @@ CACHE_DATE_FROM   = "2025-01-15"
 RELOAD_INTERVAL   = 3600
 REBUILD_INTERVAL  = 4000
 
-_SHIFT_WINDOW = 72   # часов — DTS выходит раз в день, реакция до 3 суток
-_MIN_HISTORY  = 2    # минимум исторических аналогов для сигнала
+# Фреймворк читает SHIFT_WINDOW для нарратива /values → details.
+# model() использует то же значение для окна поиска событий.
+SHIFT_WINDOW  = 72   # часов — DTS выходит раз в день, реакция до 3 суток
+MIN_HISTORY   = 2    # минимум исторических аналогов для сигнала
 
 _TAX_MONTHS = {1, 3, 4, 6, 9, 12}   # April, June, Sep, Dec, Mar, Jan
 
@@ -139,8 +144,8 @@ def model(
     dataset_index: dict | None = None,
 ) -> dict[str, float]:
     """
-    IS_SIMPLE mode. Для каждой свечи (date):
-      1. Ищем DTS-события в [date - 72ч, date]
+    Для каждой свечи (date):
+      1. Ищем DTS-события в [date - SHIFT_WINDOW, date]
       2. ctx_id, shift, debt_regime, tga_level_class из dataset row
       3. По историческим аналогам смотрим T1 / Extremum
       4. Применяем var-гипотезу
@@ -203,7 +208,7 @@ def model(
     _ctx_dates_c = dataset_index["key_dates"] if dataset_index else {}
 
     # ── События в окне [date - SHIFT_WINDOW, date] ────────────
-    window_start = date - timedelta(hours=_SHIFT_WINDOW)
+    window_start = date - timedelta(hours=SHIFT_WINDOW)
     i_l    = bisect.bisect_left(_ds_dates,  window_start)
     i_r    = bisect.bisect_right(_ds_dates, date)
     recent = [e for e in dataset[i_l:i_r] if e.get("ctx_id") is not None]
@@ -228,7 +233,7 @@ def model(
 
         shift = max(0, min(
             int((date - event["date"]).total_seconds() / 3600),
-            _SHIFT_WINDOW,
+            SHIFT_WINDOW,
         ))
 
         debt_regime  = str(event.get("debt_regime")     or "normal")
@@ -266,7 +271,7 @@ def model(
         _ctx_dates = _ctx_dates_c.get(ctx_id, [])
         _hi        = bisect.bisect_left(_ctx_dates, event["date"])
         historical = ctx_events[:_hi]
-        if len(historical) < _MIN_HISTORY:
+        if len(historical) < MIN_HISTORY:
             continue
 
         total_hist = len(historical)
