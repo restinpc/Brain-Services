@@ -58,7 +58,7 @@ VAR_RANGE = [0, 1, 2, 3, 4]
 # model() — ОСНОВНАЯ ФУНКЦИЯ
 # 
 
-def model(rates, dataset, date, *, type=0, var=0, param="", ctx):
+def model(rates, dataset, date, *, type=0, var=0, param="", ctx, dataset_index=None):
     """
     Вычисляет веса T1 + Extremum по NER-контекстам новостей.
 
