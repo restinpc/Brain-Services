@@ -1,8 +1,13 @@
 """
-brain_framework.py v12 — только IS_SIMPLE режим.
+brain_framework.py v13 — IS_SIMPLE режим + опциональный ML (USE_ML_VALUES).
 
 Full mode (events / ctx_index / sorted_arrays) удалён как дублирующий.
 Каждый сервис обязан иметь RATES_TABLE в model.py.
+
+Опционально: USE_ML_VALUES = True в model.py включает обратное обучение по
+экстремумам — _call_model возвращает обученный универсум вместо суммирования
+свечей/вероятности экстремума. Все endpoint-ы (/values, /fill_cache, /backtest,
+/posttest, /compute_batch) при этом работают без правок. См. reverse_learning.py.
 
 server.py для всех сервисов одинаковый:
     from brain_framework import build_app
@@ -68,6 +73,7 @@ from common import (
     resolve_workers, build_engines,
 )
 from cache_helper import ensure_cache_table, load_service_url, cached_values
+import reverse_learning as rl
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -260,6 +266,16 @@ class _State:
     CACHE_DATE_FROM:     str        = "2025-01-15"
     LABEL_FN:            object     = None
 
+    # ── ML-режим (USE_ML_VALUES=True в model.py) ─────────────────────────────
+    USE_ML_VALUES:        bool  = False
+    ML_INIT_MODE:         str   = "constant"   # 'constant' | 'diff'
+    ML_TARGET_PRECISION:  float = 0.95
+    ML_MAX_ITER:          int   = 20
+    ML_STEP:              float = 0.10
+    ML_EXTREMUM_LIMIT:    int   = 50
+    ML_ACTIVE_TAIL:       int   = 0            # 0 = вся история, >0 = последние N
+    ML_PRECISION_METRIC:  str   = "mean"       # 'mean' | 'min' | 'weighted'
+
     def __init__(self):
         self.CTX_KEY_COLUMNS   = ["id"]
         self.VAR_RANGE         = []
@@ -311,6 +327,11 @@ class _State:
 
         self._cache_table: str  = "vlad_values_cache"
         self._label_cache:  dict = {}
+
+        # ── ML-режим: хранилище и in-memory кеш активных кодов ───────────────
+        self.reverse_store: rl.ReverseStore | None = None
+        # ключ: (pair, day, ts, type, var, param) → list[str]; сбрасывается в _preload
+        self._ml_active_cache: dict = {}
 
     @property
     def cache_table(self) -> str:
@@ -886,6 +907,16 @@ def build_app(model_module) -> FastAPI:
     s.RATES_TABLE        = _g("RATES_TABLE",  "brain_rates_eur_usd")
     s.dataset_key_field  = _g("DATASET_KEY",  "ctx_id")
 
+    # ── ML-режим ─────────────────────────────────────────────────────────────
+    s.USE_ML_VALUES        = bool(_g("USE_ML_VALUES",        False))
+    s.ML_INIT_MODE         = _g("ML_INIT_MODE",        "constant")
+    s.ML_TARGET_PRECISION  = float(_g("ML_TARGET_PRECISION", 0.95))
+    s.ML_MAX_ITER          = int(_g("ML_MAX_ITER",     20))
+    s.ML_STEP              = float(_g("ML_STEP",       0.10))
+    s.ML_EXTREMUM_LIMIT    = int(_g("ML_EXTREMUM_LIMIT", 50))
+    s.ML_ACTIVE_TAIL       = int(_g("ML_ACTIVE_TAIL",  0))
+    s.ML_PRECISION_METRIC  = _g("ML_PRECISION_METRIC", "mean")
+
     s.model_fn = getattr(model_module, "model", None)
     if s.model_fn is None:
         raise RuntimeError("model_module должен определять функцию model()")
@@ -898,10 +929,12 @@ def build_app(model_module) -> FastAPI:
     _has_rebuild = s.index_builder_fn or s.weight_builder_fn
     log(f"  VAR_RANGE={s.VAR_RANGE} | "
         f"dataset_index={'yes' if s.model_needs_index else 'no'} | "
-        f"rebuild={'builders' if _has_rebuild else 'no'}",
+        f"rebuild={'builders' if _has_rebuild else 'no'} | "
+        f"ml={'ON' if s.USE_ML_VALUES else 'off'}",
         s.NODE_NAME, force=True)
 
     s.engine_vlad, s.engine_brain, s.engine_super = build_engines()
+    s.reverse_store = rl.ReverseStore(s.engine_vlad, port=s.PORT)
 
     # ── _call_model ───────────────────────────────────────────────────────────
 
@@ -914,18 +947,69 @@ def build_app(model_module) -> FastAPI:
         rates_f   = _filter_rates_lte(table, target_date, s)
         dataset_f = _filter_dataset_lte(target_date, s)
         np_r      = s.np_rates.get(table)
-        result = s.model_fn(
-            rates=rates_f, dataset=dataset_f, date=target_date,
-            type=calc_type, var=calc_var, param=param,
-            dataset_index=(
-                {"dates": s.dataset_dates, "by_key": s.dataset_by_key,
-                 "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field,
-                 "np_rates": np_r, "ctx_index": s.ctx_index}
-                if s.model_needs_index else None
-            ),
-        )
-        result, _ = _extract_detail(result)
-        return result
+
+        def _model_at(date_x: datetime, rates_x: list, dataset_x: list) -> dict:
+            """Низкоуровневый вызов model_fn на конкретную дату — возвращает dict."""
+            r = s.model_fn(
+                rates=rates_x, dataset=dataset_x, date=date_x,
+                type=calc_type, var=calc_var, param=param,
+                dataset_index=(
+                    {"dates": s.dataset_dates, "by_key": s.dataset_by_key,
+                     "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field,
+                     "np_rates": np_r, "ctx_index": s.ctx_index}
+                    if s.model_needs_index else None
+                ),
+            )
+            r, _ = _extract_detail(r)
+            return r or {}
+
+        # ── ОБЫЧНЫЙ РЕЖИМ ────────────────────────────────────────────────────
+        if not s.USE_ML_VALUES:
+            return _model_at(target_date, rates_f, dataset_f)
+
+        # ── ML-РЕЖИМ ─────────────────────────────────────────────────────────
+        # model_fn используется только как «провайдер активных кодов на дате
+        # экстремума». Сами values переписывает обратное обучение.
+        async def _active_codes_at(ext_dt: datetime) -> list[str]:
+            ts  = int(ext_dt.timestamp())
+            key = (pair, day, ts, calc_type, calc_var, param)
+            cached = s._ml_active_cache.get(key)
+            if cached is not None:
+                return cached
+            try:
+                rates_at   = _filter_rates_lte(table, ext_dt, s)
+                dataset_at = _filter_dataset_lte(ext_dt, s)
+                codes      = list(_model_at(ext_dt, rates_at, dataset_at).keys())
+            except Exception:
+                codes = []
+            s._ml_active_cache[key] = codes
+            return codes
+
+        params_hash = _params_hash({
+            "type": calc_type, "var": calc_var, "param": param,
+        })
+
+        try:
+            universe, _pr = await s.reverse_store.maybe_retrain(
+                pair=pair, day_flag=day, control_date=target_date,
+                params_hash=params_hash,
+                np_simple_rates=s.np_simple_rates,
+                active_codes_at=_active_codes_at,
+                init_mode=s.ML_INIT_MODE,
+                max_iter=s.ML_MAX_ITER,
+                step=s.ML_STEP,
+                target_precision=s.ML_TARGET_PRECISION,
+                extremum_limit=s.ML_EXTREMUM_LIMIT,
+                active_tail=s.ML_ACTIVE_TAIL,
+                metric=s.ML_PRECISION_METRIC,
+                log_fn=lambda m: log(m, s.NODE_NAME),
+            )
+            return universe
+        except Exception as e:
+            log(f"  ❌ ML _call_model {target_date}: {e}",
+                s.NODE_NAME, level="error")
+            send_error_trace(e, s.NODE_NAME, "ml_call_model")
+            return {}
 
     # ── _preload ──────────────────────────────────────────────────────────────
 
@@ -948,6 +1032,9 @@ def build_app(model_module) -> FastAPI:
 
         try:
             await ensure_cache_table(s.engine_vlad, s.cache_table)
+            if s.USE_ML_VALUES:
+                await s.reverse_store.ensure_tables()
+                s._ml_active_cache.clear()
             async with s.engine_vlad.begin() as conn:
                 await conn.execute(text(_DDL_BT_RESULTS))
                 await conn.execute(text(_DDL_BT_SUMMARY))
@@ -1421,6 +1508,16 @@ def build_app(model_module) -> FastAPI:
                 "rebuild_auto":       s.REBUILD_INTERVAL > 0 and bool(
                     s.index_builder_fn or s.weight_builder_fn),
                 "rebuild_interval_s": s.REBUILD_INTERVAL,
+                "ml_mode": ({
+                    "enabled":          True,
+                    "init_mode":        s.ML_INIT_MODE,
+                    "target_precision": s.ML_TARGET_PRECISION,
+                    "max_iter":         s.ML_MAX_ITER,
+                    "step":             s.ML_STEP,
+                    "extremum_limit":   s.ML_EXTREMUM_LIMIT,
+                    "active_tail":      s.ML_ACTIVE_TAIL,
+                    "precision_metric": s.ML_PRECISION_METRIC,
+                } if s.USE_ML_VALUES else {"enabled": False}),
             },
         }
 
