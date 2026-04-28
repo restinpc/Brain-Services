@@ -159,24 +159,6 @@ WEIGHTS_TABLE   = "vlad_tr_buybacks_weights_table"
 CTX_TABLE       = "vlad_tr_buybacks_context_idx"
 CTX_KEY_COLUMNS = ["id"]
 
-# CTX_QUERY добавляет вычисляемое поле `name`, которое подхватывается
-# фреймворком в _build_narrative через info.get("name").
-# Формат: "short_accepted", "long_rejected" и т.д.
-CTX_QUERY = """
-    SELECT
-        id,
-        CONCAT(
-            maturity_bucket,
-            '_',
-            IF(accepted = 1, 'accepted', 'rejected')
-        )                  AS name,
-        occurrence_count,
-        avg_par_accepted,
-        maturity_bucket,
-        accepted
-    FROM vlad_tr_buybacks_context_idx
-"""
-
 VAR_RANGE         = [0, 1, 2, 3, 4, 5]
 CACHE_DATE_FROM   = "2025-01-15"
 RELOAD_INTERVAL   = 3600
