@@ -13,7 +13,7 @@ weights.py — Buybacks Security Details.
   2. from weights import build_weights
      await build_weights(engine_vlad)  — инкрементальное обновление
 
-SHIFT_MAX = 72 ч: buyback-операции происходят раз в неделю ~в 13:40 EST.
+SHIFT_MAX = 168 ч: buyback-операции происходят раз в неделю ~в 13:40 EST.
 Рынок реагирует 1–3 торговых дня (research: "sizeable cumulative effects on
 bond returns" — Federal Reserve Bank 2024). Институциональные desk'и
 (BlackRock, hedge funds) реагируют в тот же день или следующий.
