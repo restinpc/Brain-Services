@@ -1,22 +1,13 @@
 """
-brain_framework.py v13 — IS_SIMPLE режим + опциональный ML (USE_ML_VALUES).
-
-Full mode (events / ctx_index / sorted_arrays) удалён как дублирующий.
-Каждый сервис обязан иметь RATES_TABLE в model.py.
-
-Опционально: USE_ML_VALUES = True в model.py включает обратное обучение по
-экстремумам — _call_model возвращает обученный универсум вместо суммирования
-свечей/вероятности экстремума. Все endpoint-ы (/values, /fill_cache, /backtest,
-/posttest, /compute_batch) при этом работают без правок. См. reverse_learning.py.
-
-server.py для всех сервисов одинаковый:
-    from brain_framework import build_app
+brain_framework.py v14 — IS_SIMPLE режим + опциональный ML (USE_ML_VALUES).
+Все оптимизации применены: bulk upsert, searchsorted, threadpool executor.
 """
 
 from __future__ import annotations
 
 import asyncio
 import bisect
+import concurrent.futures as _cf
 import inspect
 import json as _json
 import math
@@ -40,7 +31,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Трассировка — email-уведомления по окончании fill_cache / backtest
+# Трассировка
 # ──────────────────────────────────────────────────────────────────────────────
 _TRACE_HANDLER = os.getenv("HANDLER", "https://server.brain-project.online").rstrip("/")
 _TRACE_URL     = f"{_TRACE_HANDLER}/trace.php"
@@ -75,6 +66,13 @@ from common import (
 from cache_helper import ensure_cache_table, load_service_url, cached_values
 import reverse_learning as rl
 
+# ──────────────────────────────────────────────────────────────────────────────
+# THREADPOOL ДЛЯ ПАРАЛЛЕЛЬНЫХ ВЫЧИСЛЕНИЙ
+# ──────────────────────────────────────────────────────────────────────────────
+_FILL_EXECUTOR = _cf.ThreadPoolExecutor(
+    max_workers=min(8, (os.cpu_count() or 4) * 2),
+    thread_name_prefix="fill_worker",
+)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # NUMPY-УТИЛИТЫ
@@ -141,28 +139,35 @@ async def ensure_ctx_table(engine, table: str, extra_columns: str = "") -> None:
         """))
 
 
+# === ПАТЧ 3: upsert_ctx_rows — BULK executemany ===
 async def upsert_ctx_rows(engine, table: str, rows: list[dict]) -> dict[str, int]:
     if not rows:
         return {}
-    _reserved    = {"fingerprint_hash", "occurrence_count", "first_dt", "last_dt"}
-    extra_cols   = [k for k in rows[0] if k not in _reserved]
+    
+    _reserved  = {"fingerprint_hash", "occurrence_count", "first_dt", "last_dt"}
+    extra_cols = [k for k in rows[0] if k not in _reserved]
     extra_insert = (", ".join(f"`{c}`" for c in extra_cols) + ", ") if extra_cols else ""
     extra_vals   = (", ".join(f":{c}" for c in extra_cols) + ", ") if extra_cols else ""
+
+    params_list = []
+    for row in rows:
+        p = {"fp": row["fingerprint_hash"], "cnt": row["occurrence_count"],
+             "fd": row.get("first_dt"), "ld": row.get("last_dt")}
+        for c in extra_cols:
+            p[c] = row.get(c)
+        params_list.append(p)
+
     async with engine.begin() as conn:
-        for row in rows:
-            params = {"fp": row["fingerprint_hash"], "cnt": row["occurrence_count"],
-                      "fd": row.get("first_dt"), "ld": row.get("last_dt")}
-            for c in extra_cols:
-                params[c] = row.get(c)
-            await conn.execute(text(f"""
-                INSERT INTO `{table}`
-                    ({extra_insert}`fingerprint_hash`, `occurrence_count`, `first_dt`, `last_dt`)
-                VALUES ({extra_vals}:fp, :cnt, :fd, :ld)
-                ON DUPLICATE KEY UPDATE
-                    occurrence_count = occurrence_count + :cnt,
-                    last_dt  = IF(:ld > last_dt  OR last_dt  IS NULL, :ld,  last_dt),
-                    first_dt = IF(:fd < first_dt OR first_dt IS NULL, :fd, first_dt)
-            """), params)
+        await conn.execute(text(f"""
+            INSERT INTO `{table}`
+                ({extra_insert}`fingerprint_hash`, `occurrence_count`, `first_dt`, `last_dt`)
+            VALUES ({extra_vals}:fp, :cnt, :fd, :ld)
+            ON DUPLICATE KEY UPDATE
+                occurrence_count = occurrence_count + :cnt,
+                last_dt  = IF(:ld > last_dt  OR last_dt  IS NULL, :ld,  last_dt),
+                first_dt = IF(:fd < first_dt OR first_dt IS NULL, :fd, first_dt)
+        """), params_list)
+
     fp_list  = [r["fingerprint_hash"] for r in rows]
     fp_to_id: dict[str, int] = {}
     async with engine.connect() as conn:
@@ -194,21 +199,25 @@ async def ensure_weights_table(engine, table: str) -> None:
         """))
 
 
+# === ПАТЧ 4: insert_weight_codes — BULK INSERT ===
 async def insert_weight_codes(engine, table, ctx_id, make_code_fn,
                                occurrence_count, recurring_min_count=2,
                                shift_max=24, modes=(0, 1)) -> int:
     max_shift = shift_max if occurrence_count >= recurring_min_count else 0
-    added = 0
+    rows = [
+        {"wc": make_code_fn(ctx_id, mode, shift), "cid": ctx_id,
+         "mode": mode, "shift": shift}
+        for mode in modes
+        for shift in range(0, max_shift + 1)
+    ]
+    if not rows:
+        return 0
     async with engine.begin() as conn:
-        for mode in modes:
-            for shift in range(0, max_shift + 1):
-                wc = make_code_fn(ctx_id, mode, shift)
-                r  = await conn.execute(text(f"""
-                    INSERT IGNORE INTO `{table}` (weight_code, ctx_id, mode, shift)
-                    VALUES (:wc, :cid, :mode, :shift)
-                """), {"wc": wc, "cid": ctx_id, "mode": mode, "shift": shift})
-                added += r.rowcount
-    return added
+        r = await conn.execute(text(f"""
+            INSERT IGNORE INTO `{table}` (weight_code, ctx_id, mode, shift)
+            VALUES (:wc, :cid, :mode, :shift)
+        """), rows)
+    return r.rowcount
 
 
 async def ensure_events_table(engine, table: str, extra_columns: str = "") -> None:
@@ -266,7 +275,7 @@ class _State:
     DATASET_QUERY:       str | None = None
     DATASET_ENGINE:      str        = "vlad"
     FILTER_DATASET_BY_DATE: bool    = False
-    SHIFT_WINDOW:        int        = 12    # для нарратива /values
+    SHIFT_WINDOW:        int        = 12
     RELOAD_INTERVAL:     int        = 3600
     REBUILD_INTERVAL:    int        = 0
     VAR_RANGE:           list       = None
@@ -274,19 +283,17 @@ class _State:
     CACHE_DATE_FROM:     str        = "2025-01-15"
     LABEL_FN:            object     = None
 
-    # ── Маппинг URL → EventId ─────────────────────────────────────────────────
     URL_MAP_QUERY:  str | None = None
     URL_MAP_ENGINE: str        = "vlad"
 
-    # ── ML-режим (USE_ML_VALUES=True в model.py) ─────────────────────────────
     USE_ML_VALUES:        bool  = False
-    ML_INIT_MODE:         str   = "constant"   # 'constant' | 'diff'
+    ML_INIT_MODE:         str   = "constant"
     ML_TARGET_PRECISION:  float = 0.95
     ML_MAX_ITER:          int   = 20
     ML_STEP:              float = 0.10
     ML_EXTREMUM_LIMIT:    int   = 50
-    ML_ACTIVE_TAIL:       int   = 0            # 0 = вся история, >0 = последние N
-    ML_PRECISION_METRIC:  str   = "mean"       # 'mean' | 'min' | 'weighted'
+    ML_ACTIVE_TAIL:       int   = 0
+    ML_PRECISION_METRIC:  str   = "mean"
 
     def __init__(self):
         self.CTX_KEY_COLUMNS   = ["id"]
@@ -294,8 +301,8 @@ class _State:
         self.TYPES_RANGE       = [0, 1, 2, 3, 4]
 
         self.model_fn          = None
-        self.index_builder_fn  = None   # async def build_index(ev, eb) → dict
-        self.weight_builder_fn = None   # async def build_weights(ev) → dict
+        self.index_builder_fn  = None
+        self.weight_builder_fn = None
         self.model_needs_index = False
 
         self.engine_vlad  = None
@@ -304,12 +311,13 @@ class _State:
 
         self.weight_codes:  list       = []
         self.ctx_index:     dict       = {}
-        self.url_map:       dict       = {}   # url → event_id
+        self.url_map:       dict       = {}
         self.dataset:       list[dict] = []
         self.dataset_dates:     list = []
         self.dataset_by_key:    dict = {}
         self.dataset_key_dates: dict = {}
         self.dataset_key_field: str  = "ctx_id"
+        self._dataset_ts_arr:   np.ndarray | None = None  # для быстрого searchsorted
 
         self.rates:         dict = {}
         self.extremums:     dict = {}
@@ -332,7 +340,6 @@ class _State:
         self.np_rates: dict      = {}
         self.np_built: bool      = False
 
-        # Котировки основного инструмента (RATES_TABLE из model.py)
         self.RATES_TABLE:         str   = "brain_rates_eur_usd"
         self.simple_rates:        list  = []
         self.simple_rates_dates:  list  = []
@@ -342,14 +349,8 @@ class _State:
         self._cache_table: str  = "vlad_values_cache"
         self._label_cache:  dict = {}
 
-        # ── ML-режим: хранилище и in-memory кеш активных кодов ───────────────
         self.reverse_store: rl.ReverseStore | None = None
-        # ключ: (pair, day, ts, type, var, param) → list[str]; сбрасывается в _preload
         self._ml_active_cache: dict = {}
-
-    @property
-    def cache_table(self) -> str:
-        return self._cache_table
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -413,11 +414,12 @@ def _filter_rates_lte(table: str, date: datetime, s: _State) -> list[dict]:
     return rows[:idx]
 
 
+# === ПАТЧ 1: _filter_dataset_lte — binary search ===
 def _filter_dataset_lte(date: datetime, s: _State) -> list[dict]:
     if not s.FILTER_DATASET_BY_DATE:
         return s.dataset
-    return [e for e in s.dataset
-            if e.get("date") is not None and e["date"] <= date]
+    idx = bisect.bisect_right(s.dataset_dates, date)
+    return s.dataset[:idx]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -464,7 +466,6 @@ def _append_np_rates_row(table, dt, t1, rng, s: _State, close=0.0, open_=0.0,
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def _load_rates(s: _State):
-    """Загружает все 6 инструментов в global_rates (нужно для posttest)."""
     for table in _RATES_TABLES:
         s.rates[table]        = {}
         s.last_candles[table] = []
@@ -504,13 +505,13 @@ async def _load_rates(s: _State):
                     s.extremums[table][typ] = {r["date"] for r in res_ext.mappings().all()}
             log(f"  {table}: {len(s.rates[table])} candles", s.NODE_NAME)
         except Exception as e:
-            log(f"  [ERROR] {table}: {e}", s.NODE_NAME, level="error")
+            log(f"   {table}: {e}", s.NODE_NAME, level="error")
     try:
         _rebuild_np_rates(s)
-        log(f"  [OK] NP_RATES built: {sum(1 for v in s.np_rates.values() if v)} tables",
+        log(f"   NP_RATES built: {sum(1 for v in s.np_rates.values() if v)} tables",
             s.NODE_NAME)
     except Exception as e:
-        log(f"  [ERROR] NP_RATES build failed: {e}", s.NODE_NAME, level="error")
+        log(f"   NP_RATES build failed: {e}", s.NODE_NAME, level="error")
 
 
 async def _refresh_rates(table: str, s: _State):
@@ -551,12 +552,12 @@ async def _refresh_rates(table: str, s: _State):
                                          min_=float(r["min"] or 0))
                 n += 1
             if n > 0:
-                log(f"  📥 +{n} candle(s) {table}", s.NODE_NAME)
+                log(f"   +{n} candle(s) {table}", s.NODE_NAME)
     except Exception as e:
-        log(f"  [WARN] refresh {table}: {e}", s.NODE_NAME, level="warning")
+        log(f"   refresh {table}: {e}", s.NODE_NAME, level="warning")
 
 
-# ── Котировки основного инструмента (RATES_TABLE) ─────────────────────────────
+# ── Котировки основного инструмента ─────────────────────────────────────────────
 
 def _build_np_simple_rates(s: _State) -> None:
     if not s.simple_rates:
@@ -609,7 +610,7 @@ async def _load_simple_rates(s: _State) -> None:
         _build_np_simple_rates(s)
         log(f"  simple_rates ({table}): {len(s.simple_rates)} candles", s.NODE_NAME)
     except Exception as e:
-        log(f"  [ERROR] simple_rates: {e}", s.NODE_NAME, level="error")
+        log(f"   simple_rates: {e}", s.NODE_NAME, level="error")
         s.simple_rates, s.simple_rates_dates = [], []
         s.np_simple_rates = None
 
@@ -634,9 +635,9 @@ async def _refresh_simple_rates(s: _State) -> None:
         if new_rows:
             s.last_simple_rate_dt = s.simple_rates_dates[-1]
             _build_np_simple_rates(s)
-            log(f"  📥 +{len(new_rows)} candle(s) {table}", s.NODE_NAME)
+            log(f"   +{len(new_rows)} candle(s) {table}", s.NODE_NAME)
     except Exception as e:
-        log(f"  [WARN] refresh simple_rates: {e}", s.NODE_NAME, level="warning")
+        log(f"   refresh simple_rates: {e}", s.NODE_NAME, level="warning")
 
 
 # ── Веса, контекст, датасет ───────────────────────────────────────────────────
@@ -654,7 +655,7 @@ async def _load_weight_codes(s: _State):
         log(f"  weight_codes: {len(s.weight_codes)}", s.NODE_NAME)
     except Exception as e:
         s.weight_codes = []
-        log(f"  [ERROR] weight_codes: {e}", s.NODE_NAME, level="error")
+        log(f"   weight_codes: {e}", s.NODE_NAME, level="error")
 
 
 async def _load_ctx_index(s: _State):
@@ -673,7 +674,7 @@ async def _load_ctx_index(s: _State):
         log(f"  ctx_index: {s.ctx_row_count}", s.NODE_NAME)
     except Exception as e:
         s.ctx_index = {}
-        log(f"  [ERROR] ctx_index: {e}", s.NODE_NAME, level="error")
+        log(f"   ctx_index: {e}", s.NODE_NAME, level="error")
 
 
 async def _load_url_map(s: _State):
@@ -688,7 +689,7 @@ async def _load_url_map(s: _State):
         log(f"  url_map: {len(s.url_map)} entries", s.NODE_NAME)
     except Exception as e:
         s.url_map = {}
-        log(f"  [ERROR] url_map: {e}", s.NODE_NAME, level="error")
+        log(f"   url_map: {e}", s.NODE_NAME, level="error")
 
 
 def _build_label_from_row(info: dict, ctx_id: int) -> str:
@@ -721,7 +722,7 @@ async def _load_label_cache(s: _State):
                 s._label_cache[int(ctx_id)] = _build_label_from_row(info, int(ctx_id))
         log(f"  label_cache: {len(s._label_cache)}", s.NODE_NAME)
     except Exception as e:
-        log(f"  [WARN] label_cache: {e}", s.NODE_NAME, level="warning")
+        log(f"   label_cache: {e}", s.NODE_NAME, level="warning")
 
 
 async def _load_dataset(s: _State):
@@ -745,14 +746,21 @@ async def _load_dataset(s: _State):
         log(f"  dataset: {len(s.dataset)} rows", s.NODE_NAME)
     except Exception as e:
         s.dataset = []
-        log(f"  [ERROR] dataset: {e}", s.NODE_NAME, level="error")
+        log(f"   dataset: {e}", s.NODE_NAME, level="error")
 
 
+# === ПАТЧ 2: _build_dataset_index — сортировка + numpy timestamps ===
 def _build_dataset_index(s: _State) -> None:
     from collections import defaultdict as _dd
+    from datetime import datetime as _dt
+    import numpy as _np
+
+    # Гарантируем сортировку
+    s.dataset.sort(key=lambda e: e.get("date") or _dt.min)
+
     key_field = s.dataset_key_field
-    dates: list = []
-    by_key: dict = _dd(list)
+    dates = []
+    by_key = _dd(list)
     for e in s.dataset:
         dates.append(e.get("date"))
         k = e.get(key_field)
@@ -762,6 +770,14 @@ def _build_dataset_index(s: _State) -> None:
     s.dataset_dates     = dates
     s.dataset_by_key    = by_key
     s.dataset_key_dates = {k: [e["date"] for e in evts] for k, evts in by_key.items()}
+
+    # numpy-массив unix-timestamps для быстрого searchsorted в model()
+    s._dataset_ts_arr = _np.array(
+        [int(d.timestamp()) if isinstance(d, _dt) and d is not None else 0
+         for d in dates],
+        dtype=_np.int64,
+    )
+
     log(f"  dataset_index: {len(by_key)} unique {key_field}s", s.NODE_NAME)
 
 
@@ -840,7 +856,7 @@ def _make_detail_serializable(detail) -> object:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# НАРРАТИВ (/values → details)
+# НАРРАТИВ
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _pluralize_n(n: int, forms: tuple[str, str, str]) -> str:
@@ -862,7 +878,7 @@ def _shift_label(shift: int | None, day_flag: int) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# AUTO-DISCOVERY: context_idx.py + weights.py рядом с model.py
+# AUTO-DISCOVERY
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _discover_builders(model_module):
@@ -883,11 +899,11 @@ def _discover_builders(model_module):
             spec.loader.exec_module(module)
             fn = getattr(module, fn_name, None)
             if fn is None:
-                log(f"  [WARN] {filename} найден, но {fn_name}() отсутствует",
+                log(f"   {filename} найден, но {fn_name}() отсутствует",
                     "brain-framework", level="warning")
             return fn
         except Exception as e:
-            log(f"  [ERROR] ошибка импорта {filename}: {e}",
+            log(f"   ошибка импорта {filename}: {e}",
                 "brain-framework", level="error")
             return None
 
@@ -895,9 +911,9 @@ def _discover_builders(model_module):
     build_weights_fn = _load("weights.py",     "build_weights")
 
     if build_index_fn:
-        log("  [OK] context_idx.py (build_index)",   "brain-framework", force=True)
+        log("   context_idx.py (build_index)",   "brain-framework", force=True)
     if build_weights_fn:
-        log("  [OK] weights.py (build_weights)",      "brain-framework", force=True)
+        log("   weights.py (build_weights)",      "brain-framework", force=True)
 
     return build_index_fn, build_weights_fn
 
@@ -914,9 +930,7 @@ def build_app(model_module) -> FastAPI:
 
     if not hasattr(model_module, "RATES_TABLE"):
         raise RuntimeError(
-            "model.py должен содержать RATES_TABLE (например: "
-            "RATES_TABLE = 'brain_rates_eur_usd'). "
-            "Фреймворк поддерживает только IS_SIMPLE режим."
+            "model.py должен содержать RATES_TABLE"
         )
 
     # ── Критичные переменные ──────────────────────────────────────────────────
@@ -946,11 +960,9 @@ def build_app(model_module) -> FastAPI:
     s.RATES_TABLE        = _g("RATES_TABLE",  "brain_rates_eur_usd")
     s.dataset_key_field  = _g("DATASET_KEY",  "ctx_id")
 
-    # ── Маппинг URL → EventId ─────────────────────────────────────────────────
     s.URL_MAP_QUERY  = _g("URL_MAP_QUERY",  None)
     s.URL_MAP_ENGINE = _g("URL_MAP_ENGINE", "vlad")
 
-    # ── ML-режим ─────────────────────────────────────────────────────────────
     s.USE_ML_VALUES        = bool(_g("USE_ML_VALUES",        False))
     s.ML_INIT_MODE         = _g("ML_INIT_MODE",        "constant")
     s.ML_TARGET_PRECISION  = float(_g("ML_TARGET_PRECISION", 0.95))
@@ -991,29 +1003,33 @@ def build_app(model_module) -> FastAPI:
         dataset_f = _filter_dataset_lte(target_date, s)
         np_r      = s.np_rates.get(table)
 
+        # dataset_index с dataset_timestamps для model()
+        dataset_index_dict = None
+        if s.model_needs_index:
+            dataset_index_dict = {
+                "dates": s.dataset_dates,
+                "by_key": s.dataset_by_key,
+                "key_dates": s.dataset_key_dates,
+                "key_field": s.dataset_key_field,
+                "np_rates": np_r,
+                "ctx_index": s.ctx_index,
+                "url_map": s.url_map,
+                "dataset_timestamps": getattr(s, "_dataset_ts_arr", None),
+            }
+
         def _model_at(date_x: datetime, rates_x: list, dataset_x: list) -> dict:
-            """Низкоуровневый вызов model_fn на конкретную дату — возвращает dict."""
             r = s.model_fn(
                 rates=rates_x, dataset=dataset_x, date=date_x,
                 type=calc_type, var=calc_var, param=param,
-                dataset_index=(
-                    {"dates": s.dataset_dates, "by_key": s.dataset_by_key,
-                     "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field,
-                     "np_rates": np_r, "ctx_index": s.ctx_index,
-                     "url_map": s.url_map}
-                    if s.model_needs_index else None
-                ),
+                dataset_index=dataset_index_dict,
             )
             r, _ = _extract_detail(r)
             return r or {}
 
-        # ── ОБЫЧНЫЙ РЕЖИМ ────────────────────────────────────────────────────
         if not s.USE_ML_VALUES:
             return _model_at(target_date, rates_f, dataset_f)
 
         # ── ML-РЕЖИМ ─────────────────────────────────────────────────────────
-        # model_fn используется только как «провайдер активных кодов на дате
-        # экстремума». Сами values переписывает обратное обучение.
         async def _active_codes_at(ext_dt: datetime) -> list[str]:
             ts  = int(ext_dt.timestamp())
             key = (pair, day, ts, calc_type, calc_var, param)
@@ -1051,7 +1067,7 @@ def build_app(model_module) -> FastAPI:
             )
             return universe
         except Exception as e:
-            log(f"  [ERROR] ML _call_model {target_date}: {e}",
+            log(f"   ML _call_model {target_date}: {e}",
                 s.NODE_NAME, level="error")
             send_error_trace(e, s.NODE_NAME, "ml_call_model")
             return {}
@@ -1059,12 +1075,13 @@ def build_app(model_module) -> FastAPI:
     # ── _preload ──────────────────────────────────────────────────────────────
 
     async def _preload():
-        log("[RELOAD] FULL DATA RELOAD", s.NODE_NAME, force=True)
+        log(" FULL DATA RELOAD", s.NODE_NAME, force=True)
         s.np_built = False
         s.weight_codes.clear()
         s.ctx_index.clear()
         s.dataset.clear()
         s.url_map.clear()
+        s._dataset_ts_arr = None
 
         await _load_simple_rates(s)
         await _load_rates(s)
@@ -1086,10 +1103,10 @@ def build_app(model_module) -> FastAPI:
                 await conn.execute(text(_DDL_BT_RESULTS))
                 await conn.execute(text(_DDL_BT_SUMMARY))
         except Exception as e:
-            log(f"  [ERROR] tables: {e}", s.NODE_NAME, level="error")
+            log(f"   tables: {e}", s.NODE_NAME, level="error")
 
         s.last_reload = datetime.now()
-        log(f"[OK] RELOAD DONE: rates={len(s.simple_rates)} "
+        log(f" RELOAD DONE: rates={len(s.simple_rates)} "
             f"global_rates={sum(len(v) for v in s.global_rates.values())} "
             f"dataset={len(s.dataset)} weights={len(s.weight_codes)} "
             f"url_map={len(s.url_map)}",
@@ -1104,9 +1121,9 @@ def build_app(model_module) -> FastAPI:
             try:
                 result = await s.index_builder_fn(s.engine_vlad, s.engine_brain)
                 stats["index"] = result or {}
-                log(f"  [OK] build_index: {result}", s.NODE_NAME, force=True)
+                log(f"   build_index: {result}", s.NODE_NAME, force=True)
             except Exception as e:
-                log(f"  [ERROR] build_index: {e}", s.NODE_NAME, level="error")
+                log(f"   build_index: {e}", s.NODE_NAME, level="error")
                 send_error_trace(e, s.NODE_NAME, "build_index")
                 return {"error": str(e)}
 
@@ -1114,20 +1131,19 @@ def build_app(model_module) -> FastAPI:
             try:
                 result = await s.weight_builder_fn(s.engine_vlad)
                 stats["weights"] = result or {}
-                log(f"  [OK] build_weights: {result}", s.NODE_NAME, force=True)
+                log(f"   build_weights: {result}", s.NODE_NAME, force=True)
             except Exception as e:
-                log(f"  [ERROR] build_weights: {e}", s.NODE_NAME, level="error")
+                log(f"   build_weights: {e}", s.NODE_NAME, level="error")
                 send_error_trace(e, s.NODE_NAME, "build_weights")
                 return {"error": str(e)}
 
-        # Перезагружаем в память
         await _load_weight_codes(s)
         await _load_ctx_index(s)
         await _load_label_cache(s)
         await _load_url_map(s)
 
         s.last_rebuild = datetime.now()
-        log(f"[OK] rebuild done: weights={len(s.weight_codes)} ctx={len(s.ctx_index)} url_map={len(s.url_map)}",
+        log(f" rebuild done: weights={len(s.weight_codes)} ctx={len(s.ctx_index)} url_map={len(s.url_map)}",
             s.NODE_NAME, force=True)
 
         return {
@@ -1155,7 +1171,7 @@ def build_app(model_module) -> FastAPI:
                     await _do_rebuild()
                 s.last_reload = datetime.now()
             except Exception as e:
-                log(f"[ERROR] bg_reload: {e}", s.NODE_NAME, level="error", force=True)
+                log(f" bg_reload: {e}", s.NODE_NAME, level="error", force=True)
                 send_error_trace(e, s.NODE_NAME, "bg_reload")
 
     # ── fill_cache helpers ────────────────────────────────────────────────────
@@ -1171,6 +1187,40 @@ def build_app(model_module) -> FastAPI:
                 return {row[0] for row in res.fetchall()}
         except Exception:
             return set()
+
+    # ── _sync_compute для поточной обработки ─────────────────────────────────
+    def _sync_compute(candle, calc_type, calc_var, all_rows, all_dates, np_rates_pd, s_state):
+        td = candle["date"]
+        idx = bisect.bisect_right(all_dates, td)
+        rates_f = all_rows[:idx]
+        ds_f = _filter_dataset_lte(td, s_state)
+
+        dataset_index_dict = None
+        if s_state.model_needs_index:
+            dataset_index_dict = {
+                "dates": s_state.dataset_dates,
+                "by_key": s_state.dataset_by_key,
+                "key_dates": s_state.dataset_key_dates,
+                "key_field": s_state.dataset_key_field,
+                "np_rates": np_rates_pd,
+                "ctx_index": s_state.ctx_index,
+                "url_map": s_state.url_map,
+                "dataset_timestamps": getattr(s_state, "_dataset_ts_arr", None),
+            }
+
+        try:
+            res = s_state.model_fn(
+                rates=rates_f, dataset=ds_f, date=td,
+                type=calc_type, var=calc_var, param="",
+                dataset_index=dataset_index_dict,
+            )
+            res, _ = _extract_detail(res)
+            return res or {}
+        except Exception as _e:
+            import traceback as _tb
+            log(f"   fill {td} t={calc_type} v={calc_var}: {_e}\n{_tb.format_exc()}",
+                s_state.NODE_NAME, level="error", force=True)
+            return None
 
     # ── _fill_worker ──────────────────────────────────────────────────────────
 
@@ -1198,7 +1248,7 @@ def build_app(model_module) -> FastAPI:
             "slots_total": total_slots, "slots_done": 0,
             "started_at": datetime.now().isoformat(),
         }
-        log(f"🚀 fill_cache: {len(pd_slots)} инструментов × "
+        log(f" fill_cache: {len(pd_slots)} инструментов × "
             f"{len(type_var_slots)} type/var слотов", s.NODE_NAME, force=True)
 
         for slot_idx, (pair_id, day_flag) in enumerate(pd_slots):
@@ -1261,44 +1311,24 @@ def build_app(model_module) -> FastAPI:
                                     calc_type=calc_type, calc_var=var, param="")
                             except Exception as _e:
                                 import traceback as _tb
-                                log(f"  [ERROR] ml-fill {candle['date']} t={calc_type} v={var}: {_e}\n{_tb.format_exc()}",
+                                log(f"   ml-fill {candle['date']} t={calc_type} v={var}: {_e}\n{_tb.format_exc()}",
                                     s.NODE_NAME, level="error", force=True)
                                 result = None
                             results.append(result)
                     else:
-                        def _sync_compute(candle, _ct=calc_type, _v=var,
-                                          _all_rows=all_rows, _all_dates=all_dates_pd,
-                                          _np_r=np_rates_pd):
-                            td      = candle["date"]
-                            idx     = bisect.bisect_right(_all_dates, td)
-                            rates_f = _all_rows[:idx]
-                            ds_f    = _filter_dataset_lte(td, s)
-                            try:
-                                res = s.model_fn(
-                                    rates=rates_f, dataset=ds_f, date=td,
-                                    type=_ct, var=_v, param="",
-                                    dataset_index=(
-                                        {"dates": s.dataset_dates,
-                                         "by_key": s.dataset_by_key,
-                                         "key_dates": s.dataset_key_dates,
-                                         "key_field": s.dataset_key_field,
-                                         "np_rates": _np_r,
-                                         "ctx_index": s.ctx_index,
-                                         "url_map": s.url_map}
-                                        if s.model_needs_index else None
-                                    ),
-                                )
-                                res, _ = _extract_detail(res)
-                                return res or {}
-                            except Exception as _e:
-                                import traceback as _tb
-                                log(f"  [ERROR] fill {td} t={_ct} v={_v}: {_e}\n{_tb.format_exc()}",
-                                    s.NODE_NAME, level="error", force=True)
-                                return None
+                        # ПАТЧ 5: параллельные потоки внутри батча
+                        loop = asyncio.get_event_loop()
+                        futs = [
+                            loop.run_in_executor(
+                                _FILL_EXECUTOR,
+                                _sync_compute,
+                                candle, calc_type, var,
+                                all_rows, all_dates_pd, np_rates_pd, s
+                            )
+                            for candle in batch
+                        ]
+                        results = list(await asyncio.gather(*futs))
 
-                        results = await asyncio.to_thread(
-                            lambda _b=batch: [_sync_compute(c) for c in _b]
-                        )
                     insert_rows = []
                     for candle, result in zip(batch, results):
                         if result is None:
@@ -1320,7 +1350,7 @@ def build_app(model_module) -> FastAPI:
                                     VALUES (:url, :pair, :day, :dv, :ph, :pj, :rj)
                                 """), insert_rows)
                         except Exception as e:
-                            log(f"  [WARN] bulk insert: {e}", s.NODE_NAME, level="warning")
+                            log(f"   bulk insert: {e}", s.NODE_NAME, level="warning")
                     done += len(batch)
                     s.fill_status.update({"done": done, "skipped": skipped, "errors": errors})
                     log(f"  [{instr_label} t={calc_type}/v={var}] "
@@ -1330,12 +1360,12 @@ def build_app(model_module) -> FastAPI:
 
         state = "stopped" if s.fill_cancel.is_set() else "done"
         s.fill_status.update({"state": state, "finished_at": datetime.now().isoformat()})
-        log(f"[OK] fill_cache {state}: done={done} skip={skipped} err={errors}",
+        log(f" fill_cache {state}: done={done} skip={skipped} err={errors}",
             s.NODE_NAME, force=True)
 
         # ── Авто-бэктест ──────────────────────────────────────────────────────
         if not s.fill_cancel.is_set():
-            log("🔁 auto-backtest после fill_cache...", s.NODE_NAME, force=True)
+            log(" auto-backtest после fill_cache...", s.NODE_NAME, force=True)
             bt_df = _parse_date(date_from_str) if date_from_str else datetime(2025, 1, 1)
             bt_dt = _parse_date(date_to_str)   if date_to_str   else datetime.now()
             for bt_pair, bt_day in pd_slots:
@@ -1348,24 +1378,24 @@ def build_app(model_module) -> FastAPI:
                         )
                         label = f"pair{bt_pair}/{'d' if bt_day else 'h'} t={bt_type} v={bt_var}"
                         if "error" in bt:
-                            log(f"  [WARN] backtest [{label}]: {bt['error']}",
+                            log(f"   backtest [{label}]: {bt['error']}",
                                 s.NODE_NAME, force=True)
                         else:
-                            log(f"  [OK] backtest [{label}]: "
+                            log(f"   backtest [{label}]: "
                                 f"score={bt.get('value_score')} "
                                 f"acc={bt.get('accuracy')} "
                                 f"trades={bt.get('trade_count')}",
                                 s.NODE_NAME, force=True)
                     except Exception as e:
-                        log(f"  [ERROR] backtest pair={bt_pair} day={bt_day}: {e}",
+                        log(f"   backtest pair={bt_pair} day={bt_day}: {e}",
                             s.NODE_NAME, level="error")
                 try:
                     await _upsert_summary(bt_pair, bt_day, tier=0, df=bt_df, dt=bt_dt)
                 except Exception as e:
-                    log(f"  [WARN] summary pair={bt_pair} day={bt_day}: {e}",
+                    log(f"   summary pair={bt_pair} day={bt_day}: {e}",
                         s.NODE_NAME, level="warning")
             s.fill_status["auto_backtest"] = "done"
-            log("[OK] auto-backtest завершён", s.NODE_NAME, force=True)
+            log(" auto-backtest завершён", s.NODE_NAME, force=True)
 
         # ── Трассировка ───────────────────────────────────────────────────────
         _fc_el  = datetime.now() - datetime.fromisoformat(
@@ -1373,7 +1403,7 @@ def build_app(model_module) -> FastAPI:
         _h, _r  = divmod(int(_fc_el.total_seconds()), 3600)
         _m, _sc = divmod(_r, 60)
         _send_trace(
-            subject  = f"{'[OK]' if state == 'done' else '[WARN]'} fill_cache {state} — {s.service_url}",
+            subject  = f"{'' if state == 'done' else ''} fill_cache {state} — {s.service_url}",
             body     = (f"Сервис : {s.service_url}\n"
                         f"Пары   : {pairs}  Дни: {days}\n"
                         f"Период : {date_from_str or s.CACHE_DATE_FROM} → {date_to_str or 'now'}\n"
@@ -1483,7 +1513,7 @@ def build_app(model_module) -> FastAPI:
                     "tc": trade_count, "wc": win_count, "acc": result["accuracy"],
                 })
         except Exception as e:
-            log(f"  [WARN] backtest save: {e}", s.NODE_NAME, level="warning")
+            log(f"   backtest save: {e}", s.NODE_NAME, level="warning")
         return result
 
     async def _upsert_summary(pair, day, tier, df, dt):
@@ -1534,7 +1564,7 @@ def build_app(model_module) -> FastAPI:
         try:
             await _preload()
         except Exception as e:
-            log(f"[ERROR] initial load: {e}", s.NODE_NAME, level="error", force=True)
+            log(f" initial load: {e}", s.NODE_NAME, level="error", force=True)
         task = asyncio.create_task(_bg_reload())
         yield
         task.cancel()
@@ -1593,7 +1623,7 @@ def build_app(model_module) -> FastAPI:
     async def ep_weights():
         return ok_response({"codes": s.weight_codes, "var_range": s.VAR_RANGE})
 
-    # ── _build_narrative (IS_SIMPLE) ──────────────────────────────────────────
+    # ── _build_narrative ──────────────────────────────────────────────────────────
 
     def _build_narrative(payload: dict, date_str: str, day_flag: int, calc_type: int) -> list[str]:
         if not payload:
@@ -1781,7 +1811,6 @@ def build_app(model_module) -> FastAPI:
         date_from: str = Query(""), date_to: str = Query(""),
         batch_size: int = Query(300),
     ):
-        """fill_cache только для дневного таймфрейма (day=1)."""
         return await _start_fill(pairs, "1", date_from, date_to, batch_size)
 
     @app.get("/fill_cache_hour")
@@ -1790,7 +1819,6 @@ def build_app(model_module) -> FastAPI:
         date_from: str = Query(""), date_to: str = Query(""),
         batch_size: int = Query(300),
     ):
-        """fill_cache только для часового таймфрейма (day=0)."""
         return await _start_fill(pairs, "0", date_from, date_to, batch_size)
 
     @app.get("/fill_status")
@@ -1878,7 +1906,7 @@ def build_app(model_module) -> FastAPI:
                 try:
                     await _upsert_summary(bt_pair, bt_day, tier, df, dt)
                 except Exception as e:
-                    log(f"  [WARN] summary pair={bt_pair} day={bt_day}: {e}",
+                    log(f"   summary pair={bt_pair} day={bt_day}: {e}",
                         s.NODE_NAME, level="warning")
 
         return ok_response({
@@ -1926,7 +1954,7 @@ def build_app(model_module) -> FastAPI:
 
     @app.get("/pretest")
     async def ep_pretest():
-        log("🔍 PRETEST START", s.NODE_NAME, force=True)
+        log(" PRETEST START", s.NODE_NAME, force=True)
         model_path = os.path.join(os.path.dirname(os.path.abspath(
             sys.modules[model_module.__name__].__file__)), "model.py")
 
@@ -1940,7 +1968,7 @@ def build_app(model_module) -> FastAPI:
                     "error": f"[Тест 1 — Синтаксис] строка {e.lineno}: {e.msg}"}
         except OSError:
             pass
-        log("  [OK] Тест 1: синтаксис model.py OK", s.NODE_NAME, force=True)
+        log("   Тест 1: синтаксис model.py OK", s.NODE_NAME, force=True)
 
         # ── Тест 2: структура model() на одной дате ───────────────────────────
         _eur_rows = s.global_rates.get(s.RATES_TABLE, [])
@@ -1958,17 +1986,25 @@ def build_app(model_module) -> FastAPI:
                           _eur_rows[-1]["date"] if _eur_rows else _mid2)
         _rf2  = _eur_rows[:bisect.bisect_right(_eur_dts2, _td2)]
         _ds2  = _filter_dataset_lte(_td2, s)
+
+        dataset_index_dict2 = None
+        if s.model_needs_index:
+            dataset_index_dict2 = {
+                "dates": s.dataset_dates,
+                "by_key": s.dataset_by_key,
+                "key_dates": s.dataset_key_dates,
+                "key_field": s.dataset_key_field,
+                "np_rates": s.np_simple_rates,
+                "ctx_index": s.ctx_index,
+                "url_map": s.url_map,
+                "dataset_timestamps": getattr(s, "_dataset_ts_arr", None),
+            }
+
         try:
             _res2 = s.model_fn(
                 rates=_rf2, dataset=_ds2, date=_td2,
                 type=0, var=s.VAR_RANGE[0], param="",
-                dataset_index=(
-                    {"dates": s.dataset_dates, "by_key": s.dataset_by_key,
-                     "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field,
-                     "np_rates": s.np_simple_rates, "ctx_index": s.ctx_index,
-                     "url_map": s.url_map}
-                    if s.model_needs_index else None
-                ),
+                dataset_index=dataset_index_dict2,
             )
             _res2, _ = _extract_detail(_res2)
         except Exception as _e2:
@@ -1988,7 +2024,7 @@ def build_app(model_module) -> FastAPI:
             if not isinstance(_v2, (int, float)) or _v2 != _v2 or abs(_v2) == float("inf"):
                 return {"status": "error",
                         "error": f"[Тест 2 — Структура] значение '{_k2}' не конечный float"}
-        log(f"  [OK] Тест 2: структура model() OK — {len(_res2)} ключей",
+        log(f"   Тест 2: структура model() OK — {len(_res2)} ключей",
             s.NODE_NAME, force=True)
 
         # ── Тест 3: 10 случайных дат по каждому из 6 инструментов (≥90%) ─────
@@ -2034,21 +2070,25 @@ def build_app(model_module) -> FastAPI:
                     _rf3 = _rows3[:bisect.bisect_right(_dts3, _td3)]
                     _ds3 = _filter_dataset_lte(_td3, s)
 
+                    dataset_index_dict3 = None
+                    if s.model_needs_index:
+                        dataset_index_dict3 = {
+                            "dates": s.dataset_dates,
+                            "by_key": s.dataset_by_key,
+                            "key_dates": s.dataset_key_dates,
+                            "key_field": s.dataset_key_field,
+                            "np_rates": s.np_simple_rates,
+                            "ctx_index": s.ctx_index,
+                            "url_map": s.url_map,
+                            "dataset_timestamps": getattr(s, "_dataset_ts_arr", None),
+                        }
+
                     def _mk3(_r=_rf3, _d=_ds3, _t=_td3):
                         res, _ = _extract_detail(
                             s.model_fn(
                                 rates=_r, dataset=_d, date=_t,
                                 type=0, var=s.VAR_RANGE[0], param="",
-                                dataset_index=(
-                                    {"dates": s.dataset_dates,
-                                     "by_key": s.dataset_by_key,
-                                     "key_dates": s.dataset_key_dates,
-                                     "key_field": s.dataset_key_field,
-                                     "np_rates": s.np_simple_rates,
-                                     "ctx_index": s.ctx_index,
-                                     "url_map": s.url_map}
-                                    if s.model_needs_index else None
-                                ),
+                                dataset_index=dataset_index_dict3,
                             )
                         )
                         return bool(res)
@@ -2064,7 +2104,7 @@ def build_app(model_module) -> FastAPI:
                 _instr_counts[key] = [0, 0]
             _instr_counts[key][1] += 1
             if isinstance(_r3, Exception):
-                log(f"    [WARN] pair{_pid3}/{_tf3}: {_r3}", s.NODE_NAME, level="warning")
+                log(f"     pair{_pid3}/{_tf3}: {_r3}", s.NODE_NAME, level="warning")
             elif _r3:
                 _instr_counts[key][0] += 1
 
@@ -2079,7 +2119,7 @@ def build_app(model_module) -> FastAPI:
                 _failures3.append(f"pair{_pid3}/{_tf3}: {_ne3}/{_tot3} ({_cov3:.0%}) < 90%")
 
         if _failures3:
-            log(f"[ERROR] PRETEST FAILED: {_failures3}", s.NODE_NAME, force=True)
+            log(f" PRETEST FAILED: {_failures3}", s.NODE_NAME, force=True)
             return {"status": "error",
                     "error": f"[Тест 3 — Покрытие] {' | '.join(_failures3)}"}
 
@@ -2090,22 +2130,22 @@ def build_app(model_module) -> FastAPI:
             try:
                 _rb4 = await _do_rebuild()
                 if "error" in _rb4:
-                    log(f"[ERROR] Тест 4: rebuild вернул ошибку: {_rb4['error']}",
+                    log(f" Тест 4: rebuild вернул ошибку: {_rb4['error']}",
                         s.NODE_NAME, force=True)
                     return {"status": "error",
                             "error": f"[Тест 4 — Rebuild] {_rb4['error']}"}
-                log(f"  [OK] Тест 4: rebuild OK — "
+                log(f"   Тест 4: rebuild OK — "
                     f"ctx={_rb4.get('ctx_total')} "
                     f"weights={_rb4.get('weights_total')} "
                     f"url_map={_rb4.get('url_map_total')}",
                     s.NODE_NAME, force=True)
             except Exception as _e4:
-                log(f"[ERROR] Тест 4: exception: {_e4}", s.NODE_NAME, force=True)
+                log(f" Тест 4: exception: {_e4}", s.NODE_NAME, force=True)
                 return {"status": "error", "error": f"[Тест 4 — Rebuild] {_e4}"}
         else:
-            log("  ⏭️ Тест 4: rebuild не настроен, пропуск", s.NODE_NAME, force=True)
+            log("   Тест 4: rebuild не настроен, пропуск", s.NODE_NAME, force=True)
 
-        log("[OK] PRETEST PASSED", s.NODE_NAME, force=True)
+        log(" PRETEST PASSED", s.NODE_NAME, force=True)
         return {"status": "ok", "var_range": s.VAR_RANGE, "np_built": s.np_built}
 
     @app.get("/posttest")
@@ -2134,7 +2174,6 @@ def build_app(model_module) -> FastAPI:
                      "df": dt_from, "dt": dt_to}
             _tbl  = s.cache_table
 
-            # T1: статистика ключей в result_json
             data_stats = {"min": 0.0, "max": 0.0, "avg": 0.0}
             try:
                 async with s.engine_vlad.connect() as conn:
@@ -2153,10 +2192,9 @@ def build_app(model_module) -> FastAPI:
                         data_stats = {"min": float(row[0]), "max": float(row[1]),
                                       "avg": round(float(row[2]), 4)}
             except Exception as e:
-                log(f"  [WARN] posttest t1 {pair_id}/{tf_name}: {e}",
+                log(f"   posttest t1 {pair_id}/{tf_name}: {e}",
                     s.NODE_NAME, level="warning")
 
-            # T2: знаки значений
             values_stats = {"plus": 0, "minus": 0}
             try:
                 async with s.engine_vlad.connect() as conn:
@@ -2177,17 +2215,15 @@ def build_app(model_module) -> FastAPI:
                             pass
                     values_stats = {"plus": plus_cnt, "minus": minus_cnt}
             except Exception as e:
-                log(f"  [WARN] posttest t2 {pair_id}/{tf_name}: {e}",
+                log(f"   posttest t2 {pair_id}/{tf_name}: {e}",
                     s.NODE_NAME, level="warning")
 
-            # T3: живой вызов
             now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             try:
                 sync_out = await _call_model(pair_id, day_flag, now_str) or {}
             except Exception as e:
                 sync_out = {"error": str(e)}
 
-            # T4+T5: проплешины и симуляция
             cache_signals: dict = {}
             try:
                 async with s.engine_vlad.connect() as conn:
@@ -2205,7 +2241,7 @@ def build_app(model_module) -> FastAPI:
                         except Exception:
                             cache_signals[dt_val] = (False, 0.0)
             except Exception as e:
-                log(f"  [WARN] posttest cache {pair_id}/{tf_name}: {e}",
+                log(f"   posttest cache {pair_id}/{tf_name}: {e}",
                     s.NODE_NAME, level="warning")
 
             def _compute_hole_and_sim():
