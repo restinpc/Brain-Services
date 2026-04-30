@@ -102,13 +102,20 @@ def _build_np_rates_for_table(rates, candle_ranges, extremums, global_rates_list
                               for d in sorted_dates], dtype=np.float64)
         open_arr  = np.array([float(_gr_map[d]["open"])  if d in _gr_map else 0.0
                               for d in sorted_dates], dtype=np.float64)
+        max_arr   = np.array([float(_gr_map[d]["max"])   if d in _gr_map else 0.0
+                              for d in sorted_dates], dtype=np.float64)
+        min_arr   = np.array([float(_gr_map[d]["min"])   if d in _gr_map else 0.0
+                              for d in sorted_dates], dtype=np.float64)
     else:
         close_arr = np.zeros(n, dtype=np.float64)
         open_arr  = np.zeros(n, dtype=np.float64)
+        max_arr   = np.zeros(n, dtype=np.float64)
+        min_arr   = np.zeros(n, dtype=np.float64)
     return {
         "dates_ns": dates_ns, "t1": t1_arr, "ranges": ranges_arr,
         "ext_min": ext_min_arr, "ext_max": ext_max_arr,
         "close": close_arr, "open": open_arr,
+        "max": max_arr, "min": min_arr,
     }
 
 
@@ -263,8 +270,13 @@ class _State:
     RELOAD_INTERVAL:     int        = 3600
     REBUILD_INTERVAL:    int        = 0
     VAR_RANGE:           list       = None
+    TYPES_RANGE:         list       = None
     CACHE_DATE_FROM:     str        = "2025-01-15"
     LABEL_FN:            object     = None
+
+    # ── Маппинг URL → EventId ─────────────────────────────────────────────────
+    URL_MAP_QUERY:  str | None = None
+    URL_MAP_ENGINE: str        = "vlad"
 
     # ── ML-режим (USE_ML_VALUES=True в model.py) ─────────────────────────────
     USE_ML_VALUES:        bool  = False
@@ -279,6 +291,7 @@ class _State:
     def __init__(self):
         self.CTX_KEY_COLUMNS   = ["id"]
         self.VAR_RANGE         = []
+        self.TYPES_RANGE       = [0, 1, 2, 3, 4]
 
         self.model_fn          = None
         self.index_builder_fn  = None   # async def build_index(ev, eb) → dict
@@ -291,6 +304,7 @@ class _State:
 
         self.weight_codes:  list       = []
         self.ctx_index:     dict       = {}
+        self.url_map:       dict       = {}   # url → event_id
         self.dataset:       list[dict] = []
         self.dataset_dates:     list = []
         self.dataset_by_key:    dict = {}
@@ -426,7 +440,8 @@ def _rebuild_np_rates(s: _State) -> None:
     s.np_built = True
 
 
-def _append_np_rates_row(table, dt, t1, rng, s: _State, close=0.0, open_=0.0) -> None:
+def _append_np_rates_row(table, dt, t1, rng, s: _State, close=0.0, open_=0.0,
+                         max_=0.0, min_=0.0) -> None:
     np_r = s.np_rates.get(table)
     if np_r is None:
         return
@@ -438,6 +453,10 @@ def _append_np_rates_row(table, dt, t1, rng, s: _State, close=0.0, open_=0.0) ->
     np_r["ext_max"]  = np.append(np_r["ext_max"],  False)
     np_r["close"]    = np.append(np_r["close"],    np.float64(close))
     np_r["open"]     = np.append(np_r["open"],     np.float64(open_))
+    if "max" in np_r:
+        np_r["max"] = np.append(np_r["max"], np.float64(max_))
+    if "min" in np_r:
+        np_r["min"] = np.append(np_r["min"], np.float64(min_))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -527,7 +546,9 @@ async def _refresh_rates(table: str, s: _State):
                 if s.np_built:
                     _append_np_rates_row(table, dt, t1, rng, s,
                                          close=float(r["close"] or 0),
-                                         open_=float(r["open"]  or 0))
+                                         open_=float(r["open"]  or 0),
+                                         max_=float(r["max"] or 0),
+                                         min_=float(r["min"] or 0))
                 n += 1
             if n > 0:
                 log(f"  📥 +{n} candle(s) {table}", s.NODE_NAME)
@@ -564,6 +585,8 @@ def _build_np_simple_rates(s: _State) -> None:
         "ext_min":   ext_min,
         "close":     np.array([float(r.get("close") or 0) for r in s.simple_rates], dtype=np.float64),
         "open":      np.array([float(r.get("open")  or 0) for r in s.simple_rates], dtype=np.float64),
+        "max":       max_arr,
+        "min":       min_arr,
     }
 
 
@@ -651,6 +674,21 @@ async def _load_ctx_index(s: _State):
     except Exception as e:
         s.ctx_index = {}
         log(f"  ❌ ctx_index: {e}", s.NODE_NAME, level="error")
+
+
+async def _load_url_map(s: _State):
+    if not s.URL_MAP_QUERY:
+        s.url_map = {}
+        return
+    try:
+        async with _engine_for(s.URL_MAP_ENGINE, s).connect() as conn:
+            res = await conn.execute(text(s.URL_MAP_QUERY))
+            s.url_map = {r["url"]: r["event_id"] for r in res.mappings().all()
+                         if r["url"] and r["event_id"] is not None}
+        log(f"  url_map: {len(s.url_map)} entries", s.NODE_NAME)
+    except Exception as e:
+        s.url_map = {}
+        log(f"  ❌ url_map: {e}", s.NODE_NAME, level="error")
 
 
 def _build_label_from_row(info: dict, ctx_id: int) -> str:
@@ -901,11 +939,16 @@ def build_app(model_module) -> FastAPI:
     s.RELOAD_INTERVAL        = _g("RELOAD_INTERVAL",        3600)
     s.REBUILD_INTERVAL       = int(_g("REBUILD_INTERVAL",   0))
     s.VAR_RANGE              = _g("VAR_RANGE",              [0])
+    s.TYPES_RANGE            = _g("TYPES_RANGE",            [0, 1, 2, 3, 4])
     s.CACHE_DATE_FROM        = _g("CACHE_DATE_FROM",        "2025-01-15")
     s.LABEL_FN               = _g("LABEL_FN",               None)
 
     s.RATES_TABLE        = _g("RATES_TABLE",  "brain_rates_eur_usd")
     s.dataset_key_field  = _g("DATASET_KEY",  "ctx_id")
+
+    # ── Маппинг URL → EventId ─────────────────────────────────────────────────
+    s.URL_MAP_QUERY  = _g("URL_MAP_QUERY",  None)
+    s.URL_MAP_ENGINE = _g("URL_MAP_ENGINE", "vlad")
 
     # ── ML-режим ─────────────────────────────────────────────────────────────
     s.USE_ML_VALUES        = bool(_g("USE_ML_VALUES",        False))
@@ -956,7 +999,8 @@ def build_app(model_module) -> FastAPI:
                 dataset_index=(
                     {"dates": s.dataset_dates, "by_key": s.dataset_by_key,
                      "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field,
-                     "np_rates": np_r, "ctx_index": s.ctx_index}
+                     "np_rates": np_r, "ctx_index": s.ctx_index,
+                     "url_map": s.url_map}
                     if s.model_needs_index else None
                 ),
             )
@@ -993,13 +1037,14 @@ def build_app(model_module) -> FastAPI:
             universe, _pr = await s.reverse_store.maybe_retrain(
                 pair=pair, day_flag=day, control_date=target_date,
                 params_hash=params_hash,
-                np_simple_rates=s.np_simple_rates,
+                np_simple_rates=(np_r or s.np_simple_rates),
                 active_codes_at=_active_codes_at,
-                init_mode=s.ML_INIT_MODE,
+                train_mode=calc_type,
                 max_iter=s.ML_MAX_ITER,
                 step=s.ML_STEP,
                 target_precision=s.ML_TARGET_PRECISION,
                 extremum_limit=s.ML_EXTREMUM_LIMIT,
+                extremum_interval=calc_var,
                 active_tail=s.ML_ACTIVE_TAIL,
                 metric=s.ML_PRECISION_METRIC,
                 log_fn=lambda m: log(m, s.NODE_NAME),
@@ -1019,12 +1064,14 @@ def build_app(model_module) -> FastAPI:
         s.weight_codes.clear()
         s.ctx_index.clear()
         s.dataset.clear()
+        s.url_map.clear()
 
         await _load_simple_rates(s)
         await _load_rates(s)
         await _load_dataset(s)
         await _load_weight_codes(s)
         await _load_ctx_index(s)
+        await _load_url_map(s)
         await _load_label_cache(s)
 
         s.service_url  = f"http://localhost:{s.PORT}"
@@ -1044,7 +1091,8 @@ def build_app(model_module) -> FastAPI:
         s.last_reload = datetime.now()
         log(f"✅ RELOAD DONE: rates={len(s.simple_rates)} "
             f"global_rates={sum(len(v) for v in s.global_rates.values())} "
-            f"dataset={len(s.dataset)} weights={len(s.weight_codes)}",
+            f"dataset={len(s.dataset)} weights={len(s.weight_codes)} "
+            f"url_map={len(s.url_map)}",
             s.NODE_NAME, force=True)
 
     # ── _do_rebuild ───────────────────────────────────────────────────────────
@@ -1076,15 +1124,17 @@ def build_app(model_module) -> FastAPI:
         await _load_weight_codes(s)
         await _load_ctx_index(s)
         await _load_label_cache(s)
+        await _load_url_map(s)
 
         s.last_rebuild = datetime.now()
-        log(f"✅ rebuild done: weights={len(s.weight_codes)} ctx={len(s.ctx_index)}",
+        log(f"✅ rebuild done: weights={len(s.weight_codes)} ctx={len(s.ctx_index)} url_map={len(s.url_map)}",
             s.NODE_NAME, force=True)
 
         return {
             **stats,
             "ctx_total":     len(s.ctx_index),
             "weights_total": len(s.weight_codes),
+            "url_map_total": len(s.url_map),
             "rebuilt_at":    s.last_rebuild.isoformat(),
         }
 
@@ -1201,38 +1251,54 @@ def build_app(model_module) -> FastAPI:
                         break
                     batch = to_fetch[i:i + batch_size]
 
-                    def _sync_compute(candle, _ct=calc_type, _v=var,
-                                      _all_rows=all_rows, _all_dates=all_dates_pd,
-                                      _np_r=np_rates_pd):
-                        td      = candle["date"]
-                        idx     = bisect.bisect_right(_all_dates, td)
-                        rates_f = _all_rows[:idx]
-                        ds_f    = _filter_dataset_lte(td, s)
-                        try:
-                            res = s.model_fn(
-                                rates=rates_f, dataset=ds_f, date=td,
-                                type=_ct, var=_v, param="",
-                                dataset_index=(
-                                    {"dates": s.dataset_dates,
-                                     "by_key": s.dataset_by_key,
-                                     "key_dates": s.dataset_key_dates,
-                                     "key_field": s.dataset_key_field,
-                                     "np_rates": _np_r,
-                                     "ctx_index": s.ctx_index}
-                                    if s.model_needs_index else None
-                                ),
-                            )
-                            res, _ = _extract_detail(res)
-                            return res or {}
-                        except Exception as _e:
-                            import traceback as _tb
-                            log(f"  ❌ fill {td} t={_ct} v={_v}: {_e}\n{_tb.format_exc()}",
-                                s.NODE_NAME, level="error", force=True)
-                            return None
+                    if s.USE_ML_VALUES:
+                        results = []
+                        for candle in batch:
+                            try:
+                                result = await _call_model(
+                                    pair_id, day_flag,
+                                    candle["date"].strftime("%Y-%m-%d %H:%M:%S"),
+                                    calc_type=calc_type, calc_var=var, param="")
+                            except Exception as _e:
+                                import traceback as _tb
+                                log(f"  ❌ ml-fill {candle['date']} t={calc_type} v={var}: {_e}\n{_tb.format_exc()}",
+                                    s.NODE_NAME, level="error", force=True)
+                                result = None
+                            results.append(result)
+                    else:
+                        def _sync_compute(candle, _ct=calc_type, _v=var,
+                                          _all_rows=all_rows, _all_dates=all_dates_pd,
+                                          _np_r=np_rates_pd):
+                            td      = candle["date"]
+                            idx     = bisect.bisect_right(_all_dates, td)
+                            rates_f = _all_rows[:idx]
+                            ds_f    = _filter_dataset_lte(td, s)
+                            try:
+                                res = s.model_fn(
+                                    rates=rates_f, dataset=ds_f, date=td,
+                                    type=_ct, var=_v, param="",
+                                    dataset_index=(
+                                        {"dates": s.dataset_dates,
+                                         "by_key": s.dataset_by_key,
+                                         "key_dates": s.dataset_key_dates,
+                                         "key_field": s.dataset_key_field,
+                                         "np_rates": _np_r,
+                                         "ctx_index": s.ctx_index,
+                                         "url_map": s.url_map}
+                                        if s.model_needs_index else None
+                                    ),
+                                )
+                                res, _ = _extract_detail(res)
+                                return res or {}
+                            except Exception as _e:
+                                import traceback as _tb
+                                log(f"  ❌ fill {td} t={_ct} v={_v}: {_e}\n{_tb.format_exc()}",
+                                    s.NODE_NAME, level="error", force=True)
+                                return None
 
-                    results = await asyncio.to_thread(
-                        lambda _b=batch: [_sync_compute(c) for c in _b]
-                    )
+                        results = await asyncio.to_thread(
+                            lambda _b=batch: [_sync_compute(c) for c in _b]
+                        )
                     insert_rows = []
                     for candle, result in zip(batch, results):
                         if result is None:
@@ -1499,8 +1565,10 @@ def build_app(model_module) -> FastAPI:
             "metadata": {
                 "weight_codes":       len(s.weight_codes),
                 "ctx_index":          len(s.ctx_index),
+                "url_map":            len(s.url_map),
                 "dataset":            len(s.dataset),
                 "var_range":          s.VAR_RANGE,
+                "types_range":        s.TYPES_RANGE,
                 "np_built":           s.np_built,
                 "simple_rates":       len(s.simple_rates),
                 "last_reload":        s.last_reload.isoformat() if s.last_reload else None,
@@ -1631,10 +1699,12 @@ def build_app(model_module) -> FastAPI:
     async def ep_values(
         pair: int = Query(1), day: int = Query(1),
         date: str = Query(...),
-        type: int = Query(0, ge=0, le=2),
+        type: int = Query(0, ge=0, le=4),
         var:  int = Query(0),
         param: str = Query(""),
     ):
+        if s.TYPES_RANGE and type not in s.TYPES_RANGE:
+            return err_response(f"type={type} не входит в TYPES_RANGE={s.TYPES_RANGE}")
         if s.VAR_RANGE and var not in s.VAR_RANGE:
             return err_response(f"var={var} не входит в VAR_RANGE={s.VAR_RANGE}")
         try:
@@ -1684,7 +1754,7 @@ def build_app(model_module) -> FastAPI:
             return err_response("Допустимые pair: 1 (EUR), 3 (BTC), 4 (ETH)")
         if not all(d in {0, 1} for d in dl):
             return err_response("Допустимые day: 0 (hourly), 1 (daily)")
-        all_types  = [0, 1, 2]
+        all_types  = list(s.TYPES_RANGE or [0, 1, 2, 3, 4])
         eff_from   = date_from if date_from.strip() else s.CACHE_DATE_FROM
         s.fill_cancel.clear()
         s.fill_task = asyncio.create_task(
@@ -1895,7 +1965,8 @@ def build_app(model_module) -> FastAPI:
                 dataset_index=(
                     {"dates": s.dataset_dates, "by_key": s.dataset_by_key,
                      "key_dates": s.dataset_key_dates, "key_field": s.dataset_key_field,
-                     "np_rates": s.np_simple_rates, "ctx_index": s.ctx_index}
+                     "np_rates": s.np_simple_rates, "ctx_index": s.ctx_index,
+                     "url_map": s.url_map}
                     if s.model_needs_index else None
                 ),
             )
@@ -1974,7 +2045,8 @@ def build_app(model_module) -> FastAPI:
                                      "key_dates": s.dataset_key_dates,
                                      "key_field": s.dataset_key_field,
                                      "np_rates": s.np_simple_rates,
-                                     "ctx_index": s.ctx_index}
+                                     "ctx_index": s.ctx_index,
+                                     "url_map": s.url_map}
                                     if s.model_needs_index else None
                                 ),
                             )
@@ -2024,7 +2096,8 @@ def build_app(model_module) -> FastAPI:
                             "error": f"[Тест 4 — Rebuild] {_rb4['error']}"}
                 log(f"  ✅ Тест 4: rebuild OK — "
                     f"ctx={_rb4.get('ctx_total')} "
-                    f"weights={_rb4.get('weights_total')}",
+                    f"weights={_rb4.get('weights_total')} "
+                    f"url_map={_rb4.get('url_map_total')}",
                     s.NODE_NAME, force=True)
             except Exception as _e4:
                 log(f"❌ Тест 4: exception: {_e4}", s.NODE_NAME, force=True)
