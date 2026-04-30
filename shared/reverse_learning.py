@@ -925,44 +925,53 @@ class ReverseStore:
         metric: PrecisionMetric = "mean",
         triggered_by: str = "train",
         log_fn: Callable[[str], None] | None = None,
+        skip_db_writes: bool = False,
     ) -> tuple[dict[str, float], float]:
         init_mode = f"mode{train_mode}/iv{extremum_interval}"
 
-        prev_loaded = await self.load_universe(
-            pair=pair,
-            day_flag=day_flag,
-            control_date=control_date,
-            params_hash=params_hash,
-        )
-        prev_size = len(prev_loaded[0]) if prev_loaded else 0
-        pr_before = float(prev_loaded[1]) if prev_loaded else None
-
-        reserved = await self.reserve_slot(
-            pair=pair,
-            day_flag=day_flag,
-            control_date=control_date,
-            params_hash=params_hash,
-            triggered_by=triggered_by,
-            history_window=extremum_limit,
-            active_tail=active_tail,
-            precision_metric=metric,
-            init_mode=init_mode,
-            step_size=step,
-            target_precision=target_precision,
-        )
-
-        if not reserved:
-            # Другой процесс уже обучает эту же комбинацию.
-            # Возвращаем старый universe, если он есть.
-            loaded = await self.load_universe(
+        # skip_db_writes=True: fill_cache mode — skip reserve/save/finish DB ops.
+        # load_universe still runs to reuse existing training from previous sessions.
+        if skip_db_writes:
+            prev_loaded = None
+            prev_size   = 0
+            pr_before   = None
+        else:
+            prev_loaded = await self.load_universe(
                 pair=pair,
                 day_flag=day_flag,
                 control_date=control_date,
                 params_hash=params_hash,
             )
-            if loaded:
-                return loaded
-            return {}, 0.0
+            prev_size = len(prev_loaded[0]) if prev_loaded else 0
+            pr_before = float(prev_loaded[1]) if prev_loaded else None
+
+        if skip_db_writes:
+            reserved = True   # skip semaphore DB op in fill_cache mode
+        else:
+            reserved = await self.reserve_slot(
+                pair=pair,
+                day_flag=day_flag,
+                control_date=control_date,
+                params_hash=params_hash,
+                triggered_by=triggered_by,
+                history_window=extremum_limit,
+                active_tail=active_tail,
+                precision_metric=metric,
+                init_mode=init_mode,
+                step_size=step,
+                target_precision=target_precision,
+            )
+
+            if not reserved:
+                loaded = await self.load_universe(
+                    pair=pair,
+                    day_flag=day_flag,
+                    control_date=control_date,
+                    params_hash=params_hash,
+                )
+                if loaded:
+                    return loaded
+                return {}, 0.0
 
         try:
             universe, pr, iters, ext_cnt, _from_train_cache = await train_at_date(
@@ -983,9 +992,8 @@ class ReverseStore:
             if universe:
                 self._universe_cache[(pair, day_flag, control_date, params_hash)] = (universe, pr)
 
-            # Skip heavy DB writes when result came from train cache —
-            # the universe is identical to one already saved for adjacent candle.
-            if _from_train_cache:
+            # Skip DB writes on cache hit OR in fill_cache mode
+            if _from_train_cache or skip_db_writes:
                 return universe, pr
 
             if universe:
@@ -1080,6 +1088,7 @@ class ReverseStore:
         active_tail: int = 0,
         metric: PrecisionMetric = "mean",
         log_fn: Callable[[str], None] | None = None,
+        skip_db_writes: bool = False,
     ) -> tuple[dict[str, float], float]:
         # ── Fast pre-check: compute extremum seq+codes, check train cache ──────
         # If hit: skip ALL DB operations (load, reserve, save, finish).
@@ -1209,4 +1218,5 @@ class ReverseStore:
             metric=metric,
             triggered_by="retrain",
             log_fn=log_fn,
+            skip_db_writes=skip_db_writes,
         )
