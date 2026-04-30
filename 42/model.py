@@ -1,6 +1,6 @@
 """
 model.py — service 33, calendar weights + reverse-learning ML
-DEBUG VERSION — подробные логи на каждом шаге model()
+OPTIMIZED VERSION
 """
 
 from __future__ import annotations
@@ -92,14 +92,20 @@ ACTIVE_MODES = tuple(
     if x.strip() != ""
 )
 
-FORECAST_MAP  = {"UNKNOWN": "X", "BEAT": "B", "MISS": "M", "INLINE": "I"}
-SURPRISE_MAP  = {"UNKNOWN": "X", "UP": "U", "DOWN": "D", "FLAT": "F"}
-REVISION_MAP  = {"NONE": "N", "FLAT": "T", "UP": "U", "DOWN": "D", "UNKNOWN": "X"}
-IMPORTANCE_MAP = {"high": "H", "medium": "M", "low": "L", "none": "N"}
+# OPT-1: прямые dict вместо двойного .get() через _encode()
+_FORECAST_CHARS  = {"UNKNOWN": "X", "BEAT": "B", "MISS": "M", "INLINE": "I"}
+_SURPRISE_CHARS  = {"UNKNOWN": "X", "UP": "U", "DOWN": "D", "FLAT": "F"}
+_REVISION_CHARS  = {"NONE": "N", "FLAT": "T", "UP": "U", "DOWN": "D", "UNKNOWN": "X"}
+_IMPORTANCE_CHARS = {"high": "H", "medium": "M", "low": "L", "none": "N"}
 
-# ── счётчик вызовов для ограничения вывода логов ──────────────────────────────
-_DEBUG_CALL_COUNT = 0
-_DEBUG_MAX_FULL_CALLS = 3   # подробный лог только для первых N вызовов
+# Обратная совместимость
+FORECAST_MAP  = _FORECAST_CHARS
+SURPRISE_MAP  = _SURPRISE_CHARS
+REVISION_MAP  = _REVISION_CHARS
+IMPORTANCE_MAP = _IMPORTANCE_CHARS
+
+# OPT-2: кеш weight_code — одна и та же комбинация встречается на каждой свече
+_wc_cache: dict[tuple, str] = {}
 
 
 def _dbg(msg: str) -> None:
@@ -115,16 +121,7 @@ def _to_float(value: Any) -> float | None:
         return None
 
 
-def _encode(value: str, kind: str) -> str:
-    maps = {
-        "forecast": FORECAST_MAP,
-        "surprise": SURPRISE_MAP,
-        "revision": REVISION_MAP,
-        "importance": IMPORTANCE_MAP,
-    }
-    return maps.get(kind, {}).get(value, "X")
-
-
+# OPT-1: убрана функция _encode() — прямое обращение к dict
 def make_weight_code(
     event_id: int,
     currency: str,
@@ -135,12 +132,20 @@ def make_weight_code(
     mode: int,
     hour_shift: int | None = None,
 ) -> str:
-    imp_c = _encode(importance, "importance")
-    fcd_c = _encode(forecast_dir, "forecast")
-    scd_c = _encode(surprise_dir, "surprise")
-    rcd_c = _encode(revision_dir, "revision")
-    base = f"E{event_id}_{currency}_{imp_c}_{fcd_c}_{scd_c}_{rcd_c}_{mode}"
-    return base if hour_shift is None else f"{base}_{hour_shift}"
+    # OPT-2: кешируем результат, ключ — вся комбинация аргументов
+    key = (event_id, currency, importance, forecast_dir, surprise_dir, revision_dir, mode, hour_shift)
+    cached = _wc_cache.get(key)
+    if cached is not None:
+        return cached
+
+    imp_c = _IMPORTANCE_CHARS.get(importance, "N")
+    fcd_c = _FORECAST_CHARS.get(forecast_dir, "X")
+    scd_c = _SURPRISE_CHARS.get(surprise_dir, "X")
+    rcd_c = _REVISION_CHARS.get(revision_dir, "X")
+    base  = f"E{event_id}_{currency}_{imp_c}_{fcd_c}_{scd_c}_{rcd_c}_{mode}"
+    result = base if hour_shift is None else f"{base}_{hour_shift}"
+    _wc_cache[key] = result
+    return result
 
 
 def _rel_direction(
@@ -192,21 +197,40 @@ def classify_event(
     return forecast_dir, surprise_dir, revision_dir
 
 
+# OPT-3: кеш ctx_key — для одного и того же события (url+валюта+значения)
+# результат classify_event всегда одинаковый, кешируем по ключу события
+_ctx_key_cache: dict[tuple, tuple | None] = {}
+
+
 def _ctx_key_from_event(row: dict, url_map: dict) -> tuple | None:
     url      = row.get("url")
     currency = row.get("currency_code")
     if not url or not currency:
         return None
+
+    # OPT-3: кеш по (url, currency, forecast, previous, old_previous, actual)
+    cache_key = (
+        url, currency,
+        row.get("forecast_value"), row.get("previous_value"),
+        row.get("old_previous_value"), row.get("actual_value"),
+    )
+    cached = _ctx_key_cache.get(cache_key)
+    if cached is not None:
+        # None тоже кешируем — используем sentinel
+        return None if cached is _CTX_NONE_SENTINEL else cached
+
     event_id = url_map.get(url)
     if event_id is None:
+        _ctx_key_cache[cache_key] = _CTX_NONE_SENTINEL
         return None
+
     forecast_dir, surprise_dir, revision_dir = classify_event(
         row.get("forecast_value"),
         row.get("previous_value"),
         row.get("old_previous_value"),
         row.get("actual_value"),
     )
-    return (
+    result = (
         int(event_id),
         str(currency),
         str(row.get("importance") or "none").lower(),
@@ -214,6 +238,12 @@ def _ctx_key_from_event(row: dict, url_map: dict) -> tuple | None:
         surprise_dir,
         revision_dir,
     )
+    _ctx_key_cache[cache_key] = result
+    return result
+
+
+# Sentinel для кеширования None результатов
+_CTX_NONE_SENTINEL = object()
 
 
 def _is_daily_rates(rates: list[dict]) -> bool:
@@ -238,183 +268,92 @@ def model(
     dataset_index: dict | None = None,
 ) -> dict[str, float]:
 
-    global _DEBUG_CALL_COUNT
-    _DEBUG_CALL_COUNT += 1
-    call_n = _DEBUG_CALL_COUNT
-    verbose = call_n <= _DEBUG_MAX_FULL_CALLS
-
-    if verbose:
-        _dbg(f"═══ CALL #{call_n}  date={date}  type={type}  var={var} ═══")
-
-    # ── 1. Базовые проверки ───────────────────────────────────────────────────
+    # ── 1. Базовые проверки (без debug-счётчика в production) ─────────────────
     calc_type = int(type or 0)
     calc_var  = int(var  or 0)
 
-    if calc_type not in TYPES_RANGE:
-        if verbose: _dbg(f"EARLY EXIT: calc_type={calc_type} not in TYPES_RANGE={TYPES_RANGE}")
-        return {}
-    if calc_var not in VAR_RANGE:
-        if verbose: _dbg(f"EARLY EXIT: calc_var={calc_var} not in VAR_RANGE={VAR_RANGE}")
-        return {}
-    if not rates:
-        if verbose: _dbg("EARLY EXIT: rates is empty")
-        return {}
-    if not dataset:
-        if verbose: _dbg("EARLY EXIT: dataset is empty")
-        return {}
-    if date is None:
-        if verbose: _dbg("EARLY EXIT: date is None")
-        return {}
+    if calc_type not in TYPES_RANGE: return {}
+    if calc_var  not in VAR_RANGE:   return {}
+    if not rates:   return {}
+    if not dataset: return {}
+    if date is None: return {}
 
-    if verbose:
-        _dbg(f"  rates={len(rates)} rows, dataset={len(dataset)} rows")
-
-    # ── 2. dataset_index диагностика ──────────────────────────────────────────
-    if verbose:
-        if dataset_index is None:
-            _dbg("  dataset_index=None ← фреймворк не передал индекс!")
-        else:
-            _dbg(f"  dataset_index keys: {list(dataset_index.keys())}")
-
-    ctx_index = (dataset_index or {}).get("ctx_index") or {}
-    if verbose:
-        _dbg(f"  ctx_index: {len(ctx_index)} записей")
-        if ctx_index:
-            sample_key = next(iter(ctx_index))
-            sample_val = ctx_index[sample_key]
-            _dbg(f"  ctx_index sample key : {sample_key}")
-            _dbg(f"  ctx_index sample val : {sample_val}")
-
+    # ── 2. ctx_index и url_map ────────────────────────────────────────────────
+    di        = dataset_index or {}
+    ctx_index = di.get("ctx_index") or {}
     if not ctx_index:
-        if verbose: _dbg("EARLY EXIT: ctx_index is empty")
         return {}
 
-    # ── 3. url_map диагностика ────────────────────────────────────────────────
-    url_map = (dataset_index or {}).get("url_map") or {}
-    if verbose:
-        _dbg(f"  url_map: {len(url_map)} записей")
-        if not url_map:
-            _dbg("  ⚠️ url_map ОТСУТСТВУЕТ в dataset_index — фреймворк его не передаёт!")
-            _dbg("  Попытка построить url_map из ctx_index значений (fallback)...")
+    url_map = di.get("url_map") or {}
 
-    # ── 3a. Fallback: строим url_map из значений ctx_index если там есть url ──
+    # fallback: строим url_map из ctx_index
     if not url_map:
-        fallback_url_map: dict = {}
+        fallback: dict = {}
         for key, val in ctx_index.items():
-            u = val.get("url") or val.get("Url")
+            u   = val.get("url") or val.get("Url")
             eid = key[0] if key else None
             if u and eid:
-                fallback_url_map[u] = eid
-        if verbose:
-            _dbg(f"  Fallback url_map из ctx_index: {len(fallback_url_map)} записей")
-            if fallback_url_map:
-                sample = list(fallback_url_map.items())[:2]
-                _dbg(f"  Fallback sample: {sample}")
-        if fallback_url_map:
-            url_map = fallback_url_map
+                fallback[u] = eid
+        if not fallback:
+            return {}
+        url_map = fallback
 
-    if not url_map:
-        if verbose:
-            _dbg("  EARLY EXIT: url_map пуст — нет маппинга url→event_id")
-            _dbg("  ДИАГНОЗ: фреймворк не поддерживает URL_MAP_QUERY.")
-            _dbg("  ФИКС нужен в brain_framework.py: добавить url_map в dataset_index")
-            # Покажем сколько уникальных url в датасете для понимания масштаба
-            unique_urls = {r.get("url") for r in dataset if r.get("url")}
-            _dbg(f"  Уникальных url в dataset: {len(unique_urls)}")
-            if unique_urls:
-                _dbg(f"  Примеры url: {list(unique_urls)[:3]}")
+    # ── 3. Окно дат ───────────────────────────────────────────────────────────
+    is_daily     = _is_daily_rates(rates)
+    secs_per_unit = 86400.0 if is_daily else 3600.0
+    unit          = timedelta(days=1) if is_daily else timedelta(hours=1)
+    window_start  = date - unit * SHIFT_WINDOW
+    window_end    = date + unit * SHIFT_WINDOW
+
+    # ── 4. OPT-4: searchsorted через dataset_timestamps ──────────────────────
+    ts_arr = di.get("dataset_timestamps")
+    if ts_arr is not None and len(ts_arr) > 0:
+        import numpy as _np
+        ws_ts = int(window_start.timestamp())
+        we_ts = int(window_end.timestamp())
+        lo = int(_np.searchsorted(ts_arr, ws_ts, side='left'))
+        hi = int(_np.searchsorted(ts_arr, we_ts, side='right'))
+        window_events = dataset[lo:hi]
+    else:
+        # fallback без numpy
+        window_events = [
+            e for e in dataset
+            if window_start <= (e.get("event_time") or e.get("date") or datetime.min) <= window_end
+        ]
+
+    if not window_events:
         return {}
 
-    # ── 4. Окно дат ───────────────────────────────────────────────────────────
-    is_daily     = _is_daily_rates(rates)
-    unit         = timedelta(days=1) if is_daily else timedelta(hours=1)
-    window_start = date - unit * SHIFT_WINDOW
-    window_end   = date + unit * SHIFT_WINDOW
-
-    if verbose:
-        _dbg(f"  is_daily={is_daily}  window=[{window_start} … {window_end}]")
-
-    # ── 5. Проход по датасету ─────────────────────────────────────────────────
-    n_total          = 0
-    n_no_event_time  = 0
-    n_out_of_window  = 0
-    n_no_ctx_key     = 0   # url не в url_map
-    n_no_ctx_info    = 0   # ctx_key не в ctx_index
-    n_shift_too_big  = 0
-    n_added          = 0
-
+    # ── 5. Горячий цикл ───────────────────────────────────────────────────────
     result: dict[str, float] = {}
+    date_ts = date.timestamp()
 
-    for event in dataset:
-        n_total += 1
+    for event in window_events:
         event_time = event.get("event_time") or event.get("date")
-
         if not isinstance(event_time, datetime):
-            n_no_event_time += 1
-            continue
-
-        if event_time < window_start or event_time > window_end:
-            n_out_of_window += 1
             continue
 
         ctx_key = _ctx_key_from_event(event, url_map)
         if ctx_key is None:
-            n_no_ctx_key += 1
-            if verbose and n_no_ctx_key <= 3:
-                _dbg(f"    no ctx_key: url={event.get('url')!r}  "
-                     f"currency={event.get('currency_code')!r}")
             continue
 
         ctx_info = ctx_index.get(ctx_key)
         if ctx_info is None:
-            n_no_ctx_info += 1
-            if verbose and n_no_ctx_info <= 3:
-                _dbg(f"    ctx_key not in ctx_index: {ctx_key}")
             continue
 
-        occurrence_count = int(ctx_info.get("occurrence_count") or 0)
-        is_recurring     = occurrence_count >= RECURRING_MIN_COUNT
-
-        delta = date - event_time
-        shift = int(round(delta.total_seconds() / (86400.0 if is_daily else 3600.0)))
-
+        # OPT-5: timestamp-арифметика вместо timedelta.total_seconds()
+        shift = int(round((date_ts - event_time.timestamp()) / secs_per_unit))
         if abs(shift) > SHIFT_WINDOW:
-            n_shift_too_big += 1
             continue
 
         event_id, currency, importance, fcd, scd, rcd = ctx_key
 
+        # OPT-6: сразу строим base-код один раз, shift-варианты — от него
         for mode in ACTIVE_MODES:
-            base_wc = make_weight_code(
-                event_id=event_id, currency=currency, importance=importance,
-                forecast_dir=fcd, surprise_dir=scd, revision_dir=rcd,
-                mode=mode, hour_shift=None,
-            )
-            result[base_wc] = 1.0
+            result[make_weight_code(event_id, currency, importance, fcd, scd, rcd, mode, None)] = 1.0
 
-        if is_recurring:
+        if int(ctx_info.get("occurrence_count") or 0) >= RECURRING_MIN_COUNT:
             for mode in ACTIVE_MODES:
-                shift_wc = make_weight_code(
-                    event_id=event_id, currency=currency, importance=importance,
-                    forecast_dir=fcd, surprise_dir=scd, revision_dir=rcd,
-                    mode=mode, hour_shift=shift,
-                )
-                result[shift_wc] = 1.0
-
-        n_added += 1
-
-    # ── 6. Итоговая сводка ────────────────────────────────────────────────────
-    if verbose or (call_n <= 20 and n_added == 0):
-        _dbg(f"  ИТОГ call #{call_n}:")
-        _dbg(f"    dataset total         : {n_total}")
-        _dbg(f"    нет event_time        : {n_no_event_time}")
-        _dbg(f"    вне окна              : {n_out_of_window}")
-        _dbg(f"    url не в url_map      : {n_no_ctx_key}")
-        _dbg(f"    ctx_key не в ctx_index: {n_no_ctx_info}")
-        _dbg(f"    shift > SHIFT_WINDOW  : {n_shift_too_big}")
-        _dbg(f"    добавлено событий     : {n_added}")
-        _dbg(f"    result keys           : {len(result)}")
-        if n_added == 0:
-            _dbg("  ❌ ПУСТО — смотри счётчики выше для диагноза")
+                result[make_weight_code(event_id, currency, importance, fcd, scd, rcd, mode, shift)] = 1.0
 
     return result
