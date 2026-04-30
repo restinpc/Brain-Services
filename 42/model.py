@@ -10,10 +10,10 @@ from datetime import datetime, timedelta
 from typing import Any
 
 
-SERVICE_ID = 33
-PORT = 8896
-NODE_NAME = "brain-calendar-weights-ml"
-SERVICE_TEXT = "Calendar E-code active provider with reverse-learning ML"
+SERVICE_ID = 42
+PORT = 8904
+NODE_NAME = "brain-vlad_MQL-reverse-learning-s42"
+SERVICE_TEXT = "vlad_MQL-reverse-learning events microservice"
 
 RATES_TABLE = os.getenv("RATES_TABLE", "brain_rates_eur_usd")
 
