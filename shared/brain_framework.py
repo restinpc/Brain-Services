@@ -352,6 +352,10 @@ class _State:
         self.reverse_store: rl.ReverseStore | None = None
         self._ml_active_cache: dict = {}
 
+    @property
+    def cache_table(self) -> str:
+        return self._cache_table
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # КОНСТАНТЫ
@@ -993,12 +997,14 @@ def build_app(model_module) -> FastAPI:
 
     # ── _call_model ───────────────────────────────────────────────────────────
 
-    async def _call_model(pair, day, date_str, calc_type=0, calc_var=0, param=""):
+    async def _call_model(pair, day, date_str, calc_type=0, calc_var=0, param="",
+                          _skip_refresh: bool = False):
         target_date = _parse_date(date_str)
         if not target_date:
             return None
         table   = _rates_table(pair, day)
-        await _refresh_rates(table, s)
+        if not _skip_refresh:
+            await _refresh_rates(table, s)
         rates_f   = _filter_rates_lte(table, target_date, s)
         dataset_f = _filter_dataset_lte(target_date, s)
         np_r      = s.np_rates.get(table)
@@ -1302,19 +1308,26 @@ def build_app(model_module) -> FastAPI:
                     batch = to_fetch[i:i + batch_size]
 
                     if s.USE_ML_VALUES:
-                        results = []
-                        for candle in batch:
+                        # Refresh rates once per batch, not per candle
+                        await _refresh_rates(_rates_table(pair_id, day_flag), s)
+
+                        async def _ml_one(candle, _ct=calc_type, _v=var):
                             try:
-                                result = await _call_model(
+                                return await _call_model(
                                     pair_id, day_flag,
                                     candle["date"].strftime("%Y-%m-%d %H:%M:%S"),
-                                    calc_type=calc_type, calc_var=var, param="")
+                                    calc_type=_ct, calc_var=_v, param="",
+                                    _skip_refresh=True)
                             except Exception as _e:
                                 import traceback as _tb
-                                log(f"   ml-fill {candle['date']} t={calc_type} v={var}: {_e}\n{_tb.format_exc()}",
+                                log(f"   ml-fill {candle['date']} t={_ct} v={_v}: {_e}\n{_tb.format_exc()}",
                                     s.NODE_NAME, level="error", force=True)
-                                result = None
-                            results.append(result)
+                                return None
+
+                        # Run ML calls concurrently within the batch
+                        # (maybe_retrain uses shared reverse_store but each
+                        #  control_date is independent — safe to gather)
+                        results = list(await asyncio.gather(*[_ml_one(c) for c in batch]))
                     else:
                         # ПАТЧ 5: параллельные потоки внутри батча
                         loop = asyncio.get_event_loop()
