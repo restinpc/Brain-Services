@@ -353,6 +353,8 @@ class _State:
         self._ml_active_cache: dict = {}
         # Semaphore: ensures only 1 ML train runs at a time, preventing DB pool exhaustion
         self._ml_semaphore: asyncio.Semaphore = asyncio.Semaphore(1)
+        # Flag: True during fill_cache — skips vlad_reverse_universe DB writes for speed
+        self._fill_cache_active: bool = False
 
     @property
     def cache_table(self) -> str:
@@ -1073,6 +1075,7 @@ def build_app(model_module) -> FastAPI:
                     active_tail=s.ML_ACTIVE_TAIL,
                     metric=s.ML_PRECISION_METRIC,
                     log_fn=lambda m: log(m, s.NODE_NAME),
+                    skip_db_writes=s._fill_cache_active,
                 )
                 return universe
             except Exception as e:
@@ -1237,6 +1240,7 @@ def build_app(model_module) -> FastAPI:
 
     async def _fill_worker(pairs, days, date_from_str, date_to_str, types, batch_size):
         s.fill_cancel.clear()
+        s._fill_cache_active = True   # skip vlad_reverse_universe writes for speed
         # Clear ML universe cache so fill_cache starts fresh
         if s.reverse_store:
             s.reverse_store.clear_universe_cache()
@@ -1376,6 +1380,7 @@ def build_app(model_module) -> FastAPI:
 
             s.fill_status["slots_done"] = slot_idx + 1
 
+        s._fill_cache_active = False  # restore normal mode
         state = "stopped" if s.fill_cancel.is_set() else "done"
         s.fill_status.update({"state": state, "finished_at": datetime.now().isoformat()})
         log(f" fill_cache {state}: done={done} skip={skipped} err={errors}",
