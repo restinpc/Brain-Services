@@ -453,7 +453,7 @@ async def train_at_date(
 
     cached = _train_at_date_cache.get(cache_key)
     if cached is not None:
-        return cached
+        return (*cached, True)   # True = from cache, skip DB writes
 
     use_diff   = train_mode in (2, 3, 4)
     strict_amp = train_mode == 4
@@ -551,7 +551,7 @@ async def train_at_date(
     if len(_train_at_date_cache) > 2000:
         oldest = next(iter(_train_at_date_cache))
         del _train_at_date_cache[oldest]
-    return result
+    return (*result, False)   # False = computed fresh, not from cache
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -965,7 +965,7 @@ class ReverseStore:
             return {}, 0.0
 
         try:
-            universe, pr, iters, ext_cnt = await train_at_date(
+            universe, pr, iters, ext_cnt, _from_train_cache = await train_at_date(
                 np_simple_rates=np_simple_rates,
                 control_date=control_date,
                 active_codes_at=active_codes_at,
@@ -978,6 +978,15 @@ class ReverseStore:
                 active_tail=active_tail,
                 metric=metric,
             )
+
+            # Update in-memory cache immediately
+            if universe:
+                self._universe_cache[(pair, day_flag, control_date, params_hash)] = (universe, pr)
+
+            # Skip heavy DB writes when result came from train cache —
+            # the universe is identical to one already saved for adjacent candle.
+            if _from_train_cache:
+                return universe, pr
 
             if universe:
                 await self.save_universe(
@@ -1072,6 +1081,45 @@ class ReverseStore:
         metric: PrecisionMetric = "mean",
         log_fn: Callable[[str], None] | None = None,
     ) -> tuple[dict[str, float], float]:
+        # ── Fast pre-check: compute extremum seq+codes, check train cache ──────
+        # If hit: skip ALL DB operations (load, reserve, save, finish).
+        # Adjacent candles share identical extremum sets ~50% of the time.
+        _forward_pre = train_mode in (1, 3, 4)
+        _seq_pre = (
+            collect_extremums_forward(
+                np_simple_rates, control_date,
+                limit=extremum_limit, extremum_interval=extremum_interval,
+            )
+            if _forward_pre else
+            collect_extremums_back(
+                np_simple_rates, control_date,
+                limit=extremum_limit, extremum_interval=extremum_interval,
+            )
+        )
+        _pre_codes: list[list[str]] = []
+        for _ext_date, _ in _seq_pre:
+            try:
+                _c = await active_codes_at(_ext_date)
+            except Exception:
+                _c = []
+            _pre_codes.append(sorted(set(_c)))
+
+        _seq_tuple = tuple((int(d.timestamp()), s) for d, s in _seq_pre)
+        _codes_key  = tuple(tuple(c) for c in _pre_codes)
+        _train_cache_key = (
+            _seq_tuple, _codes_key, train_mode, max_iter,
+            round(step, 6), round(target_precision, 6), active_tail, metric,
+        )
+        _cached_train = _train_at_date_cache.get(_train_cache_key)
+        if _cached_train is not None:
+            _univ_cached, _pr_cached, _, _ = _cached_train
+            # Populate universe cache so load_universe skips DB next time too
+            self._universe_cache[(pair, day_flag, control_date, params_hash)] = (
+                _univ_cached, _pr_cached
+            )
+            return _univ_cached, _pr_cached
+        # ────────────────────────────────────────────────────────────────────────
+
         loaded = await self.load_universe(
             pair=pair,
             day_flag=day_flag,
