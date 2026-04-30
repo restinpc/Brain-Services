@@ -376,6 +376,12 @@ def _diff_amp(
 ActiveCodesProvider = Callable[[datetime], Awaitable[list[str]]]
 
 
+# Cache: (seq_hash, codes_hash, train_mode, max_iter, step, target, active_tail, metric)
+# -> (universe, precision, iters, ext_cnt)
+# Adjacent hourly candles almost always share identical extremum sets -> cache hit -> skip retrain
+_train_at_date_cache: dict = {}
+
+
 async def train_at_date(
     *,
     np_simple_rates:  dict | None,
@@ -428,17 +434,33 @@ async def train_at_date(
     if not seq:
         return {}, 1.0, 0, 0
 
+    # Fast path: collect codes for all extremums first, then check cache.
+    # Adjacent candles nearly always share the same 50 extremums -> cache hit.
+    seq_tuple = tuple((int(d.timestamp()), s) for d, s in seq)
+
+    pre_codes: list[list[str]] = []
+    for ext_date, _ in seq:
+        try:
+            codes = await active_codes_at(ext_date)
+        except Exception:
+            codes = []
+        pre_codes.append(sorted(set(codes)))
+
+    codes_key = tuple(tuple(c) for c in pre_codes)
+    cache_key  = (seq_tuple, codes_key, train_mode, max_iter,
+                  round(step, 6), round(target_precision, 6),
+                  active_tail, metric)
+
+    cached = _train_at_date_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     use_diff   = train_mode in (2, 3, 4)
     strict_amp = train_mode == 4
 
     records: list[ExtremumRecord] = []
 
-    for idx, (ext_date, sign) in enumerate(seq):
-        try:
-            codes = await active_codes_at(ext_date)
-        except Exception:
-            codes = []
-
+    for idx, ((ext_date, sign), codes) in enumerate(zip(seq, pre_codes)):
         if not codes:
             continue
 
@@ -523,7 +545,13 @@ async def train_at_date(
         if abs(float(v)) > 1e-12
     }
 
-    return universe, float(final_precision), int(iterations_total), len(records)
+    result = (universe, float(final_precision), int(iterations_total), len(records))
+    _train_at_date_cache[cache_key] = result
+    # Keep cache bounded: drop oldest entries beyond 2000
+    if len(_train_at_date_cache) > 2000:
+        oldest = next(iter(_train_at_date_cache))
+        del _train_at_date_cache[oldest]
+    return result
 
 
 # ──────────────────────────────────────────────────────────────────────────────
