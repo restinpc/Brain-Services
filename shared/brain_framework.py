@@ -1311,23 +1311,20 @@ def build_app(model_module) -> FastAPI:
                         # Refresh rates once per batch, not per candle
                         await _refresh_rates(_rates_table(pair_id, day_flag), s)
 
-                        async def _ml_one(candle, _ct=calc_type, _v=var):
+                        results = []
+                        for candle in batch:
                             try:
-                                return await _call_model(
+                                result = await _call_model(
                                     pair_id, day_flag,
                                     candle["date"].strftime("%Y-%m-%d %H:%M:%S"),
-                                    calc_type=_ct, calc_var=_v, param="",
+                                    calc_type=calc_type, calc_var=var, param="",
                                     _skip_refresh=True)
                             except Exception as _e:
                                 import traceback as _tb
-                                log(f"   ml-fill {candle['date']} t={_ct} v={_v}: {_e}\n{_tb.format_exc()}",
+                                log(f"   ml-fill {candle['date']} t={calc_type} v={var}: {_e}\n{_tb.format_exc()}",
                                     s.NODE_NAME, level="error", force=True)
-                                return None
-
-                        # Run ML calls concurrently within the batch
-                        # (maybe_retrain uses shared reverse_store but each
-                        #  control_date is independent — safe to gather)
-                        results = list(await asyncio.gather(*[_ml_one(c) for c in batch]))
+                                result = None
+                            results.append(result)
                     else:
                         # ПАТЧ 5: параллельные потоки внутри батча
                         loop = asyncio.get_event_loop()
