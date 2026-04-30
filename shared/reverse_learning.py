@@ -69,6 +69,14 @@ class ExtremumRecord:
 PrecisionMetric = Literal["mean", "min", "weighted"]
 InitMode        = Literal["constant", "diff"]
 
+# Режим обучения (train_mode):
+#   0 — назад от control_date, веса ±1 (baseline)
+#   1 — вперёд от начала до control_date, веса ±1
+#   2 — назад, амплитуда = |Δclose до следующего (старшего) экстр.|; нет соседа → abs(close)
+#   3 — вперёд, амплитуда = |Δclose до следующего (младшего) экстр.|; нет соседа → abs(close)
+#   4 — вперёд (строгий), амплитуда = |Δclose до следующего экстр.|; нет соседа → пропустить
+TrainMode = int  # 0 | 1 | 2 | 3 | 4
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Прецессионная точность
@@ -183,21 +191,86 @@ def rebalance_weights(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Сборка экстремумов от control_date НАЗАД
+# Сборка экстремумов от control_date НАЗАД / ВПЕРЁД
 # ──────────────────────────────────────────────────────────────────────────────
+
+def _extremum_flags(
+    np_simple_rates: dict | None,
+    *,
+    interval: int = 3,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Возвращает (ext_max, ext_min).
+
+    interval — полный минимальный интервал регистрации экстремума.
+    interval=3 эквивалентен старой логике: одна свеча слева и одна справа.
+    interval=5/7/9 расширяет симметричное окно до ±2/±3/±4 свечей.
+    """
+    if not np_simple_rates:
+        return np.zeros(0, dtype=bool), np.zeros(0, dtype=bool)
+
+    dates_ns = np_simple_rates.get("dates_ns")
+    n = len(dates_ns) if dates_ns is not None else 0
+    if n == 0:
+        return np.zeros(0, dtype=bool), np.zeros(0, dtype=bool)
+
+    try:
+        interval_i = int(interval or 3)
+    except Exception:
+        interval_i = 3
+    if interval_i < 3:
+        interval_i = 3
+
+    # Нечётные значения 3/5/7/9 трактуются как полная ширина окна.
+    radius = max(1, interval_i // 2)
+
+    high = np.asarray(
+        np_simple_rates.get("max", np_simple_rates.get("high", np_simple_rates.get("close"))),
+        dtype=np.float64,
+    )
+    low = np.asarray(
+        np_simple_rates.get("min", np_simple_rates.get("low", np_simple_rates.get("close"))),
+        dtype=np.float64,
+    )
+
+    ext_max = np.zeros(n, dtype=bool)
+    ext_min = np.zeros(n, dtype=bool)
+    if n < 2 * radius + 1:
+        return ext_max, ext_min
+
+    for i in range(radius, n - radius):
+        h = high[i]
+        lo = low[i]
+        left_h = high[i - radius:i]
+        right_h = high[i + 1:i + radius + 1]
+        left_l = low[i - radius:i]
+        right_l = low[i + 1:i + radius + 1]
+
+        if h > np.max(left_h) and h > np.max(right_h):
+            ext_max[i] = True
+        if lo < np.min(left_l) and lo < np.min(right_l):
+            ext_min[i] = True
+
+    return ext_max, ext_min
+
 
 def collect_extremums_back(
     np_simple_rates: dict | None,
     control_date:    datetime,
     *,
     limit: int = 50,
+    extremum_interval: int = 3,
 ) -> list[tuple[datetime, int]]:
-    """[(date, sign)] от ближайшего к control_date к более старым. limit ограничивает длину."""
+    """[(date, sign)] от ближайшего к control_date к более старым."""
     if not np_simple_rates:
         return []
+
     dates_ns = np_simple_rates["dates_ns"]
-    ext_max  = np_simple_rates["ext_max"]
-    ext_min  = np_simple_rates["ext_min"]
+    ext_max, ext_min = _extremum_flags(
+        np_simple_rates,
+        interval=extremum_interval,
+    )
+
     ts       = np.int64(int(control_date.timestamp()))
     cutoff   = int(np.searchsorted(dates_ns, ts, side="right"))
 
@@ -212,24 +285,73 @@ def collect_extremums_back(
     return out
 
 
-def _diff_amp(np_simple_rates: dict | None,
-              date_a: datetime, date_b: datetime | None) -> float:
+def collect_extremums_forward(
+    np_simple_rates: dict | None,
+    control_date:    datetime,
+    *,
+    limit: int = 50,
+    extremum_interval: int = 3,
+) -> list[tuple[datetime, int]]:
+    """
+    [(date, sign)] в хронологическом порядке, до control_date включительно.
+    Возвращает последние `limit` записей.
+    Знак: ext_max → -1, ext_min → +1.
+    """
+    if not np_simple_rates:
+        return []
+
+    dates_ns = np_simple_rates["dates_ns"]
+    ext_max, ext_min = _extremum_flags(
+        np_simple_rates,
+        interval=extremum_interval,
+    )
+
+    ts       = np.int64(int(control_date.timestamp()))
+    cutoff   = int(np.searchsorted(dates_ns, ts, side="right"))
+
+    out: list[tuple[datetime, int]] = []
+    for i in range(cutoff):
+        if ext_max[i]:
+            out.append((datetime.fromtimestamp(int(dates_ns[i])), -1))
+        elif ext_min[i]:
+            out.append((datetime.fromtimestamp(int(dates_ns[i])), +1))
+
+    return out[-limit:] if len(out) > limit else out
+
+
+def _diff_amp(
+    np_simple_rates: dict | None,
+    date_a: datetime,
+    date_b: datetime | None,
+) -> float:
     if not np_simple_rates:
         return 1.0
+
     dates_ns = np_simple_rates["dates_ns"]
     close    = np_simple_rates["close"]
     n        = len(close)
+
     if n == 0:
         return 1.0
-    ia = min(int(np.searchsorted(dates_ns, np.int64(int(date_a.timestamp())))), n - 1)
+
+    ia = min(
+        int(np.searchsorted(dates_ns, np.int64(int(date_a.timestamp())))),
+        n - 1,
+    )
+
     if date_b is None:
         return abs(float(close[ia])) or 1.0
-    ib = min(int(np.searchsorted(dates_ns, np.int64(int(date_b.timestamp())))), n - 1)
+
+    ib = min(
+        int(np.searchsorted(dates_ns, np.int64(int(date_b.timestamp())))),
+        n - 1,
+    )
+
     return abs(float(close[ia] - close[ib])) or 1.0
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Основной пайплайн обучения (чистая алгоритмика, без БД)
+# Основной пайплайн обучения, чистая алгоритмика без БД
 # ──────────────────────────────────────────────────────────────────────────────
 
 ActiveCodesProvider = Callable[[datetime], Awaitable[list[str]]]
@@ -240,442 +362,737 @@ async def train_at_date(
     np_simple_rates:  dict | None,
     control_date:     datetime,
     active_codes_at:  ActiveCodesProvider,
-    init_mode:        InitMode = "constant",
+    train_mode:       TrainMode = 0,
     max_iter:         int   = 20,
     step:             float = 0.10,
     target_precision: float = 0.95,
     extremum_limit:   int   = 50,
+    extremum_interval: int = 3,
     active_tail:      int   = 0,
     metric:           PrecisionMetric = "mean",
 ) -> tuple[dict[str, float], float, int, int]:
     """
-    Returns: (universe, final_precision, iterations_total, extremum_count).
+    Returns:
+        (universe, final_precision, iterations_total, extremum_count)
+
+    train_mode:
+      0 — назад, веса ±1
+      1 — вперёд, веса ±1
+      2 — назад, амплитуда |Δclose до соседнего экстремума|;
+          нет соседа → abs(close)
+      3 — вперёд, амплитуда |Δclose до следующего экстремума|;
+          нет соседа → abs(close)
+      4 — вперёд строго, амплитуда |Δclose|;
+          нет следующего экстремума → запись пропускается
+
+    extremum_interval:
+      3/5/7/9 — минимальный интервал регистрации экстремума.
     """
-    seq = collect_extremums_back(np_simple_rates, control_date, limit=extremum_limit)
+
+    forward = train_mode in (1, 3, 4)
+
+    if forward:
+        seq = collect_extremums_forward(
+            np_simple_rates,
+            control_date,
+            limit=extremum_limit,
+            extremum_interval=extremum_interval,
+        )
+    else:
+        seq = collect_extremums_back(
+            np_simple_rates,
+            control_date,
+            limit=extremum_limit,
+            extremum_interval=extremum_interval,
+        )
+
     if not seq:
         return {}, 1.0, 0, 0
 
+    use_diff   = train_mode in (2, 3, 4)
+    strict_amp = train_mode == 4
+
     records: list[ExtremumRecord] = []
+
     for idx, (ext_date, sign) in enumerate(seq):
         try:
             codes = await active_codes_at(ext_date)
         except Exception:
             codes = []
+
         if not codes:
             continue
-        amp = (_diff_amp(np_simple_rates, ext_date,
-                         seq[idx + 1][0] if idx + 1 < len(seq) else None)
-               if init_mode == "diff" else 1.0)
-        records.append(ExtremumRecord(
-            date=ext_date, sign=sign, codes=list(codes), base_amp=amp))
+
+        if use_diff:
+            has_next = idx + 1 < len(seq)
+            next_date = seq[idx + 1][0] if has_next else None
+
+            if strict_amp and not has_next:
+                continue
+
+            amp = _diff_amp(np_simple_rates, ext_date, next_date)
+        else:
+            amp = 1.0
+
+        # Дедупликация кодов на одном экстремуме, чтобы один код не усиливался
+        # дважды из-за повторного события в одной свече.
+        records.append(
+            ExtremumRecord(
+                date=ext_date,
+                sign=sign,
+                codes=sorted(set(codes)),
+                base_amp=float(amp),
+            )
+        )
 
     if not records:
         return {}, 1.0, 0, 0
 
-    universe: dict[str, float]    = {}
-    history:  list[ExtremumRecord] = []
-    iters_total = 0
+    universe: dict[str, float] = {}
+    all_seen: set[str] = set()
+    iterations_total = 0
 
-    for rec in records:
-        had_inter = any(c in universe for c in rec.codes)
+    for rec_idx, rec in enumerate(records):
+        rec_set = set(rec.codes)
+        overlap = bool(rec_set & all_seen)
+
+        if not overlap:
+            # Новое непересекающееся подмножество.
+            for c in rec.codes:
+                if c not in universe:
+                    universe[c] = rec.sign * rec.base_amp
+            all_seen |= rec_set
+            continue
+
+        # Пересечение с уже обученным множеством.
+        # Сначала добавляем отсутствующие веса с базовым знаком.
         for c in rec.codes:
             if c not in universe:
-                universe[c] = float(rec.sign) * rec.base_amp
-        history.append(rec)
+                universe[c] = rec.sign * rec.base_amp
 
-        if had_inter:
-            universe, _pr, iters = rebalance_weights(
-                universe, history,
-                max_iter=max_iter, step=step, target=target_precision,
-                active_tail=active_tail, metric=metric)
-            iters_total += iters
+        all_seen |= rec_set
 
-    final_pr = total_precision(universe, records, metric=metric)
-    return universe, final_pr, iters_total, len(records)
+        universe, _pr, iters = rebalance_weights(
+            universe,
+            records[:rec_idx + 1],
+            max_iter=max_iter,
+            step=step,
+            target=target_precision,
+            active_tail=active_tail,
+            metric=metric,
+        )
+        iterations_total += iters
+
+    final_precision = total_precision(universe, records, metric=metric)
+
+    if final_precision < target_precision:
+        universe, final_precision, iters = rebalance_weights(
+            universe,
+            records,
+            max_iter=max_iter,
+            step=step,
+            target=target_precision,
+            active_tail=active_tail,
+            metric=metric,
+        )
+        iterations_total += iters
+
+    # Отбрасываем численный мусор.
+    universe = {
+        k: float(v)
+        for k, v in universe.items()
+        if abs(float(v)) > 1e-12
+    }
+
+    return universe, float(final_precision), int(iterations_total), len(records)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# ReverseStore: per-service таблицы и весь БД-API
+# ReverseStore: БД-хранилище обученных universe + jobs-семафор
 # ──────────────────────────────────────────────────────────────────────────────
 
 class ReverseStore:
-    """
-    Per-service хранилище. Имена таблиц параметризованы PORT-ом сервиса
-    (по аналогии с vlad_values_cache_svc{PORT}).
-
-        store = ReverseStore(engine, port=8888)
-        await store.ensure_tables()
-        ...
-    """
-
     def __init__(self, engine, *, port: int):
-        self.engine     = engine
-        self.t_universe = f"vlad_reverse_universe_svc{port}"
-        self.t_jobs     = f"vlad_reverse_jobs_svc{port}"
-
-    # ── DDL ───────────────────────────────────────────────────────────────────
+        self.engine = engine
+        self.port = int(port)
+        self.universe_table = f"vlad_reverse_universe_svc{self.port}"
+        self.jobs_table = f"vlad_reverse_jobs_svc{self.port}"
 
     async def ensure_tables(self) -> None:
         async with self.engine.begin() as conn:
             await conn.execute(text(f"""
-                CREATE TABLE IF NOT EXISTS `{self.t_universe}` (
-                    id               BIGINT       NOT NULL AUTO_INCREMENT,
-                    pair             TINYINT      NOT NULL,
-                    day_flag         TINYINT      NOT NULL,
-                    control_date     DATETIME     NOT NULL,
-                    params_hash      CHAR(32)     NOT NULL,
-                    universe_json    LONGTEXT     NOT NULL,
-                    precision_val    DECIMAL(8,5) NOT NULL DEFAULT 0,
-                    iterations       SMALLINT     NOT NULL DEFAULT 0,
-                    extremum_cnt     INT          NOT NULL DEFAULT 0,
-                    -- Поля конфига обучения (полезны для последующей оптимизации):
-                    history_window   INT          NOT NULL DEFAULT 0,
-                    active_tail      INT          NOT NULL DEFAULT 0,
-                    precision_metric VARCHAR(16)  NOT NULL DEFAULT 'mean',
-                    init_mode        VARCHAR(16)  NOT NULL DEFAULT 'constant',
-                    step_size        DECIMAL(5,3) NOT NULL DEFAULT 0.100,
-                    target_precision DECIMAL(5,3) NOT NULL DEFAULT 0.950,
-                    created_at       DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    updated_at       TIMESTAMP    DEFAULT CURRENT_TIMESTAMP
-                                                  ON UPDATE CURRENT_TIMESTAMP,
-                    PRIMARY KEY (id),
-                    UNIQUE KEY uq_universe (pair, day_flag, control_date, params_hash),
-                    INDEX idx_lookup (pair, day_flag, params_hash, control_date)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-            """))
-            await conn.execute(text(f"""
-                CREATE TABLE IF NOT EXISTS `{self.t_jobs}` (
-                    id                 BIGINT       NOT NULL AUTO_INCREMENT,
-                    pair               TINYINT      NOT NULL,
-                    day_flag           TINYINT      NOT NULL,
-                    control_date       DATETIME     NOT NULL,
-                    params_hash        CHAR(32)     NOT NULL,
-                    state              ENUM('pending','running','done','failed')
-                                       NOT NULL DEFAULT 'pending',
-                    triggered_by       ENUM('train','retrain','manual')
-                                       NOT NULL DEFAULT 'train',
-                    precision_before   DECIMAL(8,5) DEFAULT NULL,
-                    precision_after    DECIMAL(8,5) DEFAULT NULL,
-                    iterations         SMALLINT     NOT NULL DEFAULT 0,
-                    universe_size      INT          NOT NULL DEFAULT 0,
-                    prev_universe_size INT          NOT NULL DEFAULT 0,
-                    extremum_cnt       INT          NOT NULL DEFAULT 0,
-                    -- Конфиг — повторно для аудита:
-                    history_window     INT          NOT NULL DEFAULT 0,
-                    active_tail        INT          NOT NULL DEFAULT 0,
-                    precision_metric   VARCHAR(16)  NOT NULL DEFAULT 'mean',
-                    init_mode          VARCHAR(16)  NOT NULL DEFAULT 'constant',
-                    step_size          DECIMAL(5,3) NOT NULL DEFAULT 0.100,
-                    target_precision   DECIMAL(5,3) NOT NULL DEFAULT 0.950,
-                    started_at         DATETIME     NULL,
-                    finished_at        DATETIME     NULL,
-                    error_msg          TEXT         NULL,
-                    PRIMARY KEY (id),
-                    UNIQUE KEY uq_job (pair, day_flag, control_date, params_hash),
-                    INDEX idx_state (state, started_at)
+                CREATE TABLE IF NOT EXISTS `{self.universe_table}` (
+                    `id`                BIGINT       NOT NULL AUTO_INCREMENT,
+                    `pair`              INT          NOT NULL,
+                    `day_flag`          TINYINT      NOT NULL DEFAULT 0,
+                    `control_date`      DATETIME     NOT NULL,
+                    `params_hash`       CHAR(32)     NOT NULL,
+                    `universe_json`     LONGTEXT     NOT NULL,
+                    `precision_val`     DOUBLE       NOT NULL DEFAULT 0,
+                    `iterations`        INT          NOT NULL DEFAULT 0,
+                    `extremum_count`    INT          NOT NULL DEFAULT 0,
+                    `history_window`    INT          NOT NULL DEFAULT 0,
+                    `active_tail`       INT          NOT NULL DEFAULT 0,
+                    `precision_metric`  VARCHAR(16)  NOT NULL DEFAULT 'mean',
+                    `init_mode`         VARCHAR(32)  NOT NULL DEFAULT 'mode0',
+                    `step_size`         DOUBLE       NOT NULL DEFAULT 0.10,
+                    `target_precision`  DOUBLE       NOT NULL DEFAULT 0.95,
+                    `created_at`        TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+                    `updated_at`        TIMESTAMP    DEFAULT CURRENT_TIMESTAMP
+                                                   ON UPDATE CURRENT_TIMESTAMP,
+                    PRIMARY KEY (`id`),
+                    UNIQUE KEY `uk_reverse_universe`
+                        (`pair`, `day_flag`, `control_date`, `params_hash`),
+                    KEY `idx_pair_day_date`
+                        (`pair`, `day_flag`, `control_date`),
+                    KEY `idx_params_hash` (`params_hash`)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """))
 
-    # ── Universe persistence ──────────────────────────────────────────────────
-
-    async def save_universe(
-        self, *, pair: int, day_flag: int, control_date: datetime,
-        params_hash: str, universe: dict[str, float], precision_val: float,
-        iterations: int, extremum_cnt: int,
-        history_window: int = 0, active_tail: int = 0,
-        precision_metric: str = "mean", init_mode: str = "constant",
-        step_size: float = 0.10, target_precision: float = 0.95,
-    ) -> None:
-        async with self.engine.begin() as conn:
             await conn.execute(text(f"""
-                INSERT INTO `{self.t_universe}`
-                    (pair, day_flag, control_date, params_hash,
-                     universe_json, precision_val, iterations, extremum_cnt,
-                     history_window, active_tail, precision_metric,
-                     init_mode, step_size, target_precision)
-                VALUES (:pair, :day, :cd, :ph,
-                        :uj, :pv, :it, :ec,
-                        :hw, :at, :pm,
-                        :im, :ss, :tp)
-                ON DUPLICATE KEY UPDATE
-                    universe_json    = VALUES(universe_json),
-                    precision_val    = VALUES(precision_val),
-                    iterations       = VALUES(iterations),
-                    extremum_cnt     = VALUES(extremum_cnt),
-                    history_window   = VALUES(history_window),
-                    active_tail      = VALUES(active_tail),
-                    precision_metric = VALUES(precision_metric),
-                    init_mode        = VALUES(init_mode),
-                    step_size        = VALUES(step_size),
-                    target_precision = VALUES(target_precision)
-            """), {"pair": pair, "day": day_flag, "cd": control_date,
-                   "ph": params_hash,
-                   "uj": _json.dumps(universe, ensure_ascii=False),
-                   "pv": float(precision_val), "it": int(iterations),
-                   "ec": int(extremum_cnt),
-                   "hw": int(history_window), "at": int(active_tail),
-                   "pm": precision_metric, "im": init_mode,
-                   "ss": float(step_size), "tp": float(target_precision)})
+                CREATE TABLE IF NOT EXISTS `{self.jobs_table}` (
+                    `id`                  BIGINT       NOT NULL AUTO_INCREMENT,
+                    `pair`                INT          NOT NULL,
+                    `day_flag`            TINYINT      NOT NULL DEFAULT 0,
+                    `control_date`        DATETIME     NOT NULL,
+                    `params_hash`         CHAR(32)     NOT NULL,
+                    `state`               VARCHAR(16)  NOT NULL DEFAULT 'queued',
+                    `triggered_by`        VARCHAR(32)  NOT NULL DEFAULT 'unknown',
+                    `error_msg`           TEXT         NULL,
+                    `precision_before`    DOUBLE       NULL,
+                    `precision_after`     DOUBLE       NULL,
+                    `iterations`          INT          NOT NULL DEFAULT 0,
+                    `universe_size`       INT          NOT NULL DEFAULT 0,
+                    `prev_universe_size`  INT          NOT NULL DEFAULT 0,
+                    `extremum_count`      INT          NOT NULL DEFAULT 0,
+                    `history_window`      INT          NOT NULL DEFAULT 0,
+                    `active_tail`         INT          NOT NULL DEFAULT 0,
+                    `precision_metric`    VARCHAR(16)  NOT NULL DEFAULT 'mean',
+                    `init_mode`           VARCHAR(32)  NOT NULL DEFAULT 'mode0',
+                    `step_size`           DOUBLE       NOT NULL DEFAULT 0.10,
+                    `target_precision`    DOUBLE       NOT NULL DEFAULT 0.95,
+                    `created_at`          TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+                    `updated_at`          TIMESTAMP    DEFAULT CURRENT_TIMESTAMP
+                                                     ON UPDATE CURRENT_TIMESTAMP,
+                    PRIMARY KEY (`id`),
+                    UNIQUE KEY `uk_reverse_job`
+                        (`pair`, `day_flag`, `control_date`, `params_hash`),
+                    KEY `idx_state` (`state`),
+                    KEY `idx_pair_day_date`
+                        (`pair`, `day_flag`, `control_date`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """))
 
     async def load_universe(
-        self, *, pair: int, day_flag: int, control_date: datetime,
+        self,
+        *,
+        pair: int,
+        day_flag: int,
+        control_date: datetime,
         params_hash: str,
-    ) -> tuple[dict[str, float] | None, float, int]:
+    ) -> tuple[dict[str, float], float] | None:
         async with self.engine.connect() as conn:
-            row = (await conn.execute(text(f"""
-                SELECT universe_json, precision_val, extremum_cnt
-                FROM `{self.t_universe}`
-                WHERE pair=:pair AND day_flag=:day
-                  AND control_date=:cd AND params_hash=:ph
-            """), {"pair": pair, "day": day_flag,
-                   "cd": control_date, "ph": params_hash})).fetchone()
-        if not row:
-            return None, 0.0, 0
-        try:
-            u = _json.loads(row[0])
-        except Exception:
-            return None, 0.0, 0
-        return u, float(row[1] or 0), int(row[2] or 0)
-
-    async def load_latest_universe(
-        self, *, pair: int, day_flag: int, params_hash: str,
-        on_or_before: datetime,
-    ) -> tuple[dict[str, float] | None, float, datetime | None]:
-        async with self.engine.connect() as conn:
-            row = (await conn.execute(text(f"""
-                SELECT universe_json, precision_val, control_date
-                FROM `{self.t_universe}`
-                WHERE pair=:pair AND day_flag=:day AND params_hash=:ph
-                  AND control_date <= :cd
-                ORDER BY control_date DESC
+            res = await conn.execute(text(f"""
+                SELECT universe_json, precision_val
+                FROM `{self.universe_table}`
+                WHERE pair = :pair
+                  AND day_flag = :day
+                  AND control_date = :dt
+                  AND params_hash = :ph
                 LIMIT 1
-            """), {"pair": pair, "day": day_flag, "ph": params_hash,
-                   "cd": on_or_before})).fetchone()
+            """), {
+                "pair": pair,
+                "day": day_flag,
+                "dt": control_date,
+                "ph": params_hash,
+            })
+
+            row = res.mappings().first()
+
         if not row:
-            return None, 0.0, None
+            return None
+
         try:
-            u = _json.loads(row[0])
+            raw = _json.loads(row["universe_json"] or "{}")
+            universe = {
+                str(k): float(v)
+                for k, v in raw.items()
+                if v is not None
+            }
+            return universe, float(row["precision_val"] or 0.0)
         except Exception:
-            return None, 0.0, None
-        return u, float(row[1] or 0), row[2]
+            return None
 
-    # ── Семафор задач перевешивания ──────────────────────────────────────────
+    async def save_universe(
+        self,
+        *,
+        pair: int,
+        day_flag: int,
+        control_date: datetime,
+        params_hash: str,
+        universe: dict[str, float],
+        precision_val: float,
+        iterations: int,
+        extremum_cnt: int,
+        history_window: int,
+        active_tail: int,
+        precision_metric: str,
+        init_mode: str,
+        step_size: float,
+        target_precision: float,
+    ) -> None:
+        payload = _json.dumps(
+            universe,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
 
-    async def acquire_slot(
-        self, *, pair: int, day_flag: int, control_date: datetime,
-        params_hash: str, triggered_by: str = "train",
-        stale_after_secs: int = 300,
+        async with self.engine.begin() as conn:
+            await conn.execute(text(f"""
+                INSERT INTO `{self.universe_table}` (
+                    pair, day_flag, control_date, params_hash,
+                    universe_json, precision_val, iterations, extremum_count,
+                    history_window, active_tail, precision_metric, init_mode,
+                    step_size, target_precision
+                )
+                VALUES (
+                    :pair, :day, :dt, :ph,
+                    :payload, :pr, :iters, :ext_cnt,
+                    :hist, :tail, :metric, :init_mode,
+                    :step, :target
+                )
+                ON DUPLICATE KEY UPDATE
+                    universe_json     = VALUES(universe_json),
+                    precision_val     = VALUES(precision_val),
+                    iterations        = VALUES(iterations),
+                    extremum_count    = VALUES(extremum_count),
+                    history_window    = VALUES(history_window),
+                    active_tail       = VALUES(active_tail),
+                    precision_metric  = VALUES(precision_metric),
+                    init_mode         = VALUES(init_mode),
+                    step_size         = VALUES(step_size),
+                    target_precision  = VALUES(target_precision),
+                    updated_at        = CURRENT_TIMESTAMP
+            """), {
+                "pair": pair,
+                "day": day_flag,
+                "dt": control_date,
+                "ph": params_hash,
+                "payload": payload,
+                "pr": float(precision_val),
+                "iters": int(iterations),
+                "ext_cnt": int(extremum_cnt),
+                "hist": int(history_window),
+                "tail": int(active_tail),
+                "metric": str(precision_metric),
+                "init_mode": str(init_mode),
+                "step": float(step_size),
+                "target": float(target_precision),
+            })
+
+    async def reserve_slot(
+        self,
+        *,
+        pair: int,
+        day_flag: int,
+        control_date: datetime,
+        params_hash: str,
+        triggered_by: str,
+        history_window: int,
+        active_tail: int,
+        precision_metric: str,
+        init_mode: str,
+        step_size: float,
+        target_precision: float,
     ) -> bool:
         """
-        True  — задача наша (вставили или перехватили зависшую/готовую).
-        False — выполняется кем-то другим прямо сейчас.
+        Семафор: True если мы создали/заняли job.
+        False если такой job уже существует.
         """
-        p = {"pair": pair, "day": day_flag, "cd": control_date,
-             "ph": params_hash, "tb": triggered_by}
         async with self.engine.begin() as conn:
-            r = await conn.execute(text(f"""
-                INSERT IGNORE INTO `{self.t_jobs}`
-                    (pair, day_flag, control_date, params_hash,
-                     state, triggered_by, started_at)
-                VALUES (:pair, :day, :cd, :ph, 'running', :tb, NOW())
-            """), p)
-            if r.rowcount > 0:
+            res = await conn.execute(text(f"""
+                INSERT IGNORE INTO `{self.jobs_table}` (
+                    pair, day_flag, control_date, params_hash,
+                    state, triggered_by,
+                    history_window, active_tail, precision_metric, init_mode,
+                    step_size, target_precision
+                )
+                VALUES (
+                    :pair, :day, :dt, :ph,
+                    'running', :triggered_by,
+                    :hist, :tail, :metric, :init_mode,
+                    :step, :target
+                )
+            """), {
+                "pair": pair,
+                "day": day_flag,
+                "dt": control_date,
+                "ph": params_hash,
+                "triggered_by": triggered_by,
+                "hist": int(history_window),
+                "tail": int(active_tail),
+                "metric": str(precision_metric),
+                "init_mode": str(init_mode),
+                "step": float(step_size),
+                "target": float(target_precision),
+            })
+
+            if res.rowcount == 1:
                 return True
 
-            row = (await conn.execute(text(f"""
-                SELECT state, started_at FROM `{self.t_jobs}`
-                WHERE pair=:pair AND day_flag=:day
-                  AND control_date=:cd AND params_hash=:ph
-            """), p)).fetchone()
-            if not row:
-                return False
+            # Если job уже есть, но он не running, можно перезаписать как running.
+            upd = await conn.execute(text(f"""
+                UPDATE `{self.jobs_table}`
+                SET state = 'running',
+                    triggered_by = :triggered_by,
+                    error_msg = NULL,
+                    history_window = :hist,
+                    active_tail = :tail,
+                    precision_metric = :metric,
+                    init_mode = :init_mode,
+                    step_size = :step,
+                    target_precision = :target,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE pair = :pair
+                  AND day_flag = :day
+                  AND control_date = :dt
+                  AND params_hash = :ph
+                  AND state <> 'running'
+            """), {
+                "pair": pair,
+                "day": day_flag,
+                "dt": control_date,
+                "ph": params_hash,
+                "triggered_by": triggered_by,
+                "hist": int(history_window),
+                "tail": int(active_tail),
+                "metric": str(precision_metric),
+                "init_mode": str(init_mode),
+                "step": float(step_size),
+                "target": float(target_precision),
+            })
 
-            state, started = row[0], row[1]
-            if state in ('done', 'failed'):
-                await conn.execute(text(f"""
-                    UPDATE `{self.t_jobs}`
-                    SET state='running', triggered_by=:tb, started_at=NOW(),
-                        finished_at=NULL, error_msg=NULL
-                    WHERE pair=:pair AND day_flag=:day
-                      AND control_date=:cd AND params_hash=:ph
-                """), p)
-                return True
-            if state == 'running' and started:
-                if (datetime.now() - started).total_seconds() > stale_after_secs:
-                    await conn.execute(text(f"""
-                        UPDATE `{self.t_jobs}`
-                        SET started_at=NOW(), error_msg='reclaimed-stale',
-                            triggered_by=:tb
-                        WHERE pair=:pair AND day_flag=:day
-                          AND control_date=:cd AND params_hash=:ph
-                    """), p)
-                    return True
-            return False
+            return upd.rowcount == 1
 
     async def finish_slot(
-        self, *, pair: int, day_flag: int, control_date: datetime,
-        params_hash: str, state: str = 'done',
-        precision_before: float | None = None,
-        precision_after:  float | None = None,
-        iterations: int = 0, universe_size: int = 0,
-        prev_universe_size: int = 0, extremum_cnt: int = 0,
-        history_window: int = 0, active_tail: int = 0,
-        precision_metric: str = "mean", init_mode: str = "constant",
-        step_size: float = 0.10, target_precision: float = 0.95,
+        self,
+        *,
+        pair: int,
+        day_flag: int,
+        control_date: datetime,
+        params_hash: str,
+        state: str,
         error_msg: str | None = None,
+        precision_before: float | None = None,
+        precision_after: float | None = None,
+        iterations: int = 0,
+        universe_size: int = 0,
+        prev_universe_size: int = 0,
+        extremum_cnt: int = 0,
+        history_window: int = 0,
+        active_tail: int = 0,
+        precision_metric: str = "mean",
+        init_mode: str = "mode0",
+        step_size: float = 0.10,
+        target_precision: float = 0.95,
     ) -> None:
         async with self.engine.begin() as conn:
             await conn.execute(text(f"""
-                UPDATE `{self.t_jobs}`
-                SET state=:st, finished_at=NOW(),
-                    precision_before=:pb, precision_after=:pa,
-                    iterations=:it, universe_size=:us,
-                    prev_universe_size=:pus, extremum_cnt=:ec,
-                    history_window=:hw, active_tail=:at,
-                    precision_metric=:pm, init_mode=:im,
-                    step_size=:ss, target_precision=:tp,
-                    error_msg=:em
-                WHERE pair=:pair AND day_flag=:day
-                  AND control_date=:cd AND params_hash=:ph
-            """), {"st": state, "pb": precision_before, "pa": precision_after,
-                   "it": iterations, "us": universe_size, "pus": prev_universe_size,
-                   "ec": extremum_cnt, "hw": history_window, "at": active_tail,
-                   "pm": precision_metric, "im": init_mode,
-                   "ss": float(step_size), "tp": float(target_precision),
-                   "em": error_msg, "pair": pair, "day": day_flag,
-                   "cd": control_date, "ph": params_hash})
+                UPDATE `{self.jobs_table}`
+                SET state = :state,
+                    error_msg = :error_msg,
+                    precision_before = :pr_before,
+                    precision_after = :pr_after,
+                    iterations = :iters,
+                    universe_size = :universe_size,
+                    prev_universe_size = :prev_universe_size,
+                    extremum_count = :ext_cnt,
+                    history_window = :hist,
+                    active_tail = :tail,
+                    precision_metric = :metric,
+                    init_mode = :init_mode,
+                    step_size = :step,
+                    target_precision = :target,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE pair = :pair
+                  AND day_flag = :day
+                  AND control_date = :dt
+                  AND params_hash = :ph
+            """), {
+                "pair": pair,
+                "day": day_flag,
+                "dt": control_date,
+                "ph": params_hash,
+                "state": state,
+                "error_msg": error_msg,
+                "pr_before": precision_before,
+                "pr_after": precision_after,
+                "iters": int(iterations),
+                "universe_size": int(universe_size),
+                "prev_universe_size": int(prev_universe_size),
+                "ext_cnt": int(extremum_cnt),
+                "hist": int(history_window),
+                "tail": int(active_tail),
+                "metric": str(precision_metric),
+                "init_mode": str(init_mode),
+                "step": float(step_size),
+                "target": float(target_precision),
+            })
 
-    # ── Высокоуровневое API под семафором ─────────────────────────────────────
+    async def train_and_save(
+        self,
+        *,
+        pair: int,
+        day_flag: int,
+        control_date: datetime,
+        params_hash: str,
+        np_simple_rates: dict | None,
+        active_codes_at: ActiveCodesProvider,
+        train_mode: TrainMode = 0,
+        max_iter: int = 20,
+        step: float = 0.10,
+        target_precision: float = 0.95,
+        extremum_limit: int = 50,
+        extremum_interval: int = 3,
+        active_tail: int = 0,
+        metric: PrecisionMetric = "mean",
+        triggered_by: str = "train",
+        log_fn: Callable[[str], None] | None = None,
+    ) -> tuple[dict[str, float], float]:
+        init_mode = f"mode{train_mode}/iv{extremum_interval}"
 
-    async def train_and_persist(
-        self, *,
-        pair: int, day_flag: int, control_date: datetime, params_hash: str,
-        np_simple_rates: dict | None, active_codes_at: ActiveCodesProvider,
-        init_mode:        InitMode        = "constant",
-        max_iter:         int             = 20,
-        step:             float           = 0.10,
-        target_precision: float           = 0.95,
-        extremum_limit:   int             = 50,
-        active_tail:      int             = 0,
-        metric:           PrecisionMetric = "mean",
-        triggered_by:     str             = "train",
-        log_fn:           Callable[[str], None] | None = None,
-    ) -> tuple[dict[str, float], float, int, int, str]:
-        """
-        Returns: (universe, precision, iterations, extremum_cnt, status).
-            status ∈ {'trained', 'reused', 'busy-empty'}.
-        """
-        got = await self.acquire_slot(
-            pair=pair, day_flag=day_flag, control_date=control_date,
-            params_hash=params_hash, triggered_by=triggered_by)
+        prev_loaded = await self.load_universe(
+            pair=pair,
+            day_flag=day_flag,
+            control_date=control_date,
+            params_hash=params_hash,
+        )
+        prev_size = len(prev_loaded[0]) if prev_loaded else 0
+        pr_before = float(prev_loaded[1]) if prev_loaded else None
 
-        if not got:
-            for _ in range(20):                     # ждём ~10 сек чужого воркера
-                await asyncio.sleep(0.5)
-                u, pr, ec = await self.load_universe(
-                    pair=pair, day_flag=day_flag,
-                    control_date=control_date, params_hash=params_hash)
-                if u is not None:
-                    return u, pr, 0, ec, 'reused'
-            return {}, 0.0, 0, 0, 'busy-empty'
+        reserved = await self.reserve_slot(
+            pair=pair,
+            day_flag=day_flag,
+            control_date=control_date,
+            params_hash=params_hash,
+            triggered_by=triggered_by,
+            history_window=extremum_limit,
+            active_tail=active_tail,
+            precision_metric=metric,
+            init_mode=init_mode,
+            step_size=step,
+            target_precision=target_precision,
+        )
 
-        u_prev, pr_prev, _ = await self.load_universe(
-            pair=pair, day_flag=day_flag,
-            control_date=control_date, params_hash=params_hash)
-        pr_before = pr_prev if u_prev is not None else None
-        prev_size = len(u_prev) if u_prev is not None else 0
+        if not reserved:
+            # Другой процесс уже обучает эту же комбинацию.
+            # Возвращаем старый universe, если он есть.
+            loaded = await self.load_universe(
+                pair=pair,
+                day_flag=day_flag,
+                control_date=control_date,
+                params_hash=params_hash,
+            )
+            if loaded:
+                return loaded
+            return {}, 0.0
 
         try:
             universe, pr, iters, ext_cnt = await train_at_date(
                 np_simple_rates=np_simple_rates,
                 control_date=control_date,
                 active_codes_at=active_codes_at,
-                init_mode=init_mode, max_iter=max_iter, step=step,
+                train_mode=train_mode,
+                max_iter=max_iter,
+                step=step,
                 target_precision=target_precision,
                 extremum_limit=extremum_limit,
-                active_tail=active_tail, metric=metric)
+                extremum_interval=extremum_interval,
+                active_tail=active_tail,
+                metric=metric,
+            )
 
             if universe:
                 await self.save_universe(
-                    pair=pair, day_flag=day_flag, control_date=control_date,
-                    params_hash=params_hash, universe=universe,
-                    precision_val=pr, iterations=iters, extremum_cnt=ext_cnt,
-                    history_window=extremum_limit, active_tail=active_tail,
-                    precision_metric=metric, init_mode=init_mode,
-                    step_size=step, target_precision=target_precision)
+                    pair=pair,
+                    day_flag=day_flag,
+                    control_date=control_date,
+                    params_hash=params_hash,
+                    universe=universe,
+                    precision_val=pr,
+                    iterations=iters,
+                    extremum_cnt=ext_cnt,
+                    history_window=extremum_limit,
+                    active_tail=active_tail,
+                    precision_metric=metric,
+                    init_mode=init_mode,
+                    step_size=step,
+                    target_precision=target_precision,
+                )
+
             await self.finish_slot(
-                pair=pair, day_flag=day_flag, control_date=control_date,
-                params_hash=params_hash, state='done',
-                precision_before=pr_before, precision_after=pr,
-                iterations=iters, universe_size=len(universe),
-                prev_universe_size=prev_size, extremum_cnt=ext_cnt,
-                history_window=extremum_limit, active_tail=active_tail,
-                precision_metric=metric, init_mode=init_mode,
-                step_size=step, target_precision=target_precision)
+                pair=pair,
+                day_flag=day_flag,
+                control_date=control_date,
+                params_hash=params_hash,
+                state="done",
+                precision_before=pr_before,
+                precision_after=pr,
+                iterations=iters,
+                universe_size=len(universe),
+                prev_universe_size=prev_size,
+                extremum_cnt=ext_cnt,
+                history_window=extremum_limit,
+                active_tail=active_tail,
+                precision_metric=metric,
+                init_mode=init_mode,
+                step_size=step,
+                target_precision=target_precision,
+            )
+
             if log_fn:
-                log_fn(f"  ✅ ml-train {control_date}: prec={pr:.4f} "
-                       f"iters={iters} ext={ext_cnt} |U|={len(universe)}")
-            return universe, pr, iters, ext_cnt, 'trained'
+                log_fn(
+                    f"  ✅ ml-train {control_date}: "
+                    f"mode={train_mode}, interval={extremum_interval}, "
+                    f"prec={pr:.4f}, size={len(universe)}, "
+                    f"ext={ext_cnt}, iters={iters}"
+                )
+
+            return universe, pr
 
         except Exception as e:
             await self.finish_slot(
-                pair=pair, day_flag=day_flag, control_date=control_date,
-                params_hash=params_hash, state='failed',
+                pair=pair,
+                day_flag=day_flag,
+                control_date=control_date,
+                params_hash=params_hash,
+                state="failed",
                 error_msg=str(e)[:1000],
-                history_window=extremum_limit, active_tail=active_tail,
-                precision_metric=metric, init_mode=init_mode,
-                step_size=step, target_precision=target_precision)
+                precision_before=pr_before,
+                iterations=0,
+                universe_size=0,
+                prev_universe_size=prev_size,
+                extremum_cnt=0,
+                history_window=extremum_limit,
+                active_tail=active_tail,
+                precision_metric=metric,
+                init_mode=init_mode,
+                step_size=step,
+                target_precision=target_precision,
+            )
+
             if log_fn:
                 log_fn(f"  ❌ ml-train {control_date}: {e}")
-            raise
+
+            return {}, 0.0
 
     async def maybe_retrain(
-        self, *,
-        pair: int, day_flag: int, control_date: datetime, params_hash: str,
-        np_simple_rates: dict | None, active_codes_at: ActiveCodesProvider,
-        init_mode:        InitMode        = "constant",
-        max_iter:         int             = 20,
-        step:             float           = 0.10,
-        target_precision: float           = 0.95,
-        extremum_limit:   int             = 50,
-        active_tail:      int             = 0,
-        metric:           PrecisionMetric = "mean",
-        log_fn:           Callable[[str], None] | None = None,
+        self,
+        *,
+        pair: int,
+        day_flag: int,
+        control_date: datetime,
+        params_hash: str,
+        np_simple_rates: dict | None,
+        active_codes_at: ActiveCodesProvider,
+        train_mode: TrainMode = 0,
+        max_iter: int = 20,
+        step: float = 0.10,
+        target_precision: float = 0.95,
+        extremum_limit: int = 50,
+        extremum_interval: int = 3,
+        active_tail: int = 0,
+        metric: PrecisionMetric = "mean",
+        log_fn: Callable[[str], None] | None = None,
     ) -> tuple[dict[str, float], float]:
-        """
-        Smart: переиспользует свежий универсум, если на новой control_date
-        precision держится ≥ target. Иначе — перетренировка под семафором.
-        """
-        u_prev, _, prev_dt = await self.load_latest_universe(
-            pair=pair, day_flag=day_flag, params_hash=params_hash,
-            on_or_before=control_date)
+        loaded = await self.load_universe(
+            pair=pair,
+            day_flag=day_flag,
+            control_date=control_date,
+            params_hash=params_hash,
+        )
 
-        if u_prev is not None:
-            seq = collect_extremums_back(np_simple_rates, control_date,
-                                         limit=extremum_limit)
+        if loaded:
+            universe, stored_pr = loaded
+
+            # Быстрая проверка актуальной precision на текущей control_date.
+            # Если упала ниже target, запускаем retrain.
+            forward = train_mode in (1, 3, 4)
+
+            if forward:
+                seq = collect_extremums_forward(
+                    np_simple_rates,
+                    control_date,
+                    limit=extremum_limit,
+                    extremum_interval=extremum_interval,
+                )
+            else:
+                seq = collect_extremums_back(
+                    np_simple_rates,
+                    control_date,
+                    limit=extremum_limit,
+                    extremum_interval=extremum_interval,
+                )
+
             records: list[ExtremumRecord] = []
-            for ext_date, sign in seq:
+
+            for idx, (ext_date, sign) in enumerate(seq):
                 try:
                     codes = await active_codes_at(ext_date)
                 except Exception:
                     codes = []
-                if codes:
-                    records.append(ExtremumRecord(
-                        date=ext_date, sign=sign, codes=list(codes)))
-            if records:
-                pr_now = total_precision(u_prev, records, metric=metric)
-                if pr_now >= target_precision:
-                    if log_fn:
-                        log_fn(f"  ↻ ml-reuse {control_date} "
-                               f"(prev={prev_dt}, prec={pr_now:.4f})")
-                    return u_prev, pr_now
 
-        universe, pr, _it, _ec, _st = await self.train_and_persist(
-            pair=pair, day_flag=day_flag, control_date=control_date,
-            params_hash=params_hash, np_simple_rates=np_simple_rates,
-            active_codes_at=active_codes_at, init_mode=init_mode,
-            max_iter=max_iter, step=step,
-            target_precision=target_precision, extremum_limit=extremum_limit,
-            active_tail=active_tail, metric=metric,
-            triggered_by="retrain", log_fn=log_fn)
-        return universe, pr
+                if not codes:
+                    continue
+
+                # Для проверки уже сохранённого universe амплитуда не влияет
+                # на знак precision, но для一致ности с train_at_date считаем её.
+                if train_mode in (2, 3, 4):
+                    has_next = idx + 1 < len(seq)
+                    next_date = seq[idx + 1][0] if has_next else None
+                    if train_mode == 4 and not has_next:
+                        continue
+                    amp = _diff_amp(np_simple_rates, ext_date, next_date)
+                else:
+                    amp = 1.0
+
+                records.append(
+                    ExtremumRecord(
+                        date=ext_date,
+                        sign=sign,
+                        codes=sorted(set(codes)),
+                        base_amp=float(amp),
+                    )
+                )
+
+            current_pr = total_precision(universe, records, metric=metric)
+
+            if current_pr >= target_precision:
+                return universe, current_pr
+
+            if log_fn:
+                log_fn(
+                    f"  ⚠️ ml precision drop {control_date}: "
+                    f"stored={stored_pr:.4f}, current={current_pr:.4f}, "
+                    f"target={target_precision:.4f}; retrain"
+                )
+
+        return await self.train_and_save(
+            pair=pair,
+            day_flag=day_flag,
+            control_date=control_date,
+            params_hash=params_hash,
+            np_simple_rates=np_simple_rates,
+            active_codes_at=active_codes_at,
+            train_mode=train_mode,
+            max_iter=max_iter,
+            step=step,
+            target_precision=target_precision,
+            extremum_limit=extremum_limit,
+            extremum_interval=extremum_interval,
+            active_tail=active_tail,
+            metric=metric,
+            triggered_by="retrain",
+            log_fn=log_fn,
+        )
