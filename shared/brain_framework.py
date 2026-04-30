@@ -351,6 +351,8 @@ class _State:
 
         self.reverse_store: rl.ReverseStore | None = None
         self._ml_active_cache: dict = {}
+        # Semaphore: ensures only 1 ML train runs at a time, preventing DB pool exhaustion
+        self._ml_semaphore: asyncio.Semaphore = asyncio.Semaphore(1)
 
     @property
     def cache_table(self) -> str:
@@ -1055,28 +1057,29 @@ def build_app(model_module) -> FastAPI:
             "type": calc_type, "var": calc_var, "param": param,
         })
 
-        try:
-            universe, _pr = await s.reverse_store.maybe_retrain(
-                pair=pair, day_flag=day, control_date=target_date,
-                params_hash=params_hash,
-                np_simple_rates=(np_r or s.np_simple_rates),
-                active_codes_at=_active_codes_at,
-                train_mode=calc_type,
-                max_iter=s.ML_MAX_ITER,
-                step=s.ML_STEP,
-                target_precision=s.ML_TARGET_PRECISION,
-                extremum_limit=s.ML_EXTREMUM_LIMIT,
-                extremum_interval=calc_var,
-                active_tail=s.ML_ACTIVE_TAIL,
-                metric=s.ML_PRECISION_METRIC,
-                log_fn=lambda m: log(m, s.NODE_NAME),
-            )
-            return universe
-        except Exception as e:
-            log(f"   ML _call_model {target_date}: {e}",
-                s.NODE_NAME, level="error")
-            send_error_trace(e, s.NODE_NAME, "ml_call_model")
-            return {}
+        async with s._ml_semaphore:
+            try:
+                universe, _pr = await s.reverse_store.maybe_retrain(
+                    pair=pair, day_flag=day, control_date=target_date,
+                    params_hash=params_hash,
+                    np_simple_rates=(np_r or s.np_simple_rates),
+                    active_codes_at=_active_codes_at,
+                    train_mode=calc_type,
+                    max_iter=s.ML_MAX_ITER,
+                    step=s.ML_STEP,
+                    target_precision=s.ML_TARGET_PRECISION,
+                    extremum_limit=s.ML_EXTREMUM_LIMIT,
+                    extremum_interval=calc_var,
+                    active_tail=s.ML_ACTIVE_TAIL,
+                    metric=s.ML_PRECISION_METRIC,
+                    log_fn=lambda m: log(m, s.NODE_NAME),
+                )
+                return universe
+            except Exception as e:
+                log(f"   ML _call_model {target_date}: {e}",
+                    s.NODE_NAME, level="error")
+                send_error_trace(e, s.NODE_NAME, "ml_call_model")
+                return {}
 
     # ── _preload ──────────────────────────────────────────────────────────────
 
@@ -1088,6 +1091,8 @@ def build_app(model_module) -> FastAPI:
         s.dataset.clear()
         s.url_map.clear()
         s._dataset_ts_arr = None
+        if s.reverse_store:
+            s.reverse_store.clear_universe_cache()
 
         await _load_simple_rates(s)
         await _load_rates(s)
@@ -1232,6 +1237,9 @@ def build_app(model_module) -> FastAPI:
 
     async def _fill_worker(pairs, days, date_from_str, date_to_str, types, batch_size):
         s.fill_cancel.clear()
+        # Clear ML universe cache so fill_cache starts fresh
+        if s.reverse_store:
+            s.reverse_store.clear_universe_cache()
         dt_from = _parse_date(date_from_str) if date_from_str else None
         dt_to   = _parse_date(date_to_str)   if date_to_str   else None
 
