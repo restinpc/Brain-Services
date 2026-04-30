@@ -517,6 +517,13 @@ class ReverseStore:
         self.port = int(port)
         self.universe_table = f"vlad_reverse_universe_svc{self.port}"
         self.jobs_table = f"vlad_reverse_jobs_svc{self.port}"
+        # In-memory cache: (pair, day_flag, control_date, params_hash) -> (universe, precision)
+        # Eliminates repeated DB round-trips for the same key during fill_cache
+        self._universe_cache: dict = {}
+
+    def clear_universe_cache(self) -> None:
+        """Call at the start of fill_cache to start fresh."""
+        self._universe_cache.clear()
 
     async def ensure_tables(self) -> None:
         async with self.engine.begin() as conn:
@@ -591,6 +598,11 @@ class ReverseStore:
         control_date: datetime,
         params_hash: str,
     ) -> tuple[dict[str, float], float] | None:
+        # Check in-memory cache first — avoids DB round-trip on repeated lookups
+        cache_key = (pair, day_flag, control_date, params_hash)
+        if cache_key in self._universe_cache:
+            return self._universe_cache[cache_key]
+
         async with self.engine.connect() as conn:
             res = await conn.execute(text(f"""
                 SELECT universe_json, precision_val
@@ -610,6 +622,7 @@ class ReverseStore:
             row = res.mappings().first()
 
         if not row:
+            self._universe_cache[cache_key] = None
             return None
 
         try:
@@ -619,7 +632,9 @@ class ReverseStore:
                 for k, v in raw.items()
                 if v is not None
             }
-            return universe, float(row["precision_val"] or 0.0)
+            result = universe, float(row["precision_val"] or 0.0)
+            self._universe_cache[cache_key] = result
+            return result
         except Exception:
             return None
 
@@ -690,6 +705,10 @@ class ReverseStore:
                 "step": float(step_size),
                 "target": float(target_precision),
             })
+
+        # Update in-memory cache so subsequent load_universe calls skip DB
+        cache_key = (pair, day_flag, control_date, params_hash)
+        self._universe_cache[cache_key] = (dict(universe), float(precision_val))
 
     async def reserve_slot(
         self,
