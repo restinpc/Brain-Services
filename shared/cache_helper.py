@@ -59,7 +59,7 @@ CREATE TABLE IF NOT EXISTS `{table}` (
     date_val    DATETIME     NOT NULL,
     params_hash CHAR(32)     NOT NULL,
     params_json TEXT         NOT NULL,
-    result_json TEXT         NOT NULL,
+    result_json MEDIUMTEXT   NOT NULL,
     created_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (id),
     UNIQUE KEY uq_cache (service_url(100), pair, day_flag, date_val, params_hash),
