@@ -1360,7 +1360,7 @@ def build_app(model_module) -> FastAPI:
                             "url":  s.service_url, "pair": pair_id,
                             "day":  day_flag,      "dv":   candle["date"],
                             "ph":   p_hash,        "pj":   params_json,
-                            "rj":   _json.dumps(result, ensure_ascii=False),
+                            "rj":   _json.dumps({k: round(v, 6) for k, v in result.items()}, ensure_ascii=False),
                         })
                     if insert_rows:
                         try:
