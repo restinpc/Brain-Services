@@ -2480,19 +2480,19 @@ def build_app(model_module) -> FastAPI:
 
         return await asyncio.to_thread(_simulate)
 
-    async def _create_score_best_backtest_day(pair_id: int, tier: int,
-                                              calc_type: int,
-                                              vars_to_run: list[int],
-                                              df: datetime, dt: datetime,
-                                              run_backtest: bool) -> dict:
-        """Возвращает лучший day-backtest по value_score."""
+    async def _create_score_best_backtest(pair_id: int, day_flag: int, tier: int,
+                                          calc_type: int,
+                                          vars_to_run: list[int],
+                                          df: datetime, dt: datetime,
+                                          run_backtest: bool) -> dict:
+        """Возвращает лучший backtest по value_score для выбранного timeframe."""
         results: list[dict] = []
 
         if run_backtest:
             for v in vars_to_run:
                 params = {"type": calc_type, "var": v, "param": ""}
                 try:
-                    bt = await _backtest(pair_id, 1, tier, params, df, dt)
+                    bt = await _backtest(pair_id, day_flag, tier, params, df, dt)
                 except Exception as e:
                     bt = {"error": str(e), "params": params}
                 if "error" not in bt:
@@ -2503,10 +2503,10 @@ def build_app(model_module) -> FastAPI:
                     res = await conn.execute(text("""
                         SELECT value_score, accuracy, trade_count, params_json
                         FROM vlad_backtest_results
-                        WHERE service_url=:url AND pair=:pair AND day_flag=1
+                        WHERE service_url=:url AND pair=:pair AND day_flag=:day
                           AND tier=:tier AND date_from=:df AND date_to=:dt
                         ORDER BY value_score DESC
-                    """), {"url": s.service_url, "pair": pair_id,
+                    """), {"url": s.service_url, "pair": pair_id, "day": day_flag,
                            "tier": tier, "df": df, "dt": dt})
                     for r in res.mappings().all():
                         params = _json.loads(r["params_json"]) if r["params_json"] else {}
@@ -2525,33 +2525,50 @@ def build_app(model_module) -> FastAPI:
                 return {"error": str(e)}
 
         if not results:
-            return {"error": "no valid day backtest"}
+            tf_name = "day" if day_flag else "hour"
+            return {"error": f"no valid {tf_name} backtest"}
         return max(results, key=lambda x: float(x.get("value_score", -1e100)))
 
     @app.get("/create_score")
     async def ep_create_score(
         pairs: str = Query("1,3,4"),
+        days: str = Query("0,1"),
         tier: int = Query(0, ge=0, le=1),
         date_from: str = Query(""), date_to: str = Query(""),
         type: int = Query(0), var: int = Query(-1),
         run_backtest: bool = Query(True),
         accept_score: float = Query(0.60),
-        watch_score: float = Query(0.45),
+        watch_score: float = Query(0.30),
+        min_day_trades: int = Query(20, ge=0),
+        min_hour_trades: int = Query(200, ge=0),
     ):
         """
-        Считает формулу отбора модели:
-          CreateScore = 0.65 * rank(backtest day value_score)
-                      + 0.25 * rank(posttest day result)
-                      + 0.10 * rank(posttest hour result)
+        Считает оценку создания модели отдельно для day и hour в одном endpoint.
 
-        rank: худший=0.0, лучший=1.0 внутри выбранных pairs.
+        DayScore/HourScore = 0.75 * rank(backtest value_score)
+                           + 0.25 * rank(posttest result)
+
+        Важно: day и hour НЕ смешиваются. У каждого timeframe свои ранги,
+        свой score, своё решение create/watch/reject.
         """
         try:
             pl = [int(p.strip()) for p in pairs.split(",") if p.strip()]
+            dl = [int(d.strip()) for d in days.split(",") if d.strip()]
         except ValueError:
-            return err_response("pairs — числа через запятую")
+            return err_response("pairs и days — числа через запятую")
         if not pl:
             return err_response("pairs не может быть пустым")
+        if not dl:
+            return err_response("days не может быть пустым")
+
+        # Оставляем только допустимые таймфреймы и сохраняем порядок без дублей.
+        clean_days: list[int] = []
+        for d in dl:
+            if d not in (0, 1):
+                return err_response("days поддерживает только 0=hour и 1=day")
+            if d not in clean_days:
+                clean_days.append(d)
+        dl = clean_days
 
         df = _parse_date(date_from) if date_from.strip() else _parse_date(s.CACHE_DATE_FROM)
         dt = _parse_date(date_to) if date_to.strip() else datetime.now()
@@ -2560,102 +2577,138 @@ def build_app(model_module) -> FastAPI:
 
         vars_to_run = (s.VAR_RANGE if var == -1 else [var]) or [0]
         pair_labels = {1: "EUR/USD", 3: "BTC/USD", 4: "ETH/USD"}
+        tf_labels = {0: "hour", 1: "day"}
 
-        raw: dict[int, dict] = {}
+        raw: dict[int, dict[int, dict]] = {}
         for pair_id in pl:
-            bt_best = await _create_score_best_backtest_day(
-                pair_id, tier, type, vars_to_run, df, dt, run_backtest
-            )
-            post_day, post_hour = await asyncio.gather(
-                _create_score_post_history(pair_id, 1, df, dt),
-                _create_score_post_history(pair_id, 0, df, dt),
-            )
-            raw[pair_id] = {
-                "pair": pair_id,
-                "pair_label": pair_labels.get(pair_id, str(pair_id)),
-                "backtest_day": bt_best,
-                "posttest_day": post_day,
-                "posttest_hour": post_hour,
-                "value_score_day": (
-                    float(bt_best["value_score"]) if "value_score" in bt_best else None
-                ),
-                "posttest_day_result": float(post_day.get("result", 0.0)),
-                "posttest_hour_result": float(post_hour.get("result", 0.0)),
-            }
+            raw[pair_id] = {}
+            for day_flag in dl:
+                bt_best, post_tf = await asyncio.gather(
+                    _create_score_best_backtest(
+                        pair_id, day_flag, tier, type, vars_to_run, df, dt, run_backtest
+                    ),
+                    _create_score_post_history(pair_id, day_flag, df, dt),
+                )
+                raw[pair_id][day_flag] = {
+                    "pair": pair_id,
+                    "pair_label": pair_labels.get(pair_id, str(pair_id)),
+                    "timeframe": tf_labels[day_flag],
+                    "day_flag": day_flag,
+                    "backtest": bt_best,
+                    "posttest": post_tf,
+                    "value_score": (
+                        float(bt_best["value_score"]) if "value_score" in bt_best else None
+                    ),
+                    "posttest_result": float(post_tf.get("result", 0.0)),
+                }
 
-        v_rank = _rank_norm_desc({p: raw[p]["value_score_day"] for p in pl})
-        p_rank = _rank_norm_desc({p: raw[p]["posttest_day_result"] for p in pl})
-        h_rank = _rank_norm_desc({p: raw[p]["posttest_hour_result"] for p in pl})
+        results: dict[str, dict] = {str(pair_id): {
+            "pair": pair_id,
+            "pair_label": pair_labels.get(pair_id, str(pair_id)),
+        } for pair_id in pl}
+        ranking: dict[str, list[dict]] = {}
+        selected: dict[str, list[int]] = {}
 
-        results: dict[str, dict] = {}
-        ranking: list[dict] = []
-        selected: list[int] = []
+        for day_flag in dl:
+            tf_name = tf_labels[day_flag]
+            min_trades = min_day_trades if day_flag == 1 else min_hour_trades
 
-        for pair_id in pl:
-            score = round(
-                0.65 * v_rank.get(pair_id, 0.0)
-                + 0.25 * p_rank.get(pair_id, 0.0)
-                + 0.10 * h_rank.get(pair_id, 0.0),
-                4,
-            )
-
-            reasons = []
-            if raw[pair_id]["value_score_day"] is None:
-                reasons.append("нет валидного backtest day")
-            if raw[pair_id]["posttest_day"].get("trade_count", 0) == 0:
-                reasons.append("posttest day без сделок")
-            if raw[pair_id]["posttest_day_result"] < 0 and raw[pair_id]["posttest_hour_result"] < 0:
-                reasons.append("posttest day и hour отрицательные")
-
-            if raw[pair_id]["value_score_day"] is None:
-                decision = "reject"
-            elif score >= accept_score:
-                decision = "create"
-                selected.append(pair_id)
-            elif score >= watch_score:
-                decision = "watch"
-            else:
-                decision = "reject"
-
-            item = {
-                "pair": pair_id,
-                "pair_label": raw[pair_id]["pair_label"],
-                "score": score,
-                "decision": decision,
-                "reasons": reasons,
-                "metrics": {
-                    "value_score_day": raw[pair_id]["value_score_day"],
-                    "best_backtest_params": raw[pair_id]["backtest_day"].get("params"),
-                    "backtest_accuracy": raw[pair_id]["backtest_day"].get("accuracy"),
-                    "backtest_trade_count": raw[pair_id]["backtest_day"].get("trade_count"),
-                    "posttest_day_result": raw[pair_id]["posttest_day_result"],
-                    "posttest_day_cw": raw[pair_id]["posttest_day"].get("cw"),
-                    "posttest_day_trades": raw[pair_id]["posttest_day"].get("trade_count"),
-                    "posttest_hour_result": raw[pair_id]["posttest_hour_result"],
-                    "posttest_hour_cw": raw[pair_id]["posttest_hour"].get("cw"),
-                    "posttest_hour_trades": raw[pair_id]["posttest_hour"].get("trade_count"),
-                },
-                "ranks": {
-                    "V_rank": v_rank.get(pair_id, 0.0),
-                    "P_rank": p_rank.get(pair_id, 0.0),
-                    "H_rank": h_rank.get(pair_id, 0.0),
-                },
-            }
-            results[str(pair_id)] = item
-            ranking.append({
-                "pair": pair_id,
-                "pair_label": item["pair_label"],
-                "score": score,
-                "decision": decision,
+            v_rank = _rank_norm_desc({
+                pair_id: raw[pair_id][day_flag]["value_score"] for pair_id in pl
+            })
+            p_rank = _rank_norm_desc({
+                pair_id: raw[pair_id][day_flag]["posttest_result"] for pair_id in pl
             })
 
-        ranking.sort(key=lambda x: x["score"], reverse=True)
+            ranking[tf_name] = []
+            selected[tf_name] = []
+
+            for pair_id in pl:
+                item_raw = raw[pair_id][day_flag]
+                bt = item_raw["backtest"]
+                post = item_raw["posttest"]
+
+                score = round(
+                    0.75 * v_rank.get(pair_id, 0.0)
+                    + 0.25 * p_rank.get(pair_id, 0.0),
+                    4,
+                )
+
+                reasons: list[str] = []
+                value_score = item_raw["value_score"]
+                bt_trade_count = bt.get("trade_count") if isinstance(bt, dict) else None
+                post_trade_count = int(post.get("trade_count", 0) or 0)
+                post_result = item_raw["posttest_result"]
+
+                hard_reject = False
+                if value_score is None:
+                    reasons.append(f"нет валидного backtest {tf_name}")
+                    hard_reject = True
+                if bt_trade_count is not None and int(bt_trade_count) < min_trades:
+                    reasons.append(
+                        f"мало сделок backtest {tf_name}: {int(bt_trade_count)} < {min_trades}"
+                    )
+                    hard_reject = True
+                if post_trade_count == 0:
+                    reasons.append(f"posttest {tf_name} без сделок")
+                if post_result < 0:
+                    reasons.append(f"posttest {tf_name} отрицательный")
+
+                if hard_reject:
+                    decision = "reject"
+                elif score >= accept_score:
+                    decision = "create"
+                    selected[tf_name].append(pair_id)
+                elif score >= watch_score:
+                    decision = "watch"
+                else:
+                    decision = "reject"
+
+                tf_item = {
+                    "timeframe": tf_name,
+                    "day_flag": day_flag,
+                    "score": score,
+                    "decision": decision,
+                    "reasons": reasons,
+                    "metrics": {
+                        "value_score": value_score,
+                        "best_backtest_params": bt.get("params") if isinstance(bt, dict) else None,
+                        "backtest_accuracy": bt.get("accuracy") if isinstance(bt, dict) else None,
+                        "backtest_trade_count": bt_trade_count,
+                        "posttest_result": post_result,
+                        "posttest_cw": post.get("cw"),
+                        "posttest_trades": post_trade_count,
+                    },
+                    "ranks": {
+                        "V_rank": v_rank.get(pair_id, 0.0),
+                        "P_rank": p_rank.get(pair_id, 0.0),
+                    },
+                }
+
+                results[str(pair_id)][tf_name] = tf_item
+                ranking[tf_name].append({
+                    "pair": pair_id,
+                    "pair_label": results[str(pair_id)]["pair_label"],
+                    "score": score,
+                    "decision": decision,
+                })
+
+            ranking[tf_name].sort(key=lambda x: x["score"], reverse=True)
 
         return ok_response({
-            "formula": "CreateScore = 0.65*V_rank + 0.25*P_rank + 0.10*H_rank",
-            "rank_rule": "внутри выбранных pairs: худший=0.0, лучший=1.0",
-            "thresholds": {"create": accept_score, "watch": watch_score},
+            "formula": {
+                "day": "DayScore = 0.75*V_day_rank + 0.25*P_day_rank",
+                "hour": "HourScore = 0.75*V_hour_rank + 0.25*P_hour_rank",
+            },
+            "rank_rule": "ранги считаются отдельно внутри каждого timeframe: худший=0.0, лучший=1.0",
+            "thresholds": {
+                "create": accept_score,
+                "watch": watch_score,
+                "min_day_trades": min_day_trades,
+                "min_hour_trades": min_hour_trades,
+            },
             "pairs": pl,
+            "days": dl,
             "tier": tier,
             "type": type,
             "vars": vars_to_run,
