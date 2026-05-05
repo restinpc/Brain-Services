@@ -1,13 +1,16 @@
 """
 model.py — service 33, calendar weights + reverse-learning ML
-OPTIMIZED VERSION
+OPTIMIZED VERSION v2
 """
 
 from __future__ import annotations
 
+import bisect
 import os
 from datetime import datetime, timedelta
 from typing import Any
+
+import numpy as _np  # перенесён на уровень модуля — убирает повторный импорт в hot path
 
 
 SERVICE_ID = 42
@@ -93,19 +96,31 @@ ACTIVE_MODES = tuple(
 )
 
 # OPT-1: прямые dict вместо двойного .get() через _encode()
-_FORECAST_CHARS  = {"UNKNOWN": "X", "BEAT": "B", "MISS": "M", "INLINE": "I"}
-_SURPRISE_CHARS  = {"UNKNOWN": "X", "UP": "U", "DOWN": "D", "FLAT": "F"}
-_REVISION_CHARS  = {"NONE": "N", "FLAT": "T", "UP": "U", "DOWN": "D", "UNKNOWN": "X"}
+_FORECAST_CHARS   = {"UNKNOWN": "X", "BEAT": "B", "MISS": "M", "INLINE": "I"}
+_SURPRISE_CHARS   = {"UNKNOWN": "X", "UP": "U", "DOWN": "D", "FLAT": "F"}
+_REVISION_CHARS   = {"NONE": "N", "FLAT": "T", "UP": "U", "DOWN": "D", "UNKNOWN": "X"}
 _IMPORTANCE_CHARS = {"high": "H", "medium": "M", "low": "L", "none": "N"}
 
 # Обратная совместимость
-FORECAST_MAP  = _FORECAST_CHARS
-SURPRISE_MAP  = _SURPRISE_CHARS
-REVISION_MAP  = _REVISION_CHARS
+FORECAST_MAP   = _FORECAST_CHARS
+SURPRISE_MAP   = _SURPRISE_CHARS
+REVISION_MAP   = _REVISION_CHARS
 IMPORTANCE_MAP = _IMPORTANCE_CHARS
 
 # OPT-2: кеш weight_code — одна и та же комбинация встречается на каждой свече
 _wc_cache: dict[tuple, str] = {}
+
+# Sentinel для кеширования None в _ctx_key_cache.
+# Определён ДО функций, которые его используют.
+_CTX_NONE_SENTINEL: object = object()
+
+# OPT-3: кеш ctx_key — для одного и того же события (url+валюта+значения)
+# результат classify_event всегда одинаковый, кешируем по ключу события
+_ctx_key_cache: dict[tuple, Any] = {}
+
+# Кеш fallback url_map: пересчитывается при изменении ctx_index.
+# Ключ — id(ctx_index), значение — готовый dict.
+_fallback_url_map_cache: dict[int, dict] = {}
 
 
 def _dbg(msg: str) -> None:
@@ -121,7 +136,6 @@ def _to_float(value: Any) -> float | None:
         return None
 
 
-# OPT-1: убрана функция _encode() — прямое обращение к dict
 def make_weight_code(
     event_id: int,
     currency: str,
@@ -132,7 +146,7 @@ def make_weight_code(
     mode: int,
     hour_shift: int | None = None,
 ) -> str:
-    # OPT-2: кешируем результат, ключ — вся комбинация аргументов
+    """OPT-2: результат кешируется по полной комбинации аргументов."""
     key = (event_id, currency, importance, forecast_dir, surprise_dir, revision_dir, mode, hour_shift)
     cached = _wc_cache.get(key)
     if cached is not None:
@@ -142,7 +156,7 @@ def make_weight_code(
     fcd_c = _FORECAST_CHARS.get(forecast_dir, "X")
     scd_c = _SURPRISE_CHARS.get(surprise_dir, "X")
     rcd_c = _REVISION_CHARS.get(revision_dir, "X")
-    base  = f"E{event_id}_{currency}_{imp_c}_{fcd_c}_{scd_c}_{rcd_c}_{mode}"
+    base   = f"E{event_id}_{currency}_{imp_c}_{fcd_c}_{scd_c}_{rcd_c}_{mode}"
     result = base if hour_shift is None else f"{base}_{hour_shift}"
     _wc_cache[key] = result
     return result
@@ -162,8 +176,8 @@ def _rel_direction(
     if actual_f is None or reference_f is None:
         return "UNKNOWN"
     if reference_f == 0:
-        if actual_f > 0:   return up_label
-        if actual_f < 0:   return down_label
+        if actual_f > 0: return up_label
+        if actual_f < 0: return down_label
         return flat_label
     pct = (actual_f - reference_f) / abs(reference_f)
     if pct >  threshold: return up_label
@@ -197,18 +211,13 @@ def classify_event(
     return forecast_dir, surprise_dir, revision_dir
 
 
-# OPT-3: кеш ctx_key — для одного и того же события (url+валюта+значения)
-# результат classify_event всегда одинаковый, кешируем по ключу события
-_ctx_key_cache: dict[tuple, tuple | None] = {}
-
-
 def _ctx_key_from_event(row: dict, url_map: dict) -> tuple | None:
+    """OPT-3: кеш по (url, currency, forecast, previous, old_previous, actual)."""
     url      = row.get("url")
     currency = row.get("currency_code")
     if not url or not currency:
         return None
 
-    # OPT-3: кеш по (url, currency, forecast, previous, old_previous, actual)
     cache_key = (
         url, currency,
         row.get("forecast_value"), row.get("previous_value"),
@@ -216,7 +225,6 @@ def _ctx_key_from_event(row: dict, url_map: dict) -> tuple | None:
     )
     cached = _ctx_key_cache.get(cache_key)
     if cached is not None:
-        # None тоже кешируем — используем sentinel
         return None if cached is _CTX_NONE_SENTINEL else cached
 
     event_id = url_map.get(url)
@@ -242,10 +250,6 @@ def _ctx_key_from_event(row: dict, url_map: dict) -> tuple | None:
     return result
 
 
-# Sentinel для кеширования None результатов
-_CTX_NONE_SENTINEL = object()
-
-
 def _is_daily_rates(rates: list[dict]) -> bool:
     if not rates:
         return False
@@ -253,8 +257,73 @@ def _is_daily_rates(rates: list[dict]) -> bool:
     return isinstance(dt, datetime) and dt.hour == 0 and dt.minute == 0
 
 
+def _resolve_url_map(ctx_index: dict, url_map: dict) -> dict:
+    """
+    Возвращает url_map или fallback из ctx_index.
+    Результат fallback кешируется по id(ctx_index) — не пересчитывается
+    при каждом вызове model().
+    """
+    if url_map:
+        return url_map
+    cid = id(ctx_index)
+    cached_fb = _fallback_url_map_cache.get(cid)
+    if cached_fb is not None:
+        return cached_fb
+    fallback: dict = {}
+    for key, val in ctx_index.items():
+        u   = val.get("url") or val.get("Url")
+        eid = key[0] if key else None
+        if u and eid:
+            fallback[u] = eid
+    _fallback_url_map_cache[cid] = fallback
+    return fallback
+
+
 def LABEL_FN(key: tuple) -> str | None:
     return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# _build_resolved_events — ядро batch_model
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _build_resolved_events(
+    dataset: list[dict],
+    url_map: dict,
+    ctx_index: dict,
+) -> tuple[list[float], list[tuple]]:
+    """
+    Однократная подготовка датасета для пакетной обработки.
+
+    Возвращает два списка (отсортированных по event_ts):
+        ts_list       — unix-timestamp каждого события
+        resolved_list — (ctx_key, occurrence_count) для каждого события
+
+    После этого для любой target_date достаточно bisect по ts_list
+    и прохода по срезу resolved_list — без повторного парсинга событий.
+    """
+    items: list[tuple[float, tuple, int]] = []
+    for ev in dataset:
+        event_time = ev.get("event_time") or ev.get("date")
+        if not isinstance(event_time, datetime):
+            continue
+        ctx_key = _ctx_key_from_event(ev, url_map)
+        if ctx_key is None:
+            continue
+        ctx_info = ctx_index.get(ctx_key)
+        if ctx_info is None:
+            continue
+        items.append((
+            event_time.timestamp(),
+            ctx_key,
+            int(ctx_info.get("occurrence_count") or 0),
+        ))
+
+    # Датасет уже отсортирован по FullDate — сортировка для надёжности.
+    items.sort(key=lambda x: x[0])
+    ts_list       = [x[0] for x in items]
+    resolved_list = [(x[1], x[2]) for x in items]
+    return ts_list, resolved_list
 
 
 def model(
@@ -268,7 +337,7 @@ def model(
     dataset_index: dict | None = None,
 ) -> dict[str, float]:
 
-    # ── 1. Базовые проверки (без debug-счётчика в production) ─────────────────
+    # ── 1. Базовые проверки ───────────────────────────────────────────────────
     calc_type = int(type or 0)
     calc_var  = int(var  or 0)
 
@@ -284,38 +353,29 @@ def model(
     if not ctx_index:
         return {}
 
-    url_map = di.get("url_map") or {}
-
-    # fallback: строим url_map из ctx_index
+    url_map = _resolve_url_map(ctx_index, di.get("url_map") or {})
     if not url_map:
-        fallback: dict = {}
-        for key, val in ctx_index.items():
-            u   = val.get("url") or val.get("Url")
-            eid = key[0] if key else None
-            if u and eid:
-                fallback[u] = eid
-        if not fallback:
-            return {}
-        url_map = fallback
+        return {}
 
-    # ── 3. Окно дат ───────────────────────────────────────────────────────────
-    is_daily     = _is_daily_rates(rates)
+    # ── 3. Параметры окна ─────────────────────────────────────────────────────
+    is_daily      = _is_daily_rates(rates)
     secs_per_unit = 86400.0 if is_daily else 3600.0
-    unit          = timedelta(days=1) if is_daily else timedelta(hours=1)
-    window_start  = date - unit * SHIFT_WINDOW
-    window_end    = date + unit * SHIFT_WINDOW
+    window_secs   = SHIFT_WINDOW * secs_per_unit
 
-    # ── 4. OPT-4: searchsorted через dataset_timestamps ──────────────────────
+    # ── 4. OPT-4: searchsorted по dataset_timestamps (numpy, без fallback-цикла) ──
+    date_ts = date.timestamp()
+    ws_ts   = date_ts - window_secs
+    we_ts   = date_ts + window_secs
+
     ts_arr = di.get("dataset_timestamps")
     if ts_arr is not None and len(ts_arr) > 0:
-        import numpy as _np
-        ws_ts = int(window_start.timestamp())
-        we_ts = int(window_end.timestamp())
-        lo = int(_np.searchsorted(ts_arr, ws_ts, side='left'))
-        hi = int(_np.searchsorted(ts_arr, we_ts, side='right'))
+        lo = int(_np.searchsorted(ts_arr, ws_ts, side="left"))
+        hi = int(_np.searchsorted(ts_arr, we_ts, side="right"))
         window_events = dataset[lo:hi]
     else:
-        # fallback без numpy
+        unit         = timedelta(seconds=secs_per_unit)
+        window_start = date - unit * SHIFT_WINDOW
+        window_end   = date + unit * SHIFT_WINDOW
         window_events = [
             e for e in dataset
             if window_start <= (e.get("event_time") or e.get("date") or datetime.min) <= window_end
@@ -326,7 +386,6 @@ def model(
 
     # ── 5. Горячий цикл ───────────────────────────────────────────────────────
     result: dict[str, float] = {}
-    date_ts = date.timestamp()
 
     for event in window_events:
         event_time = event.get("event_time") or event.get("date")
@@ -348,7 +407,6 @@ def model(
 
         event_id, currency, importance, fcd, scd, rcd = ctx_key
 
-        # OPT-6: сразу строим base-код один раз, shift-варианты — от него
         for mode in ACTIVE_MODES:
             result[make_weight_code(event_id, currency, importance, fcd, scd, rcd, mode, None)] = 1.0
 
@@ -357,3 +415,98 @@ def model(
                 result[make_weight_code(event_id, currency, importance, fcd, scd, rcd, mode, shift)] = 1.0
 
     return result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# batch_model() — пакетный режим для fill_cache (O(D + N) вместо O(N × D))
+# ══════════════════════════════════════════════════════════════════════════════
+
+def batch_model(
+    rates: list[dict],
+    dataset: list[dict],
+    dates: list[datetime],
+    *,
+    type: int = 0,
+    var: int = 3,
+    param: str = "",
+    dataset_index: dict | None = None,
+) -> dict[datetime, dict[str, float]]:
+    """
+    Пакетная версия model() для fill_cache.
+
+    Оптимизация по сравнению с N вызовами model():
+      • _build_resolved_events() парсит датасет один раз: O(D)
+        (resolve ctx_key, lookup ctx_info, сортировка)
+      • Для каждой из N дат — bisect по ts_list + проход по узкому срезу: O(N·W)
+        где W — среднее количество событий в окне (обычно 5–30)
+      • Итого: O(D + N·W) вместо O(N·(log(D) + W·lookup))
+
+    Особенно выгодно при USE_ML_VALUES=False (fill_cache вызывает batch_model
+    напрямую). При USE_ML_VALUES=True используется как утилита или при
+    прямом тестировании.
+
+    Возвращает:
+        {date: {"weight_code": 1.0, ...}}  — если есть сигналы
+        {date: {}}                          — если FLAT / нет совпадений
+    """
+    if not dates:
+        return {}
+
+    calc_type = int(type or 0)
+    calc_var  = int(var  or 0)
+
+    if calc_type not in TYPES_RANGE or calc_var not in VAR_RANGE:
+        return {d: {} for d in dates}
+    if not rates or not dataset:
+        return {d: {} for d in dates}
+
+    # ── Контекст ──────────────────────────────────────────────────────────────
+    di        = dataset_index or {}
+    ctx_index = di.get("ctx_index") or {}
+    if not ctx_index:
+        return {d: {} for d in dates}
+
+    url_map = _resolve_url_map(ctx_index, di.get("url_map") or {})
+    if not url_map:
+        return {d: {} for d in dates}
+
+    # ── Параметры окна ────────────────────────────────────────────────────────
+    is_daily      = _is_daily_rates(rates)
+    secs_per_unit = 86400.0 if is_daily else 3600.0
+    window_secs   = SHIFT_WINDOW * secs_per_unit
+
+    # ── Однократный resolve всего датасета ────────────────────────────────────
+    ts_list, resolved_list = _build_resolved_events(dataset, url_map, ctx_index)
+
+    # ── Цикл по датам ─────────────────────────────────────────────────────────
+    results: dict[datetime, dict[str, float]] = {}
+
+    for date in dates:
+        date_ts = date.timestamp()
+        ws_ts   = date_ts - window_secs
+        we_ts   = date_ts + window_secs
+
+        lo = bisect.bisect_left(ts_list,  ws_ts)
+        hi = bisect.bisect_right(ts_list, we_ts)
+
+        result: dict[str, float] = {}
+        for idx in range(lo, hi):
+            ev_ts               = ts_list[idx]
+            ctx_key, occ_count  = resolved_list[idx]
+
+            shift = int(round((date_ts - ev_ts) / secs_per_unit))
+            if abs(shift) > SHIFT_WINDOW:
+                continue
+
+            event_id, currency, importance, fcd, scd, rcd = ctx_key
+
+            for mode in ACTIVE_MODES:
+                result[make_weight_code(event_id, currency, importance, fcd, scd, rcd, mode, None)] = 1.0
+
+            if occ_count >= RECURRING_MIN_COUNT:
+                for mode in ACTIVE_MODES:
+                    result[make_weight_code(event_id, currency, importance, fcd, scd, rcd, mode, shift)] = 1.0
+
+        results[date] = result
+
+    return results
