@@ -1080,6 +1080,7 @@ def build_app(model_module) -> FastAPI:
                     metric=s.ML_PRECISION_METRIC,
                     log_fn=lambda m: log(m, s.NODE_NAME),
                     skip_db_writes=s._fill_cache_active,
+                    model_tag=f"{pair}_{day}_{calc_type}_{calc_var}",
                 )
                 return universe
             except Exception as e:
@@ -1135,9 +1136,48 @@ def build_app(model_module) -> FastAPI:
     async def _do_rebuild() -> dict:
         stats = {}
 
+        # Retry wrapper: aiomysql occasionally raises "Packet sequence number wrong"
+        # on the very first connection attempt (stale pool state after idle period or
+        # MySQL load-balancer quirk). Disposing the pool forces fresh sockets.
+        _REBUILD_RETRIES = 3
+
+        async def _attempt_index():
+            for attempt in range(_REBUILD_RETRIES):
+                try:
+                    return await s.index_builder_fn(s.engine_vlad, s.engine_brain)
+                except Exception as exc:
+                    is_packet_err = "Packet sequence" in str(exc) or "InternalError" in type(exc).__name__
+                    if attempt < _REBUILD_RETRIES - 1 and is_packet_err:
+                        log(f"   build_index attempt {attempt+1} failed (packet err), disposing pool: {exc}",
+                            s.NODE_NAME, level="warning")
+                        try:
+                            await s.engine_vlad.dispose()
+                        except Exception:
+                            pass
+                        await asyncio.sleep(1.5 * (attempt + 1))
+                    else:
+                        raise
+
+        async def _attempt_weights():
+            for attempt in range(_REBUILD_RETRIES):
+                try:
+                    return await s.weight_builder_fn(s.engine_vlad)
+                except Exception as exc:
+                    is_packet_err = "Packet sequence" in str(exc) or "InternalError" in type(exc).__name__
+                    if attempt < _REBUILD_RETRIES - 1 and is_packet_err:
+                        log(f"   build_weights attempt {attempt+1} failed (packet err), disposing pool: {exc}",
+                            s.NODE_NAME, level="warning")
+                        try:
+                            await s.engine_vlad.dispose()
+                        except Exception:
+                            pass
+                        await asyncio.sleep(1.5 * (attempt + 1))
+                    else:
+                        raise
+
         if s.index_builder_fn is not None:
             try:
-                result = await s.index_builder_fn(s.engine_vlad, s.engine_brain)
+                result = await _attempt_index()
                 stats["index"] = result or {}
                 log(f"   build_index: {result}", s.NODE_NAME, force=True)
             except Exception as e:
@@ -1147,7 +1187,7 @@ def build_app(model_module) -> FastAPI:
 
         if s.weight_builder_fn is not None:
             try:
-                result = await s.weight_builder_fn(s.engine_vlad)
+                result = await _attempt_weights()
                 stats["weights"] = result or {}
                 log(f"   build_weights: {result}", s.NODE_NAME, force=True)
             except Exception as e:
@@ -1334,6 +1374,12 @@ def build_app(model_module) -> FastAPI:
     async def _fill_worker(pairs, days, date_from_str, date_to_str, types, batch_size):
         s.fill_cancel.clear()
         s._fill_cache_active = True   # skip vlad_reverse_universe writes for speed
+        # Lift ML semaphore: during fill_cache skip_db_writes=True, so there are no
+        # DB writes inside maybe_retrain. Train-cache deduplication handles repeated
+        # work. Allow batch_size concurrent coroutines so asyncio.gather on ML batch
+        # is actually parallel instead of bottlenecked on Semaphore(1).
+        _orig_ml_semaphore   = s._ml_semaphore
+        s._ml_semaphore      = asyncio.Semaphore(max(4, batch_size))
         # Clear ML universe cache so fill_cache starts fresh
         if s.reverse_store:
             s.reverse_store.clear_universe_cache()
@@ -1427,20 +1473,24 @@ def build_app(model_module) -> FastAPI:
                         # Refresh rates once per batch, not per candle
                         await _refresh_rates(_rates_table(pair_id, day_flag), s)
 
-                        results = []
-                        for candle in batch:
-                            try:
-                                result = await _call_model(
-                                    pair_id, day_flag,
-                                    candle["date"].strftime("%Y-%m-%d %H:%M:%S"),
-                                    calc_type=calc_type, calc_var=var, param="",
-                                    _skip_refresh=True)
-                            except Exception as _e:
-                                import traceback as _tb
-                                log(f"   ml-fill {candle['date']} t={calc_type} v={var}: {_e}\n{_tb.format_exc()}",
-                                    s.NODE_NAME, level="error", force=True)
-                                result = None
-                            results.append(result)
+                        # PARALLEL GATHER: during fill_cache skip_db_writes=True,
+                        # _train_at_date_cache deduplicates work across concurrent calls.
+                        # Semaphore is lifted to batch_size above, so all coroutines
+                        # run concurrently instead of sequentially.
+                        _ml_coros = [
+                            _call_model(
+                                pair_id, day_flag,
+                                candle["date"].strftime("%Y-%m-%d %H:%M:%S"),
+                                calc_type=calc_type, calc_var=var, param="",
+                                _skip_refresh=True,
+                            )
+                            for candle in batch
+                        ]
+                        _ml_raw = await asyncio.gather(*_ml_coros, return_exceptions=True)
+                        results = [
+                            None if isinstance(r, BaseException) else r
+                            for r in _ml_raw
+                        ]
                     elif s.batch_model_fn is not None:
                         # ОПТИМИЗАЦИЯ: batch_model вычисляет траекторию ОДИН РАЗ
                         # для всего ряда (O(N)), а не O(N²) через per-candle вызовы.
@@ -1521,6 +1571,7 @@ def build_app(model_module) -> FastAPI:
             s.fill_status["slots_done"] = slot_idx + 1
 
         s._fill_cache_active = False  # restore normal mode
+        s._ml_semaphore      = _orig_ml_semaphore   # restore semaphore
         state = "stopped" if s.fill_cancel.is_set() else "done"
         s.fill_status.update({"state": state, "finished_at": datetime.now().isoformat()})
         log(f" fill_cache {state}: done={done} skip={skipped} err={errors}",
