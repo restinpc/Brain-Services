@@ -984,6 +984,9 @@ def build_app(model_module) -> FastAPI:
     if s.model_fn is None:
         raise RuntimeError("model_module должен определять функцию model()")
 
+    # batch_model() — опциональная пакетная точка входа (O(N) fill_cache).
+    s.batch_model_fn = getattr(model_module, "batch_model", None)
+
     sig = inspect.signature(s.model_fn)
     s.model_needs_index = "dataset_index" in sig.parameters
 
@@ -993,7 +996,8 @@ def build_app(model_module) -> FastAPI:
     log(f"  VAR_RANGE={s.VAR_RANGE} | "
         f"dataset_index={'yes' if s.model_needs_index else 'no'} | "
         f"rebuild={'builders' if _has_rebuild else 'no'} | "
-        f"ml={'ON' if s.USE_ML_VALUES else 'off'}",
+        f"ml={'ON' if s.USE_ML_VALUES else 'off'} | "
+        f"batch_model={'yes' if s.batch_model_fn else 'no'}",
         s.NODE_NAME, force=True)
 
     s.engine_vlad, s.engine_brain, s.engine_super = build_engines()
@@ -1337,6 +1341,42 @@ def build_app(model_module) -> FastAPI:
                                     s.NODE_NAME, level="error", force=True)
                                 result = None
                             results.append(result)
+                    elif s.batch_model_fn is not None:
+                        # ОПТИМИЗАЦИЯ: batch_model вычисляет траекторию ОДИН РАЗ
+                        # для всего ряда (O(N)), а не O(N²) через per-candle вызовы.
+                        dataset_index_dict_b = None
+                        if s.model_needs_index:
+                            dataset_index_dict_b = {
+                                "dates": s.dataset_dates,
+                                "by_key": s.dataset_by_key,
+                                "key_dates": s.dataset_key_dates,
+                                "key_field": s.dataset_key_field,
+                                "np_rates": np_rates_pd,
+                                "ctx_index": s.ctx_index,
+                                "url_map": s.url_map,
+                                "dataset_timestamps": getattr(s, "_dataset_ts_arr", None),
+                            }
+                        try:
+                            batch_dates = [c["date"] for c in batch]
+                            # Полный срез all_rows до последней целевой даты.
+                            max_batch_date = batch_dates[-1]
+                            idx_end = bisect.bisect_right(all_dates_pd, max_batch_date)
+                            rates_for_batch = all_rows[:idx_end]
+                            dataset_f_b = _filter_dataset_lte(max_batch_date, s)
+
+                            batch_map = s.batch_model_fn(
+                                rates=rates_for_batch,
+                                dataset=dataset_f_b,
+                                dates=batch_dates,
+                                type=calc_type, var=var, param="",
+                                dataset_index=dataset_index_dict_b,
+                            )
+                            results = [batch_map.get(c["date"]) for c in batch]
+                        except Exception as _e:
+                            import traceback as _tb
+                            log(f"   batch_model t={calc_type} v={var}: {_e}\n{_tb.format_exc()}",
+                                s.NODE_NAME, level="error", force=True)
+                            results = [None] * len(batch)
                     else:
                         # ПАТЧ 5: параллельные потоки внутри батча
                         loop = asyncio.get_event_loop()
