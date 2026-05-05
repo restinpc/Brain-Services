@@ -2082,8 +2082,39 @@ def build_app(model_module) -> FastAPI:
                 _rows3 = s.global_rates.get(_tbl3, [])
                 if not _dts3:
                     continue
-                _pool3   = [d for d in _dts3 if d >= _pt3_date_start] or _dts3
-                _sample3 = sorted(random.sample(_pool3, min(10, len(_pool3))))
+
+                # ── пул дат: только те, где модель уже «прогрелась» ──────
+                # Требуем минимум _MIN_CTX3 свечей контекста до тестовой даты,
+                # чтобы не попадать на "холодный старт" начала истории.
+                _MIN_CTX3 = 50
+                _pool3 = [
+                    d for i, d in enumerate(_dts3)
+                    if d >= _pt3_date_start and i >= _MIN_CTX3
+                ]
+                # Фолбэк: мало данных — берём последние 75% дат от date_start
+                if len(_pool3) < 10:
+                    _base3 = [d for d in _dts3 if d >= _pt3_date_start] or list(_dts3)
+                    _pool3 = _base3[max(0, len(_base3) // 4):]
+
+                # ── стратифицированный сэмплинг ───────────────────────────
+                # Делим пул на 10 временны́х бакетов, берём 1 дату из каждого.
+                # Гарантирует равномерное покрытие всей истории и убирает
+                # нестабильность результатов между запусками.
+                _n3 = min(10, len(_pool3))
+                if _n3 == 0:
+                    continue
+                if len(_pool3) >= _n3 * 2:
+                    _bsz3 = len(_pool3) // _n3
+                    _sample3 = sorted([
+                        random.choice(_pool3[_i3 * _bsz3: (_i3 + 1) * _bsz3])
+                        for _i3 in range(_n3)
+                    ])
+                else:
+                    _sample3 = sorted(
+                        random.sample(_pool3, _n3) if len(_pool3) >= _n3 else _pool3
+                    )
+                # ─────────────────────────────────────────────────────────
+
                 log(f"  [Тест 3] pair{_pid3}/{_tf3}: {len(_sample3)} дат "
                     f"(от {_sample3[0].date() if _sample3 else '—'} "
                     f"до {_sample3[-1].date() if _sample3 else '—'})...",
@@ -2114,6 +2145,15 @@ def build_app(model_module) -> FastAPI:
                                 dataset_index=dataset_index_dict3,
                             )
                         )
+                        # PRETEST_ALLOW_EMPTY=True: модель объявила, что {} —
+                        # валидный ответ (напр. стратегия с состоянием FLAT).
+                        # Считаем успехом любой dict, включая пустой.
+                        # PRETEST_ALLOW_EMPTY=False (умолчание): обычный
+                        # микросервис обязан возвращать непустой dict — {}
+                        # считается провалом.
+                        _allow_empty = getattr(model_module, "PRETEST_ALLOW_EMPTY", False)
+                        if _allow_empty:
+                            return res is not None and isinstance(res, dict)
                         return bool(res)
 
                     _tasks3.append((_pid3, _tf3))
@@ -2136,7 +2176,7 @@ def build_app(model_module) -> FastAPI:
             _cov3 = _ne3 / _tot3 if _tot3 else 0
             _ok3  = _cov3 >= 0.90
             log(f"  {chr(9989) if _ok3 else chr(10060)} pair{_pid3}/{_tf3}: "
-                f"{_ne3}/{_tot3} ({_cov3:.0%}), порог 90%",
+                f"{_ne3}/{_tot3} ({_cov3:.0%}) без ошибки, порог 90%",
                 s.NODE_NAME, force=True)
             if not _ok3:
                 _failures3.append(f"pair{_pid3}/{_tf3}: {_ne3}/{_tot3} ({_cov3:.0%}) < 90%")
