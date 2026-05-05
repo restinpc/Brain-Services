@@ -1240,6 +1240,95 @@ def build_app(model_module) -> FastAPI:
                 s_state.NODE_NAME, level="error", force=True)
             return None
 
+    # ── _prewarm_ml_active_cache ──────────────────────────────────────────────
+    #
+    # Суть оптимизации:
+    #   maybe_retrain() при каждом вызове проходит по историческим экстремумам
+    #   и для каждого вызывает _active_codes_at(ext_dt) → model(rates[:idx]).
+    #   Это та же O(N²) проблема, что и в основном цикле.
+    #
+    #   Если batch_model доступен — вычисляем активные коды для ВСЕХ экстремумов
+    #   одним вызовом (O(N)) и кладём в _ml_active_cache.
+    #   После этого каждый _active_codes_at внутри maybe_retrain = O(1) lookup.
+
+    async def _prewarm_ml_active_cache(
+        pair_id: int,
+        day_flag: int,
+        type_var_slots: list,
+    ) -> int:
+        """
+        Прогревает _ml_active_cache для всех экстремумов пары/таймфрейма.
+        Возвращает количество прогретых записей.
+        """
+        if s.batch_model_fn is None:
+            return 0
+
+        tbl    = _rates_table(pair_id, day_flag)
+        np_r   = s.np_rates.get(tbl)
+        rows   = s.global_rates.get(tbl, [])
+        if not rows or np_r is None:
+            return 0
+
+        # Собираем даты экстремумов из np_rates (уже вычислены при загрузке).
+        ext_max = np_r.get("ext_max")
+        ext_min = np_r.get("ext_min")
+        ext_dates: list[datetime] = []
+        if ext_max is not None:
+            ext_dates += [rows[i]["date"] for i, v in enumerate(ext_max) if v]
+        if ext_min is not None:
+            ext_dates += [rows[i]["date"] for i, v in enumerate(ext_min) if v]
+        if not ext_dates:
+            return 0
+        ext_dates = sorted(set(ext_dates))
+
+        dataset_index_dict = None
+        if s.model_needs_index:
+            dataset_index_dict = {
+                "dates":              s.dataset_dates,
+                "by_key":             s.dataset_by_key,
+                "key_dates":          s.dataset_key_dates,
+                "key_field":          s.dataset_key_field,
+                "np_rates":           np_r,
+                "ctx_index":          s.ctx_index,
+                "url_map":            s.url_map,
+                "dataset_timestamps": getattr(s, "_dataset_ts_arr", None),
+            }
+
+        warmed = 0
+        for calc_type, calc_var in type_var_slots:
+            if s.fill_cancel.is_set():
+                break
+
+            # Фильтруем только незакешированные экстремумы.
+            missing = [
+                d for d in ext_dates
+                if (pair_id, day_flag, int(d.timestamp()), calc_type, calc_var, "") \
+                   not in s._ml_active_cache
+            ]
+            if not missing:
+                continue
+
+            try:
+                # batch_model за один вызов — O(N) вместо O(N²).
+                batch_results = s.batch_model_fn(
+                    rates=rows,
+                    dataset=_filter_dataset_lte(missing[-1], s),
+                    dates=missing,
+                    type=calc_type, var=calc_var, param="",
+                    dataset_index=dataset_index_dict,
+                )
+                for ext_dt, result in batch_results.items():
+                    key = (pair_id, day_flag, int(ext_dt.timestamp()),
+                           calc_type, calc_var, "")
+                    s._ml_active_cache[key] = list(result.keys())
+                    warmed += 1
+            except Exception as _e:
+                log(f"   prewarm pair{pair_id}/{'d' if day_flag else 'h'} "
+                    f"t={calc_type} v={calc_var}: {_e}",
+                    s.NODE_NAME, level="warning")
+
+        return warmed
+
     # ── _fill_worker ──────────────────────────────────────────────────────────
 
     async def _fill_worker(pairs, days, date_from_str, date_to_str, types, batch_size):
@@ -1293,6 +1382,17 @@ def build_app(model_module) -> FastAPI:
             instr_label  = f"pair{pair_id}/{'d' if day_flag else 'h'}"
             log(f"  [{instr_label}] {len(candles)} свечей × "
                 f"{len(type_var_slots)} type/var слотов", s.NODE_NAME, force=True)
+
+            # ── Прогрев ML-кеша через batch_model ────────────────────────────
+            # Если модель имеет batch_model и USE_ML_VALUES=True — вычисляем
+            # активные коды для всех экстремумов одним вызовом.
+            # maybe_retrain() будет получать _active_codes_at из кеша (O(1))
+            # вместо пересчёта срезов rates на каждый экстремум.
+            if s.USE_ML_VALUES and s.batch_model_fn is not None:
+                warmed = await _prewarm_ml_active_cache(pair_id, day_flag, type_var_slots)
+                if warmed:
+                    log(f"  [{instr_label}] ML-кеш прогрет: {warmed} экстремумов",
+                        s.NODE_NAME, force=True)
 
             for calc_type, var in type_var_slots:
                 if s.fill_cancel.is_set():
