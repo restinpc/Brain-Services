@@ -638,6 +638,27 @@ class ReverseStore:
         # Eliminates repeated DB round-trips for the same key during fill_cache
         self._universe_cache: dict = {}
 
+        # Separate read-only engine with NullPool for load_universe.
+        #
+        # Problem: load_universe uses the shared engine pool (size=20, overflow=20=40 total).
+        # During fill_cache + concurrent /values requests, the pool gets exhausted and
+        # each load_universe call waits 30 seconds (pool_timeout) before failing.
+        # With 660k candles that's days of fill_cache time.
+        #
+        # NullPool: no pooling — each load_universe opens its own connection and closes it
+        # immediately. Never competes with fill_cache inserts, bg_reload, or other readers.
+        try:
+            from sqlalchemy.ext.asyncio import create_async_engine
+            from sqlalchemy.pool import NullPool
+            self._read_engine = create_async_engine(
+                engine.sync_engine.url,
+                poolclass=NullPool,
+                connect_args=getattr(engine.sync_engine, "dialect", None) and
+                             getattr(engine.sync_engine.pool, "_creator_arg", {}) or {},
+            )
+        except Exception:
+            self._read_engine = engine  # fallback to shared engine
+
     def clear_universe_cache(self) -> None:
         """Call at the start of fill_cache to start fresh."""
         self._universe_cache.clear()
@@ -752,17 +773,23 @@ class ReverseStore:
         params = {"pair": pair, "day": day_flag, "dt": control_date, "ph": params_hash}
 
         async def _fetch():
-            async with self.engine.connect() as conn:
-                res = await conn.execute(text(f"""
-                    SELECT universe_json, precision_val
-                    FROM `{self.universe_table}`
-                    WHERE pair = :pair
-                      AND day_flag = :day
-                      AND control_date = :dt
-                      AND params_hash = :ph
-                    LIMIT 1
-                """), params)
-                return res.mappings().first()
+            # Use _read_engine (NullPool) — does NOT compete with shared pool.
+            # asyncio.wait_for gives a hard 5-second ceiling so fill_cache never
+            # stalls 30 seconds per candle when the DB is under load.
+            async def _query():
+                async with self._read_engine.connect() as conn:
+                    res = await conn.execute(text(f"""
+                        SELECT universe_json, precision_val
+                        FROM `{self.universe_table}`
+                        WHERE pair = :pair
+                          AND day_flag = :day
+                          AND control_date = :dt
+                          AND params_hash = :ph
+                        LIMIT 1
+                    """), params)
+                    return res.mappings().first()
+
+            return await asyncio.wait_for(_query(), timeout=5.0)
 
         try:
             row = await self._run_with_retry(_fetch)
