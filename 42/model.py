@@ -1,512 +1,1284 @@
 """
-model.py — service 33, calendar weights + reverse-learning ML
-OPTIMIZED VERSION v2
+reverse_learning.py — ML-режим для /values: обратное обучение по экстремумам.
+
+Включается единым флагом USE_ML_VALUES в model.py. Когда он True, _call_model
+в brain_framework.py возвращает ОБУЧЕННЫЙ универсум весов вместо результата
+обычной model_fn (а сама model_fn используется как «провайдер активных кодов»
+на дате каждого экстремума). Все существующие endpoint-ы (/values, /fill_cache,
+/backtest, /posttest, /compute_batch) при этом продолжают работать без правок —
+они просто получат другие values и так же спокойно их кешируют/бэктестят.
+
+ИДЕЯ
+====
+1. От control_date идём по экстремумам simple_rates НАЗАД в историю.
+2. На каждом экстремуме берём active_codes (через model_fn в режиме «только ключи»).
+3. Назначаем им начальный вес ±1 (или |Δ close| до след. экстр.).
+   Знак: верхний экстремум (max) → '-', нижний (min) → '+'.
+4. Шаг 0 (k=1): первое подмножество S1 + начальные веса.
+   Шаг k≥1: новое Sk.
+       • Если Sk ∩ (∪Si, i<k) = ∅ → объединяем без подгонки.
+       • Если пересекается → запускаем перевешивание для накопленной истории
+         (опционально только для последнего active_tail записей — для O(N²)).
+5. Прецессионная точность Ei = (Σ w_signed) · sign_i / Σ|w| ∈ [-1; 1].
+   Агрегация по всем Ei: 'mean' (по умолчанию) | 'min' | 'weighted' (свежие важнее).
+6. Веса вне универсума → 0.
+7. На fill_cache: для каждой свечки сначала проверяем precision уже сохранённого
+   универсума на новой control_date; если упала ниже target — перетренировываем
+   под семафором (vlad_reverse_jobs_svc{PORT}, UNIQUE-ключ → нет дублей задач).
+
+ПЕРЕВЕШИВАНИЕ
+=============
+Итеративный, max_iter=20:
+  • цикл 0 и каждый чётный → направленный шаг ±step (default 10%).
+  • нечётные циклы          → плавающий шум ±step/2 от модуля веса.
+Сохраняется лучший снимок по precision; ранний выход при достижении target.
+
+ТАБЛИЦЫ (per-service)
+=====================
+Создаются автоматически в _preload() через ReverseStore(engine, port=PORT):
+  • vlad_reverse_universe_svc{PORT} — обученные универсумы.
+  • vlad_reverse_jobs_svc{PORT}     — семафор + аудит задач перевешивания.
 """
 
 from __future__ import annotations
 
+import asyncio
 import bisect
-import os
-from datetime import datetime, timedelta
-from typing import Any
+import json as _json
+import random
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Awaitable, Callable, Literal
 
-import numpy as _np  # перенесён на уровень модуля — убирает повторный импорт в hot path
-
-
-SERVICE_ID = 42
-PORT = 8904
-NODE_NAME = "brain-vlad_MQL-reverse-learning-s42"
-SERVICE_TEXT = "vlad_MQL-reverse-learning events microservice"
-
-RATES_TABLE = os.getenv("RATES_TABLE", "brain_rates_eur_usd")
-
-CTX_TABLE = os.getenv("CTX_TABLE", "brain_calendar_context_idx")
-WEIGHTS_TABLE = os.getenv("WEIGHTS_TABLE", "brain_calendar_weights")
-WEIGHTS_CODE_COLUMN = "weight_code"
-
-CTX_KEY_COLUMNS = [
-    "event_id",
-    "currency_code",
-    "importance",
-    "forecast_dir",
-    "surprise_dir",
-    "revision_dir",
-]
-
-DATASET_ENGINE = os.getenv("DATASET_ENGINE", "brain")
-
-DATASET_QUERY = """
-    SELECT
-        Url              AS url,
-        CurrencyCode     AS currency_code,
-        Importance       AS importance,
-        ForecastValue    AS forecast_value,
-        PreviousValue    AS previous_value,
-        OldPreviousValue AS old_previous_value,
-        ActualValue      AS actual_value,
-        FullDate         AS event_time,
-        FullDate         AS date,
-        EventType        AS event_type
-    FROM brain_calendar
-    WHERE ActualValue IS NOT NULL
-      AND Processed = 1
-      AND FullDate IS NOT NULL
-      AND Url IS NOT NULL
-      AND CurrencyCode IS NOT NULL
-      AND (EventType IS NULL OR EventType NOT IN (2))
-    ORDER BY FullDate
-"""
-
-FILTER_DATASET_BY_DATE = True
-DATASET_KEY = "url"
-
-URL_MAP_QUERY = """
-    SELECT Url AS url, EventId AS event_id
-    FROM brain_calendar
-    WHERE Url IS NOT NULL AND EventId IS NOT NULL
-    GROUP BY Url, EventId
-"""
-URL_MAP_ENGINE = os.getenv("URL_MAP_ENGINE", "vlad")
-
-SHIFT_WINDOW = int(os.getenv("SHIFT_WINDOW", "12"))
-
-TYPES_RANGE = [0, 1, 2, 3, 4]
-VAR_RANGE = [3, 5, 7, 9]
-
-CACHE_DATE_FROM = os.getenv("CACHE_DATE_FROM", "2025-01-15")
-RELOAD_INTERVAL = int(os.getenv("RELOAD_INTERVAL", "3600"))
-REBUILD_INTERVAL = int(os.getenv("REBUILD_INTERVAL", "7200"))
-
-USE_ML_VALUES = True
-ML_TARGET_PRECISION = float(os.getenv("ML_TARGET_PRECISION", "0.95"))
-ML_MAX_ITER = int(os.getenv("ML_MAX_ITER", "20"))
-ML_STEP = float(os.getenv("ML_STEP", "0.10"))
-ML_EXTREMUM_LIMIT = int(os.getenv("ML_EXTREMUM_LIMIT", "50"))
-ML_ACTIVE_TAIL = int(os.getenv("ML_ACTIVE_TAIL", "0"))
-ML_PRECISION_METRIC = os.getenv("ML_PRECISION_METRIC", "mean")
-
-DIRECTION_THRESHOLD = float(os.getenv("DIRECTION_THRESHOLD", "0.01"))
-RECURRING_MIN_COUNT = int(os.getenv("RECURRING_MIN_COUNT", "2"))
-
-_ACTIVE_WEIGHT_MODES_RAW = os.getenv("ACTIVE_WEIGHT_MODES", "0")
-ACTIVE_MODES = tuple(
-    int(x.strip())
-    for x in _ACTIVE_WEIGHT_MODES_RAW.split(",")
-    if x.strip() != ""
-)
-
-# OPT-1: прямые dict вместо двойного .get() через _encode()
-_FORECAST_CHARS   = {"UNKNOWN": "X", "BEAT": "B", "MISS": "M", "INLINE": "I"}
-_SURPRISE_CHARS   = {"UNKNOWN": "X", "UP": "U", "DOWN": "D", "FLAT": "F"}
-_REVISION_CHARS   = {"NONE": "N", "FLAT": "T", "UP": "U", "DOWN": "D", "UNKNOWN": "X"}
-_IMPORTANCE_CHARS = {"high": "H", "medium": "M", "low": "L", "none": "N"}
-
-# Обратная совместимость
-FORECAST_MAP   = _FORECAST_CHARS
-SURPRISE_MAP   = _SURPRISE_CHARS
-REVISION_MAP   = _REVISION_CHARS
-IMPORTANCE_MAP = _IMPORTANCE_CHARS
-
-# OPT-2: кеш weight_code — одна и та же комбинация встречается на каждой свече
-_wc_cache: dict[tuple, str] = {}
-
-# Sentinel для кеширования None в _ctx_key_cache.
-# Определён ДО функций, которые его используют.
-_CTX_NONE_SENTINEL: object = object()
-
-# OPT-3: кеш ctx_key — для одного и того же события (url+валюта+значения)
-# результат classify_event всегда одинаковый, кешируем по ключу события
-_ctx_key_cache: dict[tuple, Any] = {}
-
-# Кеш fallback url_map: пересчитывается при изменении ctx_index.
-# Ключ — id(ctx_index), значение — готовый dict.
-_fallback_url_map_cache: dict[int, dict] = {}
+import numpy as np
+from sqlalchemy import text
 
 
-def _dbg(msg: str) -> None:
-    print(f"[MODEL_DEBUG] {msg}", flush=True)
+# ──────────────────────────────────────────────────────────────────────────────
+# Datatypes
+# ──────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class ExtremumRecord:
+    """Один исторический экстремум: дата, ожидаемый знак сигнала, активные коды."""
+    date:     datetime
+    sign:     int               # +1 для нижнего (buy), -1 для верхнего (sell)
+    codes:    list[str]
+    base_amp: float = 1.0       # модуль начального веса
 
 
-def _to_float(value: Any) -> float | None:
-    if value is None:
-        return None
+PrecisionMetric = Literal["mean", "min", "weighted"]
+InitMode        = Literal["constant", "diff"]
+
+# Режим обучения (train_mode):
+#   0 — назад от control_date, веса ±1 (baseline)
+#   1 — вперёд от начала до control_date, веса ±1
+#   2 — назад, амплитуда = |Δclose до следующего (старшего) экстр.|; нет соседа → abs(close)
+#   3 — вперёд, амплитуда = |Δclose до следующего (младшего) экстр.|; нет соседа → abs(close)
+#   4 — вперёд (строгий), амплитуда = |Δclose до следующего экстр.|; нет соседа → пропустить
+TrainMode = int  # 0 | 1 | 2 | 3 | 4
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Прецессионная точность
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _precision_for(weights: dict[str, float], rec: ExtremumRecord) -> float:
+    s_signed = 0.0
+    s_abs    = 0.0
+    for c in rec.codes:
+        w = weights.get(c, 0.0)
+        s_signed += w
+        s_abs    += abs(w)
+    if s_abs <= 1e-12:
+        return 0.0
+    return (s_signed * rec.sign) / s_abs
+
+
+def total_precision(
+    weights: dict[str, float],
+    records: list[ExtremumRecord],
+    *,
+    metric:        PrecisionMetric = "mean",
+    recency_decay: float = 0.92,
+) -> float:
+    """
+    metric='mean'     — обычное среднее.
+    metric='min'      — минимум по Ei (жёстко: один плохой тянет всё в ноль).
+    metric='weighted' — свежие экстремумы важнее (records[0] — ближайший к control_date).
+    """
+    if not records:
+        return 1.0
+    if metric == "min":
+        return min(_precision_for(weights, r) for r in records)
+    if metric == "weighted":
+        s_w = 0.0
+        s   = 0.0
+        for i, r in enumerate(records):
+            w = recency_decay ** i
+            s += _precision_for(weights, r) * w
+            s_w += w
+        return s / s_w if s_w > 0 else 0.0
+    return sum(_precision_for(weights, r) for r in records) / len(records)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Перевешивание
+# ──────────────────────────────────────────────────────────────────────────────
+
+def rebalance_weights(
+    weights:  dict[str, float],
+    records:  list[ExtremumRecord],
+    *,
+    max_iter:    int   = 20,
+    step:        float = 0.10,
+    target:      float = 0.95,
+    active_tail: int   = 0,                 # 0 = вся история; >0 = только последние N
+    metric:      PrecisionMetric = "mean",
+    rng_seed:    int | None = None,
+) -> tuple[dict[str, float], float, int]:
+    """
+    Возвращает (best_weights, best_precision, iterations_done).
+    Чётные циклы — направленный шаг ±step. Нечётные — шум ±step/2.
+
+    active_tail ограничивает «окно подгонки»: rebalance видит только последние N
+    записей, что даёт O(N²·active_tail) вместо O(N³). Старые экстремумы
+    становятся «замороженными» — их веса трогаются только если они есть среди
+    кодов хвоста.
+    """
+    rng    = random.Random(rng_seed) if rng_seed is not None else random
+    work   = records[-active_tail:] if active_tail and active_tail > 0 else records
+    if not work:
+        return dict(weights), 1.0, 0
+
+    cur     = dict(weights)
+    best    = dict(cur)
+    best_pr = total_precision(cur, work, metric=metric)
+    iters   = 0
+
+    if best_pr >= target:
+        return best, best_pr, 0
+
+    for cycle in range(max_iter):
+        iters = cycle + 1
+        if cycle % 2 == 0:
+            bad = [r for r in work if _precision_for(cur, r) < target]
+            if not bad:
+                break
+            for r in bad:
+                tgt_sign = r.sign
+                for c in r.codes:
+                    w = cur.get(c, 0.0)
+                    if w == 0.0:
+                        cur[c] = tgt_sign * 0.01 * r.base_amp
+                        continue
+                    same = (w > 0 and tgt_sign > 0) or (w < 0 and tgt_sign < 0)
+                    cur[c] = w * ((1.0 + step) if same else (1.0 - step))
+                    if abs(cur[c]) < 1e-9:
+                        cur[c] = tgt_sign * 0.01 * r.base_amp
+        else:
+            for c, w in list(cur.items()):
+                amp    = abs(w) if abs(w) > 1e-9 else 0.01
+                cur[c] = w + rng.uniform(-step / 2, step / 2) * amp
+
+        pr = total_precision(cur, work, metric=metric)
+        if pr > best_pr:
+            best_pr = pr
+            best    = dict(cur)
+        if best_pr >= target:
+            break
+
+    return best, best_pr, iters
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Сборка экстремумов от control_date НАЗАД / ВПЕРЁД
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Cache for extremum flags: id(np_simple_rates) + interval -> (ext_max, ext_min)
+# np_simple_rates dict doesn't change during fill_cache, so this is safe.
+_extremum_flags_cache: dict = {}
+
+# Cache for precomputed sorted extremum list:
+# (id(np_simple_rates), n, radius) -> ([(ts_int, sign_int), ...], [ts_int, ...])
+# Computed once per dataset, then collect_extremums_back/forward use bisect O(1)
+# instead of scanning the full candle array on each call (up to 119k iterations).
+_all_extremums_cache: dict = {}
+
+
+def _extremum_flags(
+    np_simple_rates: dict | None,
+    *,
+    interval: int = 3,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Возвращает (ext_max, ext_min).
+
+    interval — полный минимальный интервал регистрации экстремума.
+    interval=3 эквивалентен старой логике: одна свеча слева и одна справа.
+    interval=5/7/9 расширяет симметричное окно до ±2/±3/±4 свечей.
+
+    OPTIMIZED: векторизовано через sliding_window_view вместо Python-цикла.
+    Ускорение ~1400x на 119k свечей (1000ms → 0.7ms).
+    Результат кешируется по id объекта + interval.
+    """
+    if not np_simple_rates:
+        return np.zeros(0, dtype=bool), np.zeros(0, dtype=bool)
+
+    dates_ns = np_simple_rates.get("dates_ns")
+    n = len(dates_ns) if dates_ns is not None else 0
+    if n == 0:
+        return np.zeros(0, dtype=bool), np.zeros(0, dtype=bool)
+
     try:
-        return float(value)
+        interval_i = int(interval or 3)
     except Exception:
-        return None
+        interval_i = 3
+    if interval_i < 3:
+        interval_i = 3
 
+    radius = max(1, interval_i // 2)
 
-def make_weight_code(
-    event_id: int,
-    currency: str,
-    importance: str,
-    forecast_dir: str,
-    surprise_dir: str,
-    revision_dir: str,
-    mode: int,
-    hour_shift: int | None = None,
-) -> str:
-    """OPT-2: результат кешируется по полной комбинации аргументов."""
-    key = (event_id, currency, importance, forecast_dir, surprise_dir, revision_dir, mode, hour_shift)
-    cached = _wc_cache.get(key)
+    # Check cache first
+    cache_key = (id(np_simple_rates), n, radius)
+    cached = _extremum_flags_cache.get(cache_key)
     if cached is not None:
         return cached
 
-    imp_c = _IMPORTANCE_CHARS.get(importance, "N")
-    fcd_c = _FORECAST_CHARS.get(forecast_dir, "X")
-    scd_c = _SURPRISE_CHARS.get(surprise_dir, "X")
-    rcd_c = _REVISION_CHARS.get(revision_dir, "X")
-    base   = f"E{event_id}_{currency}_{imp_c}_{fcd_c}_{scd_c}_{rcd_c}_{mode}"
-    result = base if hour_shift is None else f"{base}_{hour_shift}"
-    _wc_cache[key] = result
+    high = np.asarray(
+        np_simple_rates.get("max", np_simple_rates.get("high", np_simple_rates.get("close"))),
+        dtype=np.float64,
+    )
+    low = np.asarray(
+        np_simple_rates.get("min", np_simple_rates.get("low", np_simple_rates.get("close"))),
+        dtype=np.float64,
+    )
+
+    ext_max = np.zeros(n, dtype=bool)
+    ext_min = np.zeros(n, dtype=bool)
+    if n < 2 * radius + 1:
+        _extremum_flags_cache[cache_key] = (ext_max, ext_min)
+        return ext_max, ext_min
+
+    # Vectorized via sliding_window_view — replaces Python loop O(n*radius*4) → O(n)
+    from numpy.lib.stride_tricks import sliding_window_view
+    w  = 2 * radius + 1
+    wh = sliding_window_view(high, w)   # shape: (n - w + 1, w)
+    wl = sliding_window_view(low,  w)
+
+    center_h = wh[:, radius]
+    center_l = wl[:, radius]
+
+    inner_max = (center_h > wh[:, :radius].max(axis=1)) &                 (center_h > wh[:, radius+1:].max(axis=1))
+    inner_min = (center_l < wl[:, :radius].min(axis=1)) &                 (center_l < wl[:, radius+1:].min(axis=1))
+
+    ext_max[radius:n - radius] = inner_max
+    ext_min[radius:n - radius] = inner_min
+
+    result = (ext_max, ext_min)
+    _extremum_flags_cache[cache_key] = result
     return result
 
 
-def _rel_direction(
-    actual: Any,
-    reference: Any,
-    threshold: float = DIRECTION_THRESHOLD,
+def _get_all_extremums(
+    np_simple_rates: dict,
     *,
-    up_label: str = "UP",
-    down_label: str = "DOWN",
-    flat_label: str = "FLAT",
-) -> str:
-    actual_f    = _to_float(actual)
-    reference_f = _to_float(reference)
-    if actual_f is None or reference_f is None:
-        return "UNKNOWN"
-    if reference_f == 0:
-        if actual_f > 0: return up_label
-        if actual_f < 0: return down_label
-        return flat_label
-    pct = (actual_f - reference_f) / abs(reference_f)
-    if pct >  threshold: return up_label
-    if pct < -threshold: return down_label
-    return flat_label
+    interval: int = 3,
+) -> tuple[list[tuple[int, int]], list[int]]:
+    """
+    Возвращает (all_ext, all_ext_ts) — все экстремумы датасета в хронологическом
+    порядке. Вычисляется один раз per (id, n, radius), затем кешируется.
 
+    all_ext    : [(unix_ts_int, sign_int), ...]   знак: -1 max, +1 min
+    all_ext_ts : [unix_ts_int, ...]               только timestamps (для bisect)
 
-def classify_event(
-    forecast: Any,
-    previous: Any,
-    old_previous: Any,
-    actual: Any,
-) -> tuple[str, str, str]:
-    forecast_f = _to_float(forecast)
-    if forecast_f is None or forecast_f == 0:
-        forecast_dir = "UNKNOWN"
-    else:
-        forecast_dir = _rel_direction(
-            actual, forecast,
-            up_label="BEAT", down_label="MISS", flat_label="INLINE",
-        )
-    surprise_dir = _rel_direction(actual, previous)
-    old_prev_f   = _to_float(old_previous)
-    previous_f   = _to_float(previous)
-    if old_prev_f is None or old_prev_f == 0 or previous_f is None:
-        revision_dir = "NONE"
-    elif previous_f == old_prev_f:
-        revision_dir = "FLAT"
-    else:
-        revision_dir = _rel_direction(previous, old_previous)
-    return forecast_dir, surprise_dir, revision_dir
+    collect_extremums_back/forward используют bisect → O(log n + limit)
+    вместо Python-цикла по всему массиву O(n).
+    """
+    dates_ns = np_simple_rates.get("dates_ns")
+    n = len(dates_ns) if dates_ns is not None else 0
+    if n == 0:
+        return [], []
 
+    try:
+        interval_i = int(interval or 3)
+    except Exception:
+        interval_i = 3
+    if interval_i < 3:
+        interval_i = 3
+    radius = max(1, interval_i // 2)
 
-def _ctx_key_from_event(row: dict, url_map: dict) -> tuple | None:
-    """OPT-3: кеш по (url, currency, forecast, previous, old_previous, actual)."""
-    url      = row.get("url")
-    currency = row.get("currency_code")
-    if not url or not currency:
-        return None
-
-    cache_key = (
-        url, currency,
-        row.get("forecast_value"), row.get("previous_value"),
-        row.get("old_previous_value"), row.get("actual_value"),
-    )
-    cached = _ctx_key_cache.get(cache_key)
+    cache_key = (id(np_simple_rates), n, radius)
+    cached = _all_extremums_cache.get(cache_key)
     if cached is not None:
-        return None if cached is _CTX_NONE_SENTINEL else cached
+        return cached
 
-    event_id = url_map.get(url)
-    if event_id is None:
-        _ctx_key_cache[cache_key] = _CTX_NONE_SENTINEL
-        return None
+    ext_max, ext_min = _extremum_flags(np_simple_rates, interval=interval_i)
 
-    forecast_dir, surprise_dir, revision_dir = classify_event(
-        row.get("forecast_value"),
-        row.get("previous_value"),
-        row.get("old_previous_value"),
-        row.get("actual_value"),
-    )
-    result = (
-        int(event_id),
-        str(currency),
-        str(row.get("importance") or "none").lower(),
-        forecast_dir,
-        surprise_dir,
-        revision_dir,
-    )
-    _ctx_key_cache[cache_key] = result
+    # Vectorized: build combined int8 array, flatnonzero at C speed
+    combined = np.zeros(n, dtype=np.int8)
+    combined[ext_min] = 1
+    combined[ext_max] = -1   # max wins (matches original elif logic)
+
+    indices = np.flatnonzero(combined)  # ascending, C speed
+
+    # Plain Python lists — no numpy overhead per bisect/slice lookup
+    all_ext    = [(int(dates_ns[i]), int(combined[i])) for i in indices]
+    all_ext_ts = [x[0] for x in all_ext]
+
+    result = (all_ext, all_ext_ts)
+    _all_extremums_cache[cache_key] = result
     return result
 
 
-def _is_daily_rates(rates: list[dict]) -> bool:
-    if not rates:
-        return False
-    dt = rates[-1].get("date")
-    return isinstance(dt, datetime) and dt.hour == 0 and dt.minute == 0
-
-
-def _resolve_url_map(ctx_index: dict, url_map: dict) -> dict:
-    """
-    Возвращает url_map или fallback из ctx_index.
-    Результат fallback кешируется по id(ctx_index) — не пересчитывается
-    при каждом вызове model().
-    """
-    if url_map:
-        return url_map
-    cid = id(ctx_index)
-    cached_fb = _fallback_url_map_cache.get(cid)
-    if cached_fb is not None:
-        return cached_fb
-    fallback: dict = {}
-    for key, val in ctx_index.items():
-        u   = val.get("url") or val.get("Url")
-        eid = key[0] if key else None
-        if u and eid:
-            fallback[u] = eid
-    _fallback_url_map_cache[cid] = fallback
-    return fallback
-
-
-def LABEL_FN(key: tuple) -> str | None:
-    return None
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# _build_resolved_events — ядро batch_model
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _build_resolved_events(
-    dataset: list[dict],
-    url_map: dict,
-    ctx_index: dict,
-) -> tuple[list[float], list[tuple]]:
-    """
-    Однократная подготовка датасета для пакетной обработки.
-
-    Возвращает два списка (отсортированных по event_ts):
-        ts_list       — unix-timestamp каждого события
-        resolved_list — (ctx_key, occurrence_count) для каждого события
-
-    После этого для любой target_date достаточно bisect по ts_list
-    и прохода по срезу resolved_list — без повторного парсинга событий.
-    """
-    items: list[tuple[float, tuple, int]] = []
-    for ev in dataset:
-        event_time = ev.get("event_time") or ev.get("date")
-        if not isinstance(event_time, datetime):
-            continue
-        ctx_key = _ctx_key_from_event(ev, url_map)
-        if ctx_key is None:
-            continue
-        ctx_info = ctx_index.get(ctx_key)
-        if ctx_info is None:
-            continue
-        items.append((
-            event_time.timestamp(),
-            ctx_key,
-            int(ctx_info.get("occurrence_count") or 0),
-        ))
-
-    # Датасет уже отсортирован по FullDate — сортировка для надёжности.
-    items.sort(key=lambda x: x[0])
-    ts_list       = [x[0] for x in items]
-    resolved_list = [(x[1], x[2]) for x in items]
-    return ts_list, resolved_list
-
-
-def model(
-    rates: list[dict],
-    dataset: list[dict],
-    date: datetime,
+def collect_extremums_back(
+    np_simple_rates: dict | None,
+    control_date:    datetime,
     *,
-    type: int = 0,
-    var: int = 3,
-    param: str = "",
-    dataset_index: dict | None = None,
-) -> dict[str, float]:
+    limit: int = 50,
+    extremum_interval: int = 3,
+) -> list[tuple[datetime, int]]:
+    """
+    [(date, sign)] от ближайшего к control_date к более старым.
 
-    # ── 1. Базовые проверки ───────────────────────────────────────────────────
-    calc_type = int(type or 0)
-    calc_var  = int(var  or 0)
+    OPTIMIZED: precomputed list + bisect → O(log n + limit)
+    вместо Python-цикла O(n) по всему массиву свечей.
+    """
+    if not np_simple_rates:
+        return []
 
-    if calc_type not in TYPES_RANGE: return {}
-    if calc_var  not in VAR_RANGE:   return {}
-    if not rates:   return {}
-    if not dataset: return {}
-    if date is None: return {}
+    all_ext, all_ext_ts = _get_all_extremums(np_simple_rates, interval=extremum_interval)
+    if not all_ext:
+        return []
 
-    # ── 2. ctx_index и url_map ────────────────────────────────────────────────
-    di        = dataset_index or {}
-    ctx_index = di.get("ctx_index") or {}
-    if not ctx_index:
-        return {}
+    ts         = int(control_date.timestamp())
+    cutoff_idx = bisect.bisect_right(all_ext_ts, ts)   # первый индекс > ts
+    start      = max(0, cutoff_idx - limit)
+    chunk      = all_ext[start:cutoff_idx]
 
-    url_map = _resolve_url_map(ctx_index, di.get("url_map") or {})
-    if not url_map:
-        return {}
+    # chunk в хронологическом порядке → разворачиваем (ближайший к control_date первый)
+    return [(datetime.fromtimestamp(t), s) for t, s in reversed(chunk)]
 
-    # ── 3. Параметры окна ─────────────────────────────────────────────────────
-    is_daily      = _is_daily_rates(rates)
-    secs_per_unit = 86400.0 if is_daily else 3600.0
-    window_secs   = SHIFT_WINDOW * secs_per_unit
 
-    # ── 4. OPT-4: searchsorted по dataset_timestamps (numpy, без fallback-цикла) ──
-    date_ts = date.timestamp()
-    ws_ts   = date_ts - window_secs
-    we_ts   = date_ts + window_secs
+def collect_extremums_forward(
+    np_simple_rates: dict | None,
+    control_date:    datetime,
+    *,
+    limit: int = 50,
+    extremum_interval: int = 3,
+) -> list[tuple[datetime, int]]:
+    """
+    [(date, sign)] в хронологическом порядке, до control_date включительно.
+    Возвращает последние `limit` записей.
 
-    ts_arr = di.get("dataset_timestamps")
-    if ts_arr is not None and len(ts_arr) > 0:
-        lo = int(_np.searchsorted(ts_arr, ws_ts, side="left"))
-        hi = int(_np.searchsorted(ts_arr, we_ts, side="right"))
-        window_events = dataset[lo:hi]
+    OPTIMIZED: precomputed list + bisect → O(log n + limit).
+    """
+    if not np_simple_rates:
+        return []
+
+    all_ext, all_ext_ts = _get_all_extremums(np_simple_rates, interval=extremum_interval)
+    if not all_ext:
+        return []
+
+    ts         = int(control_date.timestamp())
+    cutoff_idx = bisect.bisect_right(all_ext_ts, ts)
+    start      = max(0, cutoff_idx - limit)
+    chunk      = all_ext[start:cutoff_idx]
+
+    # Хронологический порядок — разворот не нужен
+    return [(datetime.fromtimestamp(t), s) for t, s in chunk]
+
+
+def _diff_amp(
+    np_simple_rates: dict | None,
+    date_a: datetime,
+    date_b: datetime | None,
+) -> float:
+    if not np_simple_rates:
+        return 1.0
+
+    dates_ns = np_simple_rates["dates_ns"]
+    close    = np_simple_rates["close"]
+    n        = len(close)
+
+    if n == 0:
+        return 1.0
+
+    ia = min(
+        int(np.searchsorted(dates_ns, np.int64(int(date_a.timestamp())))),
+        n - 1,
+    )
+
+    if date_b is None:
+        return abs(float(close[ia])) or 1.0
+
+    ib = min(
+        int(np.searchsorted(dates_ns, np.int64(int(date_b.timestamp())))),
+        n - 1,
+    )
+
+    return abs(float(close[ia] - close[ib])) or 1.0
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Основной пайплайн обучения, чистая алгоритмика без БД
+# ──────────────────────────────────────────────────────────────────────────────
+
+ActiveCodesProvider = Callable[[datetime], Awaitable[list[str]]]
+
+
+# Cache: (seq_hash, codes_hash, train_mode, max_iter, step, target, active_tail, metric)
+# -> (universe, precision, iters, ext_cnt)
+# Adjacent hourly candles almost always share identical extremum sets -> cache hit -> skip retrain
+_train_at_date_cache: dict = {}
+_TRAIN_CACHE_MAX = 4096  # увеличено с 2000: больше типов/vars/пар помещается без вытеснения
+
+# Cache: (model_tag, seq_tuple) -> (pre_codes, codes_key)
+# Avoids 50 `await active_codes_at()` calls when seq_tuple is unchanged between
+# consecutive candles (the common case: adjacent hourly/daily candles share the
+# same 50 extremums, so codes never need to be re-fetched from _ml_active_cache).
+_seq_codes_cache: dict = {}
+_SEQ_CODES_CACHE_MAX = 1024
+
+
+async def train_at_date(
+    *,
+    np_simple_rates:  dict | None,
+    control_date:     datetime,
+    active_codes_at:  ActiveCodesProvider,
+    train_mode:       TrainMode = 0,
+    max_iter:         int   = 20,
+    step:             float = 0.10,
+    target_precision: float = 0.95,
+    extremum_limit:   int   = 50,
+    extremum_interval: int = 3,
+    active_tail:      int   = 0,
+    metric:           PrecisionMetric = "mean",
+) -> tuple[dict[str, float], float, int, int]:
+    """
+    Returns:
+        (universe, final_precision, iterations_total, extremum_count)
+
+    train_mode:
+      0 — назад, веса ±1
+      1 — вперёд, веса ±1
+      2 — назад, амплитуда |Δclose до соседнего экстремума|;
+          нет соседа → abs(close)
+      3 — вперёд, амплитуда |Δclose до следующего экстремума|;
+          нет соседа → abs(close)
+      4 — вперёд строго, амплитуда |Δclose|;
+          нет следующего экстремума → запись пропускается
+
+    extremum_interval:
+      3/5/7/9 — минимальный интервал регистрации экстремума.
+    """
+
+    forward = train_mode in (1, 3, 4)
+
+    if forward:
+        seq = collect_extremums_forward(
+            np_simple_rates,
+            control_date,
+            limit=extremum_limit,
+            extremum_interval=extremum_interval,
+        )
     else:
-        unit         = timedelta(seconds=secs_per_unit)
-        window_start = date - unit * SHIFT_WINDOW
-        window_end   = date + unit * SHIFT_WINDOW
-        window_events = [
-            e for e in dataset
-            if window_start <= (e.get("event_time") or e.get("date") or datetime.min) <= window_end
-        ]
+        seq = collect_extremums_back(
+            np_simple_rates,
+            control_date,
+            limit=extremum_limit,
+            extremum_interval=extremum_interval,
+        )
 
-    if not window_events:
-        return {}
+    if not seq:
+        return {}, 1.0, 0, 0
 
-    # ── 5. Горячий цикл ───────────────────────────────────────────────────────
-    result: dict[str, float] = {}
+    # Fast path: collect codes for all extremums first, then check cache.
+    # Adjacent candles nearly always share the same 50 extremums -> cache hit.
+    seq_tuple = tuple((int(d.timestamp()), s) for d, s in seq)
 
-    for event in window_events:
-        event_time = event.get("event_time") or event.get("date")
-        if not isinstance(event_time, datetime):
+    pre_codes: list[list[str]] = []
+    for ext_date, _ in seq:
+        try:
+            codes = await active_codes_at(ext_date)
+        except Exception:
+            codes = []
+        pre_codes.append(sorted(set(codes)))
+
+    codes_key = tuple(tuple(c) for c in pre_codes)
+    cache_key  = (seq_tuple, codes_key, train_mode, max_iter,
+                  round(step, 6), round(target_precision, 6),
+                  active_tail, metric)
+
+    cached = _train_at_date_cache.get(cache_key)
+    if cached is not None:
+        return (*cached, True)   # True = from cache, skip DB writes
+
+    use_diff   = train_mode in (2, 3, 4)
+    strict_amp = train_mode == 4
+
+    records: list[ExtremumRecord] = []
+
+    for idx, ((ext_date, sign), codes) in enumerate(zip(seq, pre_codes)):
+        if not codes:
             continue
 
-        ctx_key = _ctx_key_from_event(event, url_map)
-        if ctx_key is None:
-            continue
+        if use_diff:
+            has_next = idx + 1 < len(seq)
+            next_date = seq[idx + 1][0] if has_next else None
 
-        ctx_info = ctx_index.get(ctx_key)
-        if ctx_info is None:
-            continue
-
-        # OPT-5: timestamp-арифметика вместо timedelta.total_seconds()
-        shift = int(round((date_ts - event_time.timestamp()) / secs_per_unit))
-        if abs(shift) > SHIFT_WINDOW:
-            continue
-
-        event_id, currency, importance, fcd, scd, rcd = ctx_key
-
-        for mode in ACTIVE_MODES:
-            result[make_weight_code(event_id, currency, importance, fcd, scd, rcd, mode, None)] = 1.0
-
-        if int(ctx_info.get("occurrence_count") or 0) >= RECURRING_MIN_COUNT:
-            for mode in ACTIVE_MODES:
-                result[make_weight_code(event_id, currency, importance, fcd, scd, rcd, mode, shift)] = 1.0
-
-    return result
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# batch_model() — пакетный режим для fill_cache (O(D + N) вместо O(N × D))
-# ══════════════════════════════════════════════════════════════════════════════
-
-def batch_model(
-    rates: list[dict],
-    dataset: list[dict],
-    dates: list[datetime],
-    *,
-    type: int = 0,
-    var: int = 3,
-    param: str = "",
-    dataset_index: dict | None = None,
-) -> dict[datetime, dict[str, float]]:
-    """
-    Пакетная версия model() для fill_cache.
-
-    Оптимизация по сравнению с N вызовами model():
-      • _build_resolved_events() парсит датасет один раз: O(D)
-        (resolve ctx_key, lookup ctx_info, сортировка)
-      • Для каждой из N дат — bisect по ts_list + проход по узкому срезу: O(N·W)
-        где W — среднее количество событий в окне (обычно 5–30)
-      • Итого: O(D + N·W) вместо O(N·(log(D) + W·lookup))
-
-    Особенно выгодно при USE_ML_VALUES=False (fill_cache вызывает batch_model
-    напрямую). При USE_ML_VALUES=True используется как утилита или при
-    прямом тестировании.
-
-    Возвращает:
-        {date: {"weight_code": 1.0, ...}}  — если есть сигналы
-        {date: {}}                          — если FLAT / нет совпадений
-    """
-    if not dates:
-        return {}
-
-    calc_type = int(type or 0)
-    calc_var  = int(var  or 0)
-
-    if calc_type not in TYPES_RANGE or calc_var not in VAR_RANGE:
-        return {d: {} for d in dates}
-    if not rates or not dataset:
-        return {d: {} for d in dates}
-
-    # ── Контекст ──────────────────────────────────────────────────────────────
-    di        = dataset_index or {}
-    ctx_index = di.get("ctx_index") or {}
-    if not ctx_index:
-        return {d: {} for d in dates}
-
-    url_map = _resolve_url_map(ctx_index, di.get("url_map") or {})
-    if not url_map:
-        return {d: {} for d in dates}
-
-    # ── Параметры окна ────────────────────────────────────────────────────────
-    is_daily      = _is_daily_rates(rates)
-    secs_per_unit = 86400.0 if is_daily else 3600.0
-    window_secs   = SHIFT_WINDOW * secs_per_unit
-
-    # ── Однократный resolve всего датасета ────────────────────────────────────
-    ts_list, resolved_list = _build_resolved_events(dataset, url_map, ctx_index)
-
-    # ── Цикл по датам ─────────────────────────────────────────────────────────
-    results: dict[datetime, dict[str, float]] = {}
-
-    for date in dates:
-        date_ts = date.timestamp()
-        ws_ts   = date_ts - window_secs
-        we_ts   = date_ts + window_secs
-
-        lo = bisect.bisect_left(ts_list,  ws_ts)
-        hi = bisect.bisect_right(ts_list, we_ts)
-
-        result: dict[str, float] = {}
-        for idx in range(lo, hi):
-            ev_ts               = ts_list[idx]
-            ctx_key, occ_count  = resolved_list[idx]
-
-            shift = int(round((date_ts - ev_ts) / secs_per_unit))
-            if abs(shift) > SHIFT_WINDOW:
+            if strict_amp and not has_next:
                 continue
 
-            event_id, currency, importance, fcd, scd, rcd = ctx_key
+            amp = _diff_amp(np_simple_rates, ext_date, next_date)
+        else:
+            amp = 1.0
 
-            for mode in ACTIVE_MODES:
-                result[make_weight_code(event_id, currency, importance, fcd, scd, rcd, mode, None)] = 1.0
+        # Дедупликация кодов на одном экстремуме, чтобы один код не усиливался
+        # дважды из-за повторного события в одной свече.
+        records.append(
+            ExtremumRecord(
+                date=ext_date,
+                sign=sign,
+                codes=sorted(set(codes)),
+                base_amp=float(amp),
+            )
+        )
 
-            if occ_count >= RECURRING_MIN_COUNT:
-                for mode in ACTIVE_MODES:
-                    result[make_weight_code(event_id, currency, importance, fcd, scd, rcd, mode, shift)] = 1.0
+    if not records:
+        return {}, 1.0, 0, 0
 
-        results[date] = result
+    universe: dict[str, float] = {}
+    all_seen: set[str] = set()
+    iterations_total = 0
 
-    return results
+    for rec_idx, rec in enumerate(records):
+        rec_set = set(rec.codes)
+        overlap = bool(rec_set & all_seen)
+
+        if not overlap:
+            # Новое непересекающееся подмножество.
+            for c in rec.codes:
+                if c not in universe:
+                    universe[c] = rec.sign * rec.base_amp
+            all_seen |= rec_set
+            continue
+
+        # Пересечение с уже обученным множеством.
+        # Сначала добавляем отсутствующие веса с базовым знаком.
+        for c in rec.codes:
+            if c not in universe:
+                universe[c] = rec.sign * rec.base_amp
+
+        all_seen |= rec_set
+
+        universe, _pr, iters = rebalance_weights(
+            universe,
+            records[:rec_idx + 1],
+            max_iter=max_iter,
+            step=step,
+            target=target_precision,
+            active_tail=active_tail,
+            metric=metric,
+        )
+        iterations_total += iters
+
+    final_precision = total_precision(universe, records, metric=metric)
+
+    if final_precision < target_precision:
+        universe, final_precision, iters = rebalance_weights(
+            universe,
+            records,
+            max_iter=max_iter,
+            step=step,
+            target=target_precision,
+            active_tail=active_tail,
+            metric=metric,
+        )
+        iterations_total += iters
+
+    # Отбрасываем численный мусор.
+    universe = {
+        k: float(v)
+        for k, v in universe.items()
+        if abs(float(v)) > 1e-12
+    }
+
+    result = (universe, float(final_precision), int(iterations_total), len(records))
+    _train_at_date_cache[cache_key] = result
+    # Keep cache bounded
+    if len(_train_at_date_cache) > _TRAIN_CACHE_MAX:
+        oldest = next(iter(_train_at_date_cache))
+        del _train_at_date_cache[oldest]
+    return (*result, False)   # False = computed fresh, not from cache
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ReverseStore: БД-хранилище обученных universe + jobs-семафор
+# ──────────────────────────────────────────────────────────────────────────────
+
+class ReverseStore:
+    def __init__(self, engine, *, port: int):
+        self.engine = engine
+        self.port = int(port)
+        self.universe_table = f"vlad_reverse_universe_svc{self.port}"
+        self.jobs_table = f"vlad_reverse_jobs_svc{self.port}"
+        # In-memory cache: (pair, day_flag, control_date, params_hash) -> (universe, precision)
+        # Eliminates repeated DB round-trips for the same key during fill_cache
+        self._universe_cache: dict = {}
+
+    def clear_universe_cache(self) -> None:
+        """Call at the start of fill_cache to start fresh."""
+        self._universe_cache.clear()
+
+    async def ensure_tables(self) -> None:
+        async with self.engine.begin() as conn:
+            await conn.execute(text(f"""
+                CREATE TABLE IF NOT EXISTS `{self.universe_table}` (
+                    `id`                BIGINT       NOT NULL AUTO_INCREMENT,
+                    `pair`              INT          NOT NULL,
+                    `day_flag`          TINYINT      NOT NULL DEFAULT 0,
+                    `control_date`      DATETIME     NOT NULL,
+                    `params_hash`       CHAR(32)     NOT NULL,
+                    `universe_json`     LONGTEXT     NOT NULL,
+                    `precision_val`     DOUBLE       NOT NULL DEFAULT 0,
+                    `iterations`        INT          NOT NULL DEFAULT 0,
+                    `extremum_count`    INT          NOT NULL DEFAULT 0,
+                    `history_window`    INT          NOT NULL DEFAULT 0,
+                    `active_tail`       INT          NOT NULL DEFAULT 0,
+                    `precision_metric`  VARCHAR(16)  NOT NULL DEFAULT 'mean',
+                    `init_mode`         VARCHAR(32)  NOT NULL DEFAULT 'mode0',
+                    `step_size`         DOUBLE       NOT NULL DEFAULT 0.10,
+                    `target_precision`  DOUBLE       NOT NULL DEFAULT 0.95,
+                    `created_at`        TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+                    `updated_at`        TIMESTAMP    DEFAULT CURRENT_TIMESTAMP
+                                                   ON UPDATE CURRENT_TIMESTAMP,
+                    PRIMARY KEY (`id`),
+                    UNIQUE KEY `uk_reverse_universe`
+                        (`pair`, `day_flag`, `control_date`, `params_hash`),
+                    KEY `idx_pair_day_date`
+                        (`pair`, `day_flag`, `control_date`),
+                    KEY `idx_params_hash` (`params_hash`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """))
+
+            await conn.execute(text(f"""
+                CREATE TABLE IF NOT EXISTS `{self.jobs_table}` (
+                    `id`                  BIGINT       NOT NULL AUTO_INCREMENT,
+                    `pair`                INT          NOT NULL,
+                    `day_flag`            TINYINT      NOT NULL DEFAULT 0,
+                    `control_date`        DATETIME     NOT NULL,
+                    `params_hash`         CHAR(32)     NOT NULL,
+                    `state`               VARCHAR(16)  NOT NULL DEFAULT 'queued',
+                    `triggered_by`        VARCHAR(32)  NOT NULL DEFAULT 'unknown',
+                    `error_msg`           TEXT         NULL,
+                    `precision_before`    DOUBLE       NULL,
+                    `precision_after`     DOUBLE       NULL,
+                    `iterations`          INT          NOT NULL DEFAULT 0,
+                    `universe_size`       INT          NOT NULL DEFAULT 0,
+                    `prev_universe_size`  INT          NOT NULL DEFAULT 0,
+                    `extremum_count`      INT          NOT NULL DEFAULT 0,
+                    `history_window`      INT          NOT NULL DEFAULT 0,
+                    `active_tail`         INT          NOT NULL DEFAULT 0,
+                    `precision_metric`    VARCHAR(16)  NOT NULL DEFAULT 'mean',
+                    `init_mode`           VARCHAR(32)  NOT NULL DEFAULT 'mode0',
+                    `step_size`           DOUBLE       NOT NULL DEFAULT 0.10,
+                    `target_precision`    DOUBLE       NOT NULL DEFAULT 0.95,
+                    `created_at`          TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+                    `updated_at`          TIMESTAMP    DEFAULT CURRENT_TIMESTAMP
+                                                     ON UPDATE CURRENT_TIMESTAMP,
+                    PRIMARY KEY (`id`),
+                    UNIQUE KEY `uk_reverse_job`
+                        (`pair`, `day_flag`, `control_date`, `params_hash`),
+                    KEY `idx_state` (`state`),
+                    KEY `idx_pair_day_date`
+                        (`pair`, `day_flag`, `control_date`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """))
+
+    async def load_universe(
+        self,
+        *,
+        pair: int,
+        day_flag: int,
+        control_date: datetime,
+        params_hash: str,
+    ) -> tuple[dict[str, float], float] | None:
+        # Check in-memory cache first — avoids DB round-trip on repeated lookups
+        cache_key = (pair, day_flag, control_date, params_hash)
+        if cache_key in self._universe_cache:
+            return self._universe_cache[cache_key]
+
+        async with self.engine.connect() as conn:
+            res = await conn.execute(text(f"""
+                SELECT universe_json, precision_val
+                FROM `{self.universe_table}`
+                WHERE pair = :pair
+                  AND day_flag = :day
+                  AND control_date = :dt
+                  AND params_hash = :ph
+                LIMIT 1
+            """), {
+                "pair": pair,
+                "day": day_flag,
+                "dt": control_date,
+                "ph": params_hash,
+            })
+
+            row = res.mappings().first()
+
+        if not row:
+            self._universe_cache[cache_key] = None
+            return None
+
+        try:
+            raw = _json.loads(row["universe_json"] or "{}")
+            universe = {
+                str(k): float(v)
+                for k, v in raw.items()
+                if v is not None
+            }
+            result = universe, float(row["precision_val"] or 0.0)
+            self._universe_cache[cache_key] = result
+            return result
+        except Exception:
+            return None
+
+    async def save_universe(
+        self,
+        *,
+        pair: int,
+        day_flag: int,
+        control_date: datetime,
+        params_hash: str,
+        universe: dict[str, float],
+        precision_val: float,
+        iterations: int,
+        extremum_cnt: int,
+        history_window: int,
+        active_tail: int,
+        precision_metric: str,
+        init_mode: str,
+        step_size: float,
+        target_precision: float,
+    ) -> None:
+        payload = _json.dumps(
+            universe,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+        async with self.engine.begin() as conn:
+            await conn.execute(text(f"""
+                INSERT INTO `{self.universe_table}` (
+                    pair, day_flag, control_date, params_hash,
+                    universe_json, precision_val, iterations, extremum_count,
+                    history_window, active_tail, precision_metric, init_mode,
+                    step_size, target_precision
+                )
+                VALUES (
+                    :pair, :day, :dt, :ph,
+                    :payload, :pr, :iters, :ext_cnt,
+                    :hist, :tail, :metric, :init_mode,
+                    :step, :target
+                )
+                ON DUPLICATE KEY UPDATE
+                    universe_json     = VALUES(universe_json),
+                    precision_val     = VALUES(precision_val),
+                    iterations        = VALUES(iterations),
+                    extremum_count    = VALUES(extremum_count),
+                    history_window    = VALUES(history_window),
+                    active_tail       = VALUES(active_tail),
+                    precision_metric  = VALUES(precision_metric),
+                    init_mode         = VALUES(init_mode),
+                    step_size         = VALUES(step_size),
+                    target_precision  = VALUES(target_precision),
+                    updated_at        = CURRENT_TIMESTAMP
+            """), {
+                "pair": pair,
+                "day": day_flag,
+                "dt": control_date,
+                "ph": params_hash,
+                "payload": payload,
+                "pr": float(precision_val),
+                "iters": int(iterations),
+                "ext_cnt": int(extremum_cnt),
+                "hist": int(history_window),
+                "tail": int(active_tail),
+                "metric": str(precision_metric),
+                "init_mode": str(init_mode),
+                "step": float(step_size),
+                "target": float(target_precision),
+            })
+
+        # Update in-memory cache so subsequent load_universe calls skip DB
+        cache_key = (pair, day_flag, control_date, params_hash)
+        self._universe_cache[cache_key] = (dict(universe), float(precision_val))
+
+    async def reserve_slot(
+        self,
+        *,
+        pair: int,
+        day_flag: int,
+        control_date: datetime,
+        params_hash: str,
+        triggered_by: str,
+        history_window: int,
+        active_tail: int,
+        precision_metric: str,
+        init_mode: str,
+        step_size: float,
+        target_precision: float,
+    ) -> bool:
+        """
+        Семафор: True если мы создали/заняли job.
+        False если такой job уже существует.
+        """
+        async with self.engine.begin() as conn:
+            res = await conn.execute(text(f"""
+                INSERT IGNORE INTO `{self.jobs_table}` (
+                    pair, day_flag, control_date, params_hash,
+                    state, triggered_by,
+                    history_window, active_tail, precision_metric, init_mode,
+                    step_size, target_precision
+                )
+                VALUES (
+                    :pair, :day, :dt, :ph,
+                    'running', :triggered_by,
+                    :hist, :tail, :metric, :init_mode,
+                    :step, :target
+                )
+            """), {
+                "pair": pair,
+                "day": day_flag,
+                "dt": control_date,
+                "ph": params_hash,
+                "triggered_by": triggered_by,
+                "hist": int(history_window),
+                "tail": int(active_tail),
+                "metric": str(precision_metric),
+                "init_mode": str(init_mode),
+                "step": float(step_size),
+                "target": float(target_precision),
+            })
+
+            if res.rowcount == 1:
+                return True
+
+            # Если job уже есть, но он не running, можно перезаписать как running.
+            upd = await conn.execute(text(f"""
+                UPDATE `{self.jobs_table}`
+                SET state = 'running',
+                    triggered_by = :triggered_by,
+                    error_msg = NULL,
+                    history_window = :hist,
+                    active_tail = :tail,
+                    precision_metric = :metric,
+                    init_mode = :init_mode,
+                    step_size = :step,
+                    target_precision = :target,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE pair = :pair
+                  AND day_flag = :day
+                  AND control_date = :dt
+                  AND params_hash = :ph
+                  AND state <> 'running'
+            """), {
+                "pair": pair,
+                "day": day_flag,
+                "dt": control_date,
+                "ph": params_hash,
+                "triggered_by": triggered_by,
+                "hist": int(history_window),
+                "tail": int(active_tail),
+                "metric": str(precision_metric),
+                "init_mode": str(init_mode),
+                "step": float(step_size),
+                "target": float(target_precision),
+            })
+
+            return upd.rowcount == 1
+
+    async def finish_slot(
+        self,
+        *,
+        pair: int,
+        day_flag: int,
+        control_date: datetime,
+        params_hash: str,
+        state: str,
+        error_msg: str | None = None,
+        precision_before: float | None = None,
+        precision_after: float | None = None,
+        iterations: int = 0,
+        universe_size: int = 0,
+        prev_universe_size: int = 0,
+        extremum_cnt: int = 0,
+        history_window: int = 0,
+        active_tail: int = 0,
+        precision_metric: str = "mean",
+        init_mode: str = "mode0",
+        step_size: float = 0.10,
+        target_precision: float = 0.95,
+    ) -> None:
+        async with self.engine.begin() as conn:
+            await conn.execute(text(f"""
+                UPDATE `{self.jobs_table}`
+                SET state = :state,
+                    error_msg = :error_msg,
+                    precision_before = :pr_before,
+                    precision_after = :pr_after,
+                    iterations = :iters,
+                    universe_size = :universe_size,
+                    prev_universe_size = :prev_universe_size,
+                    extremum_count = :ext_cnt,
+                    history_window = :hist,
+                    active_tail = :tail,
+                    precision_metric = :metric,
+                    init_mode = :init_mode,
+                    step_size = :step,
+                    target_precision = :target,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE pair = :pair
+                  AND day_flag = :day
+                  AND control_date = :dt
+                  AND params_hash = :ph
+            """), {
+                "pair": pair,
+                "day": day_flag,
+                "dt": control_date,
+                "ph": params_hash,
+                "state": state,
+                "error_msg": error_msg,
+                "pr_before": precision_before,
+                "pr_after": precision_after,
+                "iters": int(iterations),
+                "universe_size": int(universe_size),
+                "prev_universe_size": int(prev_universe_size),
+                "ext_cnt": int(extremum_cnt),
+                "hist": int(history_window),
+                "tail": int(active_tail),
+                "metric": str(precision_metric),
+                "init_mode": str(init_mode),
+                "step": float(step_size),
+                "target": float(target_precision),
+            })
+
+    async def train_and_save(
+        self,
+        *,
+        pair: int,
+        day_flag: int,
+        control_date: datetime,
+        params_hash: str,
+        np_simple_rates: dict | None,
+        active_codes_at: ActiveCodesProvider,
+        train_mode: TrainMode = 0,
+        max_iter: int = 20,
+        step: float = 0.10,
+        target_precision: float = 0.95,
+        extremum_limit: int = 50,
+        extremum_interval: int = 3,
+        active_tail: int = 0,
+        metric: PrecisionMetric = "mean",
+        triggered_by: str = "train",
+        log_fn: Callable[[str], None] | None = None,
+        skip_db_writes: bool = False,
+    ) -> tuple[dict[str, float], float]:
+        init_mode = f"mode{train_mode}/iv{extremum_interval}"
+
+        # skip_db_writes=True: fill_cache mode — skip reserve/save/finish DB ops.
+        # load_universe still runs to reuse existing training from previous sessions.
+        if skip_db_writes:
+            prev_loaded = None
+            prev_size   = 0
+            pr_before   = None
+        else:
+            prev_loaded = await self.load_universe(
+                pair=pair,
+                day_flag=day_flag,
+                control_date=control_date,
+                params_hash=params_hash,
+            )
+            prev_size = len(prev_loaded[0]) if prev_loaded else 0
+            pr_before = float(prev_loaded[1]) if prev_loaded else None
+
+        if skip_db_writes:
+            reserved = True   # skip semaphore DB op in fill_cache mode
+        else:
+            reserved = await self.reserve_slot(
+                pair=pair,
+                day_flag=day_flag,
+                control_date=control_date,
+                params_hash=params_hash,
+                triggered_by=triggered_by,
+                history_window=extremum_limit,
+                active_tail=active_tail,
+                precision_metric=metric,
+                init_mode=init_mode,
+                step_size=step,
+                target_precision=target_precision,
+            )
+
+            if not reserved:
+                loaded = await self.load_universe(
+                    pair=pair,
+                    day_flag=day_flag,
+                    control_date=control_date,
+                    params_hash=params_hash,
+                )
+                if loaded:
+                    return loaded
+                return {}, 0.0
+
+        try:
+            universe, pr, iters, ext_cnt, _from_train_cache = await train_at_date(
+                np_simple_rates=np_simple_rates,
+                control_date=control_date,
+                active_codes_at=active_codes_at,
+                train_mode=train_mode,
+                max_iter=max_iter,
+                step=step,
+                target_precision=target_precision,
+                extremum_limit=extremum_limit,
+                extremum_interval=extremum_interval,
+                active_tail=active_tail,
+                metric=metric,
+            )
+
+            # Update in-memory cache immediately
+            if universe:
+                self._universe_cache[(pair, day_flag, control_date, params_hash)] = (universe, pr)
+
+            # Skip DB writes on cache hit OR in fill_cache mode
+            if _from_train_cache or skip_db_writes:
+                return universe, pr
+
+            if universe:
+                await self.save_universe(
+                    pair=pair,
+                    day_flag=day_flag,
+                    control_date=control_date,
+                    params_hash=params_hash,
+                    universe=universe,
+                    precision_val=pr,
+                    iterations=iters,
+                    extremum_cnt=ext_cnt,
+                    history_window=extremum_limit,
+                    active_tail=active_tail,
+                    precision_metric=metric,
+                    init_mode=init_mode,
+                    step_size=step,
+                    target_precision=target_precision,
+                )
+
+            await self.finish_slot(
+                pair=pair,
+                day_flag=day_flag,
+                control_date=control_date,
+                params_hash=params_hash,
+                state="done",
+                precision_before=pr_before,
+                precision_after=pr,
+                iterations=iters,
+                universe_size=len(universe),
+                prev_universe_size=prev_size,
+                extremum_cnt=ext_cnt,
+                history_window=extremum_limit,
+                active_tail=active_tail,
+                precision_metric=metric,
+                init_mode=init_mode,
+                step_size=step,
+                target_precision=target_precision,
+            )
+
+            if log_fn:
+                log_fn(
+                    f"  ✅ ml-train {control_date}: "
+                    f"mode={train_mode}, interval={extremum_interval}, "
+                    f"prec={pr:.4f}, size={len(universe)}, "
+                    f"ext={ext_cnt}, iters={iters}"
+                )
+
+            return universe, pr
+
+        except Exception as e:
+            await self.finish_slot(
+                pair=pair,
+                day_flag=day_flag,
+                control_date=control_date,
+                params_hash=params_hash,
+                state="failed",
+                error_msg=str(e)[:1000],
+                precision_before=pr_before,
+                iterations=0,
+                universe_size=0,
+                prev_universe_size=prev_size,
+                extremum_cnt=0,
+                history_window=extremum_limit,
+                active_tail=active_tail,
+                precision_metric=metric,
+                init_mode=init_mode,
+                step_size=step,
+                target_precision=target_precision,
+            )
+
+            if log_fn:
+                log_fn(f"  ❌ ml-train {control_date}: {e}")
+
+            return {}, 0.0
+
+    async def maybe_retrain(
+        self,
+        *,
+        pair: int,
+        day_flag: int,
+        control_date: datetime,
+        params_hash: str,
+        np_simple_rates: dict | None,
+        active_codes_at: ActiveCodesProvider,
+        train_mode: TrainMode = 0,
+        max_iter: int = 20,
+        step: float = 0.10,
+        target_precision: float = 0.95,
+        extremum_limit: int = 50,
+        extremum_interval: int = 3,
+        active_tail: int = 0,
+        metric: PrecisionMetric = "mean",
+        log_fn: Callable[[str], None] | None = None,
+        skip_db_writes: bool = False,
+        model_tag: str = "",
+    ) -> tuple[dict[str, float], float]:
+        # ── Шаг 1: собираем экстремумы и активные коды ОДИН РАЗ ─────────────
+        # Оригинал делал collect + active_codes_at до 3 раз:
+        #   1) здесь для pre-check кеша
+        #   2) в блоке проверки precision загруженного universe
+        #   3) внутри train_at_date → train_and_save
+        # Теперь всё делается один раз, результаты переиспользуются.
+        _forward_pre = train_mode in (1, 3, 4)
+        _seq_pre = (
+            collect_extremums_forward(
+                np_simple_rates, control_date,
+                limit=extremum_limit, extremum_interval=extremum_interval,
+            )
+            if _forward_pre else
+            collect_extremums_back(
+                np_simple_rates, control_date,
+                limit=extremum_limit, extremum_interval=extremum_interval,
+            )
+        )
+
+        _seq_tuple = tuple((int(d.timestamp()), s) for d, s in _seq_pre)
+
+        # ── Шаг 1.5: seq_codes_cache — пропускаем 50 await-ов если seq не изменился ──
+        # Для соседних свечей seq_tuple почти всегда идентичен (те же 50 экстремумов).
+        # _ml_active_cache детерминирован, поэтому codes тоже идентичны.
+        # Кеш ключ = (model_tag, seq_tuple): model_tag кодирует pair/day/type/var
+        # чтобы не смешивать коды от разных пар/режимов.
+        _seq_cache_key = (model_tag, _seq_tuple)
+        _cached_seq    = _seq_codes_cache.get(_seq_cache_key)
+
+        if _cached_seq is not None:
+            _pre_codes, _codes_key = _cached_seq
+        else:
+            _pre_codes: list[list[str]] = []
+            for _ext_date, _ in _seq_pre:
+                try:
+                    _c = await active_codes_at(_ext_date)
+                except Exception:
+                    _c = []
+                _pre_codes.append(sorted(set(_c)))
+            _codes_key = tuple(tuple(c) for c in _pre_codes)
+            _seq_codes_cache[_seq_cache_key] = (_pre_codes, _codes_key)
+            if len(_seq_codes_cache) > _SEQ_CODES_CACHE_MAX:
+                del _seq_codes_cache[next(iter(_seq_codes_cache))]
+        _train_cache_key  = (
+            _seq_tuple, _codes_key, train_mode, max_iter,
+            round(step, 6), round(target_precision, 6), active_tail, metric,
+        )
+        _cached_train = _train_at_date_cache.get(_train_cache_key)
+        if _cached_train is not None:
+            _univ_cached, _pr_cached, _, _ = _cached_train
+            self._universe_cache[(pair, day_flag, control_date, params_hash)] = (
+                _univ_cached, _pr_cached
+            )
+            return _univ_cached, _pr_cached
+
+        # ── Шаг 3: если universe уже загружен — проверяем precision ─────────
+        # Используем уже собранные _seq_pre + _pre_codes, без повторного collect.
+        loaded = await self.load_universe(
+            pair=pair,
+            day_flag=day_flag,
+            control_date=control_date,
+            params_hash=params_hash,
+        )
+
+        if loaded:
+            universe, stored_pr = loaded
+            use_diff   = train_mode in (2, 3, 4)
+            strict_amp = train_mode == 4
+
+            records: list[ExtremumRecord] = []
+            for idx, ((ext_date, sign), codes) in enumerate(zip(_seq_pre, _pre_codes)):
+                if not codes:
+                    continue
+                if use_diff:
+                    has_next  = idx + 1 < len(_seq_pre)
+                    next_date = _seq_pre[idx + 1][0] if has_next else None
+                    if strict_amp and not has_next:
+                        continue
+                    amp = _diff_amp(np_simple_rates, ext_date, next_date)
+                else:
+                    amp = 1.0
+                records.append(ExtremumRecord(
+                    date=ext_date, sign=sign,
+                    codes=sorted(set(codes)), base_amp=float(amp),
+                ))
+
+            current_pr = total_precision(universe, records, metric=metric)
+            if current_pr >= target_precision:
+                return universe, current_pr
+
+            if log_fn:
+                log_fn(
+                    f"  ⚠️ ml precision drop {control_date}: "
+                    f"stored={stored_pr:.4f}, current={current_pr:.4f}, "
+                    f"target={target_precision:.4f}; retrain"
+                )
+
+        # ── Шаг 4: обучаем.
+        # Передаём pre-собранные коды через замыкание — train_at_date
+        # вызовет active_codes_at и получит результаты из кеша (O(1)).
+        _pre_codes_map: dict[int, list[str]] = {
+            int(ext_date.timestamp()): codes
+            for (ext_date, _), codes in zip(_seq_pre, _pre_codes)
+        }
+
+        async def _fast_active_codes_at(ext_dt: datetime) -> list[str]:
+            ts = int(ext_dt.timestamp())
+            pre = _pre_codes_map.get(ts)
+            if pre is not None:
+                return pre
+            # Fallback для дат вне _seq_pre (edge case).
+            return await active_codes_at(ext_dt)
+
+        return await self.train_and_save(
+            pair=pair,
+            day_flag=day_flag,
+            control_date=control_date,
+            params_hash=params_hash,
+            np_simple_rates=np_simple_rates,
+            active_codes_at=_fast_active_codes_at,
+            train_mode=train_mode,
+            max_iter=max_iter,
+            step=step,
+            target_precision=target_precision,
+            extremum_limit=extremum_limit,
+            extremum_interval=extremum_interval,
+            active_tail=active_tail,
+            metric=metric,
+            triggered_by="retrain",
+            log_fn=log_fn,
+            skip_db_writes=skip_db_writes,
+        )
