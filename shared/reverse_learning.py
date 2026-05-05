@@ -43,6 +43,7 @@ reverse_learning.py — ML-режим для /values: обратное обуч�
 from __future__ import annotations
 
 import asyncio
+import bisect
 import json as _json
 import random
 from dataclasses import dataclass
@@ -198,6 +199,12 @@ def rebalance_weights(
 # np_simple_rates dict doesn't change during fill_cache, so this is safe.
 _extremum_flags_cache: dict = {}
 
+# Cache for precomputed sorted extremum list:
+# (id(np_simple_rates), n, radius) -> ([(ts_int, sign_int), ...], [ts_int, ...])
+# Computed once per dataset, then collect_extremums_back/forward use bisect O(1)
+# instead of scanning the full candle array on each call (up to 119k iterations).
+_all_extremums_cache: dict = {}
+
 
 def _extremum_flags(
     np_simple_rates: dict | None,
@@ -273,6 +280,57 @@ def _extremum_flags(
     return result
 
 
+def _get_all_extremums(
+    np_simple_rates: dict,
+    *,
+    interval: int = 3,
+) -> tuple[list[tuple[int, int]], list[int]]:
+    """
+    Возвращает (all_ext, all_ext_ts) — все экстремумы датасета в хронологическом
+    порядке. Вычисляется один раз per (id, n, radius), затем кешируется.
+
+    all_ext    : [(unix_ts_int, sign_int), ...]   знак: -1 max, +1 min
+    all_ext_ts : [unix_ts_int, ...]               только timestamps (для bisect)
+
+    collect_extremums_back/forward используют bisect → O(log n + limit)
+    вместо Python-цикла по всему массиву O(n).
+    """
+    dates_ns = np_simple_rates.get("dates_ns")
+    n = len(dates_ns) if dates_ns is not None else 0
+    if n == 0:
+        return [], []
+
+    try:
+        interval_i = int(interval or 3)
+    except Exception:
+        interval_i = 3
+    if interval_i < 3:
+        interval_i = 3
+    radius = max(1, interval_i // 2)
+
+    cache_key = (id(np_simple_rates), n, radius)
+    cached = _all_extremums_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    ext_max, ext_min = _extremum_flags(np_simple_rates, interval=interval_i)
+
+    # Vectorized: build combined int8 array, flatnonzero at C speed
+    combined = np.zeros(n, dtype=np.int8)
+    combined[ext_min] = 1
+    combined[ext_max] = -1   # max wins (matches original elif logic)
+
+    indices = np.flatnonzero(combined)  # ascending, C speed
+
+    # Plain Python lists — no numpy overhead per bisect/slice lookup
+    all_ext    = [(int(dates_ns[i]), int(combined[i])) for i in indices]
+    all_ext_ts = [x[0] for x in all_ext]
+
+    result = (all_ext, all_ext_ts)
+    _all_extremums_cache[cache_key] = result
+    return result
+
+
 def collect_extremums_back(
     np_simple_rates: dict | None,
     control_date:    datetime,
@@ -280,28 +338,26 @@ def collect_extremums_back(
     limit: int = 50,
     extremum_interval: int = 3,
 ) -> list[tuple[datetime, int]]:
-    """[(date, sign)] от ближайшего к control_date к более старым."""
+    """
+    [(date, sign)] от ближайшего к control_date к более старым.
+
+    OPTIMIZED: precomputed list + bisect → O(log n + limit)
+    вместо Python-цикла O(n) по всему массиву свечей.
+    """
     if not np_simple_rates:
         return []
 
-    dates_ns = np_simple_rates["dates_ns"]
-    ext_max, ext_min = _extremum_flags(
-        np_simple_rates,
-        interval=extremum_interval,
-    )
+    all_ext, all_ext_ts = _get_all_extremums(np_simple_rates, interval=extremum_interval)
+    if not all_ext:
+        return []
 
-    ts       = np.int64(int(control_date.timestamp()))
-    cutoff   = int(np.searchsorted(dates_ns, ts, side="right"))
+    ts         = int(control_date.timestamp())
+    cutoff_idx = bisect.bisect_right(all_ext_ts, ts)   # первый индекс > ts
+    start      = max(0, cutoff_idx - limit)
+    chunk      = all_ext[start:cutoff_idx]
 
-    out: list[tuple[datetime, int]] = []
-    for i in range(cutoff - 1, -1, -1):
-        if ext_max[i]:
-            out.append((datetime.fromtimestamp(int(dates_ns[i])), -1))
-        elif ext_min[i]:
-            out.append((datetime.fromtimestamp(int(dates_ns[i])), +1))
-        if len(out) >= limit:
-            break
-    return out
+    # chunk в хронологическом порядке → разворачиваем (ближайший к control_date первый)
+    return [(datetime.fromtimestamp(t), s) for t, s in reversed(chunk)]
 
 
 def collect_extremums_forward(
@@ -314,28 +370,23 @@ def collect_extremums_forward(
     """
     [(date, sign)] в хронологическом порядке, до control_date включительно.
     Возвращает последние `limit` записей.
-    Знак: ext_max → -1, ext_min → +1.
+
+    OPTIMIZED: precomputed list + bisect → O(log n + limit).
     """
     if not np_simple_rates:
         return []
 
-    dates_ns = np_simple_rates["dates_ns"]
-    ext_max, ext_min = _extremum_flags(
-        np_simple_rates,
-        interval=extremum_interval,
-    )
+    all_ext, all_ext_ts = _get_all_extremums(np_simple_rates, interval=extremum_interval)
+    if not all_ext:
+        return []
 
-    ts       = np.int64(int(control_date.timestamp()))
-    cutoff   = int(np.searchsorted(dates_ns, ts, side="right"))
+    ts         = int(control_date.timestamp())
+    cutoff_idx = bisect.bisect_right(all_ext_ts, ts)
+    start      = max(0, cutoff_idx - limit)
+    chunk      = all_ext[start:cutoff_idx]
 
-    out: list[tuple[datetime, int]] = []
-    for i in range(cutoff):
-        if ext_max[i]:
-            out.append((datetime.fromtimestamp(int(dates_ns[i])), -1))
-        elif ext_min[i]:
-            out.append((datetime.fromtimestamp(int(dates_ns[i])), +1))
-
-    return out[-limit:] if len(out) > limit else out
+    # Хронологический порядок — разворот не нужен
+    return [(datetime.fromtimestamp(t), s) for t, s in chunk]
 
 
 def _diff_amp(
@@ -381,6 +432,13 @@ ActiveCodesProvider = Callable[[datetime], Awaitable[list[str]]]
 # Adjacent hourly candles almost always share identical extremum sets -> cache hit -> skip retrain
 _train_at_date_cache: dict = {}
 _TRAIN_CACHE_MAX = 4096  # увеличено с 2000: больше типов/vars/пар помещается без вытеснения
+
+# Cache: (model_tag, seq_tuple) -> (pre_codes, codes_key)
+# Avoids 50 `await active_codes_at()` calls when seq_tuple is unchanged between
+# consecutive candles (the common case: adjacent hourly/daily candles share the
+# same 50 extremums, so codes never need to be re-fetched from _ml_active_cache).
+_seq_codes_cache: dict = {}
+_SEQ_CODES_CACHE_MAX = 1024
 
 
 async def train_at_date(
@@ -1090,6 +1148,7 @@ class ReverseStore:
         metric: PrecisionMetric = "mean",
         log_fn: Callable[[str], None] | None = None,
         skip_db_writes: bool = False,
+        model_tag: str = "",
     ) -> tuple[dict[str, float], float]:
         # ── Шаг 1: собираем экстремумы и активные коды ОДИН РАЗ ─────────────
         # Оригинал делал collect + active_codes_at до 3 раз:
@@ -1110,17 +1169,30 @@ class ReverseStore:
             )
         )
 
-        _pre_codes: list[list[str]] = []
-        for _ext_date, _ in _seq_pre:
-            try:
-                _c = await active_codes_at(_ext_date)
-            except Exception:
-                _c = []
-            _pre_codes.append(sorted(set(_c)))
+        _seq_tuple = tuple((int(d.timestamp()), s) for d, s in _seq_pre)
 
-        # ── Шаг 2: проверяем train-кеш (O(1) lookup) ────────────────────────
-        _seq_tuple       = tuple((int(d.timestamp()), s) for d, s in _seq_pre)
-        _codes_key        = tuple(tuple(c) for c in _pre_codes)
+        # ── Шаг 1.5: seq_codes_cache — пропускаем 50 await-ов если seq не изменился ──
+        # Для соседних свечей seq_tuple почти всегда идентичен (те же 50 экстремумов).
+        # _ml_active_cache детерминирован, поэтому codes тоже идентичны.
+        # Кеш ключ = (model_tag, seq_tuple): model_tag кодирует pair/day/type/var
+        # чтобы не смешивать коды от разных пар/режимов.
+        _seq_cache_key = (model_tag, _seq_tuple)
+        _cached_seq    = _seq_codes_cache.get(_seq_cache_key)
+
+        if _cached_seq is not None:
+            _pre_codes, _codes_key = _cached_seq
+        else:
+            _pre_codes: list[list[str]] = []
+            for _ext_date, _ in _seq_pre:
+                try:
+                    _c = await active_codes_at(_ext_date)
+                except Exception:
+                    _c = []
+                _pre_codes.append(sorted(set(_c)))
+            _codes_key = tuple(tuple(c) for c in _pre_codes)
+            _seq_codes_cache[_seq_cache_key] = (_pre_codes, _codes_key)
+            if len(_seq_codes_cache) > _SEQ_CODES_CACHE_MAX:
+                del _seq_codes_cache[next(iter(_seq_codes_cache))]
         _train_cache_key  = (
             _seq_tuple, _codes_key, train_mode, max_iter,
             round(step, 6), round(target_precision, 6), active_tail, metric,
