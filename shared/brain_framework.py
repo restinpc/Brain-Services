@@ -1893,6 +1893,175 @@ def build_app(model_module) -> FastAPI:
         s.fill_cancel.set()
         return ok_response({"stopped": True})
 
+    @app.get("/clear_cache")
+    async def ep_clear_cache(
+        pairs:        str  = Query("", description="Пары через запятую: 1,3,4 — пусто = все"),
+        days:         str  = Query("", description="Таймфреймы: 0=hour,1=day — пусто = все"),
+        date_from:    str  = Query("", description="От даты YYYY-MM-DD — пусто = без ограничения"),
+        date_to:      str  = Query("", description="До даты YYYY-MM-DD — пусто = без ограничения"),
+        types:        str  = Query("", description="type через запятую — пусто = все"),
+        vars_:        str  = Query("", alias="vars", description="var через запятую — пусто = все"),
+        also_backtest: bool = Query(False, description="Также очистить vlad_backtest_results"),
+        stop_fill:    bool  = Query(True,  description="Остановить fill_cache если запущен"),
+    ):
+        """
+        Очищает кеш текущего сервиса (таблица vlad_values_cache_svcPORT).
+
+        Параметры позволяют точечно удалить только нужный срез:
+            /clear_cache                        — весь кеш сервиса
+            /clear_cache?pairs=1&days=0         — только EUR/USD hour
+            /clear_cache?date_from=2025-01-01   — с определённой даты
+            /clear_cache?types=0&vars=0,1       — конкретные type/var слоты
+            /clear_cache?also_backtest=true     — + vlad_backtest_results
+        """
+        # ── Остановить fill если запущен ──────────────────────────────────────
+        was_running = False
+        if stop_fill and s.fill_status.get("state") == "running":
+            s.fill_cancel.set()
+            was_running = True
+            # Даём воркеру секунду завершить текущий батч
+            await asyncio.sleep(1.0)
+
+        # ── Парсим фильтры ────────────────────────────────────────────────────
+        pair_list  = [int(p.strip()) for p in pairs.split(",")  if p.strip().isdigit()]
+        day_list   = [int(d.strip()) for d in days.split(",")   if d.strip().isdigit()]
+        type_list  = [int(t.strip()) for t in types.split(",")  if t.strip().isdigit()]
+        var_list   = [int(v.strip()) for v in vars_.split(",")  if v.strip().isdigit()]
+
+        dt_from = _parse_date(date_from) if date_from.strip() else None
+        dt_to   = _parse_date(date_to)   if date_to.strip()   else None
+
+        if dt_from and dt_to and dt_from > dt_to:
+            return err_response("date_from не может быть позже date_to")
+
+        # ── Строим WHERE для cache-таблицы ────────────────────────────────────
+        def _build_where(extra_params: dict) -> tuple[str, dict]:
+            clauses = ["service_url = :svc_url"]
+            params  = {"svc_url": s.service_url, **extra_params}
+
+            if pair_list:
+                placeholders = ", ".join(f":pair{i}" for i in range(len(pair_list)))
+                clauses.append(f"pair IN ({placeholders})")
+                for i, p in enumerate(pair_list):
+                    params[f"pair{i}"] = p
+
+            if day_list:
+                placeholders = ", ".join(f":day{i}" for i in range(len(day_list)))
+                clauses.append(f"day_flag IN ({placeholders})")
+                for i, d in enumerate(day_list):
+                    params[f"day{i}"] = d
+
+            if dt_from:
+                clauses.append("date_val >= :dt_from")
+                params["dt_from"] = dt_from
+            if dt_to:
+                clauses.append("date_val <= :dt_to")
+                params["dt_to"] = dt_to
+
+            # Фильтр по type/var через params_hash: пересчитываем хэши
+            if type_list or var_list:
+                t_range = type_list or s.TYPES_RANGE
+                v_range = var_list  or s.VAR_RANGE
+                hashes  = [
+                    _params_hash({"type": t, "var": v, "param": ""})
+                    for t in t_range for v in v_range
+                ]
+                placeholders = ", ".join(f":ph{i}" for i in range(len(hashes)))
+                clauses.append(f"params_hash IN ({placeholders})")
+                for i, h in enumerate(hashes):
+                    params[f"ph{i}"] = h
+
+            return " AND ".join(clauses), params
+
+        deleted_cache     = 0
+        deleted_backtest  = 0
+        errors: list[str] = []
+
+        # ── Удаляем из cache-таблицы ──────────────────────────────────────────
+        try:
+            where, params = _build_where({})
+            async with s.engine_vlad.begin() as conn:
+                res = await conn.execute(
+                    text(f"DELETE FROM `{s.cache_table}` WHERE {where}"), params
+                )
+                deleted_cache = res.rowcount
+        except Exception as e:
+            errors.append(f"cache: {e}")
+            log(f"   clear_cache error: {e}", s.NODE_NAME, level="error")
+
+        # ── Опционально — backtest results ────────────────────────────────────
+        if also_backtest:
+            try:
+                # vlad_backtest_results фильтруется аналогично, без date_val
+                clauses = ["service_url = :svc_url"]
+                params2: dict = {"svc_url": s.service_url}
+                if pair_list:
+                    pls = ", ".join(f":pair{i}" for i in range(len(pair_list)))
+                    clauses.append(f"pair IN ({pls})")
+                    for i, p in enumerate(pair_list):
+                        params2[f"pair{i}"] = p
+                if day_list:
+                    pls = ", ".join(f":day{i}" for i in range(len(day_list)))
+                    clauses.append(f"day_flag IN ({pls})")
+                    for i, d in enumerate(day_list):
+                        params2[f"day{i}"] = d
+                if type_list or var_list:
+                    t_range = type_list or s.TYPES_RANGE
+                    v_range = var_list  or s.VAR_RANGE
+                    hashes  = [
+                        _params_hash({"type": t, "var": v, "param": ""})
+                        for t in t_range for v in v_range
+                    ]
+                    pls = ", ".join(f":ph{i}" for i in range(len(hashes)))
+                    clauses.append(f"params_hash IN ({pls})")
+                    for i, h in enumerate(hashes):
+                        params2[f"ph{i}"] = h
+                where2 = " AND ".join(clauses)
+                async with s.engine_vlad.begin() as conn:
+                    res = await conn.execute(
+                        text(f"DELETE FROM vlad_backtest_results WHERE {where2}"), params2
+                    )
+                    deleted_backtest = res.rowcount
+            except Exception as e:
+                errors.append(f"backtest: {e}")
+                log(f"   clear_cache backtest error: {e}", s.NODE_NAME, level="error")
+
+        # ── Сбрасываем ML-кеш если чистим всё ────────────────────────────────
+        if not pair_list and not day_list and not dt_from and not dt_to \
+                and not type_list and not var_list:
+            s._ml_active_cache.clear()
+            if s.reverse_store:
+                s.reverse_store.clear_universe_cache()
+
+        log(
+            f" clear_cache: удалено {deleted_cache} записей кеша"
+            + (f", {deleted_backtest} backtest" if also_backtest else "")
+            + (f" | фильтры: pairs={pair_list or 'all'} days={day_list or 'all'}"
+               f" dates=[{dt_from or '*'} → {dt_to or '*'}]"
+               f" types={type_list or 'all'} vars={var_list or 'all'}" if any(
+                   [pair_list, day_list, dt_from, dt_to, type_list, var_list]) else " (полная очистка)"),
+            s.NODE_NAME, force=True,
+        )
+
+        payload: dict = {
+            "service_url":      s.service_url,
+            "cache_table":      s.cache_table,
+            "deleted_cache":    deleted_cache,
+            "deleted_backtest": deleted_backtest,
+            "fill_was_running": was_running,
+            "filters": {
+                "pairs":     pair_list  or "all",
+                "days":      day_list   or "all",
+                "date_from": dt_from.isoformat() if dt_from else None,
+                "date_to":   dt_to.isoformat()   if dt_to   else None,
+                "types":     type_list  or "all",
+                "vars":      var_list   or "all",
+            },
+        }
+        if errors:
+            payload["errors"] = errors
+        return ok_response(payload)
+
     @app.get("/reload")
     async def ep_reload():
         try:
