@@ -1207,7 +1207,13 @@ class ReverseStore:
 
         # ── Шаг 3: если universe уже загружен — проверяем precision ─────────
         # Используем уже собранные _seq_pre + _pre_codes, без повторного collect.
-        loaded = await self.load_universe(
+        #
+        # skip_db_writes=True (fill_cache режим): пропускаем load_universe полностью.
+        # В fill_cache нам важна скорость вычислений, а не переиспользование старого
+        # обучения из БД. _train_at_date_cache уже дедуплицирует повторную работу
+        # внутри сессии. Открывать DB-соединение при каждом из N параллельных вызовов
+        # asyncio.gather не нужно и приводит к исчерпанию пула соединений.
+        loaded = None if skip_db_writes else await self.load_universe(
             pair=pair,
             day_flag=day_flag,
             control_date=control_date,
