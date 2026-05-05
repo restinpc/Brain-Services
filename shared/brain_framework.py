@@ -1315,6 +1315,12 @@ def build_app(model_module) -> FastAPI:
         """
         Прогревает _ml_active_cache для всех экстремумов пары/таймфрейма.
         Возвращает количество прогретых записей.
+
+        ИСПРАВЛЕНИЕ: ext_dates вычисляются ВНУТРИ цикла по calc_var, т.к. каждый
+        интервал (3/5/7/9) даёт разный набор экстремумов. Предыдущая версия
+        вычисляла ext_dates один раз с interval=3 и использовала их для всех
+        calc_var — для var=5/7/9 кеш был бесполезен, каждый active_codes_at
+        запускал model() (~5ms), 50 вызовов × 5ms = 250ms на каждую свечу.
         """
         if s.batch_model_fn is None:
             return 0
@@ -1324,18 +1330,6 @@ def build_app(model_module) -> FastAPI:
         rows   = s.global_rates.get(tbl, [])
         if not rows or np_r is None:
             return 0
-
-        # Собираем даты экстремумов из np_rates (уже вычислены при загрузке).
-        ext_max = np_r.get("ext_max")
-        ext_min = np_r.get("ext_min")
-        ext_dates: list[datetime] = []
-        if ext_max is not None:
-            ext_dates += [rows[i]["date"] for i, v in enumerate(ext_max) if v]
-        if ext_min is not None:
-            ext_dates += [rows[i]["date"] for i, v in enumerate(ext_min) if v]
-        if not ext_dates:
-            return 0
-        ext_dates = sorted(set(ext_dates))
 
         dataset_index_dict = None
         if s.model_needs_index:
@@ -1350,38 +1344,71 @@ def build_app(model_module) -> FastAPI:
                 "dataset_timestamps": getattr(s, "_dataset_ts_arr", None),
             }
 
-        warmed = 0
+        # Группируем слоты по calc_var — один batch_model call на интервал
+        # (train_mode не влияет на набор дат экстремумов, только на обучение).
+        from itertools import groupby as _groupby
+        slots_by_var: dict[int, list[int]] = {}
         for calc_type, calc_var in type_var_slots:
+            slots_by_var.setdefault(calc_var, []).append(calc_type)
+
+        warmed = 0
+
+        for calc_var, calc_types in slots_by_var.items():
             if s.fill_cancel.is_set():
                 break
 
-            # Фильтруем только незакешированные экстремумы.
-            missing = [
-                d for d in ext_dates
-                if (pair_id, day_flag, int(d.timestamp()), calc_type, calc_var, "") \
-                   not in s._ml_active_cache
-            ]
-            if not missing:
+            # ── Получаем экстремумы ДЛЯ ДАННОГО ИНТЕРВАЛА через reverse_learning ──
+            # np_r["ext_max"] вычислен с interval≈3 (одна свеча слева/справа).
+            # Для calc_var=5/7/9 это неверный набор дат.
+            # _get_all_extremums кеширует результат: O(1) для повторных вызовов.
+            try:
+                all_ext, _ = rl._get_all_extremums(np_r, interval=calc_var)
+                ext_dates = [datetime.fromtimestamp(t) for t, _ in all_ext]
+            except Exception:
+                # Fallback: если rl недоступен — используем np_r["ext_max"] (interval≈3)
+                ext_max = np_r.get("ext_max")
+                ext_min = np_r.get("ext_min")
+                ext_dates_raw: list[datetime] = []
+                if ext_max is not None:
+                    ext_dates_raw += [rows[i]["date"] for i, v in enumerate(ext_max) if v]
+                if ext_min is not None:
+                    ext_dates_raw += [rows[i]["date"] for i, v in enumerate(ext_min) if v]
+                ext_dates = sorted(set(ext_dates_raw))
+
+            if not ext_dates:
                 continue
 
-            try:
-                # batch_model за один вызов — O(N) вместо O(N²).
-                batch_results = s.batch_model_fn(
-                    rates=rows,
-                    dataset=_filter_dataset_lte(missing[-1], s),
-                    dates=missing,
-                    type=calc_type, var=calc_var, param="",
-                    dataset_index=dataset_index_dict,
-                )
-                for ext_dt, result in batch_results.items():
-                    key = (pair_id, day_flag, int(ext_dt.timestamp()),
-                           calc_type, calc_var, "")
-                    s._ml_active_cache[key] = list(result.keys())
-                    warmed += 1
-            except Exception as _e:
-                log(f"   prewarm pair{pair_id}/{'d' if day_flag else 'h'} "
-                    f"t={calc_type} v={calc_var}: {_e}",
-                    s.NODE_NAME, level="warning")
+            # ── Для каждого train_mode прогреваем кеш ────────────────────────
+            for calc_type in calc_types:
+                if s.fill_cancel.is_set():
+                    break
+
+                missing = [
+                    d for d in ext_dates
+                    if (pair_id, day_flag, int(d.timestamp()), calc_type, calc_var, "")
+                       not in s._ml_active_cache
+                ]
+                if not missing:
+                    continue
+
+                try:
+                    # batch_model за один вызов — O(N) вместо O(N²).
+                    batch_results = s.batch_model_fn(
+                        rates=rows,
+                        dataset=_filter_dataset_lte(missing[-1], s),
+                        dates=missing,
+                        type=calc_type, var=calc_var, param="",
+                        dataset_index=dataset_index_dict,
+                    )
+                    for ext_dt, result in batch_results.items():
+                        key = (pair_id, day_flag, int(ext_dt.timestamp()),
+                               calc_type, calc_var, "")
+                        s._ml_active_cache[key] = list(result.keys())
+                        warmed += 1
+                except Exception as _e:
+                    log(f"   prewarm pair{pair_id}/{'d' if day_flag else 'h'} "
+                        f"t={calc_type} v={calc_var}: {_e}",
+                        s.NODE_NAME, level="warning")
 
         return warmed
 
