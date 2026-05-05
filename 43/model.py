@@ -34,6 +34,7 @@ model.py v2 — Output Strategy Microservice (improved)
 
 from __future__ import annotations
 
+import bisect
 import hashlib
 import json
 import math
@@ -924,3 +925,69 @@ def model(
     if last_value == 0.0:
         return {}
     return {"output": round(last_value, 4)}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# batch_model() — пакетный режим для fill_cache (O(N) вместо O(N²))
+# ══════════════════════════════════════════════════════════════════════════════
+
+def batch_model(
+    rates: list[dict],
+    dataset: list[dict],
+    dates: list[datetime],
+    *,
+    type: int = 0,
+    var: int = 0,
+    param: str = "",
+    dataset_index: dict | None = None,
+) -> dict[datetime, dict[str, float]]:
+    """
+    Пакетная версия model() для fill_cache.
+
+    Вычисляет полную траекторию ОДИН РАЗ по всему `rates`,
+    затем для каждой даты из `dates` читает значение по индексу.
+
+    Сложность: O(N) вместо O(N²) при последовательном вызове model()
+    на каждой свече — ключевое ускорение fill_cache.
+
+    Гарантия каузальности: все стратегии в _STRATEGY_FNS каузальны
+    (trajectory[i] зависит только от rates[0..i]), поэтому вычисление
+    по полному ряду эквивалентно вычислению по срезу.
+
+    Возвращает:
+        {date: {"output": X}}  — LONG/SHORT
+        {date: {}}             — FLAT
+    """
+    if not rates or not dates:
+        return {d: {} for d in dates}
+
+    calc_var = int(var or 0)
+    if calc_var not in VAR_RANGE:
+        return {d: {} for d in dates}
+
+    # Маркер по ВСЕЙ истории — попадаем в кэш при повторных вызовах.
+    last_dt = rates[-1].get("date")
+    last_ts = int(last_dt.timestamp()) if isinstance(last_dt, datetime) else 0
+    first_close = float(rates[0].get("close") or 0.0)
+    last_close = float(rates[-1].get("close") or 0.0)
+    fp = (round(first_close, 6), round(last_close, 6))
+    marker = (calc_var, len(rates), last_ts, _hash_param(param), fp)
+
+    # Одно вычисление траектории на весь ряд.
+    trajectory = _compute_trajectory(marker, rates, calc_var, param)
+    if trajectory.size == 0:
+        return {d: {} for d in dates}
+
+    # Индекс date → позиция в rates для быстрого bisect.
+    rate_dates = [r["date"] for r in rates]
+
+    results: dict[datetime, dict[str, float]] = {}
+    for target_date in dates:
+        idx = bisect.bisect_right(rate_dates, target_date) - 1
+        if idx < 0:
+            results[target_date] = {}
+            continue
+        val = float(trajectory[idx])
+        results[target_date] = {} if val == 0.0 else {"output": round(val, 4)}
+
+    return results
