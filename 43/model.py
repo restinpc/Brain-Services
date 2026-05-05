@@ -132,7 +132,7 @@ CACHE_DATE_FROM = os.getenv("CACHE_DATE_FROM", "2025-01-15")
 
 # Важно: True включает загрузку weights и ML-значений во фреймворке.
 # Без этого в логе будет ml=off, а weights/url_map могут остаться нулевыми.
-USE_ML_VALUES = os.getenv("USE_ML_VALUES", "1") == "1"
+USE_ML_VALUES = False  # вся логика стратегии внутри модели, reverse learning не нужен
 
 
 # ══════════════════════════════════════════════════════════════════════════════
