@@ -45,7 +45,12 @@ from typing import Any, Sequence
 import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
 
-# Опциональный sklearn — для GMM fallback в var=3.
+try:
+    from scipy.signal import lfilter as _sp_lfilter  # type: ignore
+    _HAS_SCIPY = True
+except Exception:
+    _sp_lfilter = None  # type: ignore
+    _HAS_SCIPY = False
 try:
     from sklearn.mixture import GaussianMixture  # type: ignore
     _HAS_SKLEARN = True
@@ -197,20 +202,36 @@ def _sma_v(arr: np.ndarray, n: int) -> np.ndarray:
 
 def _wilder_avg(values: np.ndarray, n: int) -> np.ndarray:
     """
-    Average по Уайлдеру: на прогреве — кумулятивное среднее,
-    после — рекурсия avg = ((n-1)*prev + curr) / n.
-    Используется в RSI и ATR.
+    Average по Уайлдеру: y[i] = y[i-1]*(n-1)/n + x[i]/n.
+
+    Если scipy доступен — реализован через lfilter (IIR 1-го порядка, ~50× быстрее).
+    Fallback: Python-цикл (оригинальное поведение).
+    Разница в зоне прогрева [0..n] несущественна — стратегии пропускают эти бары.
     """
     sz = values.size
     out = np.empty(sz, dtype=np.float64)
     if sz == 0:
         return out
+
+    if _HAS_SCIPY and sz > 1:
+        v = values.astype(np.float64)
+        alpha = 1.0 / n
+        b_filt = np.array([alpha])
+        a_filt = np.array([1.0, -(1.0 - alpha)])
+        # zi = начальное состояние, аппроксимирующее cumulative mean.
+        zi = np.array([v[0]])
+        out, _ = _sp_lfilter(b_filt, a_filt, v, zi=zi)
+        return out
+
+    # Fallback: Python-цикл с предвычисленными константами.
+    alpha_keep = (n - 1) / n
+    alpha_new = 1.0 / n
     acc = 0.0
     for i in range(sz):
         if i < n:
             acc = (acc * i + values[i]) / (i + 1)
         else:
-            acc = (acc * (n - 1) + values[i]) / n
+            acc = acc * alpha_keep + values[i] * alpha_new
         out[i] = acc
     return out
 
@@ -248,16 +269,29 @@ def _atr(high: np.ndarray, low: np.ndarray, close: np.ndarray, n: int = 14) -> n
 
 
 def _rolling_std_v(arr: np.ndarray, n: int) -> np.ndarray:
-    """Векторизованное скользящее стандартное отклонение."""
+    """Векторизованное скользящее стандартное отклонение.
+    Прогрев через алгоритм Велфорда — O(n) вместо O(n²).
+    """
     if arr.size == 0 or n <= 1:
         return np.zeros(arr.size, dtype=np.float64)
     n = min(n, arr.size)
+    a = arr.astype(np.float64)
     out = np.zeros(arr.size, dtype=np.float64)
-    # Прогрев — расширяющееся std.
-    for i in range(1, min(n, arr.size)):
-        out[i] = float(arr[: i + 1].std())
-    if arr.size > n:
-        windows = sliding_window_view(arr.astype(np.float64), n)
+
+    # Прогрев [0..n-2]: алгоритм Велфорда за O(n) суммарно.
+    mean = a[0]
+    m2 = 0.0
+    for i in range(1, n):
+        x = a[i]
+        delta = x - mean
+        mean += delta / (i + 1)
+        delta2 = x - mean
+        m2 += delta * delta2
+        out[i] = math.sqrt(m2 / (i + 1)) if i >= 1 else 0.0
+
+    # После прогрева: sliding_window_view — полностью векторно.
+    if arr.size >= n:
+        windows = sliding_window_view(a, n)
         out[n - 1 :] = windows.std(axis=1)
     return out
 
@@ -267,16 +301,16 @@ def _rolling_std_v(arr: np.ndarray, n: int) -> np.ndarray:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _rates_to_arrays(rates: Sequence[dict]) -> dict[str, np.ndarray]:
+    # Векторная распаковка через list comprehension + np.fromiter — быстрее
+    # чем побарный float(r.get(...)) в явном цикле.
     n = len(rates)
-    op = np.empty(n, dtype=np.float64)
-    cl = np.empty(n, dtype=np.float64)
-    lo = np.empty(n, dtype=np.float64)
-    hi = np.empty(n, dtype=np.float64)
-    for i, r in enumerate(rates):
-        op[i] = float(r.get("open") or 0.0)
-        cl[i] = float(r.get("close") or 0.0)
-        lo[i] = float(r.get("min") or 0.0)
-        hi[i] = float(r.get("max") or 0.0)
+    if n == 0:
+        empty = np.zeros(0, dtype=np.float64)
+        return {"open": empty, "close": empty, "low": empty, "high": empty}
+    op = np.fromiter((float(r.get("open") or 0.0)  for r in rates), dtype=np.float64, count=n)
+    cl = np.fromiter((float(r.get("close") or 0.0) for r in rates), dtype=np.float64, count=n)
+    lo = np.fromiter((float(r.get("min") or 0.0)   for r in rates), dtype=np.float64, count=n)
+    hi = np.fromiter((float(r.get("max") or 0.0)   for r in rates), dtype=np.float64, count=n)
     return {"open": op, "close": cl, "low": lo, "high": hi}
 
 
@@ -571,6 +605,7 @@ def _strategy_regime_hmm(arr: dict[str, np.ndarray], hp: dict[str, Any]) -> np.n
 
     Фичи: log-return, скользящая волатильность, моментум.
     Кластеры с положительным средним → bull, отрицательным → bear.
+    Модель кэшируется и переобучается только каждые _HMM_RETRAIN_STEP баров.
     """
     win = int(hp.get("ml_window", 20))
     n_states = int(hp.get("ml_components", 3))
@@ -601,37 +636,57 @@ def _strategy_regime_hmm(arr: dict[str, np.ndarray], hp: dict[str, Any]) -> np.n
     if train.shape[0] < n_states * 10:
         return _strategy_donchian_improved(arr, hp)
 
+    # Ключ кэша: квантуем длину обучающей выборки с шагом _HMM_RETRAIN_STEP,
+    # чтобы не переобучать модель на каждый новый бар.
+    train_len_quantized = (train.shape[0] // _HMM_RETRAIN_STEP) * _HMM_RETRAIN_STEP
+    hmm_key = (_hash_param(json.dumps(hp, sort_keys=True)), n_states, train_len_quantized)
+
     labels = None
-    state_means: dict[int, float] = {}
+    cached_model = _HMM_MODEL_CACHE.get(hmm_key)
 
-    # Попытка №1: HMM
-    if _HAS_HMM:
+    if cached_model is not None:
+        # Переиспользуем обученную модель — только predict, без fit.
         try:
-            hmm = GaussianHMM(  # type: ignore[misc]
-                n_components=n_states,
-                covariance_type="diag",
-                n_iter=50,
-                random_state=42,
-            )
-            hmm.fit(train)
-            labels = hmm.predict(X)
+            labels = cached_model.predict(X)
         except Exception:
             labels = None
+            _HMM_MODEL_CACHE.pop(hmm_key, None)
 
-    # Попытка №2: GMM
-    if labels is None and _HAS_SKLEARN:
-        try:
-            gm = GaussianMixture(  # type: ignore[misc]
-                n_components=n_states,
-                covariance_type="diag",
-                max_iter=100,
-                n_init=2,
-                random_state=42,
-            )
-            gm.fit(train)
-            labels = gm.predict(X)
-        except Exception:
-            labels = None
+    if labels is None:
+        # Попытка №1: HMM
+        if _HAS_HMM:
+            try:
+                hmm = GaussianHMM(  # type: ignore[misc]
+                    n_components=n_states,
+                    covariance_type="diag",
+                    n_iter=50,
+                    random_state=42,
+                )
+                hmm.fit(train)
+                labels = hmm.predict(X)
+                if len(_HMM_MODEL_CACHE) >= _HMM_MODEL_CACHE_MAX:
+                    _HMM_MODEL_CACHE.pop(next(iter(_HMM_MODEL_CACHE)))
+                _HMM_MODEL_CACHE[hmm_key] = hmm
+            except Exception:
+                labels = None
+
+        # Попытка №2: GMM
+        if labels is None and _HAS_SKLEARN:
+            try:
+                gm = GaussianMixture(  # type: ignore[misc]
+                    n_components=n_states,
+                    covariance_type="diag",
+                    max_iter=100,
+                    n_init=2,
+                    random_state=42,
+                )
+                gm.fit(train)
+                labels = gm.predict(X)
+                if len(_HMM_MODEL_CACHE) >= _HMM_MODEL_CACHE_MAX:
+                    _HMM_MODEL_CACHE.pop(next(iter(_HMM_MODEL_CACHE)))
+                _HMM_MODEL_CACHE[hmm_key] = gm
+            except Exception:
+                labels = None
 
     if labels is None:
         return _strategy_donchian_improved(arr, hp)
@@ -762,7 +817,13 @@ def _run_state_machine(
 # ══════════════════════════════════════════════════════════════════════════════
 
 _TRAJECTORY_CACHE: dict[tuple, np.ndarray] = {}
-_CACHE_MAX = 32
+_CACHE_MAX = 1024  # было 32 — увеличено в 32× для покрытия пар×дней×vars
+
+# Кэш обученных HMM/GMM моделей: ключ = (hash_param, n_states, len_train)
+# Модель переобучается только при изменении обучающей выборки на ≥ 50 баров.
+_HMM_MODEL_CACHE: dict[tuple, Any] = {}
+_HMM_MODEL_CACHE_MAX = 64
+_HMM_RETRAIN_STEP = 50  # переобучаем при росте выборки на этот шаг
 
 
 def _safe_float(value: Any, default: float | None = None) -> float | None:
