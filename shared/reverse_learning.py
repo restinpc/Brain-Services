@@ -618,6 +618,17 @@ async def train_at_date(
 # ──────────────────────────────────────────────────────────────────────────────
 
 class ReverseStore:
+    # Connection errors that warrant dispose + retry.
+    # "Packet sequence number wrong" happens when a fresh or stale connection
+    # gets a corrupt MySQL packet (server overload, proxy quirk, idle timeout).
+    _RETRYABLE = (
+        "Packet sequence",
+        "Lost connection",
+        "server has gone away",
+        "Can't connect",
+        "Connection refused",
+    )
+
     def __init__(self, engine, *, port: int):
         self.engine = engine
         self.port = int(port)
@@ -631,9 +642,36 @@ class ReverseStore:
         """Call at the start of fill_cache to start fresh."""
         self._universe_cache.clear()
 
+    def _is_retryable(self, exc: Exception) -> bool:
+        msg = str(exc)
+        return any(kw in msg for kw in self._RETRYABLE)
+
+    async def _run_with_retry(self, coro_fn, max_attempts: int = 3):
+        """
+        Запускает DB-корутину с retry + dispose на ошибках соединения.
+
+        'Packet sequence number wrong' возникает когда aiomysql получает
+        неожиданный пакет от MySQL при установке нового соединения (перегрузка
+        сервера, proxy, истекший idle-timeout). Dispose сбрасывает пул,
+        следующая попытка создаёт чистый сокет.
+        """
+        for attempt in range(max_attempts):
+            try:
+                return await coro_fn()
+            except Exception as exc:
+                if attempt < max_attempts - 1 and self._is_retryable(exc):
+                    try:
+                        await self.engine.dispose()
+                    except Exception:
+                        pass
+                    await asyncio.sleep(1.5 * (attempt + 1))
+                else:
+                    raise
+
     async def ensure_tables(self) -> None:
-        async with self.engine.begin() as conn:
-            await conn.execute(text(f"""
+        async def _do():
+            async with self.engine.begin() as conn:
+                await conn.execute(text(f"""
                 CREATE TABLE IF NOT EXISTS `{self.universe_table}` (
                     `id`                BIGINT       NOT NULL AUTO_INCREMENT,
                     `pair`              INT          NOT NULL,
@@ -696,6 +734,8 @@ class ReverseStore:
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """))
 
+        await self._run_with_retry(_do)
+
     async def load_universe(
         self,
         *,
@@ -709,23 +749,25 @@ class ReverseStore:
         if cache_key in self._universe_cache:
             return self._universe_cache[cache_key]
 
-        async with self.engine.connect() as conn:
-            res = await conn.execute(text(f"""
-                SELECT universe_json, precision_val
-                FROM `{self.universe_table}`
-                WHERE pair = :pair
-                  AND day_flag = :day
-                  AND control_date = :dt
-                  AND params_hash = :ph
-                LIMIT 1
-            """), {
-                "pair": pair,
-                "day": day_flag,
-                "dt": control_date,
-                "ph": params_hash,
-            })
+        params = {"pair": pair, "day": day_flag, "dt": control_date, "ph": params_hash}
 
-            row = res.mappings().first()
+        async def _fetch():
+            async with self.engine.connect() as conn:
+                res = await conn.execute(text(f"""
+                    SELECT universe_json, precision_val
+                    FROM `{self.universe_table}`
+                    WHERE pair = :pair
+                      AND day_flag = :day
+                      AND control_date = :dt
+                      AND params_hash = :ph
+                    LIMIT 1
+                """), params)
+                return res.mappings().first()
+
+        try:
+            row = await self._run_with_retry(_fetch)
+        except Exception:
+            return None
 
         if not row:
             self._universe_cache[cache_key] = None
