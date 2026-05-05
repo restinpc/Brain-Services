@@ -1001,6 +1001,22 @@ def build_app(model_module) -> FastAPI:
         s.NODE_NAME, force=True)
 
     s.engine_vlad, s.engine_brain, s.engine_super = build_engines()
+
+    # ── Patch connection pool settings ────────────────────────────────────────
+    # build_engines() в common.py создаёт движки без pool_pre_ping.
+    # Это приводит к "Packet sequence number wrong" при использовании
+    # протухших соединений из пула. Патчим pool._pre_ping напрямую
+    # (публичный API не позволяет менять это после создания движка).
+    for _eng in (s.engine_vlad, s.engine_brain, s.engine_super):
+        if _eng is None:
+            continue
+        try:
+            _pool = _eng.sync_engine.pool
+            _pool._pre_ping    = True   # проверять соединение перед выдачей из пула
+            _pool._recycle     = 1800   # принудительно пересоздавать каждые 30 мин
+        except Exception as _pe:
+            log(f"   pool patch: {_pe}", s.NODE_NAME, level="warning")
+
     s.reverse_store = rl.ReverseStore(s.engine_vlad, port=s.PORT)
 
     # ── _call_model ───────────────────────────────────────────────────────────
@@ -1374,13 +1390,6 @@ def build_app(model_module) -> FastAPI:
     async def _fill_worker(pairs, days, date_from_str, date_to_str, types, batch_size):
         s.fill_cancel.clear()
         s._fill_cache_active = True   # skip vlad_reverse_universe writes for speed
-        # Lift ML semaphore: during fill_cache skip_db_writes=True, so there are no
-        # DB writes inside maybe_retrain. Train-cache deduplication handles repeated
-        # work. Allow limited concurrent coroutines for asyncio.gather batches.
-        # Cap at 8: higher values exhaust the DB connection pool (pool_size=20,
-        # overflow=20) since each coroutine can open one connection in rare cases.
-        _orig_ml_semaphore   = s._ml_semaphore
-        s._ml_semaphore      = asyncio.Semaphore(8)
         # Clear ML universe cache so fill_cache starts fresh
         if s.reverse_store:
             s.reverse_store.clear_universe_cache()
@@ -1409,170 +1418,176 @@ def build_app(model_module) -> FastAPI:
         log(f" fill_cache: {len(pd_slots)} инструментов × "
             f"{len(type_var_slots)} type/var слотов", s.NODE_NAME, force=True)
 
-        for slot_idx, (pair_id, day_flag) in enumerate(pd_slots):
-            if s.fill_cancel.is_set():
-                break
-
-            tbl      = _rates_table(pair_id, day_flag)
-            all_rows = s.global_rates.get(tbl, [])
-            candles  = [r for r in all_rows
-                        if (dt_from is None or r["date"] >= dt_from)
-                        and (dt_to   is None or r["date"] <= dt_to)]
-            if not candles:
-                s.fill_status["slots_done"] = slot_idx + 1
-                log(f"  [pair{pair_id}/{'d' if day_flag else 'h'}] нет свечей, пропуск",
-                    s.NODE_NAME, force=True)
-                continue
-
-            np_rates_pd  = s.np_rates.get(tbl)
-            all_dates_pd = [r["date"] for r in all_rows]
-            instr_label  = f"pair{pair_id}/{'d' if day_flag else 'h'}"
-            log(f"  [{instr_label}] {len(candles)} свечей × "
-                f"{len(type_var_slots)} type/var слотов", s.NODE_NAME, force=True)
-
-            # ── Прогрев ML-кеша через batch_model ────────────────────────────
-            # Если модель имеет batch_model и USE_ML_VALUES=True — вычисляем
-            # активные коды для всех экстремумов одним вызовом.
-            # maybe_retrain() будет получать _active_codes_at из кеша (O(1))
-            # вместо пересчёта срезов rates на каждый экстремум.
-            if s.USE_ML_VALUES and s.batch_model_fn is not None:
-                warmed = await _prewarm_ml_active_cache(pair_id, day_flag, type_var_slots)
-                if warmed:
-                    log(f"  [{instr_label}] ML-кеш прогрет: {warmed} экстремумов",
-                        s.NODE_NAME, force=True)
-
-            for calc_type, var in type_var_slots:
+        try:
+            for slot_idx, (pair_id, day_flag) in enumerate(pd_slots):
                 if s.fill_cancel.is_set():
                     break
 
-                extra       = {"type": calc_type, "var": var, "param": ""}
-                p_hash      = _params_hash(extra)
-                params_json = _json.dumps(extra, ensure_ascii=False)
-                _tbl_c      = s.cache_table
+                tbl      = _rates_table(pair_id, day_flag)
+                all_rows = s.global_rates.get(tbl, [])
+                candles  = [r for r in all_rows
+                            if (dt_from is None or r["date"] >= dt_from)
+                            and (dt_to   is None or r["date"] <= dt_to)]
+                if not candles:
+                    s.fill_status["slots_done"] = slot_idx + 1
+                    log(f"  [pair{pair_id}/{'d' if day_flag else 'h'}] нет свечей, пропуск",
+                        s.NODE_NAME, force=True)
+                    continue
 
-                try:
-                    async with s.engine_vlad.connect() as conn:
-                        res = await conn.execute(text(f"""
-                            SELECT date_val FROM `{_tbl_c}`
-                            WHERE service_url=:url AND pair=:pair
-                              AND day_flag=:day AND params_hash=:ph
-                        """), {"url": s.service_url, "pair": pair_id,
-                               "day": day_flag, "ph": p_hash})
-                        cached = {r[0] for r in res.fetchall()}
-                except Exception:
-                    cached = set()
+                np_rates_pd  = s.np_rates.get(tbl)
+                all_dates_pd = [r["date"] for r in all_rows]
+                instr_label  = f"pair{pair_id}/{'d' if day_flag else 'h'}"
+                log(f"  [{instr_label}] {len(candles)} свечей × "
+                    f"{len(type_var_slots)} type/var слотов", s.NODE_NAME, force=True)
 
-                to_fetch  = [c for c in candles if c["date"] not in cached]
-                skipped  += len(candles) - len(to_fetch)
+                # ── Прогрев ML-кеша через batch_model ────────────────────────────
+                # Если модель имеет batch_model и USE_ML_VALUES=True — вычисляем
+                # активные коды для всех экстремумов одним вызовом.
+                # maybe_retrain() будет получать _active_codes_at из кеша (O(1))
+                # вместо пересчёта срезов rates на каждый экстремум.
+                if s.USE_ML_VALUES and s.batch_model_fn is not None:
+                    warmed = await _prewarm_ml_active_cache(pair_id, day_flag, type_var_slots)
+                    if warmed:
+                        log(f"  [{instr_label}] ML-кеш прогрет: {warmed} экстремумов",
+                            s.NODE_NAME, force=True)
 
-                for i in range(0, len(to_fetch), batch_size):
+                for calc_type, var in type_var_slots:
                     if s.fill_cancel.is_set():
                         break
-                    batch = to_fetch[i:i + batch_size]
 
-                    if s.USE_ML_VALUES:
-                        # Refresh rates once per batch, not per candle
-                        await _refresh_rates(_rates_table(pair_id, day_flag), s)
+                    extra       = {"type": calc_type, "var": var, "param": ""}
+                    p_hash      = _params_hash(extra)
+                    params_json = _json.dumps(extra, ensure_ascii=False)
+                    _tbl_c      = s.cache_table
 
-                        # PARALLEL GATHER: during fill_cache skip_db_writes=True,
-                        # _train_at_date_cache deduplicates work across concurrent calls.
-                        # Semaphore is lifted to batch_size above, so all coroutines
-                        # run concurrently instead of sequentially.
-                        _ml_coros = [
-                            _call_model(
-                                pair_id, day_flag,
-                                candle["date"].strftime("%Y-%m-%d %H:%M:%S"),
-                                calc_type=calc_type, calc_var=var, param="",
-                                _skip_refresh=True,
-                            )
-                            for candle in batch
-                        ]
-                        _ml_raw = await asyncio.gather(*_ml_coros, return_exceptions=True)
-                        results = [
-                            None if isinstance(r, BaseException) else r
-                            for r in _ml_raw
-                        ]
-                    elif s.batch_model_fn is not None:
-                        # ОПТИМИЗАЦИЯ: batch_model вычисляет траекторию ОДИН РАЗ
-                        # для всего ряда (O(N)), а не O(N²) через per-candle вызовы.
-                        dataset_index_dict_b = None
-                        if s.model_needs_index:
-                            dataset_index_dict_b = {
-                                "dates": s.dataset_dates,
-                                "by_key": s.dataset_by_key,
-                                "key_dates": s.dataset_key_dates,
-                                "key_field": s.dataset_key_field,
-                                "np_rates": np_rates_pd,
-                                "ctx_index": s.ctx_index,
-                                "url_map": s.url_map,
-                                "dataset_timestamps": getattr(s, "_dataset_ts_arr", None),
-                            }
-                        try:
-                            batch_dates = [c["date"] for c in batch]
-                            # Полный срез all_rows до последней целевой даты.
-                            max_batch_date = batch_dates[-1]
-                            idx_end = bisect.bisect_right(all_dates_pd, max_batch_date)
-                            rates_for_batch = all_rows[:idx_end]
-                            dataset_f_b = _filter_dataset_lte(max_batch_date, s)
+                    try:
+                        async with s.engine_vlad.connect() as conn:
+                            res = await conn.execute(text(f"""
+                                SELECT date_val FROM `{_tbl_c}`
+                                WHERE service_url=:url AND pair=:pair
+                                  AND day_flag=:day AND params_hash=:ph
+                            """), {"url": s.service_url, "pair": pair_id,
+                                   "day": day_flag, "ph": p_hash})
+                            cached = {r[0] for r in res.fetchall()}
+                    except Exception:
+                        cached = set()
 
-                            batch_map = s.batch_model_fn(
-                                rates=rates_for_batch,
-                                dataset=dataset_f_b,
-                                dates=batch_dates,
-                                type=calc_type, var=var, param="",
-                                dataset_index=dataset_index_dict_b,
-                            )
-                            results = [batch_map.get(c["date"]) for c in batch]
-                        except Exception as _e:
-                            import traceback as _tb
-                            log(f"   batch_model t={calc_type} v={var}: {_e}\n{_tb.format_exc()}",
-                                s.NODE_NAME, level="error", force=True)
-                            results = [None] * len(batch)
-                    else:
-                        # ПАТЧ 5: параллельные потоки внутри батча
-                        loop = asyncio.get_event_loop()
-                        futs = [
-                            loop.run_in_executor(
-                                _FILL_EXECUTOR,
-                                _sync_compute,
-                                candle, calc_type, var,
-                                all_rows, all_dates_pd, np_rates_pd, s
-                            )
-                            for candle in batch
-                        ]
-                        results = list(await asyncio.gather(*futs))
+                    to_fetch  = [c for c in candles if c["date"] not in cached]
+                    skipped  += len(candles) - len(to_fetch)
 
-                    insert_rows = []
-                    for candle, result in zip(batch, results):
-                        if result is None:
-                            errors += 1
-                            continue
-                        insert_rows.append({
-                            "url":  s.service_url, "pair": pair_id,
-                            "day":  day_flag,      "dv":   candle["date"],
-                            "ph":   p_hash,        "pj":   params_json,
-                            "rj":   _json.dumps({k: round(v, 6) for k, v in result.items()}, ensure_ascii=False),
-                        })
-                    if insert_rows:
-                        try:
-                            async with s.engine_vlad.begin() as conn:
-                                await conn.execute(text(f"""
-                                    INSERT IGNORE INTO `{_tbl_c}`
-                                        (service_url, pair, day_flag, date_val,
-                                         params_hash, params_json, result_json)
-                                    VALUES (:url, :pair, :day, :dv, :ph, :pj, :rj)
-                                """), insert_rows)
-                        except Exception as e:
-                            log(f"   bulk insert: {e}", s.NODE_NAME, level="warning")
-                    done += len(batch)
-                    s.fill_status.update({"done": done, "skipped": skipped, "errors": errors})
-                    log(f"  [{instr_label} t={calc_type}/v={var}] "
-                        f"{done}/{total} err={errors}", s.NODE_NAME, force=True)
+                    for i in range(0, len(to_fetch), batch_size):
+                        if s.fill_cancel.is_set():
+                            break
+                        batch = to_fetch[i:i + batch_size]
 
-            s.fill_status["slots_done"] = slot_idx + 1
+                        if s.USE_ML_VALUES:
+                            # Refresh rates once per batch, not per candle
+                            await _refresh_rates(_rates_table(pair_id, day_flag), s)
 
-        s._fill_cache_active = False  # restore normal mode
-        s._ml_semaphore      = _orig_ml_semaphore   # restore semaphore
+                            # Sequential: after caching optimisations (_seq_codes_cache,
+                            # _all_extremums_cache, _train_at_date_cache) maybe_retrain
+                            # is essentially zero-I/O. asyncio.gather would not give real
+                            # parallelism (single event loop) but WOULD cause concurrent
+                            # DB connection requests if any cache misses coincide.
+                            results = []
+                            for candle in batch:
+                                try:
+                                    result = await _call_model(
+                                        pair_id, day_flag,
+                                        candle["date"].strftime("%Y-%m-%d %H:%M:%S"),
+                                        calc_type=calc_type, calc_var=var, param="",
+                                        _skip_refresh=True)
+                                except Exception as _e:
+                                    import traceback as _tb
+                                    log(f"   ml-fill {candle['date']} t={calc_type} v={var}: {_e}\n{_tb.format_exc()}",
+                                        s.NODE_NAME, level="error", force=True)
+                                    result = None
+                                results.append(result)
+                        elif s.batch_model_fn is not None:
+                            # ОПТИМИЗАЦИЯ: batch_model вычисляет траекторию ОДИН РАЗ
+                            # для всего ряда (O(N)), а не O(N²) через per-candle вызовы.
+                            dataset_index_dict_b = None
+                            if s.model_needs_index:
+                                dataset_index_dict_b = {
+                                    "dates": s.dataset_dates,
+                                    "by_key": s.dataset_by_key,
+                                    "key_dates": s.dataset_key_dates,
+                                    "key_field": s.dataset_key_field,
+                                    "np_rates": np_rates_pd,
+                                    "ctx_index": s.ctx_index,
+                                    "url_map": s.url_map,
+                                    "dataset_timestamps": getattr(s, "_dataset_ts_arr", None),
+                                }
+                            try:
+                                batch_dates = [c["date"] for c in batch]
+                                # Полный срез all_rows до последней целевой даты.
+                                max_batch_date = batch_dates[-1]
+                                idx_end = bisect.bisect_right(all_dates_pd, max_batch_date)
+                                rates_for_batch = all_rows[:idx_end]
+                                dataset_f_b = _filter_dataset_lte(max_batch_date, s)
+
+                                batch_map = s.batch_model_fn(
+                                    rates=rates_for_batch,
+                                    dataset=dataset_f_b,
+                                    dates=batch_dates,
+                                    type=calc_type, var=var, param="",
+                                    dataset_index=dataset_index_dict_b,
+                                )
+                                results = [batch_map.get(c["date"]) for c in batch]
+                            except Exception as _e:
+                                import traceback as _tb
+                                log(f"   batch_model t={calc_type} v={var}: {_e}\n{_tb.format_exc()}",
+                                    s.NODE_NAME, level="error", force=True)
+                                results = [None] * len(batch)
+                        else:
+                            # ПАТЧ 5: параллельные потоки внутри батча
+                            loop = asyncio.get_event_loop()
+                            futs = [
+                                loop.run_in_executor(
+                                    _FILL_EXECUTOR,
+                                    _sync_compute,
+                                    candle, calc_type, var,
+                                    all_rows, all_dates_pd, np_rates_pd, s
+                                )
+                                for candle in batch
+                            ]
+                            results = list(await asyncio.gather(*futs))
+
+                        insert_rows = []
+                        for candle, result in zip(batch, results):
+                            if result is None:
+                                errors += 1
+                                continue
+                            insert_rows.append({
+                                "url":  s.service_url, "pair": pair_id,
+                                "day":  day_flag,      "dv":   candle["date"],
+                                "ph":   p_hash,        "pj":   params_json,
+                                "rj":   _json.dumps({k: round(v, 6) for k, v in result.items()}, ensure_ascii=False),
+                            })
+                        if insert_rows:
+                            try:
+                                async with s.engine_vlad.begin() as conn:
+                                    await conn.execute(text(f"""
+                                        INSERT IGNORE INTO `{_tbl_c}`
+                                            (service_url, pair, day_flag, date_val,
+                                             params_hash, params_json, result_json)
+                                        VALUES (:url, :pair, :day, :dv, :ph, :pj, :rj)
+                                    """), insert_rows)
+                            except Exception as e:
+                                log(f"   bulk insert: {e}", s.NODE_NAME, level="warning")
+                        done += len(batch)
+                        s.fill_status.update({"done": done, "skipped": skipped, "errors": errors})
+                        log(f"  [{instr_label} t={calc_type}/v={var}] "
+                            f"{done}/{total} err={errors}", s.NODE_NAME, force=True)
+
+                s.fill_status["slots_done"] = slot_idx + 1
+
+        finally:
+            # Guaranteed cleanup — runs even if an exception aborts the loop.
+            # Without this, _fill_cache_active stays True forever after a crash,
+            # causing all subsequent /values calls to also use skip_db_writes=True.
+            s._fill_cache_active = False
+
         state = "stopped" if s.fill_cancel.is_set() else "done"
         s.fill_status.update({"state": state, "finished_at": datetime.now().isoformat()})
         log(f" fill_cache {state}: done={done} skip={skipped} err={errors}",
