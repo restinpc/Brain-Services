@@ -1376,10 +1376,11 @@ def build_app(model_module) -> FastAPI:
         s._fill_cache_active = True   # skip vlad_reverse_universe writes for speed
         # Lift ML semaphore: during fill_cache skip_db_writes=True, so there are no
         # DB writes inside maybe_retrain. Train-cache deduplication handles repeated
-        # work. Allow batch_size concurrent coroutines so asyncio.gather on ML batch
-        # is actually parallel instead of bottlenecked on Semaphore(1).
+        # work. Allow limited concurrent coroutines for asyncio.gather batches.
+        # Cap at 8: higher values exhaust the DB connection pool (pool_size=20,
+        # overflow=20) since each coroutine can open one connection in rare cases.
         _orig_ml_semaphore   = s._ml_semaphore
-        s._ml_semaphore      = asyncio.Semaphore(max(4, batch_size))
+        s._ml_semaphore      = asyncio.Semaphore(8)
         # Clear ML universe cache so fill_cache starts fresh
         if s.reverse_store:
             s.reverse_store.clear_universe_cache()
