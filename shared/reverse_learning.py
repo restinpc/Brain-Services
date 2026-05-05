@@ -380,6 +380,7 @@ ActiveCodesProvider = Callable[[datetime], Awaitable[list[str]]]
 # -> (universe, precision, iters, ext_cnt)
 # Adjacent hourly candles almost always share identical extremum sets -> cache hit -> skip retrain
 _train_at_date_cache: dict = {}
+_TRAIN_CACHE_MAX = 4096  # увеличено с 2000: больше типов/vars/пар помещается без вытеснения
 
 
 async def train_at_date(
@@ -547,8 +548,8 @@ async def train_at_date(
 
     result = (universe, float(final_precision), int(iterations_total), len(records))
     _train_at_date_cache[cache_key] = result
-    # Keep cache bounded: drop oldest entries beyond 2000
-    if len(_train_at_date_cache) > 2000:
+    # Keep cache bounded
+    if len(_train_at_date_cache) > _TRAIN_CACHE_MAX:
         oldest = next(iter(_train_at_date_cache))
         del _train_at_date_cache[oldest]
     return (*result, False)   # False = computed fresh, not from cache
@@ -1090,9 +1091,12 @@ class ReverseStore:
         log_fn: Callable[[str], None] | None = None,
         skip_db_writes: bool = False,
     ) -> tuple[dict[str, float], float]:
-        # ── Fast pre-check: compute extremum seq+codes, check train cache ──────
-        # If hit: skip ALL DB operations (load, reserve, save, finish).
-        # Adjacent candles share identical extremum sets ~50% of the time.
+        # ── Шаг 1: собираем экстремумы и активные коды ОДИН РАЗ ─────────────
+        # Оригинал делал collect + active_codes_at до 3 раз:
+        #   1) здесь для pre-check кеша
+        #   2) в блоке проверки precision загруженного universe
+        #   3) внутри train_at_date → train_and_save
+        # Теперь всё делается один раз, результаты переиспользуются.
         _forward_pre = train_mode in (1, 3, 4)
         _seq_pre = (
             collect_extremums_forward(
@@ -1105,6 +1109,7 @@ class ReverseStore:
                 limit=extremum_limit, extremum_interval=extremum_interval,
             )
         )
+
         _pre_codes: list[list[str]] = []
         for _ext_date, _ in _seq_pre:
             try:
@@ -1113,22 +1118,23 @@ class ReverseStore:
                 _c = []
             _pre_codes.append(sorted(set(_c)))
 
-        _seq_tuple = tuple((int(d.timestamp()), s) for d, s in _seq_pre)
-        _codes_key  = tuple(tuple(c) for c in _pre_codes)
-        _train_cache_key = (
+        # ── Шаг 2: проверяем train-кеш (O(1) lookup) ────────────────────────
+        _seq_tuple       = tuple((int(d.timestamp()), s) for d, s in _seq_pre)
+        _codes_key        = tuple(tuple(c) for c in _pre_codes)
+        _train_cache_key  = (
             _seq_tuple, _codes_key, train_mode, max_iter,
             round(step, 6), round(target_precision, 6), active_tail, metric,
         )
         _cached_train = _train_at_date_cache.get(_train_cache_key)
         if _cached_train is not None:
             _univ_cached, _pr_cached, _, _ = _cached_train
-            # Populate universe cache so load_universe skips DB next time too
             self._universe_cache[(pair, day_flag, control_date, params_hash)] = (
                 _univ_cached, _pr_cached
             )
             return _univ_cached, _pr_cached
-        # ────────────────────────────────────────────────────────────────────────
 
+        # ── Шаг 3: если universe уже загружен — проверяем precision ─────────
+        # Используем уже собранные _seq_pre + _pre_codes, без повторного collect.
         loaded = await self.load_universe(
             pair=pair,
             day_flag=day_flag,
@@ -1138,59 +1144,27 @@ class ReverseStore:
 
         if loaded:
             universe, stored_pr = loaded
-
-            # Быстрая проверка актуальной precision на текущей control_date.
-            # Если упала ниже target, запускаем retrain.
-            forward = train_mode in (1, 3, 4)
-
-            if forward:
-                seq = collect_extremums_forward(
-                    np_simple_rates,
-                    control_date,
-                    limit=extremum_limit,
-                    extremum_interval=extremum_interval,
-                )
-            else:
-                seq = collect_extremums_back(
-                    np_simple_rates,
-                    control_date,
-                    limit=extremum_limit,
-                    extremum_interval=extremum_interval,
-                )
+            use_diff   = train_mode in (2, 3, 4)
+            strict_amp = train_mode == 4
 
             records: list[ExtremumRecord] = []
-
-            for idx, (ext_date, sign) in enumerate(seq):
-                try:
-                    codes = await active_codes_at(ext_date)
-                except Exception:
-                    codes = []
-
+            for idx, ((ext_date, sign), codes) in enumerate(zip(_seq_pre, _pre_codes)):
                 if not codes:
                     continue
-
-                # Для проверки уже сохранённого universe амплитуда не влияет
-                # на знак precision, но для一致ности с train_at_date считаем её.
-                if train_mode in (2, 3, 4):
-                    has_next = idx + 1 < len(seq)
-                    next_date = seq[idx + 1][0] if has_next else None
-                    if train_mode == 4 and not has_next:
+                if use_diff:
+                    has_next  = idx + 1 < len(_seq_pre)
+                    next_date = _seq_pre[idx + 1][0] if has_next else None
+                    if strict_amp and not has_next:
                         continue
                     amp = _diff_amp(np_simple_rates, ext_date, next_date)
                 else:
                     amp = 1.0
-
-                records.append(
-                    ExtremumRecord(
-                        date=ext_date,
-                        sign=sign,
-                        codes=sorted(set(codes)),
-                        base_amp=float(amp),
-                    )
-                )
+                records.append(ExtremumRecord(
+                    date=ext_date, sign=sign,
+                    codes=sorted(set(codes)), base_amp=float(amp),
+                ))
 
             current_pr = total_precision(universe, records, metric=metric)
-
             if current_pr >= target_precision:
                 return universe, current_pr
 
@@ -1201,13 +1175,29 @@ class ReverseStore:
                     f"target={target_precision:.4f}; retrain"
                 )
 
+        # ── Шаг 4: обучаем.
+        # Передаём pre-собранные коды через замыкание — train_at_date
+        # вызовет active_codes_at и получит результаты из кеша (O(1)).
+        _pre_codes_map: dict[int, list[str]] = {
+            int(ext_date.timestamp()): codes
+            for (ext_date, _), codes in zip(_seq_pre, _pre_codes)
+        }
+
+        async def _fast_active_codes_at(ext_dt: datetime) -> list[str]:
+            ts = int(ext_dt.timestamp())
+            pre = _pre_codes_map.get(ts)
+            if pre is not None:
+                return pre
+            # Fallback для дат вне _seq_pre (edge case).
+            return await active_codes_at(ext_dt)
+
         return await self.train_and_save(
             pair=pair,
             day_flag=day_flag,
             control_date=control_date,
             params_hash=params_hash,
             np_simple_rates=np_simple_rates,
-            active_codes_at=active_codes_at,
+            active_codes_at=_fast_active_codes_at,
             train_mode=train_mode,
             max_iter=max_iter,
             step=step,
