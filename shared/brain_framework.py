@@ -1508,28 +1508,93 @@ def build_app(model_module) -> FastAPI:
                         batch = to_fetch[i:i + batch_size]
 
                         if s.USE_ML_VALUES:
-                            # Refresh rates once per batch, not per candle
+                            # Refresh rates once per batch, not per candle.
                             await _refresh_rates(_rates_table(pair_id, day_flag), s)
 
-                            # Sequential: after caching optimisations (_seq_codes_cache,
-                            # _all_extremums_cache, _train_at_date_cache) maybe_retrain
-                            # is essentially zero-I/O. asyncio.gather would not give real
-                            # parallelism (single event loop) but WOULD cause concurrent
-                            # DB connection requests if any cache misses coincide.
-                            results = []
-                            for candle in batch:
-                                try:
-                                    result = await _call_model(
-                                        pair_id, day_flag,
-                                        candle["date"].strftime("%Y-%m-%d %H:%M:%S"),
-                                        calc_type=calc_type, calc_var=var, param="",
-                                        _skip_refresh=True)
-                                except Exception as _e:
-                                    import traceback as _tb
-                                    log(f"   ml-fill {candle['date']} t={calc_type} v={var}: {_e}\n{_tb.format_exc()}",
-                                        s.NODE_NAME, level="error", force=True)
-                                    result = None
-                                results.append(result)
+                            # OPT-ML-BATCH: соседние свечи обычно имеют один и тот же
+                            # набор последних N экстремумов. Для таких свечей результат
+                            # train_at_date() идентичен, поэтому считаем ML только один
+                            # раз на уникальный seq_tuple и размножаем universe по датам.
+                            results = [None] * len(batch)
+                            try:
+                                grouped: dict[tuple, list[int]] = {}
+                                _forward_ml = calc_type in (1, 3, 4)
+                                for _idx, candle in enumerate(batch):
+                                    _dt = candle["date"]
+                                    _seq = (
+                                        rl.collect_extremums_forward(
+                                            np_rates_pd or s.np_simple_rates,
+                                            _dt,
+                                            limit=s.ML_EXTREMUM_LIMIT,
+                                            extremum_interval=var,
+                                        )
+                                        if _forward_ml else
+                                        rl.collect_extremums_back(
+                                            np_rates_pd or s.np_simple_rates,
+                                            _dt,
+                                            limit=s.ML_EXTREMUM_LIMIT,
+                                            extremum_interval=var,
+                                        )
+                                    )
+                                    _key = tuple((int(d.timestamp()), sign) for d, sign in _seq)
+                                    grouped.setdefault(_key, []).append(_idx)
+
+                                if len(grouped) < len(batch):
+                                    log(
+                                        f"  [{instr_label} t={calc_type}/v={var}] "
+                                        f"ML groups: {len(batch)} candles -> {len(grouped)} seq",
+                                        s.NODE_NAME, force=True,
+                                    )
+
+                                for _indices in grouped.values():
+                                    if s.fill_cancel.is_set():
+                                        break
+                                    _rep = batch[_indices[0]]
+                                    try:
+                                        _result = await _call_model(
+                                            pair_id, day_flag,
+                                            _rep["date"].strftime("%Y-%m-%d %H:%M:%S"),
+                                            calc_type=calc_type, calc_var=var, param="",
+                                            _skip_refresh=True,
+                                        )
+                                    except Exception as _e:
+                                        import traceback as _tb
+                                        log(
+                                            f"   ml-fill {_rep['date']} t={calc_type} v={var}: "
+                                            f"{_e}\n{_tb.format_exc()}",
+                                            s.NODE_NAME, level="error", force=True,
+                                        )
+                                        _result = None
+
+                                    for _idx in _indices:
+                                        results[_idx] = _result
+                            except Exception as _e:
+                                # Safety fallback: if grouping fails for any unexpected
+                                # edge case, preserve old per-candle behavior.
+                                import traceback as _tb
+                                log(
+                                    f"   ml-group-fill fallback t={calc_type} v={var}: "
+                                    f"{_e}\n{_tb.format_exc()}",
+                                    s.NODE_NAME, level="warning", force=True,
+                                )
+                                results = []
+                                for candle in batch:
+                                    try:
+                                        result = await _call_model(
+                                            pair_id, day_flag,
+                                            candle["date"].strftime("%Y-%m-%d %H:%M:%S"),
+                                            calc_type=calc_type, calc_var=var, param="",
+                                            _skip_refresh=True,
+                                        )
+                                    except Exception as _e2:
+                                        import traceback as _tb2
+                                        log(
+                                            f"   ml-fill {candle['date']} t={calc_type} v={var}: "
+                                            f"{_e2}\n{_tb2.format_exc()}",
+                                            s.NODE_NAME, level="error", force=True,
+                                        )
+                                        result = None
+                                    results.append(result)
                         elif s.batch_model_fn is not None:
                             # ОПТИМИЗАЦИЯ: batch_model вычисляет траекторию ОДИН РАЗ
                             # для всего ряда (O(N)), а не O(N²) через per-candle вызовы.
