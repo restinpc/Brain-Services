@@ -45,6 +45,7 @@ from __future__ import annotations
 import asyncio
 import bisect
 import json as _json
+import os
 import random
 from dataclasses import dataclass
 from datetime import datetime
@@ -52,6 +53,16 @@ from typing import Awaitable, Callable, Literal
 
 import numpy as np
 from sqlalchemy import text
+
+try:
+    from numba import njit as _njit
+except Exception:  # pragma: no cover - numba is optional in production
+    _njit = None
+
+_NUMBA_ENABLED = (
+    _njit is not None
+    and os.getenv("RL_USE_NUMBA", "1").strip().lower() not in {"0", "false", "no", "off"}
+)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -189,6 +200,410 @@ def rebalance_weights(
             break
 
     return best, best_pr, iters
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Fast path: NumPy/Numba precision + rebalance over dense arrays
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Старые Python-реализации оставляем как эталон и fallback.
+_total_precision_py = total_precision
+_rebalance_weights_py = rebalance_weights
+
+
+def _metric_id(metric: str) -> int:
+    if metric == "min":
+        return 1
+    if metric == "weighted":
+        return 2
+    return 0
+
+
+def _build_csr(records: list[ExtremumRecord], code_to_idx: dict[str, int]):
+    """CSR-представление records: offsets + flat indices.
+
+    Важно: code_to_idx строится в порядке вставки старого dict-universe.
+    Поэтому обход rec.codes сохраняет старую семантику и порядок суммирования.
+    """
+    offsets = np.empty(len(records) + 1, dtype=np.int32)
+    signs = np.empty(len(records), dtype=np.int8)
+    base_amps = np.empty(len(records), dtype=np.float64)
+    flat: list[int] = []
+    offsets[0] = 0
+    for i, r in enumerate(records):
+        signs[i] = int(r.sign)
+        base_amps[i] = float(r.base_amp)
+        for c in r.codes:
+            flat.append(code_to_idx.get(c, -1))
+        offsets[i + 1] = len(flat)
+    return offsets, np.asarray(flat, dtype=np.int32), signs, base_amps
+
+
+if _NUMBA_ENABLED:
+    @_njit(cache=True)
+    def _precision_one_jit(weights_arr, rec_indices, start, end, sign):
+        s_signed = 0.0
+        s_abs = 0.0
+        for p in range(start, end):
+            idx = rec_indices[p]
+            if idx < 0:
+                continue
+            w = weights_arr[idx]
+            s_signed += w
+            s_abs += abs(w)
+        if s_abs <= 1e-12:
+            return 0.0
+        return (s_signed * sign) / s_abs
+
+    @_njit(cache=True)
+    def _total_precision_jit(weights_arr, offsets, rec_indices, signs, recency_weights,
+                             start_rec, rec_count, metric_id):
+        if rec_count <= 0:
+            return 1.0
+
+        if metric_id == 1:  # min
+            best = 1.0e308
+            for j in range(rec_count):
+                r = start_rec + j
+                pr = _precision_one_jit(
+                    weights_arr, rec_indices, offsets[r], offsets[r + 1], signs[r]
+                )
+                if pr < best:
+                    best = pr
+            return best
+
+        if metric_id == 2:  # weighted
+            s = 0.0
+            sw = 0.0
+            for j in range(rec_count):
+                r = start_rec + j
+                w = recency_weights[j]
+                s += _precision_one_jit(
+                    weights_arr, rec_indices, offsets[r], offsets[r + 1], signs[r]
+                ) * w
+                sw += w
+            return s / sw if sw > 0.0 else 0.0
+
+        s = 0.0
+        for j in range(rec_count):
+            r = start_rec + j
+            s += _precision_one_jit(
+                weights_arr, rec_indices, offsets[r], offsets[r + 1], signs[r]
+            )
+        return s / rec_count
+
+    @_njit(cache=True)
+    def _mark_bad_jit(weights_arr, offsets, rec_indices, signs,
+                      start_rec, rec_count, target, bad_flags):
+        any_bad = False
+        for j in range(rec_count):
+            r = start_rec + j
+            pr = _precision_one_jit(
+                weights_arr, rec_indices, offsets[r], offsets[r + 1], signs[r]
+            )
+            bad = pr < target
+            bad_flags[j] = bad
+            if bad:
+                any_bad = True
+        return any_bad
+
+    @_njit(cache=True)
+    def _directed_update_jit(weights_arr, offsets, rec_indices, signs, base_amps,
+                             start_rec, rec_count, step, bad_flags):
+        for j in range(rec_count):
+            if not bad_flags[j]:
+                continue
+            r = start_rec + j
+            tgt_sign = signs[r]
+            base_amp = base_amps[r]
+            for p in range(offsets[r], offsets[r + 1]):
+                idx = rec_indices[p]
+                if idx < 0:
+                    continue
+                w = weights_arr[idx]
+                if w == 0.0:
+                    weights_arr[idx] = tgt_sign * 0.01 * base_amp
+                    continue
+                same = (w > 0.0 and tgt_sign > 0) or (w < 0.0 and tgt_sign < 0)
+                if same:
+                    nw = w * (1.0 + step)
+                else:
+                    nw = w * (1.0 - step)
+                if abs(nw) < 1e-9:
+                    nw = tgt_sign * 0.01 * base_amp
+                weights_arr[idx] = nw
+
+    @_njit(cache=True)
+    def _noise_update_prefix_jit(weights_arr, active_count, noise_arr):
+        for i in range(active_count):
+            w = weights_arr[i]
+            amp = abs(w) if abs(w) > 1e-9 else 0.01
+            weights_arr[i] = w + noise_arr[i] * amp
+else:
+    _precision_one_jit = None
+    _total_precision_jit = None
+    _mark_bad_jit = None
+    _directed_update_jit = None
+    _noise_update_prefix_jit = None
+
+
+def _recency_weights(count: int, recency_decay: float = 0.92) -> np.ndarray:
+    return np.asarray([recency_decay ** i for i in range(count)], dtype=np.float64)
+
+
+def total_precision_fast(
+    weights: dict[str, float],
+    records: list[ExtremumRecord],
+    *,
+    metric: PrecisionMetric = "mean",
+    recency_decay: float = 0.92,
+) -> float:
+    """Drop-in replacement for total_precision().
+
+    Для numba-path строит плотный массив весов и CSR records. Если Numba не доступна,
+    автоматически используется исходная Python-реализация.
+    """
+    if not records:
+        return 1.0
+    if not _NUMBA_ENABLED:
+        return _total_precision_py(weights, records, metric=metric, recency_decay=recency_decay)
+
+    code_order = list(weights.keys())
+    code_to_idx = {c: i for i, c in enumerate(code_order)}
+    weights_arr = np.asarray([float(weights[c]) for c in code_order], dtype=np.float64)
+    offsets, rec_indices, signs, _base_amps = _build_csr(records, code_to_idx)
+    return float(_total_precision_jit(
+        weights_arr, offsets, rec_indices, signs,
+        _recency_weights(len(records), recency_decay),
+        0, len(records), _metric_id(metric),
+    ))
+
+
+def _rebalance_prefix_fast(
+    cur_arr: np.ndarray,
+    active_count: int,
+    offsets: np.ndarray,
+    rec_indices: np.ndarray,
+    signs: np.ndarray,
+    base_amps: np.ndarray,
+    rec_count: int,
+    *,
+    max_iter: int,
+    step: float,
+    target: float,
+    active_tail: int,
+    metric: PrecisionMetric,
+    rng,
+) -> tuple[np.ndarray, float, int]:
+    """JIT-перевешивание prefix-universe.
+
+    active_count нужен для точного совпадения со старым dict: шум применяется только
+    к уже вставленным ключам, а не ко всем кодам будущих экстремумов.
+    """
+    work_len = active_tail if active_tail and active_tail > 0 and active_tail < rec_count else rec_count
+    if work_len <= 0:
+        return cur_arr[:active_count].copy(), 1.0, 0
+
+    start_rec = rec_count - work_len
+    metric_id = _metric_id(metric)
+    recency_weights = _recency_weights(work_len)
+    bad_flags = np.zeros(work_len, dtype=np.bool_)
+
+    best_pr = float(_total_precision_jit(
+        cur_arr, offsets, rec_indices, signs, recency_weights,
+        start_rec, work_len, metric_id,
+    ))
+    best_arr = cur_arr[:active_count].copy()
+    if best_pr >= target:
+        return best_arr, best_pr, 0
+
+    iters = 0
+    for cycle in range(max_iter):
+        iters = cycle + 1
+        if cycle % 2 == 0:
+            any_bad = bool(_mark_bad_jit(
+                cur_arr, offsets, rec_indices, signs,
+                start_rec, work_len, target, bad_flags,
+            ))
+            if not any_bad:
+                break
+            _directed_update_jit(
+                cur_arr, offsets, rec_indices, signs, base_amps,
+                start_rec, work_len, step, bad_flags,
+            )
+        else:
+            # ВАЖНО: сохраняем точный порядок и число random.uniform(), как в старом
+            # for c, w in list(cur.items()). Нельзя заменять на np.random/numba RNG.
+            noise = np.asarray(
+                [rng.uniform(-step / 2, step / 2) for _ in range(active_count)],
+                dtype=np.float64,
+            )
+            _noise_update_prefix_jit(cur_arr, active_count, noise)
+
+        pr = float(_total_precision_jit(
+            cur_arr, offsets, rec_indices, signs, recency_weights,
+            start_rec, work_len, metric_id,
+        ))
+        if pr > best_pr:
+            best_pr = pr
+            best_arr = cur_arr[:active_count].copy()
+        if best_pr >= target:
+            break
+
+    return best_arr, best_pr, iters
+
+
+def rebalance_weights_fast(
+    weights: dict[str, float],
+    records: list[ExtremumRecord],
+    *,
+    max_iter: int = 20,
+    step: float = 0.10,
+    target: float = 0.95,
+    active_tail: int = 0,
+    metric: PrecisionMetric = "mean",
+    rng_seed: int | None = None,
+) -> tuple[dict[str, float], float, int]:
+    """Drop-in replacement for rebalance_weights()."""
+    if not _NUMBA_ENABLED:
+        return _rebalance_weights_py(
+            weights, records,
+            max_iter=max_iter, step=step, target=target,
+            active_tail=active_tail, metric=metric, rng_seed=rng_seed,
+        )
+
+    work_len = active_tail if active_tail and active_tail > 0 and active_tail < len(records) else len(records)
+    if work_len <= 0:
+        return dict(weights), 1.0, 0
+
+    code_order = list(weights.keys())
+    code_to_idx = {c: i for i, c in enumerate(code_order)}
+    cur_arr = np.asarray([float(weights[c]) for c in code_order], dtype=np.float64)
+    offsets, rec_indices, signs, base_amps = _build_csr(records, code_to_idx)
+    rng = random.Random(rng_seed) if rng_seed is not None else random
+
+    best_arr, best_pr, iters = _rebalance_prefix_fast(
+        cur_arr, len(code_order), offsets, rec_indices, signs, base_amps, len(records),
+        max_iter=max_iter, step=step, target=target,
+        active_tail=active_tail, metric=metric, rng=rng,
+    )
+    return {c: float(best_arr[i]) for i, c in enumerate(code_order)}, best_pr, iters
+
+
+def _train_records_numba_exact(
+    records: list[ExtremumRecord],
+    *,
+    max_iter: int,
+    step: float,
+    target_precision: float,
+    active_tail: int,
+    metric: PrecisionMetric,
+) -> tuple[dict[str, float], float, int, int]:
+    """Fast implementation of the train loop over already-built records.
+
+    Результат должен совпадать со старым dict-алгоритмом при одинаковом состоянии
+    random: порядок вставки ключей и порядок шумовых random.uniform() сохранён.
+    """
+    if not _NUMBA_ENABLED:
+        # Python fallback: тот же код, что был в train_at_date.
+        universe: dict[str, float] = {}
+        all_seen: set[str] = set()
+        iterations_total = 0
+        for rec_idx, rec in enumerate(records):
+            rec_set = set(rec.codes)
+            overlap = bool(rec_set & all_seen)
+            if not overlap:
+                for c in rec.codes:
+                    if c not in universe:
+                        universe[c] = rec.sign * rec.base_amp
+                all_seen |= rec_set
+                continue
+            for c in rec.codes:
+                if c not in universe:
+                    universe[c] = rec.sign * rec.base_amp
+            all_seen |= rec_set
+            universe, _pr, iters = _rebalance_weights_py(
+                universe, records[:rec_idx + 1],
+                max_iter=max_iter, step=step, target=target_precision,
+                active_tail=active_tail, metric=metric,
+            )
+            iterations_total += iters
+        final_precision = _total_precision_py(universe, records, metric=metric)
+        if final_precision < target_precision:
+            universe, final_precision, iters = _rebalance_weights_py(
+                universe, records,
+                max_iter=max_iter, step=step, target=target_precision,
+                active_tail=active_tail, metric=metric,
+            )
+            iterations_total += iters
+        universe = {k: float(v) for k, v in universe.items() if abs(float(v)) > 1e-12}
+        return universe, float(final_precision), int(iterations_total), len(records)
+
+    # 1) Строим глобальный code_order ровно в порядке появления в старом dict.
+    code_to_idx: dict[str, int] = {}
+    code_order: list[str] = []
+    new_indices_by_rec: list[list[int]] = []
+    overlap_by_rec: list[bool] = []
+    seen: set[str] = set()
+
+    for rec in records:
+        rec_set = set(rec.codes)
+        overlap_by_rec.append(bool(rec_set & seen))
+        new_idxs: list[int] = []
+        for c in rec.codes:
+            if c not in code_to_idx:
+                code_to_idx[c] = len(code_order)
+                code_order.append(c)
+                new_idxs.append(code_to_idx[c])
+        new_indices_by_rec.append(new_idxs)
+        seen |= rec_set
+
+    offsets, rec_indices, signs, base_amps = _build_csr(records, code_to_idx)
+    cur_arr = np.zeros(len(code_order), dtype=np.float64)
+    active_count = 0
+    iterations_total = 0
+
+    for rec_idx, rec in enumerate(records):
+        for idx in new_indices_by_rec[rec_idx]:
+            cur_arr[idx] = rec.sign * rec.base_amp
+        active_count += len(new_indices_by_rec[rec_idx])
+
+        if not overlap_by_rec[rec_idx]:
+            continue
+
+        best_arr, _pr, iters = _rebalance_prefix_fast(
+            cur_arr, active_count, offsets, rec_indices, signs, base_amps, rec_idx + 1,
+            max_iter=max_iter, step=step, target=target_precision,
+            active_tail=active_tail, metric=metric, rng=random,
+        )
+        cur_arr[:active_count] = best_arr
+        iterations_total += iters
+
+    final_precision = float(_total_precision_jit(
+        cur_arr, offsets, rec_indices, signs, _recency_weights(len(records)),
+        0, len(records), _metric_id(metric),
+    ))
+
+    if final_precision < target_precision:
+        best_arr, final_precision, iters = _rebalance_prefix_fast(
+            cur_arr, active_count, offsets, rec_indices, signs, base_amps, len(records),
+            max_iter=max_iter, step=step, target=target_precision,
+            active_tail=active_tail, metric=metric, rng=random,
+        )
+        cur_arr[:active_count] = best_arr
+        iterations_total += iters
+
+    universe = {
+        code_order[i]: float(cur_arr[i])
+        for i in range(active_count)
+        if abs(float(cur_arr[i])) > 1e-12
+    }
+    return universe, float(final_precision), int(iterations_total), len(records)
+
+
+# Публичные имена теперь указывают на быстрые drop-in функции.
+total_precision = total_precision_fast
+rebalance_weights = rebalance_weights_fast
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -548,63 +963,18 @@ async def train_at_date(
     if not records:
         return {}, 1.0, 0, 0
 
-    universe: dict[str, float] = {}
-    all_seen: set[str] = set()
-    iterations_total = 0
+    # Fast path: NumPy/Numba-перевешивание по CSR-представлению records.
+    # При RL_USE_NUMBA=0 или отсутствии numba автоматически сработает Python fallback.
+    universe, final_precision, iterations_total, ext_count = _train_records_numba_exact(
+        records,
+        max_iter=max_iter,
+        step=step,
+        target_precision=target_precision,
+        active_tail=active_tail,
+        metric=metric,
+    )
 
-    for rec_idx, rec in enumerate(records):
-        rec_set = set(rec.codes)
-        overlap = bool(rec_set & all_seen)
-
-        if not overlap:
-            # Новое непересекающееся подмножество.
-            for c in rec.codes:
-                if c not in universe:
-                    universe[c] = rec.sign * rec.base_amp
-            all_seen |= rec_set
-            continue
-
-        # Пересечение с уже обученным множеством.
-        # Сначала добавляем отсутствующие веса с базовым знаком.
-        for c in rec.codes:
-            if c not in universe:
-                universe[c] = rec.sign * rec.base_amp
-
-        all_seen |= rec_set
-
-        universe, _pr, iters = rebalance_weights(
-            universe,
-            records[:rec_idx + 1],
-            max_iter=max_iter,
-            step=step,
-            target=target_precision,
-            active_tail=active_tail,
-            metric=metric,
-        )
-        iterations_total += iters
-
-    final_precision = total_precision(universe, records, metric=metric)
-
-    if final_precision < target_precision:
-        universe, final_precision, iters = rebalance_weights(
-            universe,
-            records,
-            max_iter=max_iter,
-            step=step,
-            target=target_precision,
-            active_tail=active_tail,
-            metric=metric,
-        )
-        iterations_total += iters
-
-    # Отбрасываем численный мусор.
-    universe = {
-        k: float(v)
-        for k, v in universe.items()
-        if abs(float(v)) > 1e-12
-    }
-
-    result = (universe, float(final_precision), int(iterations_total), len(records))
+    result = (universe, float(final_precision), int(iterations_total), int(ext_count))
     _train_at_date_cache[cache_key] = result
     # Keep cache bounded
     if len(_train_at_date_cache) > _TRAIN_CACHE_MAX:
