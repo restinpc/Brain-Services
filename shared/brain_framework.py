@@ -1131,14 +1131,22 @@ def build_app(model_module) -> FastAPI:
 
         try:
             await ensure_cache_table(s.engine_vlad, s.cache_table)
-            if s.USE_ML_VALUES:
+        except Exception as e:
+            log(f"   cache table: {e}", s.NODE_NAME, level="error")
+
+        if s.USE_ML_VALUES:
+            try:
                 await s.reverse_store.ensure_tables()
                 s._ml_active_cache.clear()
+            except Exception as e:
+                log(f"   reverse tables: {e}", s.NODE_NAME, level="error")
+
+        try:
             async with s.engine_vlad.begin() as conn:
                 await conn.execute(text(_DDL_BT_RESULTS))
                 await conn.execute(text(_DDL_BT_SUMMARY))
         except Exception as e:
-            log(f"   tables: {e}", s.NODE_NAME, level="error")
+            log(f"   bt tables: {e}", s.NODE_NAME, level="error")
 
         s.last_reload = datetime.now()
         log(f" RELOAD DONE: rates={len(s.simple_rates)} "
