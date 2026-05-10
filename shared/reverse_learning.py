@@ -1007,7 +1007,6 @@ class ReverseStore:
         # In-memory cache: (pair, day_flag, control_date, params_hash) -> (universe, precision)
         # Eliminates repeated DB round-trips for the same key during fill_cache
         self._universe_cache: dict = {}
-        self._tables_ensured: bool = False
 
         # Separate read-only engine with NullPool for load_universe.
         #
@@ -1059,13 +1058,6 @@ class ReverseStore:
                     await asyncio.sleep(1.5 * (attempt + 1))
                 else:
                     raise
-
-    async def _ensure_tables_once(self) -> None:
-        """Lazy one-time table creation — гарантирует что таблицы существуют
-        перед первым обращением, независимо от того отработал ли _preload."""
-        if not self._tables_ensured:
-            await self.ensure_tables()
-            self._tables_ensured = True
 
     async def ensure_tables(self) -> None:
         async def _do():
@@ -1282,6 +1274,7 @@ class ReverseStore:
         Семафор: True если мы создали/заняли job.
         False если такой job уже существует.
         """
+        await self.ensure_tables()
         async with self.engine.begin() as conn:
             res = await conn.execute(text(f"""
                 INSERT IGNORE INTO `{self.jobs_table}` (
@@ -1597,7 +1590,6 @@ class ReverseStore:
         skip_db_writes: bool = False,
         model_tag: str = "",
     ) -> tuple[dict[str, float], float]:
-        await self._ensure_tables_once()
         # ── Шаг 1: собираем экстремумы и активные коды ОДИН РАЗ ─────────────
         # Оригинал делал collect + active_codes_at до 3 раз:
         #   1) здесь для pre-check кеша
