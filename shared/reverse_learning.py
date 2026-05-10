@@ -1091,39 +1091,39 @@ class ReverseStore:
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """))
 
-            await conn.execute(text(f"""
-                CREATE TABLE IF NOT EXISTS `{self.jobs_table}` (
-                    `id`                  BIGINT       NOT NULL AUTO_INCREMENT,
-                    `pair`                INT          NOT NULL,
-                    `day_flag`            TINYINT      NOT NULL DEFAULT 0,
-                    `control_date`        DATETIME     NOT NULL,
-                    `params_hash`         CHAR(32)     NOT NULL,
-                    `state`               VARCHAR(16)  NOT NULL DEFAULT 'queued',
-                    `triggered_by`        VARCHAR(32)  NOT NULL DEFAULT 'unknown',
-                    `error_msg`           TEXT         NULL,
-                    `precision_before`    DOUBLE       NULL,
-                    `precision_after`     DOUBLE       NULL,
-                    `iterations`          INT          NOT NULL DEFAULT 0,
-                    `universe_size`       INT          NOT NULL DEFAULT 0,
-                    `prev_universe_size`  INT          NOT NULL DEFAULT 0,
-                    `extremum_count`      INT          NOT NULL DEFAULT 0,
-                    `history_window`      INT          NOT NULL DEFAULT 0,
-                    `active_tail`         INT          NOT NULL DEFAULT 0,
-                    `precision_metric`    VARCHAR(16)  NOT NULL DEFAULT 'mean',
-                    `init_mode`           VARCHAR(32)  NOT NULL DEFAULT 'mode0',
-                    `step_size`           DOUBLE       NOT NULL DEFAULT 0.10,
-                    `target_precision`    DOUBLE       NOT NULL DEFAULT 0.95,
-                    `created_at`          TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
-                    `updated_at`          TIMESTAMP    DEFAULT CURRENT_TIMESTAMP
-                                                     ON UPDATE CURRENT_TIMESTAMP,
-                    PRIMARY KEY (`id`),
-                    UNIQUE KEY `uk_reverse_job`
-                        (`pair`, `day_flag`, `control_date`, `params_hash`),
-                    KEY `idx_state` (`state`),
-                    KEY `idx_pair_day_date`
-                        (`pair`, `day_flag`, `control_date`)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-            """))
+                await conn.execute(text(f"""
+                    CREATE TABLE IF NOT EXISTS `{self.jobs_table}` (
+                        `id`                  BIGINT       NOT NULL AUTO_INCREMENT,
+                        `pair`                INT          NOT NULL,
+                        `day_flag`            TINYINT      NOT NULL DEFAULT 0,
+                        `control_date`        DATETIME     NOT NULL,
+                        `params_hash`         CHAR(32)     NOT NULL,
+                        `state`               VARCHAR(16)  NOT NULL DEFAULT 'queued',
+                        `triggered_by`        VARCHAR(32)  NOT NULL DEFAULT 'unknown',
+                        `error_msg`           TEXT         NULL,
+                        `precision_before`    DOUBLE       NULL,
+                        `precision_after`     DOUBLE       NULL,
+                        `iterations`          INT          NOT NULL DEFAULT 0,
+                        `universe_size`       INT          NOT NULL DEFAULT 0,
+                        `prev_universe_size`  INT          NOT NULL DEFAULT 0,
+                        `extremum_count`      INT          NOT NULL DEFAULT 0,
+                        `history_window`      INT          NOT NULL DEFAULT 0,
+                        `active_tail`         INT          NOT NULL DEFAULT 0,
+                        `precision_metric`    VARCHAR(16)  NOT NULL DEFAULT 'mean',
+                        `init_mode`           VARCHAR(32)  NOT NULL DEFAULT 'mode0',
+                        `step_size`           DOUBLE       NOT NULL DEFAULT 0.10,
+                        `target_precision`    DOUBLE       NOT NULL DEFAULT 0.95,
+                        `created_at`          TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+                        `updated_at`          TIMESTAMP    DEFAULT CURRENT_TIMESTAMP
+                                                         ON UPDATE CURRENT_TIMESTAMP,
+                        PRIMARY KEY (`id`),
+                        UNIQUE KEY `uk_reverse_job`
+                            (`pair`, `day_flag`, `control_date`, `params_hash`),
+                        KEY `idx_state` (`state`),
+                        KEY `idx_pair_day_date`
+                            (`pair`, `day_flag`, `control_date`)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """))
 
         await self._run_with_retry(_do)
 
