@@ -829,6 +829,49 @@ def collect_extremums_forward(
     return [(datetime.fromtimestamp(t), s) for t, s in chunk]
 
 
+def group_control_dates_by_extremum_state(
+    np_simple_rates: dict | None,
+    control_dates: list[datetime],
+    *,
+    train_mode: TrainMode = 0,
+    extremum_limit: int = 50,
+    extremum_interval: int = 3,
+) -> tuple[dict[tuple, list[int]], dict[tuple, list[tuple[datetime, int]]]]:
+    """Group control dates by the exact extremum sequence used for training.
+
+    This is the exact safe form of incremental fill-cache training: every candle
+    between two consecutive extrema has the same `seq_tuple`, therefore the ML
+    universe is byte-for-byte the same for those candles.  We can train once for
+    the group and copy the result to all dates in the group without changing
+    answers.
+
+    Returns:
+        groups: {seq_tuple: [indexes into control_dates]}
+        seq_by_key: {seq_tuple: original [(date, sign), ...] sequence}
+    """
+    groups: dict[tuple, list[int]] = {}
+    seq_by_key: dict[tuple, list[tuple[datetime, int]]] = {}
+    if not control_dates:
+        return groups, seq_by_key
+
+    forward = train_mode in (1, 3, 4)
+    collect_fn = collect_extremums_forward if forward else collect_extremums_back
+
+    for idx, dt in enumerate(control_dates):
+        seq = collect_fn(
+            np_simple_rates,
+            dt,
+            limit=extremum_limit,
+            extremum_interval=extremum_interval,
+        )
+        key = tuple((int(d.timestamp()), int(sign)) for d, sign in seq)
+        groups.setdefault(key, []).append(idx)
+        if key not in seq_by_key:
+            seq_by_key[key] = seq
+
+    return groups, seq_by_key
+
+
 def _diff_amp(
     np_simple_rates: dict | None,
     date_a: datetime,
