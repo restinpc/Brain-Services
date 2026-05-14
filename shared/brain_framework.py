@@ -1562,27 +1562,20 @@ def build_app(model_module) -> FastAPI:
                             # раз на уникальный seq_tuple и размножаем universe по датам.
                             results = [None] * len(batch)
                             try:
-                                grouped: dict[tuple, list[int]] = {}
-                                _forward_ml = calc_type in (1, 3, 4)
-                                for _idx, candle in enumerate(batch):
-                                    _dt = candle["date"]
-                                    _seq = (
-                                        rl.collect_extremums_forward(
-                                            np_rates_pd or s.np_simple_rates,
-                                            _dt,
-                                            limit=s.ML_EXTREMUM_LIMIT,
-                                            extremum_interval=var,
-                                        )
-                                        if _forward_ml else
-                                        rl.collect_extremums_back(
-                                            np_rates_pd or s.np_simple_rates,
-                                            _dt,
-                                            limit=s.ML_EXTREMUM_LIMIT,
-                                            extremum_interval=var,
-                                        )
-                                    )
-                                    _key = tuple((int(d.timestamp()), sign) for d, sign in _seq)
-                                    grouped.setdefault(_key, []).append(_idx)
+                                # Exact incremental-by-extremum-state path:
+                                # train once per unique extremum sequence, then copy
+                                # that universe to all candles that have the same
+                                # training state. This preserves answers because
+                                # train_at_date()/maybe_retrain() depend on control_date
+                                # only through this exact sequence of extrema.
+                                _batch_dates = [c["date"] for c in batch]
+                                grouped, _seq_by_key = rl.group_control_dates_by_extremum_state(
+                                    np_rates_pd or s.np_simple_rates,
+                                    _batch_dates,
+                                    train_mode=calc_type,
+                                    extremum_limit=s.ML_EXTREMUM_LIMIT,
+                                    extremum_interval=var,
+                                )
 
                                 if len(grouped) < len(batch):
                                     log(
