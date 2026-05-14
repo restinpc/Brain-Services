@@ -78,6 +78,12 @@ RELOAD_INTERVAL = int(os.getenv("RELOAD_INTERVAL", "3600"))
 REBUILD_INTERVAL = int(os.getenv("REBUILD_INTERVAL", "7200"))
 
 USE_ML_VALUES = True
+
+# Generic framework capabilities. The framework may use these only if present;
+# other models that do not declare them keep the old sliced-input behavior.
+MODEL_CAN_FILTER_DATASET_BY_DATE = True   # model() can receive full dataset and apply date cutoff itself
+MODEL_USES_RATE_HISTORY = False           # rates are needed only as non-empty marker / timeframe hint
+
 ML_TARGET_PRECISION = float(os.getenv("ML_TARGET_PRECISION", "0.95"))
 ML_MAX_ITER = int(os.getenv("ML_MAX_ITER", "20"))
 ML_STEP = float(os.getenv("ML_STEP", "0.10"))
@@ -121,6 +127,11 @@ _ctx_key_cache: dict[tuple, Any] = {}
 # Кеш fallback url_map: пересчитывается при изменении ctx_index.
 # Ключ — id(ctx_index), значение — готовый dict.
 _fallback_url_map_cache: dict[int, dict] = {}
+
+# Resolved events cache: one full resolve per loaded dataset/context snapshot.
+# Key contains object ids and lengths so reload/rebuild naturally invalidates it.
+_resolved_events_cache: dict[tuple, tuple[list[float], list[tuple]]] = {}
+_RESOLVED_EVENTS_CACHE_MAX = 16
 
 
 def _dbg(msg: str) -> None:
@@ -326,6 +337,46 @@ def _build_resolved_events(
     return ts_list, resolved_list
 
 
+def _get_resolved_events_cached(
+    dataset: list[dict],
+    url_map: dict,
+    ctx_index: dict,
+) -> tuple[list[float], list[tuple]]:
+    """Return cached resolved event index for the current dataset/context snapshot."""
+    key = (id(dataset), len(dataset), id(url_map), len(url_map), id(ctx_index), len(ctx_index))
+    cached = _resolved_events_cache.get(key)
+    if cached is not None:
+        return cached
+
+    resolved = _build_resolved_events(dataset, url_map, ctx_index)
+    _resolved_events_cache[key] = resolved
+    if len(_resolved_events_cache) > _RESOLVED_EVENTS_CACHE_MAX:
+        _resolved_events_cache.pop(next(iter(_resolved_events_cache)), None)
+    return resolved
+
+
+def _is_daily_from_context(rates: list[dict], di: dict) -> bool:
+    if "is_daily" in di:
+        return bool(di.get("is_daily"))
+    return _is_daily_rates(rates)
+
+
+def _date_bounds(date: datetime, window_secs: float, di: dict) -> tuple[float, float]:
+    date_ts = date.timestamp()
+    ws_ts = date_ts - window_secs
+    we_ts = date_ts + window_secs
+
+    # When the framework passes a full dataset instead of dataset[:date], preserve
+    # FILTER_DATASET_BY_DATE semantics: do not let future events leak into the result.
+    filter_lte = bool(di.get("filter_dataset_by_date", FILTER_DATASET_BY_DATE))
+    if filter_lte:
+        cutoff = di.get("dataset_cutoff_ts")
+        if cutoff is None:
+            cutoff = date_ts
+        we_ts = min(we_ts, float(cutoff))
+    return ws_ts, we_ts
+
+
 def model(
     rates: list[dict],
     dataset: list[dict],
@@ -337,7 +388,6 @@ def model(
     dataset_index: dict | None = None,
 ) -> dict[str, float]:
 
-    # ── 1. Базовые проверки ───────────────────────────────────────────────────
     calc_type = int(type or 0)
     calc_var  = int(var  or 0)
 
@@ -347,7 +397,6 @@ def model(
     if not dataset: return {}
     if date is None: return {}
 
-    # ── 2. ctx_index и url_map ────────────────────────────────────────────────
     di        = dataset_index or {}
     ctx_index = di.get("ctx_index") or {}
     if not ctx_index:
@@ -357,51 +406,27 @@ def model(
     if not url_map:
         return {}
 
-    # ── 3. Параметры окна ─────────────────────────────────────────────────────
-    is_daily      = _is_daily_rates(rates)
+    is_daily      = _is_daily_from_context(rates, di)
     secs_per_unit = 86400.0 if is_daily else 3600.0
     window_secs   = SHIFT_WINDOW * secs_per_unit
+    date_ts       = date.timestamp()
+    ws_ts, we_ts  = _date_bounds(date, window_secs, di)
 
-    # ── 4. OPT-4: searchsorted по dataset_timestamps (numpy, без fallback-цикла) ──
-    date_ts = date.timestamp()
-    ws_ts   = date_ts - window_secs
-    we_ts   = date_ts + window_secs
+    source_dataset = di.get("full_dataset") or dataset
+    ts_list, resolved_list = _get_resolved_events_cached(source_dataset, url_map, ctx_index)
 
-    ts_arr = di.get("dataset_timestamps")
-    if ts_arr is not None and len(ts_arr) > 0:
-        lo = int(_np.searchsorted(ts_arr, ws_ts, side="left"))
-        hi = int(_np.searchsorted(ts_arr, we_ts, side="right"))
-        window_events = dataset[lo:hi]
-    else:
-        unit         = timedelta(seconds=secs_per_unit)
-        window_start = date - unit * SHIFT_WINDOW
-        window_end   = date + unit * SHIFT_WINDOW
-        window_events = [
-            e for e in dataset
-            if window_start <= (e.get("event_time") or e.get("date") or datetime.min) <= window_end
-        ]
-
-    if not window_events:
+    lo = bisect.bisect_left(ts_list,  ws_ts)
+    hi = bisect.bisect_right(ts_list, we_ts)
+    if lo >= hi:
         return {}
 
-    # ── 5. Горячий цикл ───────────────────────────────────────────────────────
     result: dict[str, float] = {}
 
-    for event in window_events:
-        event_time = event.get("event_time") or event.get("date")
-        if not isinstance(event_time, datetime):
-            continue
+    for idx in range(lo, hi):
+        ev_ts, item = ts_list[idx], resolved_list[idx]
+        ctx_key, occ_count = item
 
-        ctx_key = _ctx_key_from_event(event, url_map)
-        if ctx_key is None:
-            continue
-
-        ctx_info = ctx_index.get(ctx_key)
-        if ctx_info is None:
-            continue
-
-        # OPT-5: timestamp-арифметика вместо timedelta.total_seconds()
-        shift = int(round((date_ts - event_time.timestamp()) / secs_per_unit))
+        shift = int(round((date_ts - ev_ts) / secs_per_unit))
         if abs(shift) > SHIFT_WINDOW:
             continue
 
@@ -410,7 +435,7 @@ def model(
         for mode in ACTIVE_MODES:
             result[make_weight_code(event_id, currency, importance, fcd, scd, rcd, mode, None)] = 1.0
 
-        if int(ctx_info.get("occurrence_count") or 0) >= RECURRING_MIN_COUNT:
+        if occ_count >= RECURRING_MIN_COUNT:
             for mode in ACTIVE_MODES:
                 result[make_weight_code(event_id, currency, importance, fcd, scd, rcd, mode, shift)] = 1.0
 
@@ -434,20 +459,9 @@ def batch_model(
     """
     Пакетная версия model() для fill_cache.
 
-    Оптимизация по сравнению с N вызовами model():
-      • _build_resolved_events() парсит датасет один раз: O(D)
-        (resolve ctx_key, lookup ctx_info, сортировка)
-      • Для каждой из N дат — bisect по ts_list + проход по узкому срезу: O(N·W)
-        где W — среднее количество событий в окне (обычно 5–30)
-      • Итого: O(D + N·W) вместо O(N·(log(D) + W·lookup))
-
-    Особенно выгодно при USE_ML_VALUES=False (fill_cache вызывает batch_model
-    напрямую). При USE_ML_VALUES=True используется как утилита или при
-    прямом тестировании.
-
-    Возвращает:
-        {date: {"weight_code": 1.0, ...}}  — если есть сигналы
-        {date: {}}                          — если FLAT / нет совпадений
+    В этой версии resolved-index датасета кешируется между batch-вызовами, поэтому
+    ML-active prewarm и обычный fill_cache не пересобирают ctx_key для всех событий
+    на каждом вызове batch_model().
     """
     if not dates:
         return {}
@@ -460,7 +474,6 @@ def batch_model(
     if not rates or not dataset:
         return {d: {} for d in dates}
 
-    # ── Контекст ──────────────────────────────────────────────────────────────
     di        = dataset_index or {}
     ctx_index = di.get("ctx_index") or {}
     if not ctx_index:
@@ -470,29 +483,26 @@ def batch_model(
     if not url_map:
         return {d: {} for d in dates}
 
-    # ── Параметры окна ────────────────────────────────────────────────────────
-    is_daily      = _is_daily_rates(rates)
+    is_daily      = _is_daily_from_context(rates, di)
     secs_per_unit = 86400.0 if is_daily else 3600.0
     window_secs   = SHIFT_WINDOW * secs_per_unit
 
-    # ── Однократный resolve всего датасета ────────────────────────────────────
-    ts_list, resolved_list = _build_resolved_events(dataset, url_map, ctx_index)
+    source_dataset = di.get("full_dataset") or dataset
+    ts_list, resolved_list = _get_resolved_events_cached(source_dataset, url_map, ctx_index)
 
-    # ── Цикл по датам ─────────────────────────────────────────────────────────
     results: dict[datetime, dict[str, float]] = {}
 
     for date in dates:
         date_ts = date.timestamp()
-        ws_ts   = date_ts - window_secs
-        we_ts   = date_ts + window_secs
+        ws_ts, we_ts = _date_bounds(date, window_secs, di)
 
         lo = bisect.bisect_left(ts_list,  ws_ts)
         hi = bisect.bisect_right(ts_list, we_ts)
 
         result: dict[str, float] = {}
         for idx in range(lo, hi):
-            ev_ts               = ts_list[idx]
-            ctx_key, occ_count  = resolved_list[idx]
+            ev_ts = ts_list[idx]
+            ctx_key, occ_count = resolved_list[idx]
 
             shift = int(round((date_ts - ev_ts) / secs_per_unit))
             if abs(shift) > SHIFT_WINDOW:
