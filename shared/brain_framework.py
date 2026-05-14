@@ -304,6 +304,8 @@ class _State:
         self.index_builder_fn  = None
         self.weight_builder_fn = None
         self.model_needs_index = False
+        self.model_can_filter_dataset_by_date = False
+        self.model_uses_rate_history = True
 
         self.engine_vlad  = None
         self.engine_brain = None
@@ -325,6 +327,7 @@ class _State:
         self.avg_range:     dict = {}
         self.last_candles:  dict = {}
         self.global_rates:  dict = {}
+        self.global_rates_dates: dict = {}
         self.last_rates_refresh: dict = {}
 
         self.ctx_row_count:     int = 0
@@ -351,7 +354,8 @@ class _State:
 
         self.reverse_store: rl.ReverseStore | None = None
         self._ml_active_cache: dict = {}
-        # Semaphore: ensures only 1 ML train runs at a time, preventing DB pool exhaustion
+        # Backward-compatible field; ML training is deduplicated inside ReverseStore
+        # by per-train-key locks instead of one global /values semaphore.
         self._ml_semaphore: asyncio.Semaphore = asyncio.Semaphore(1)
         # Flag: True during fill_cache — skips vlad_reverse_universe DB writes for speed
         self._fill_cache_active: bool = False
@@ -418,7 +422,11 @@ def _filter_rates_lte(table: str, date: datetime, s: _State) -> list[dict]:
     rows = s.global_rates.get(table, [])
     if not rows:
         return []
-    idx = bisect.bisect_right([r["date"] for r in rows], date)
+    dates = s.global_rates_dates.get(table)
+    if dates is None or len(dates) != len(rows):
+        dates = [r["date"] for r in rows]
+        s.global_rates_dates[table] = dates
+    idx = bisect.bisect_right(dates, date)
     return rows[:idx]
 
 
@@ -480,6 +488,7 @@ async def _load_rates(s: _State):
         s.candle_ranges[table] = {}
         s.extremums[table]    = {"min": set(), "max": set()}
         s.global_rates[table] = []
+        s.global_rates_dates[table] = []
         try:
             async with s.engine_brain.connect() as conn:
                 res = await conn.execute(text(
@@ -501,6 +510,7 @@ async def _load_rates(s: _State):
                     rng = float(r["max"] or 0) - float(r["min"] or 0)
                     s.candle_ranges[table][dt] = rng
                     ranges.append(rng)
+                s.global_rates_dates[table] = [r["date"] for r in s.global_rates[table]]
                 s.avg_range[table] = sum(ranges) / len(ranges) if ranges else 0.0
                 interval = "1 DAY" if table.endswith("_day") else "1 HOUR"
                 for typ in ("min", "max"):
@@ -552,6 +562,7 @@ async def _refresh_rates(table: str, s: _State):
                     "close": float(r["close"] or 0),
                     "min":   float(r["min"]   or 0), "max": float(r["max"] or 0),
                 })
+                s.global_rates_dates.setdefault(table, []).append(dt)
                 if s.np_built:
                     _append_np_rates_row(table, dt, t1, rng, s,
                                          close=float(r["close"] or 0),
@@ -989,6 +1000,8 @@ def build_app(model_module) -> FastAPI:
 
     sig = inspect.signature(s.model_fn)
     s.model_needs_index = "dataset_index" in sig.parameters
+    s.model_can_filter_dataset_by_date = bool(_g("MODEL_CAN_FILTER_DATASET_BY_DATE", False))
+    s.model_uses_rate_history = bool(_g("MODEL_USES_RATE_HISTORY", True))
 
     s.index_builder_fn, s.weight_builder_fn = _discover_builders(model_module)
 
@@ -997,7 +1010,9 @@ def build_app(model_module) -> FastAPI:
         f"dataset_index={'yes' if s.model_needs_index else 'no'} | "
         f"rebuild={'builders' if _has_rebuild else 'no'} | "
         f"ml={'ON' if s.USE_ML_VALUES else 'off'} | "
-        f"batch_model={'yes' if s.batch_model_fn else 'no'}",
+        f"batch_model={'yes' if s.batch_model_fn else 'no'} | "
+        f"model_filters_dataset={'yes' if s.model_can_filter_dataset_by_date else 'no'} | "
+        f"rate_history={'yes' if s.model_uses_rate_history else 'no'}",
         s.NODE_NAME, force=True)
 
     s.engine_vlad, s.engine_brain, s.engine_super = build_engines()
@@ -1026,17 +1041,15 @@ def build_app(model_module) -> FastAPI:
         target_date = _parse_date(date_str)
         if not target_date:
             return None
-        table   = _rates_table(pair, day)
+        table = _rates_table(pair, day)
         if not _skip_refresh:
             await _refresh_rates(table, s)
-        rates_f   = _filter_rates_lte(table, target_date, s)
-        dataset_f = _filter_dataset_lte(target_date, s)
-        np_r      = s.np_rates.get(table)
+        np_r = s.np_rates.get(table)
 
-        # dataset_index с dataset_timestamps для model()
-        dataset_index_dict = None
-        if s.model_needs_index:
-            dataset_index_dict = {
+        def _dataset_index_for(date_x: datetime):
+            if not s.model_needs_index:
+                return None
+            di = {
                 "dates": s.dataset_dates,
                 "by_key": s.dataset_by_key,
                 "key_dates": s.dataset_key_dates,
@@ -1045,9 +1058,30 @@ def build_app(model_module) -> FastAPI:
                 "ctx_index": s.ctx_index,
                 "url_map": s.url_map,
                 "dataset_timestamps": getattr(s, "_dataset_ts_arr", None),
+                "filter_dataset_by_date": bool(s.FILTER_DATASET_BY_DATE),
+                "dataset_cutoff_ts": float(date_x.timestamp()),
+                "is_daily": bool(day),
+                "rates_table": table,
             }
+            if s.model_can_filter_dataset_by_date:
+                di["full_dataset"] = s.dataset
+            return di
 
-        def _model_at(date_x: datetime, rates_x: list, dataset_x: list) -> dict:
+        def _model_inputs_for(date_x: datetime):
+            if s.model_uses_rate_history:
+                rates_x = _filter_rates_lte(table, date_x, s)
+            else:
+                # Generic capability path: model declared that it does not need
+                # the historical rate slice. Keep a non-empty marker for backward
+                # compatibility with models that only check truthiness/timeframe.
+                marker_dt = date_x.replace(hour=0, minute=0, second=0, microsecond=0) if day else date_x
+                rates_x = [{"date": marker_dt}]
+
+            dataset_x = s.dataset if s.model_can_filter_dataset_by_date else _filter_dataset_lte(date_x, s)
+            return rates_x, dataset_x, _dataset_index_for(date_x)
+
+        def _model_at(date_x: datetime) -> dict:
+            rates_x, dataset_x, dataset_index_dict = _model_inputs_for(date_x)
             r = s.model_fn(
                 rates=rates_x, dataset=dataset_x, date=date_x,
                 type=calc_type, var=calc_var, param=param,
@@ -1057,7 +1091,7 @@ def build_app(model_module) -> FastAPI:
             return r or {}
 
         if not s.USE_ML_VALUES:
-            return _model_at(target_date, rates_f, dataset_f)
+            return _model_at(target_date)
 
         # ── ML-РЕЖИМ ─────────────────────────────────────────────────────────
         async def _active_codes_at(ext_dt: datetime) -> list[str]:
@@ -1067,9 +1101,7 @@ def build_app(model_module) -> FastAPI:
             if cached is not None:
                 return cached
             try:
-                rates_at   = _filter_rates_lte(table, ext_dt, s)
-                dataset_at = _filter_dataset_lte(ext_dt, s)
-                codes      = list(_model_at(ext_dt, rates_at, dataset_at).keys())
+                codes = list(_model_at(ext_dt).keys())
             except Exception:
                 codes = []
             s._ml_active_cache[key] = codes
@@ -1079,31 +1111,30 @@ def build_app(model_module) -> FastAPI:
             "type": calc_type, "var": calc_var, "param": param,
         })
 
-        async with s._ml_semaphore:
-            try:
-                universe, _pr = await s.reverse_store.maybe_retrain(
-                    pair=pair, day_flag=day, control_date=target_date,
-                    params_hash=params_hash,
-                    np_simple_rates=(np_r or s.np_simple_rates),
-                    active_codes_at=_active_codes_at,
-                    train_mode=calc_type,
-                    max_iter=s.ML_MAX_ITER,
-                    step=s.ML_STEP,
-                    target_precision=s.ML_TARGET_PRECISION,
-                    extremum_limit=s.ML_EXTREMUM_LIMIT,
-                    extremum_interval=calc_var,
-                    active_tail=s.ML_ACTIVE_TAIL,
-                    metric=s.ML_PRECISION_METRIC,
-                    log_fn=lambda m: log(m, s.NODE_NAME),
-                    skip_db_writes=s._fill_cache_active,
-                    model_tag=f"{pair}_{day}_{calc_type}_{calc_var}",
-                )
-                return universe
-            except Exception as e:
-                log(f"   ML _call_model {target_date}: {e}",
-                    s.NODE_NAME, level="error")
-                send_error_trace(e, s.NODE_NAME, "ml_call_model")
-                return {}
+        try:
+            universe, _pr = await s.reverse_store.maybe_retrain(
+                pair=pair, day_flag=day, control_date=target_date,
+                params_hash=params_hash,
+                np_simple_rates=(np_r or s.np_simple_rates),
+                active_codes_at=_active_codes_at,
+                train_mode=calc_type,
+                max_iter=s.ML_MAX_ITER,
+                step=s.ML_STEP,
+                target_precision=s.ML_TARGET_PRECISION,
+                extremum_limit=s.ML_EXTREMUM_LIMIT,
+                extremum_interval=calc_var,
+                active_tail=s.ML_ACTIVE_TAIL,
+                metric=s.ML_PRECISION_METRIC,
+                log_fn=lambda m: log(m, s.NODE_NAME),
+                skip_db_writes=s._fill_cache_active,
+                model_tag=f"{pair}_{day}_{calc_type}_{calc_var}_{param}",
+            )
+            return universe
+        except Exception as e:
+            log(f"   ML _call_model {target_date}: {e}",
+                s.NODE_NAME, level="error")
+            send_error_trace(e, s.NODE_NAME, "ml_call_model")
+            return {}
 
     # ── _preload ──────────────────────────────────────────────────────────────
 
@@ -1350,7 +1381,11 @@ def build_app(model_module) -> FastAPI:
                 "ctx_index":          s.ctx_index,
                 "url_map":            s.url_map,
                 "dataset_timestamps": getattr(s, "_dataset_ts_arr", None),
+                "filter_dataset_by_date": bool(s.FILTER_DATASET_BY_DATE),
+                "is_daily": bool(day_flag),
             }
+            if s.model_can_filter_dataset_by_date:
+                dataset_index_dict["full_dataset"] = s.dataset
 
         # Группируем слоты по calc_var — один batch_model call на интервал
         # (train_mode не влияет на набор дат экстремумов, только на обучение).
@@ -1401,9 +1436,11 @@ def build_app(model_module) -> FastAPI:
 
                 try:
                     # batch_model за один вызов — O(N) вместо O(N²).
+                    rates_for_prewarm = rows if s.model_uses_rate_history else [{"date": missing[-1]}]
+                    dataset_for_prewarm = s.dataset if s.model_can_filter_dataset_by_date else _filter_dataset_lte(missing[-1], s)
                     batch_results = s.batch_model_fn(
-                        rates=rows,
-                        dataset=_filter_dataset_lte(missing[-1], s),
+                        rates=rates_for_prewarm,
+                        dataset=dataset_for_prewarm,
                         dates=missing,
                         type=calc_type, var=calc_var, param="",
                         dataset_index=dataset_index_dict,
@@ -1617,14 +1654,18 @@ def build_app(model_module) -> FastAPI:
                                     "ctx_index": s.ctx_index,
                                     "url_map": s.url_map,
                                     "dataset_timestamps": getattr(s, "_dataset_ts_arr", None),
+                                    "filter_dataset_by_date": bool(s.FILTER_DATASET_BY_DATE),
+                                    "is_daily": bool(day_flag),
                                 }
+                                if s.model_can_filter_dataset_by_date:
+                                    dataset_index_dict_b["full_dataset"] = s.dataset
                             try:
                                 batch_dates = [c["date"] for c in batch]
                                 # Полный срез all_rows до последней целевой даты.
                                 max_batch_date = batch_dates[-1]
                                 idx_end = bisect.bisect_right(all_dates_pd, max_batch_date)
-                                rates_for_batch = all_rows[:idx_end]
-                                dataset_f_b = _filter_dataset_lte(max_batch_date, s)
+                                rates_for_batch = all_rows[:idx_end] if s.model_uses_rate_history else [{"date": max_batch_date}]
+                                dataset_f_b = s.dataset if s.model_can_filter_dataset_by_date else _filter_dataset_lte(max_batch_date, s)
 
                                 batch_map = s.batch_model_fn(
                                     rates=rates_for_batch,
