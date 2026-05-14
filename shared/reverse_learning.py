@@ -44,6 +44,9 @@ from __future__ import annotations
 
 import asyncio
 import bisect
+import concurrent.futures as _cf
+import functools
+import hashlib
 import json as _json
 import os
 import random
@@ -63,6 +66,21 @@ _NUMBA_ENABLED = (
     _njit is not None
     and os.getenv("RL_USE_NUMBA", "1").strip().lower() not in {"0", "false", "no", "off"}
 )
+
+# CPU-bound training should not block the FastAPI event loop.
+# Keep workers low: the keyed train lock deduplicates identical jobs, while this
+# executor controls CPU pressure for independent universes.
+_RL_TRAIN_WORKERS = max(1, int(os.getenv("RL_TRAIN_WORKERS", "1")))
+_RL_TRAIN_EXECUTOR = _cf.ThreadPoolExecutor(
+    max_workers=_RL_TRAIN_WORKERS,
+    thread_name_prefix="rl_train",
+)
+
+
+def _stable_seed(key: object) -> int:
+    """Deterministic seed for the stochastic rebalance step."""
+    raw = repr(key).encode("utf-8", errors="replace")
+    return int.from_bytes(hashlib.blake2b(raw, digest_size=8).digest(), "little")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -498,6 +516,7 @@ def _train_records_numba_exact(
     target_precision: float,
     active_tail: int,
     metric: PrecisionMetric,
+    rng_seed: int | None = None,
 ) -> tuple[dict[str, float], float, int, int]:
     """Fast implementation of the train loop over already-built records.
 
@@ -506,6 +525,9 @@ def _train_records_numba_exact(
     """
     if not _NUMBA_ENABLED:
         # Python fallback: тот же код, что был в train_at_date.
+        # If rng_seed is supplied, use a deterministic sequence of per-rebalance
+        # seeds instead of the process-global RNG.
+        rng = random.Random(rng_seed) if rng_seed is not None else None
         universe: dict[str, float] = {}
         all_seen: set[str] = set()
         iterations_total = 0
@@ -526,6 +548,7 @@ def _train_records_numba_exact(
                 universe, records[:rec_idx + 1],
                 max_iter=max_iter, step=step, target=target_precision,
                 active_tail=active_tail, metric=metric,
+                rng_seed=(rng.randrange(0, 2**63) if rng is not None else None),
             )
             iterations_total += iters
         final_precision = _total_precision_py(universe, records, metric=metric)
@@ -534,6 +557,7 @@ def _train_records_numba_exact(
                 universe, records,
                 max_iter=max_iter, step=step, target=target_precision,
                 active_tail=active_tail, metric=metric,
+                rng_seed=(rng.randrange(0, 2**63) if rng is not None else None),
             )
             iterations_total += iters
         universe = {k: float(v) for k, v in universe.items() if abs(float(v)) > 1e-12}
@@ -559,6 +583,7 @@ def _train_records_numba_exact(
         seen |= rec_set
 
     offsets, rec_indices, signs, base_amps = _build_csr(records, code_to_idx)
+    rng = random.Random(rng_seed) if rng_seed is not None else random
     cur_arr = np.zeros(len(code_order), dtype=np.float64)
     active_count = 0
     iterations_total = 0
@@ -574,7 +599,7 @@ def _train_records_numba_exact(
         best_arr, _pr, iters = _rebalance_prefix_fast(
             cur_arr, active_count, offsets, rec_indices, signs, base_amps, rec_idx + 1,
             max_iter=max_iter, step=step, target=target_precision,
-            active_tail=active_tail, metric=metric, rng=random,
+            active_tail=active_tail, metric=metric, rng=rng,
         )
         cur_arr[:active_count] = best_arr
         iterations_total += iters
@@ -588,7 +613,7 @@ def _train_records_numba_exact(
         best_arr, final_precision, iters = _rebalance_prefix_fast(
             cur_arr, active_count, offsets, rec_indices, signs, base_amps, len(records),
             max_iter=max_iter, step=step, target=target_precision,
-            active_tail=active_tail, metric=metric, rng=random,
+            active_tail=active_tail, metric=metric, rng=rng,
         )
         cur_arr[:active_count] = best_arr
         iterations_total += iters
@@ -856,6 +881,109 @@ _seq_codes_cache: dict = {}
 _SEQ_CODES_CACHE_MAX = 1024
 
 
+def _build_records_from_seq_codes(
+    *,
+    seq: list[tuple[datetime, int]],
+    pre_codes: list[list[str]],
+    np_simple_rates: dict | None,
+    train_mode: TrainMode,
+) -> list[ExtremumRecord]:
+    """Build ExtremumRecord objects from already collected extremums/codes.
+
+    This prevents maybe_retrain() from collecting the same extremums and active
+    codes, then asking train_at_date() to do it all again.
+    """
+    use_diff = train_mode in (2, 3, 4)
+    strict_amp = train_mode == 4
+    records: list[ExtremumRecord] = []
+
+    for idx, ((ext_date, sign), codes) in enumerate(zip(seq, pre_codes)):
+        if not codes:
+            continue
+
+        if use_diff:
+            has_next = idx + 1 < len(seq)
+            next_date = seq[idx + 1][0] if has_next else None
+            if strict_amp and not has_next:
+                continue
+            amp = _diff_amp(np_simple_rates, ext_date, next_date)
+        else:
+            amp = 1.0
+
+        records.append(ExtremumRecord(
+            date=ext_date,
+            sign=sign,
+            codes=codes,
+            base_amp=float(amp),
+        ))
+
+    return records
+
+
+async def _run_train_records(
+    *,
+    records: list[ExtremumRecord],
+    max_iter: int,
+    step: float,
+    target_precision: float,
+    active_tail: int,
+    metric: PrecisionMetric,
+    rng_seed: int | None,
+) -> tuple[dict[str, float], float, int, int]:
+    """Run CPU-bound training off the event loop."""
+    loop = asyncio.get_running_loop()
+    fn = functools.partial(
+        _train_records_numba_exact,
+        records,
+        max_iter=max_iter,
+        step=step,
+        target_precision=target_precision,
+        active_tail=active_tail,
+        metric=metric,
+        rng_seed=rng_seed,
+    )
+    return await loop.run_in_executor(_RL_TRAIN_EXECUTOR, fn)
+
+
+async def train_prebuilt_records(
+    *,
+    records: list[ExtremumRecord],
+    cache_key: tuple,
+    max_iter: int,
+    step: float,
+    target_precision: float,
+    active_tail: int,
+    metric: PrecisionMetric,
+) -> tuple[dict[str, float], float, int, int, bool]:
+    """Train using records that were already built by maybe_retrain().
+
+    Returns (universe, precision, iterations, ext_count, from_cache).
+    """
+    cached = _train_at_date_cache.get(cache_key)
+    if cached is not None:
+        return (*cached, True)
+
+    if not records:
+        return {}, 1.0, 0, 0, False
+
+    universe, final_precision, iterations_total, ext_count = await _run_train_records(
+        records=records,
+        max_iter=max_iter,
+        step=step,
+        target_precision=target_precision,
+        active_tail=active_tail,
+        metric=metric,
+        rng_seed=_stable_seed(cache_key),
+    )
+
+    result = (universe, float(final_precision), int(iterations_total), int(ext_count))
+    _train_at_date_cache[cache_key] = result
+    if len(_train_at_date_cache) > _TRAIN_CACHE_MAX:
+        del _train_at_date_cache[next(iter(_train_at_date_cache))]
+
+    return (*result, False)
+
+
 async def train_at_date(
     *,
     np_simple_rates:  dict | None,
@@ -912,15 +1040,23 @@ async def train_at_date(
     # Adjacent candles nearly always share the same 50 extremums -> cache hit.
     seq_tuple = tuple((int(d.timestamp()), s) for d, s in seq)
 
-    pre_codes: list[list[str]] = []
-    for ext_date, _ in seq:
-        try:
-            codes = await active_codes_at(ext_date)
-        except Exception:
-            codes = []
-        pre_codes.append(sorted(set(codes)))
+    seq_codes_key = (id(active_codes_at), seq_tuple)
+    cached_seq_codes = _seq_codes_cache.get(seq_codes_key)
+    if cached_seq_codes is not None:
+        pre_codes, codes_key = cached_seq_codes
+    else:
+        pre_codes: list[list[str]] = []
+        for ext_date, _ in seq:
+            try:
+                codes = await active_codes_at(ext_date)
+            except Exception:
+                codes = []
+            pre_codes.append(sorted(set(codes)))
 
-    codes_key = tuple(tuple(c) for c in pre_codes)
+        codes_key = tuple(tuple(c) for c in pre_codes)
+        _seq_codes_cache[seq_codes_key] = (pre_codes, codes_key)
+        if len(_seq_codes_cache) > _SEQ_CODES_CACHE_MAX:
+            del _seq_codes_cache[next(iter(_seq_codes_cache))]
     cache_key  = (seq_tuple, codes_key, train_mode, max_iter,
                   round(step, 6), round(target_precision, 6),
                   active_tail, metric)
@@ -965,13 +1101,14 @@ async def train_at_date(
 
     # Fast path: NumPy/Numba-перевешивание по CSR-представлению records.
     # При RL_USE_NUMBA=0 или отсутствии numba автоматически сработает Python fallback.
-    universe, final_precision, iterations_total, ext_count = _train_records_numba_exact(
-        records,
+    universe, final_precision, iterations_total, ext_count = await _run_train_records(
+        records=records,
         max_iter=max_iter,
         step=step,
         target_precision=target_precision,
         active_tail=active_tail,
         metric=metric,
+        rng_seed=_stable_seed(cache_key),
     )
 
     result = (universe, float(final_precision), int(iterations_total), int(ext_count))
@@ -1007,6 +1144,8 @@ class ReverseStore:
         # In-memory cache: (pair, day_flag, control_date, params_hash) -> (universe, precision)
         # Eliminates repeated DB round-trips for the same key during fill_cache
         self._universe_cache: dict = {}
+        self._train_locks: dict[tuple, asyncio.Lock] = {}
+        self._train_locks_guard = asyncio.Lock()
 
         # Separate read-only engine with NullPool for load_universe.
         #
@@ -1028,6 +1167,18 @@ class ReverseStore:
             )
         except Exception:
             self._read_engine = engine  # fallback to shared engine
+
+    async def _get_train_lock(self, key: tuple) -> asyncio.Lock:
+        async with self._train_locks_guard:
+            lock = self._train_locks.get(key)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._train_locks[key] = lock
+            if len(self._train_locks) > 4096:
+                for old_key in list(self._train_locks.keys())[:512]:
+                    if old_key != key:
+                        self._train_locks.pop(old_key, None)
+            return lock
 
     def clear_universe_cache(self) -> None:
         """Call at the start of fill_cache to start fresh."""
@@ -1590,141 +1741,212 @@ class ReverseStore:
         skip_db_writes: bool = False,
         model_tag: str = "",
     ) -> tuple[dict[str, float], float]:
-        # ── Шаг 1: собираем экстремумы и активные коды ОДИН РАЗ ─────────────
-        # Оригинал делал collect + active_codes_at до 3 раз:
-        #   1) здесь для pre-check кеша
-        #   2) в блоке проверки precision загруженного universe
-        #   3) внутри train_at_date → train_and_save
-        # Теперь всё делается один раз, результаты переиспользуются.
-        _forward_pre = train_mode in (1, 3, 4)
-        _seq_pre = (
+        """Return a valid ML universe, retraining only when necessary.
+
+        Optimized path:
+          • collect extremums + active codes once;
+          • build records once;
+          • use a per-train-cache-key async lock instead of one global semaphore;
+          • train prebuilt records directly, without re-entering train_at_date().
+        """
+        init_mode = f"mode{train_mode}/iv{extremum_interval}"
+
+        forward = train_mode in (1, 3, 4)
+        seq = (
             collect_extremums_forward(
                 np_simple_rates, control_date,
                 limit=extremum_limit, extremum_interval=extremum_interval,
             )
-            if _forward_pre else
+            if forward else
             collect_extremums_back(
                 np_simple_rates, control_date,
                 limit=extremum_limit, extremum_interval=extremum_interval,
             )
         )
+        seq_tuple = tuple((int(d.timestamp()), s) for d, s in seq)
 
-        _seq_tuple = tuple((int(d.timestamp()), s) for d, s in _seq_pre)
-
-        # ── Шаг 1.5: seq_codes_cache — пропускаем 50 await-ов если seq не изменился ──
-        # Для соседних свечей seq_tuple почти всегда идентичен (те же 50 экстремумов).
-        # _ml_active_cache детерминирован, поэтому codes тоже идентичны.
-        # Кеш ключ = (model_tag, seq_tuple): model_tag кодирует pair/day/type/var
-        # чтобы не смешивать коды от разных пар/режимов.
-        _seq_cache_key = (model_tag, _seq_tuple)
-        _cached_seq    = _seq_codes_cache.get(_seq_cache_key)
-
-        if _cached_seq is not None:
-            _pre_codes, _codes_key = _cached_seq
+        seq_cache_key = (model_tag, seq_tuple)
+        cached_seq = _seq_codes_cache.get(seq_cache_key)
+        if cached_seq is not None:
+            pre_codes, codes_key = cached_seq
         else:
-            _pre_codes: list[list[str]] = []
-            for _ext_date, _ in _seq_pre:
+            pre_codes: list[list[str]] = []
+            for ext_date, _ in seq:
                 try:
-                    _c = await active_codes_at(_ext_date)
+                    codes = await active_codes_at(ext_date)
                 except Exception:
-                    _c = []
-                _pre_codes.append(sorted(set(_c)))
-            _codes_key = tuple(tuple(c) for c in _pre_codes)
-            _seq_codes_cache[_seq_cache_key] = (_pre_codes, _codes_key)
+                    codes = []
+                pre_codes.append(sorted(set(codes)))
+            codes_key = tuple(tuple(c) for c in pre_codes)
+            _seq_codes_cache[seq_cache_key] = (pre_codes, codes_key)
             if len(_seq_codes_cache) > _SEQ_CODES_CACHE_MAX:
                 del _seq_codes_cache[next(iter(_seq_codes_cache))]
-        _train_cache_key  = (
-            _seq_tuple, _codes_key, train_mode, max_iter,
+
+        train_cache_key = (
+            seq_tuple, codes_key, train_mode, max_iter,
             round(step, 6), round(target_precision, 6), active_tail, metric,
         )
-        _cached_train = _train_at_date_cache.get(_train_cache_key)
-        if _cached_train is not None:
-            _univ_cached, _pr_cached, _, _ = _cached_train
-            self._universe_cache[(pair, day_flag, control_date, params_hash)] = (
-                _univ_cached, _pr_cached
-            )
-            return _univ_cached, _pr_cached
 
-        # ── Шаг 3: если universe уже загружен — проверяем precision ─────────
-        # Используем уже собранные _seq_pre + _pre_codes, без повторного collect.
-        #
-        # skip_db_writes=True (fill_cache режим): пропускаем load_universe полностью.
-        # В fill_cache нам важна скорость вычислений, а не переиспользование старого
-        # обучения из БД. _train_at_date_cache уже дедуплицирует повторную работу
-        # внутри сессии. Открывать DB-соединение при каждом из N параллельных вызовов
-        # asyncio.gather не нужно и приводит к исчерпанию пула соединений.
-        loaded = None if skip_db_writes else await self.load_universe(
-            pair=pair,
-            day_flag=day_flag,
-            control_date=control_date,
-            params_hash=params_hash,
+        cached_train = _train_at_date_cache.get(train_cache_key)
+        if cached_train is not None:
+            universe, pr, _, _ = cached_train
+            self._universe_cache[(pair, day_flag, control_date, params_hash)] = (universe, pr)
+            return universe, pr
+
+        records = _build_records_from_seq_codes(
+            seq=seq,
+            pre_codes=pre_codes,
+            np_simple_rates=np_simple_rates,
+            train_mode=train_mode,
         )
+        if not records:
+            return {}, 1.0
 
-        if loaded:
-            universe, stored_pr = loaded
-            use_diff   = train_mode in (2, 3, 4)
-            strict_amp = train_mode == 4
+        lock = await self._get_train_lock(train_cache_key)
+        async with lock:
+            # Double-check after waiting: another request may have trained this exact universe.
+            cached_train = _train_at_date_cache.get(train_cache_key)
+            if cached_train is not None:
+                universe, pr, _, _ = cached_train
+                self._universe_cache[(pair, day_flag, control_date, params_hash)] = (universe, pr)
+                return universe, pr
 
-            records: list[ExtremumRecord] = []
-            for idx, ((ext_date, sign), codes) in enumerate(zip(_seq_pre, _pre_codes)):
-                if not codes:
-                    continue
-                if use_diff:
-                    has_next  = idx + 1 < len(_seq_pre)
-                    next_date = _seq_pre[idx + 1][0] if has_next else None
-                    if strict_amp and not has_next:
-                        continue
-                    amp = _diff_amp(np_simple_rates, ext_date, next_date)
-                else:
-                    amp = 1.0
-                records.append(ExtremumRecord(
-                    date=ext_date, sign=sign,
-                    codes=sorted(set(codes)), base_amp=float(amp),
-                ))
+            loaded = None if skip_db_writes else await self.load_universe(
+                pair=pair,
+                day_flag=day_flag,
+                control_date=control_date,
+                params_hash=params_hash,
+            )
+            prev_size = len(loaded[0]) if loaded else 0
+            pr_before = float(loaded[1]) if loaded else None
 
-            current_pr = total_precision(universe, records, metric=metric)
-            if current_pr >= target_precision:
-                return universe, current_pr
+            if loaded:
+                universe_loaded, stored_pr = loaded
+                current_pr = total_precision(universe_loaded, records, metric=metric)
+                if current_pr >= target_precision:
+                    return universe_loaded, current_pr
 
-            if log_fn:
-                log_fn(
-                    f"  ⚠️ ml precision drop {control_date}: "
-                    f"stored={stored_pr:.4f}, current={current_pr:.4f}, "
-                    f"target={target_precision:.4f}; retrain"
+                if log_fn:
+                    log_fn(
+                        f"  ⚠️ ml precision drop {control_date}: "
+                        f"stored={stored_pr:.4f}, current={current_pr:.4f}, "
+                        f"target={target_precision:.4f}; retrain"
+                    )
+
+            reserved = True
+            if not skip_db_writes:
+                reserved = await self.reserve_slot(
+                    pair=pair,
+                    day_flag=day_flag,
+                    control_date=control_date,
+                    params_hash=params_hash,
+                    triggered_by="retrain",
+                    history_window=extremum_limit,
+                    active_tail=active_tail,
+                    precision_metric=metric,
+                    init_mode=init_mode,
+                    step_size=step,
+                    target_precision=target_precision,
+                )
+                if not reserved:
+                    loaded_after_wait = await self.load_universe(
+                        pair=pair,
+                        day_flag=day_flag,
+                        control_date=control_date,
+                        params_hash=params_hash,
+                    )
+                    if loaded_after_wait:
+                        return loaded_after_wait
+                    return {}, 0.0
+
+            try:
+                universe, pr, iters, ext_cnt, from_train_cache = await train_prebuilt_records(
+                    records=records,
+                    cache_key=train_cache_key,
+                    max_iter=max_iter,
+                    step=step,
+                    target_precision=target_precision,
+                    active_tail=active_tail,
+                    metric=metric,
                 )
 
-        # ── Шаг 4: обучаем.
-        # Передаём pre-собранные коды через замыкание — train_at_date
-        # вызовет active_codes_at и получит результаты из кеша (O(1)).
-        _pre_codes_map: dict[int, list[str]] = {
-            int(ext_date.timestamp()): codes
-            for (ext_date, _), codes in zip(_seq_pre, _pre_codes)
-        }
+                if universe:
+                    self._universe_cache[(pair, day_flag, control_date, params_hash)] = (universe, pr)
 
-        async def _fast_active_codes_at(ext_dt: datetime) -> list[str]:
-            ts = int(ext_dt.timestamp())
-            pre = _pre_codes_map.get(ts)
-            if pre is not None:
-                return pre
-            # Fallback для дат вне _seq_pre (edge case).
-            return await active_codes_at(ext_dt)
+                if skip_db_writes:
+                    return universe, pr
 
-        return await self.train_and_save(
-            pair=pair,
-            day_flag=day_flag,
-            control_date=control_date,
-            params_hash=params_hash,
-            np_simple_rates=np_simple_rates,
-            active_codes_at=_fast_active_codes_at,
-            train_mode=train_mode,
-            max_iter=max_iter,
-            step=step,
-            target_precision=target_precision,
-            extremum_limit=extremum_limit,
-            extremum_interval=extremum_interval,
-            active_tail=active_tail,
-            metric=metric,
-            triggered_by="retrain",
-            log_fn=log_fn,
-            skip_db_writes=skip_db_writes,
-        )
+                if universe and not from_train_cache:
+                    await self.save_universe(
+                        pair=pair,
+                        day_flag=day_flag,
+                        control_date=control_date,
+                        params_hash=params_hash,
+                        universe=universe,
+                        precision_val=pr,
+                        iterations=iters,
+                        extremum_cnt=ext_cnt,
+                        history_window=extremum_limit,
+                        active_tail=active_tail,
+                        precision_metric=metric,
+                        init_mode=init_mode,
+                        step_size=step,
+                        target_precision=target_precision,
+                    )
+
+                await self.finish_slot(
+                    pair=pair,
+                    day_flag=day_flag,
+                    control_date=control_date,
+                    params_hash=params_hash,
+                    state="done",
+                    precision_before=pr_before,
+                    precision_after=pr,
+                    iterations=iters,
+                    universe_size=len(universe),
+                    prev_universe_size=prev_size,
+                    extremum_cnt=ext_cnt,
+                    history_window=extremum_limit,
+                    active_tail=active_tail,
+                    precision_metric=metric,
+                    init_mode=init_mode,
+                    step_size=step,
+                    target_precision=target_precision,
+                )
+
+                if log_fn:
+                    log_fn(
+                        f"  ✅ ml-train {control_date}: "
+                        f"mode={train_mode}, interval={extremum_interval}, "
+                        f"prec={pr:.4f}, size={len(universe)}, "
+                        f"ext={ext_cnt}, iters={iters}"
+                    )
+
+                return universe, pr
+
+            except Exception as e:
+                if not skip_db_writes:
+                    await self.finish_slot(
+                        pair=pair,
+                        day_flag=day_flag,
+                        control_date=control_date,
+                        params_hash=params_hash,
+                        state="failed",
+                        error_msg=str(e)[:1000],
+                        precision_before=pr_before,
+                        iterations=0,
+                        universe_size=0,
+                        prev_universe_size=prev_size,
+                        extremum_cnt=0,
+                        history_window=extremum_limit,
+                        active_tail=active_tail,
+                        precision_metric=metric,
+                        init_mode=init_mode,
+                        step_size=step,
+                        target_precision=target_precision,
+                    )
+
+                if log_fn:
+                    log_fn(f"  ❌ ml-train {control_date}: {e}")
+
+                return {}, 0.0
