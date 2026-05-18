@@ -1,8 +1,9 @@
 """
-model.py — FRED DFF (Effective Federal Funds Rate)
+model.py — FRED CBBTCUSD (Bitcoin Price in USD)
 
-Датасет: sasha_fred_dff (id, date_iso, value, loaded_at).
-Типы событий: rate_hike / rate_cut / rate_unchanged.
+Датасет: sasha_fred_cbbtcusd (id, date_iso, value, loaded_at).
+Типы событий:
+  bull_breakout / bull_drift / sideways / bear_drift / bear_drop.
 
 Код веса: {ctx_id}_{mode}_{shift}
   mode=0 -> T1
@@ -22,8 +23,8 @@ def _dt_to_ts(dt: datetime) -> int:
 
 RATES_TABLE = "brain_rates_eur_usd"
 
-WEIGHTS_TABLE = "sasha_fred_dff_weights"
-CTX_TABLE = "sasha_fred_dff_context_idx"
+WEIGHTS_TABLE = "sasha_fred_cbbtcusd_weights"
+CTX_TABLE = "sasha_fred_cbbtcusd_context_idx"
 CTX_KEY_COLUMNS = ["id"]
 
 DATASET_QUERY = """
@@ -34,7 +35,7 @@ DATASET_QUERY = """
         loaded_at,
         STR_TO_DATE(DATE_FORMAT(date_iso, '%Y-%m-%d'), '%Y-%m-%d') AS event_time,
         CAST('2000-01-01 00:00:00' AS DATETIME) AS date
-    FROM sasha_fred_dff
+    FROM sasha_fred_cbbtcusd
     WHERE date_iso IS NOT NULL
       AND value IS NOT NULL
       AND STR_TO_DATE(DATE_FORMAT(date_iso, '%Y-%m-%d'), '%Y-%m-%d') IS NOT NULL
@@ -87,18 +88,22 @@ def _build_reverse(ctx_index: dict) -> dict[str, tuple[int, dict]]:
     return reverse
 
 
-def _event_type(delta: float) -> str:
-    if delta > 0:
-        return "rate_hike"
-    if delta < 0:
-        return "rate_cut"
-    return "rate_unchanged"
+def _event_type(pct_change: float) -> str:
+    if pct_change >= 2.0:
+        return "bull_breakout"
+    if pct_change >= 0.5:
+        return "bull_drift"
+    if pct_change <= -2.0:
+        return "bear_drop"
+    if pct_change <= -0.5:
+        return "bear_drift"
+    return "sideways"
 
 
 def _prepare_events(dataset: list[dict]) -> list[tuple[datetime, float, str]]:
     """
-    Превращаем сырой ряд value в список событий изменения:
-    (event_time, delta_value), где delta_value != 0.
+    Превращаем ряд BTC в список событий:
+    (event_time, pct_change, event_type).
     """
     events: list[tuple[datetime, float, str]] = []
     prev_value = None
@@ -112,31 +117,31 @@ def _prepare_events(dataset: list[dict]) -> list[tuple[datetime, float, str]]:
         except (TypeError, ValueError):
             continue
 
-        if prev_value is not None:
-            delta = value - prev_value
-            events.append((dt, delta, _event_type(delta)))
+        if prev_value is not None and prev_value != 0:
+            pct_change = ((value - prev_value) / prev_value) * 100.0
+            events.append((dt, pct_change, _event_type(pct_change)))
         prev_value = value
 
     return events
 
 
-def _apply_var(signed_t1: float, delta: float, var: int, ctx_info: dict) -> float:
-    avg_abs_change = float(ctx_info.get("avg_abs_change") or 0.0)
+def _apply_var(signed_t1: float, pct_change: float, var: int, ctx_info: dict) -> float:
+    avg_abs_pct = float(ctx_info.get("avg_abs_pct_change") or 0.0)
 
     if var == 0:
         return signed_t1
     if var == 1:
-        if avg_abs_change <= 0:
+        if avg_abs_pct <= 0:
             return 0.0
-        return signed_t1 if abs(delta) >= avg_abs_change else 0.0
+        return signed_t1 if abs(pct_change) >= avg_abs_pct else 0.0
     if var == 2:
-        base = avg_abs_change if avg_abs_change > 0 else abs(delta)
+        base = avg_abs_pct if avg_abs_pct > 0 else abs(pct_change)
         if base <= 0:
             return 0.0
-        scale = min(abs(delta) / base, 3.0)
+        scale = min(abs(pct_change) / base, 3.0)
         return signed_t1 * scale
     if var == 3:
-        return signed_t1 if delta > 0 else 0.0
+        return signed_t1 if pct_change > 0 else 0.0
     return 0.0
 
 
@@ -204,7 +209,6 @@ def model(
                 ext_min.add(rates[i]["date"])
         ext_set = ext_max if is_bull else ext_min
         if is_daily:
-            # Daily tables can keep non-midnight timestamps; align lookups by date.
             rates_t1_by_day = {
                 r["date"].date(): float((r.get("close") or 0) - (r.get("open") or 0))
                 for r in rates
@@ -218,7 +222,7 @@ def model(
     result: dict[str, float] = {}
     window_sec = SHIFT_WINDOW * 86400
 
-    for event_time, delta, event_type in events:
+    for event_time, pct_change, event_type in events:
         lookup = reverse.get(event_type)
         if lookup is None:
             continue
@@ -266,9 +270,9 @@ def model(
                 t1 = rates_t1.get(t_date, 0.0)
                 ext_hit = t_date in ext_set
 
-        direction = 1.0 if delta > 0 else -1.0
+        direction = 1.0 if pct_change > 0 else -1.0
         signed_t1 = t1 * direction
-        weighted_t1 = _apply_var(signed_t1, delta, var, ctx_info)
+        weighted_t1 = _apply_var(signed_t1, pct_change, var, ctx_info)
 
         if weighted_t1 != 0.0 and type in (0, 1):
             wc = f"{ctx_id}_0_{shift}"
