@@ -1,6 +1,7 @@
 """
 brain_framework.py v14 — IS_SIMPLE режим + опциональный ML (USE_ML_VALUES).
 Все оптимизации применены: bulk upsert, searchsorted, threadpool executor.
+ДОПОЛНЕНО: конфиг-лоадер (config.toml/json), run_standard_model, auto-build weights.
 """
 
 from __future__ import annotations
@@ -118,6 +119,273 @@ def _build_np_rates_for_table(rates, candle_ranges, extremums, global_rates_list
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# [A] КОНФИГ-ЛОАДЕР И run_standard_model
+# ══════════════════════════════════════════════════════════════════════════════
+
+import json as _json_cfg
+import sys as _sys_cfg
+from typing import Callable, Optional
+
+# Глобальный кеш конфига текущего сервиса (один процесс = один сервис)
+_SERVICE_CONFIG: dict = {}
+
+
+def get_service_config() -> dict:
+    """
+    Публичный геттер — вызывается из model.py для чтения конфига.
+    Безопасно вызывать из enrich_dataset() и model().
+    """
+    return _SERVICE_CONFIG
+
+
+def _load_service_config(model_dir: str) -> dict:
+    """
+    Ищет конфиг в директории сервиса. Порядок приоритета:
+      1. config.toml  — предпочтительный (поддерживает комментарии)
+      2. config.json  — для PHP-совместимости
+      3. {}           — дефолты подставит build_app из model.py атрибутов
+
+    .env остаётся только для секретов (DB_HOST, DB_PASSWORD и т.д.)
+    """
+    import os
+
+    toml_path = os.path.join(model_dir, "config.toml")
+    if os.path.exists(toml_path):
+        try:
+            if _sys_cfg.version_info >= (3, 11):
+                import tomllib
+                with open(toml_path, "rb") as f:
+                    data = tomllib.load(f)
+            else:
+                import tomli  # pip install tomli
+                with open(toml_path, "rb") as f:
+                    data = tomli.load(f)
+            log(f"   config: {toml_path}", "brain-framework", force=True)
+            return data
+        except ImportError:
+            log("   config: tomli not installed, trying config.json",
+                "brain-framework", level="warning")
+        except Exception as e:
+            log(f"   config: toml error — {e}", "brain-framework", level="error")
+
+    json_path = os.path.join(model_dir, "config.json")
+    if os.path.exists(json_path):
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                data = _json_cfg.load(f)
+            log(f"   config: {json_path}", "brain-framework", force=True)
+            return data
+        except Exception as e:
+            log(f"   config: json error — {e}", "brain-framework", level="error")
+
+    log("   config: no config file, using model.py attributes",
+        "brain-framework", force=True)
+    return {}
+
+
+# ── run_standard_model ────────────────────────────────────────────────────────
+
+def run_standard_model(
+    rates: list[dict],
+    dataset: list[dict],
+    date: datetime,
+    *,
+    type: int,
+    var: int,
+    dataset_index: dict | None,
+    shift_window: int,
+    apply_var_fn: Callable[[float, float, int, dict], float],
+    min_occurrence: int = 2,
+    get_event_fn: Optional[Callable[[dict], Optional[tuple]]] = None,
+    signal_fn: Optional[Callable] = None,
+) -> dict[str, float]:
+    """
+    Универсальный движок модели. Вызывается из model() сервиса.
+
+    Параметры
+    ─────────
+    apply_var_fn(signed_t1, pct, var, ctx_info) → float
+        Специфична для сервиса. Как взвешивать T1.
+
+    signal_fn(type, ctx_id, shift, weighted_t1, ext_hit, pct, occ, direction, ctx_info)
+        → dict[str, float]  — свои weight_code для этого event
+        → {}                — пропустить событие
+        → None              — использовать встроенную логику (type 0/1/2)
+        Передавать только если нужны кастомные type (3, 4, 5...).
+        Для type 0/1/2 возвращать None — дублировать логику не нужно.
+
+    get_event_fn(row) → (event_time, pct, event_type) | None
+        Как парсить строку датасета.
+        Дефолт: читает готовые поля из enriched-таблицы (date_dt / event_time,
+        pct_change, event_type). Передавать только для нестандартных датасетов.
+    """
+    if not rates or not dataset:
+        return {}
+
+    ctx_index = (dataset_index or {}).get("ctx_index") or {}
+    if not ctx_index:
+        return {}
+
+    reverse: dict[str, tuple[int, dict]] = {
+        str(info.get("event_type") or "").strip().lower(): (int(info["id"]), info)
+        for _, info in ctx_index.items()
+        if info.get("id") and info.get("event_type")
+    }
+    if not reverse:
+        return {}
+
+    np_rates = (dataset_index or {}).get("np_rates")
+    np_view, is_bull = _std_slice_np(np_rates, date, rates)
+    is_daily = rates[-1]["date"].hour == 0 and rates[-1]["date"].minute == 0
+    r_t1, r_t1d, ext_set, ext_day = _std_rate_dicts(rates, is_bull, is_daily, np_view)
+
+    _get_event = get_event_fn or _std_get_event
+    result: dict[str, float] = {}
+    window_sec = shift_window * 86400
+
+    for row in dataset:
+        parsed = _get_event(row)
+        if parsed is None:
+            continue
+        event_time, pct, event_type = parsed
+
+        lookup = reverse.get(event_type)
+        if lookup is None:
+            continue
+        ctx_id, ctx_info = lookup
+        occ = int(ctx_info.get("occurrence_count") or 0)
+
+        diff_sec = (date - event_time).total_seconds()
+        if diff_sec < 0 or diff_sec > window_sec:
+            continue
+
+        shift = int(diff_sec // 86400)
+        if occ < min_occurrence and shift != 0:
+            continue
+
+        t_date = (event_time + timedelta(days=shift)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        if t_date > date:
+            continue
+
+        t1, ext_hit = _std_candle(t_date, np_view, is_daily, r_t1, r_t1d, ext_set, ext_day)
+        direction   = 1.0 if pct > 0 else -1.0
+        weighted_t1 = apply_var_fn(t1 * direction, pct, var, ctx_info)
+
+        if signal_fn is not None:
+            contribution = signal_fn(
+                type, ctx_id, shift, weighted_t1,
+                ext_hit, pct, occ, direction, ctx_info,
+            )
+            if contribution is None:
+                contribution = _std_signal(
+                    type, ctx_id, shift, weighted_t1,
+                    ext_hit, pct, occ, direction,
+                )
+        else:
+            contribution = _std_signal(
+                type, ctx_id, shift, weighted_t1,
+                ext_hit, pct, occ, direction,
+            )
+
+        for wc, val in contribution.items():
+            if val != 0.0:
+                result[wc] = result.get(wc, 0.0) + val
+
+    return {k: v for k, v in result.items() if v != 0.0}
+
+
+def _std_signal(
+    type: int, ctx_id: int, shift: int,
+    weighted_t1: float, ext_hit: bool,
+    pct: float, occ: int, direction: float,
+) -> dict[str, float]:
+    """Встроенная логика типов 0 / 1 / 2."""
+    result: dict[str, float] = {}
+    if weighted_t1 != 0.0 and type in (0, 1):
+        result[f"{ctx_id}_0_{shift}"] = round(weighted_t1, 6)
+    if type in (0, 2) and occ > 0 and ext_hit:
+        ext = ((1.0 / occ) * 2 - 1) * direction
+        if ext != 0.0:
+            result[f"{ctx_id}_1_{shift}"] = round(ext, 6)
+    return result
+
+
+def _std_get_event(row: dict) -> Optional[tuple]:
+    """Парсит строку enriched-датасета."""
+    v = row.get("event_time") or row.get("date_dt")
+    if v is None:
+        return None
+    if isinstance(v, str):
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+            try:
+                v = datetime.strptime(v[:19], fmt)
+                break
+            except ValueError:
+                pass
+        else:
+            return None
+    try:
+        return v, float(row["pct_change"]), str(row["event_type"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _std_slice_np(np_rates, date, rates):
+    is_bull = float(rates[-1].get("close") or 0) > float(rates[-1].get("open") or 0)
+    if np_rates is None:
+        return None, is_bull
+    dn = np_rates.get("dates_ns")
+    if dn is None:
+        return None, is_bull
+    cut = int(np.searchsorted(dn, int(date.timestamp()), side="right"))
+    if cut > 0:
+        is_bull = float(np_rates["close"][cut - 1]) > float(np_rates["open"][cut - 1])
+    return {
+        "dates_ns": dn[:cut],
+        "t1":       np_rates["t1"][:cut],
+        "ext":      (np_rates["ext_max"] if is_bull else np_rates["ext_min"])[:cut],
+        "cut":      cut,
+    }, is_bull
+
+
+def _std_rate_dicts(rates, is_bull, is_daily, np_view):
+    if np_view is not None:
+        return {}, {}, set(), {}
+    t1   = {r["date"]: float((r.get("close") or 0) - (r.get("open") or 0)) for r in rates}
+    emax, emin = set(), set()
+    for i in range(1, len(rates) - 1):
+        h  = float(rates[i].get("max") or 0)
+        lo = float(rates[i].get("min") or 0)
+        if h  > float(rates[i-1].get("max") or 0) and h  > float(rates[i+1].get("max") or 0): emax.add(rates[i]["date"])
+        if lo < float(rates[i-1].get("min") or 0) and lo < float(rates[i+1].get("min") or 0): emin.add(rates[i]["date"])
+    ext  = emax if is_bull else emin
+    t1d  = {r["date"].date(): float((r.get("close") or 0) - (r.get("open") or 0)) for r in rates} if is_daily else {}
+    extd = {d.date(): True for d in ext} if is_daily else {}
+    return t1, t1d, ext, extd
+
+
+def _std_candle(t_date, np_view, is_daily, r_t1, r_t1d, ext_set, ext_day):
+    if np_view is not None:
+        ts  = int(t_date.timestamp())
+        idx = int(np.searchsorted(np_view["dates_ns"], ts, side="left"))
+        if idx >= np_view["cut"] or int(np_view["dates_ns"][idx]) != ts:
+            if not is_daily:
+                return 0.0, False
+            l = int(np.searchsorted(np_view["dates_ns"], ts, side="left"))
+            r = int(np.searchsorted(np_view["dates_ns"], ts + 86400, side="left"))
+            if r <= l:
+                return 0.0, False
+            idx = r - 1
+        return float(np_view["t1"][idx]), bool(np_view["ext"][idx])
+    if is_daily:
+        dk = t_date.date()
+        return r_t1d.get(dk, 0.0), bool(ext_day.get(dk, False))
+    return r_t1.get(t_date, 0.0), t_date in ext_set
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # ПУБЛИЧНЫЕ ХЕЛПЕРЫ ДЛЯ rebuild_index() В model.py
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -143,7 +411,7 @@ async def ensure_ctx_table(engine, table: str, extra_columns: str = "") -> None:
 async def upsert_ctx_rows(engine, table: str, rows: list[dict]) -> dict[str, int]:
     if not rows:
         return {}
-    
+
     _reserved  = {"fingerprint_hash", "occurrence_count", "first_dt", "last_dt"}
     extra_cols = [k for k in rows[0] if k not in _reserved]
     extra_insert = (", ".join(f"`{c}`" for c in extra_cols) + ", ") if extra_cols else ""
@@ -295,12 +563,20 @@ class _State:
     ML_ACTIVE_TAIL:       int   = 0
     ML_PRECISION_METRIC:  str   = "mean"
 
+    # Новые поля для enriched-паттерна
+    PARSER_TABLE:         str | None = None
+    ENRICHED_TABLE:       str | None = None
+    DATASET_INDEX_FIELDS: list | None = None
+    DATASET_DATE_FIELD:   str = "date_dt"
+    enrich_fn:            object = None
+
     def __init__(self):
         self.CTX_KEY_COLUMNS   = ["id"]
         self.VAR_RANGE         = []
         self.TYPES_RANGE       = [0, 1, 2, 3, 4]
 
         self.model_fn          = None
+        self.batch_model_fn    = None
         self.index_builder_fn  = None
         self.weight_builder_fn = None
         self.model_needs_index = False
@@ -944,53 +1220,121 @@ def _discover_builders(model_module):
 def build_app(model_module) -> FastAPI:
     s = _State()
 
-    def _g(attr, default):
-        return getattr(model_module, attr, default)
+    # ── Загрузка конфига ──────────────────────────────────────────────────────
+    global _SERVICE_CONFIG
+    _model_dir = os.path.dirname(os.path.abspath(
+        sys.modules[model_module.__name__].__file__
+    ))
+    _SERVICE_CONFIG = _load_service_config(_model_dir)
+    _c = _SERVICE_CONFIG  # алиас
 
-    if not hasattr(model_module, "RATES_TABLE"):
-        raise RuntimeError(
-            "model.py должен содержать RATES_TABLE"
-        )
+    # Хелпер: config.toml[section][key] → model.py attr → .env → default
+    def _get(section: str, key: str, attr: str, env_key: str = "", default=None):
+        v = _c.get(section, {}).get(key)
+        if v is not None:
+            return v
+        v = getattr(model_module, attr, None)
+        if v is not None:
+            return v
+        if env_key:
+            v = os.getenv(env_key)
+            if v is not None:
+                try:
+                    return type(default)(v) if default is not None else v
+                except Exception:
+                    return v
+        return default
 
-    # ── Критичные переменные ──────────────────────────────────────────────────
-    s.SERVICE_ID   = _g("SERVICE_ID",   int(os.getenv("SERVICE_ID",   "0")))
-    s.PORT         = _g("PORT",         int(os.getenv("PORT",         "9000")))
-    s.NODE_NAME    = _g("NODE_NAME",    os.getenv("NODE_NAME",    "brain-svc"))
-    s.SERVICE_TEXT = _g("SERVICE_TEXT", os.getenv("SERVICE_TEXT", "Brain microservice"))
+    # ── Идентификация ─────────────────────────────────────────────────────────
+    s.SERVICE_ID   = int(_get("service", "id",   "SERVICE_ID",   "SERVICE_ID",   0))
+    s.PORT         = int(_get("service", "port", "PORT",         "PORT",         9000))
+    s.NODE_NAME    =     _get("service", "name", "NODE_NAME",    "NODE_NAME",    "brain-svc")
+    s.SERVICE_TEXT =     _get("service", "text", "SERVICE_TEXT", "SERVICE_TEXT", "Brain microservice")
 
-    # ── Опциональные настройки ────────────────────────────────────────────────
-    s.WEIGHTS_TABLE          = _g("WEIGHTS_TABLE",          None)
-    s.WEIGHTS_CODE_COLUMN    = _g("WEIGHTS_CODE_COLUMN",    "weight_code")
-    s.CTX_TABLE              = _g("CTX_TABLE",              None)
-    s.CTX_QUERY              = _g("CTX_QUERY",              None)
-    s.CTX_KEY_COLUMNS        = _g("CTX_KEY_COLUMNS",        ["id"])
-    s.DATASET_TABLE          = _g("DATASET_TABLE",          None)
-    s.DATASET_QUERY          = _g("DATASET_QUERY",          None)
-    s.DATASET_ENGINE         = _g("DATASET_ENGINE",         "vlad")
-    s.FILTER_DATASET_BY_DATE = _g("FILTER_DATASET_BY_DATE", False)
-    s.SHIFT_WINDOW           = _g("SHIFT_WINDOW",           12)
-    s.RELOAD_INTERVAL        = _g("RELOAD_INTERVAL",        3600)
-    s.REBUILD_INTERVAL       = int(_g("REBUILD_INTERVAL",   0))
-    s.VAR_RANGE              = _g("VAR_RANGE",              [0])
-    s.TYPES_RANGE            = _g("TYPES_RANGE",            [0, 1, 2, 3, 4])
-    s.CACHE_DATE_FROM        = _g("CACHE_DATE_FROM",        "2025-01-15")
-    s.LABEL_FN               = _g("LABEL_FN",               None)
+    # ── Котировки ─────────────────────────────────────────────────────────────
+    if not hasattr(model_module, "RATES_TABLE") and not _c.get("rates", {}).get("table"):
+        raise RuntimeError("RATES_TABLE должен быть задан в config.toml [rates] table или model.py")
+    s.RATES_TABLE = _get("rates", "table", "RATES_TABLE", "", "brain_rates_eur_usd")
 
-    s.RATES_TABLE        = _g("RATES_TABLE",  "brain_rates_eur_usd")
-    s.dataset_key_field  = _g("DATASET_KEY",  "ctx_id")
+    # ── Кеш ───────────────────────────────────────────────────────────────────
+    s.CACHE_DATE_FROM  =      _get("cache", "date_from",        "CACHE_DATE_FROM",  "", "2025-01-15")
+    s.VAR_RANGE        =      _get("cache", "var_range",        "VAR_RANGE",        "", [0])
+    s.TYPES_RANGE      =      _get("cache", "types_range",      "TYPES_RANGE",      "", [0, 1, 2, 3, 4])
+    s.SHIFT_WINDOW     = int( _get("cache", "shift_window",     "SHIFT_WINDOW",     "", 12))
+    s.REBUILD_INTERVAL = int(_get("cache", "rebuild_interval", "REBUILD_INTERVAL", "", 0))
+    s.RELOAD_INTERVAL = int(_get("cache", "reload_interval", "RELOAD_INTERVAL", "", 3600))
 
-    s.URL_MAP_QUERY  = _g("URL_MAP_QUERY",  None)
-    s.URL_MAP_ENGINE = _g("URL_MAP_ENGINE", "vlad")
+    # ── Датасет (новый способ — через enriched_table) ─────────────────────────
+    s.PARSER_TABLE         = _get("dataset", "parser_table",   "PARSER_TABLE",         "", None)
+    s.ENRICHED_TABLE       = _get("dataset", "enriched_table", "ENRICHED_TABLE",       "", None)
+    s.DATASET_INDEX_FIELDS = _get("dataset", "index_fields",   "DATASET_INDEX_FIELDS", "", None)
+    s.DATASET_DATE_FIELD   = _get("dataset", "date_field",     "DATASET_DATE_FIELD",   "", "date_dt")
 
-    s.USE_ML_VALUES        = bool(_g("USE_ML_VALUES",        False))
-    s.ML_INIT_MODE         = _g("ML_INIT_MODE",        "constant")
-    s.ML_TARGET_PRECISION  = float(_g("ML_TARGET_PRECISION", 0.95))
-    s.ML_MAX_ITER          = int(_g("ML_MAX_ITER",     20))
-    s.ML_STEP              = float(_g("ML_STEP",       0.10))
-    s.ML_EXTREMUM_LIMIT    = int(_g("ML_EXTREMUM_LIMIT", 50))
-    s.ML_ACTIVE_TAIL       = int(_g("ML_ACTIVE_TAIL",  0))
-    s.ML_PRECISION_METRIC  = _g("ML_PRECISION_METRIC", "mean")
+    # ── Датасет (старый способ — прямой запрос, обратная совместимость) ───────
+    s.DATASET_TABLE          = _get("dataset", "table",          "DATASET_TABLE",          "", None)
+    s.DATASET_QUERY          = _get("dataset", "query",          "DATASET_QUERY",           "", None)
+    s.DATASET_ENGINE         = _get("dataset", "engine",         "DATASET_ENGINE",          "", "vlad")
+    s.FILTER_DATASET_BY_DATE = bool(_get("dataset", "filter_by_date", "FILTER_DATASET_BY_DATE", "", False))
+    s.dataset_key_field = _get("dataset", "key_field", "DATASET_KEY", "", "ctx_id")
 
+    # ── Контекст и веса ───────────────────────────────────────────────────────
+    s.CTX_KEY_COLUMNS    = _get("ctx", "key_columns",        "CTX_KEY_COLUMNS",    "", ["id"])
+    s.CTX_TABLE          = _get("ctx", "table",              "CTX_TABLE",          "", None)
+    s.CTX_QUERY          = _get("ctx", "query",              "CTX_QUERY",          "", None)
+    s.WEIGHTS_TABLE      = _get("ctx", "weights_table",      "WEIGHTS_TABLE",      "", None)
+    s.WEIGHTS_CODE_COLUMN= _get("ctx", "weights_code_column","WEIGHTS_CODE_COLUMN","", "weight_code")
+    s.URL_MAP_QUERY      = _get("ctx", "url_map_query",      "URL_MAP_QUERY",      "", None)
+    s.URL_MAP_ENGINE     = _get("ctx", "url_map_engine",     "URL_MAP_ENGINE",     "", "vlad")
+
+    # ── ML ────────────────────────────────────────────────────────────────────
+    s.USE_ML_VALUES       = bool( _get("ml", "enabled",          "USE_ML_VALUES",       "", False))
+    s.ML_INIT_MODE        =       _get("ml", "init_mode",        "ML_INIT_MODE",        "", "constant")
+    s.ML_TARGET_PRECISION = float(_get("ml", "target_precision", "ML_TARGET_PRECISION", "", 0.95))
+    s.ML_MAX_ITER         = int(  _get("ml", "max_iter",         "ML_MAX_ITER",         "", 20))
+    s.ML_STEP             = float(_get("ml", "step",             "ML_STEP",             "", 0.10))
+    s.ML_EXTREMUM_LIMIT   = int(  _get("ml", "extremum_limit",   "ML_EXTREMUM_LIMIT",   "", 50))
+    s.ML_ACTIVE_TAIL      = int(  _get("ml", "active_tail",      "ML_ACTIVE_TAIL",      "", 0))
+    s.ML_PRECISION_METRIC =       _get("ml", "precision_metric", "ML_PRECISION_METRIC", "", "mean")
+
+    # ── Прочее ────────────────────────────────────────────────────────────────
+    s.LABEL_FN  = getattr(model_module, "LABEL_FN",  None)
+    s.enrich_fn = getattr(model_module, "enrich_dataset", None)
+
+    # ── Авто-деривация для новых сервисов с ENRICHED_TABLE ───────────────────
+    if s.ENRICHED_TABLE:
+        et = s.ENRICHED_TABLE
+        df = s.DATASET_DATE_FIELD
+
+        if not s.WEIGHTS_TABLE:
+            s.WEIGHTS_TABLE = f"{et}_weights"
+
+        if not s.DATASET_QUERY and not s.DATASET_TABLE:
+            s.DATASET_QUERY  = f"SELECT *, `{df}` AS date FROM `{et}` ORDER BY `{df}`"
+            s.DATASET_ENGINE = _get("dataset", "engine", "DATASET_ENGINE", "", "vlad")
+
+        if not s.CTX_TABLE and not s.CTX_QUERY:
+            s.CTX_QUERY = f"""
+                SELECT
+                    idx.id,
+                    idx.event_type,
+                    idx.date_added,
+                    COALESCE(agg.occurrence_count,   0) AS occurrence_count,
+                    COALESCE(agg.avg_abs_pct_change, 0) AS avg_abs_pct_change,
+                    COALESCE(agg.avg_pct_change,     0) AS avg_pct_change
+                FROM `{et}_indexes` idx
+                LEFT JOIN (
+                    SELECT
+                        event_type,
+                        COUNT(*)             AS occurrence_count,
+                        AVG(ABS(pct_change)) AS avg_abs_pct_change,
+                        AVG(pct_change)      AS avg_pct_change
+                    FROM `{et}`
+                    GROUP BY event_type
+                ) agg ON agg.event_type = idx.event_type
+                WHERE idx.mask_id = 1
+            """
+
+    # ── model() и batch_model() ──────────────────────────────────────────────
     s.model_fn = getattr(model_module, "model", None)
     if s.model_fn is None:
         raise RuntimeError("model_module должен определять функцию model()")
@@ -1000,8 +1344,8 @@ def build_app(model_module) -> FastAPI:
 
     sig = inspect.signature(s.model_fn)
     s.model_needs_index = "dataset_index" in sig.parameters
-    s.model_can_filter_dataset_by_date = bool(_g("MODEL_CAN_FILTER_DATASET_BY_DATE", False))
-    s.model_uses_rate_history = bool(_g("MODEL_USES_RATE_HISTORY", True))
+    s.model_can_filter_dataset_by_date = bool(_get("dataset", "model_can_filter", "MODEL_CAN_FILTER_DATASET_BY_DATE", "", False))
+    s.model_uses_rate_history = bool(_get("dataset", "model_uses_rates", "MODEL_USES_RATE_HISTORY", "", True))
 
     s.index_builder_fn, s.weight_builder_fn = _discover_builders(model_module)
 
@@ -1011,6 +1355,7 @@ def build_app(model_module) -> FastAPI:
         f"rebuild={'builders' if _has_rebuild else 'no'} | "
         f"ml={'ON' if s.USE_ML_VALUES else 'off'} | "
         f"batch_model={'yes' if s.batch_model_fn else 'no'} | "
+        f"enriched_table={s.ENRICHED_TABLE or 'no'} | "
         f"model_filters_dataset={'yes' if s.model_can_filter_dataset_by_date else 'no'} | "
         f"rate_history={'yes' if s.model_uses_rate_history else 'no'}",
         s.NODE_NAME, force=True)
@@ -1186,42 +1531,58 @@ def build_app(model_module) -> FastAPI:
             f"url_map={len(s.url_map)}",
             s.NODE_NAME, force=True)
 
-    # ── _do_rebuild ───────────────────────────────────────────────────────────
+    # ── _do_rebuild [C] ───────────────────────────────────────────────────────
 
     async def _do_rebuild() -> dict:
         stats = {}
 
-        # Retry wrapper: aiomysql occasionally raises "Packet sequence number wrong"
-        # on the very first connection attempt (stale pool state after idle period or
-        # MySQL load-balancer quirk). Disposing the pool forces fresh sockets.
-        _REBUILD_RETRIES = 3
+        # Шаг 0: enrich_dataset() — трансформация raw → enriched
+        # Вызывается если model.py содержит функцию enrich_dataset()
+        if s.enrich_fn is not None:
+            try:
+                r = await s.enrich_fn(s.engine_vlad, s.engine_brain)
+                stats["enrich"] = r or {}
+                log(f"   enrich_dataset: {r}", s.NODE_NAME, force=True)
+            except Exception as e:
+                log(f"   enrich_dataset: {e}", s.NODE_NAME, level="error")
+                send_error_trace(e, s.NODE_NAME, "enrich_dataset")
+                return {"error": str(e)}
 
-        async def _attempt_index():
-            for attempt in range(_REBUILD_RETRIES):
-                try:
-                    return await s.index_builder_fn(s.engine_vlad, s.engine_brain)
-                except Exception as exc:
-                    is_packet_err = "Packet sequence" in str(exc) or "InternalError" in type(exc).__name__
-                    if attempt < _REBUILD_RETRIES - 1 and is_packet_err:
-                        log(f"   build_index attempt {attempt+1} failed (packet err), disposing pool: {exc}",
-                            s.NODE_NAME, level="warning")
-                        try:
-                            await s.engine_vlad.dispose()
-                        except Exception:
-                            pass
-                        await asyncio.sleep(1.5 * (attempt + 1))
-                    else:
-                        raise
+        # Шаг 1: dataset_indexer — строит _mask и _indexes таблицы
+        # Вызывается если заданы ENRICHED_TABLE + DATASET_INDEX_FIELDS
+        if s.ENRICHED_TABLE and s.DATASET_INDEX_FIELDS:
+            try:
+                from dataset_indexer import build_indexes, parse_indexes
+                await build_indexes(
+                    s.engine_vlad, s.ENRICHED_TABLE, s.DATASET_INDEX_FIELDS
+                )
+                await parse_indexes(
+                    s.engine_vlad, s.ENRICHED_TABLE, s.DATASET_DATE_FIELD
+                )
+                stats["dataset_indexer"] = {
+                    "mask_table":    f"{s.ENRICHED_TABLE}_mask",
+                    "indexes_table": f"{s.ENRICHED_TABLE}_indexes",
+                }
+                stats["auto_weights"] = await _auto_build_weights()
+                log(f"   dataset_indexer: {s.ENRICHED_TABLE}", s.NODE_NAME, force=True)
+            except Exception as e:
+                log(f"   dataset_indexer: {e}", s.NODE_NAME, level="error")
+                send_error_trace(e, s.NODE_NAME, "dataset_indexer")
+                return {"error": str(e)}
 
-        async def _attempt_weights():
-            for attempt in range(_REBUILD_RETRIES):
+        # Шаг 2: кастомные context_idx.py + weights.py (старый способ)
+        # Запускается если рядом с model.py лежат эти файлы
+        _RETRIES = 3
+
+        async def _attempt(fn, *args):
+            for attempt in range(_RETRIES):
                 try:
-                    return await s.weight_builder_fn(s.engine_vlad)
+                    return await fn(*args)
                 except Exception as exc:
-                    is_packet_err = "Packet sequence" in str(exc) or "InternalError" in type(exc).__name__
-                    if attempt < _REBUILD_RETRIES - 1 and is_packet_err:
-                        log(f"   build_weights attempt {attempt+1} failed (packet err), disposing pool: {exc}",
-                            s.NODE_NAME, level="warning")
+                    if attempt < _RETRIES - 1 and (
+                        "Packet sequence" in str(exc)
+                        or "InternalError" in type(exc).__name__
+                    ):
                         try:
                             await s.engine_vlad.dispose()
                         except Exception:
@@ -1232,9 +1593,9 @@ def build_app(model_module) -> FastAPI:
 
         if s.index_builder_fn is not None:
             try:
-                result = await _attempt_index()
-                stats["index"] = result or {}
-                log(f"   build_index: {result}", s.NODE_NAME, force=True)
+                r = await _attempt(s.index_builder_fn, s.engine_vlad, s.engine_brain)
+                stats["index"] = r or {}
+                log(f"   build_index: {r}", s.NODE_NAME, force=True)
             except Exception as e:
                 log(f"   build_index: {e}", s.NODE_NAME, level="error")
                 send_error_trace(e, s.NODE_NAME, "build_index")
@@ -1242,9 +1603,9 @@ def build_app(model_module) -> FastAPI:
 
         if s.weight_builder_fn is not None:
             try:
-                result = await _attempt_weights()
-                stats["weights"] = result or {}
-                log(f"   build_weights: {result}", s.NODE_NAME, force=True)
+                r = await _attempt(s.weight_builder_fn, s.engine_vlad)
+                stats["weights"] = r or {}
+                log(f"   build_weights: {r}", s.NODE_NAME, force=True)
             except Exception as e:
                 log(f"   build_weights: {e}", s.NODE_NAME, level="error")
                 send_error_trace(e, s.NODE_NAME, "build_weights")
@@ -1254,18 +1615,84 @@ def build_app(model_module) -> FastAPI:
         await _load_ctx_index(s)
         await _load_label_cache(s)
         await _load_url_map(s)
-
         s.last_rebuild = datetime.now()
-        log(f" rebuild done: weights={len(s.weight_codes)} ctx={len(s.ctx_index)} url_map={len(s.url_map)}",
-            s.NODE_NAME, force=True)
-
+        log(
+            f" rebuild done: weights={len(s.weight_codes)} ctx={len(s.ctx_index)}",
+            s.NODE_NAME, force=True,
+        )
         return {
             **stats,
             "ctx_total":     len(s.ctx_index),
             "weights_total": len(s.weight_codes),
-            "url_map_total": len(s.url_map),
             "rebuilt_at":    s.last_rebuild.isoformat(),
         }
+
+    async def _auto_build_weights() -> dict:
+        """
+        Авто-генерация весов из _indexes-таблицы.
+        Вызывается только для новых сервисов (ENRICHED_TABLE задан).
+        Формат {idx_id}_{mode}_{shift} — совместим с run_standard_model.
+        Использует INSERT IGNORE чтобы не менять id при повторных запусках
+        и не инвалидировать кеш.
+        """
+        if not s.ENRICHED_TABLE or not s.WEIGHTS_TABLE:
+            return {"skipped": True}
+
+        et        = s.ENRICHED_TABLE
+        idx_table = f"{et}_indexes"
+
+        try:
+            async with s.engine_vlad.connect() as conn:
+                res = await conn.execute(text(f"""
+                    SELECT idx.id, COALESCE(agg.cnt, 0) AS occ
+                    FROM `{idx_table}` idx
+                    LEFT JOIN (
+                        SELECT event_type, COUNT(*) AS cnt
+                        FROM   `{et}` GROUP BY event_type
+                    ) agg ON agg.event_type = idx.event_type
+                    WHERE idx.mask_id = 1
+                    ORDER BY idx.id
+                """))
+                ctx_rows = res.fetchall()
+        except Exception as e:
+            return {"error": str(e)}
+
+        rows = [
+            {
+                "wc":     f"{ctx_id}_{mode}_{shift}",
+                "ctx_id": int(ctx_id),
+                "mode":   int(mode),
+                "shift":  int(shift),
+            }
+            for ctx_id, occ in ctx_rows
+            for mode in (0, 1)
+            for shift in range(0, (s.SHIFT_WINDOW if (occ or 0) >= 2 else 0) + 1)
+        ]
+        if not rows:
+            return {"weights": 0}
+
+        async with s.engine_vlad.begin() as conn:
+            await conn.execute(text(f"""
+                CREATE TABLE IF NOT EXISTS `{s.WEIGHTS_TABLE}` (
+                    id          INT         NOT NULL AUTO_INCREMENT,
+                    weight_code VARCHAR(40) NOT NULL,
+                    ctx_id      INT         NOT NULL,
+                    mode        TINYINT     NOT NULL,
+                    shift       SMALLINT    NOT NULL DEFAULT 0,
+                    PRIMARY KEY (id),
+                    UNIQUE KEY  uk_wc (weight_code),
+                    INDEX       idx_ctx_id (ctx_id)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """))
+            # INSERT IGNORE — не меняет существующие id, не инвалидирует кеш
+            for i in range(0, len(rows), 500):
+                await conn.execute(text(f"""
+                    INSERT IGNORE INTO `{s.WEIGHTS_TABLE}`
+                        (weight_code, ctx_id, mode, shift)
+                    VALUES (:wc, :ctx_id, :mode, :shift)
+                """), rows[i: i + 500])
+
+        return {"contexts": len(ctx_rows), "weights": len(rows)}
 
     # ── _bg_reload ────────────────────────────────────────────────────────────
 
@@ -1276,8 +1703,12 @@ def build_app(model_module) -> FastAPI:
                 await _refresh_simple_rates(s)
                 for table in _RATES_TABLES:
                     await _refresh_rates(table, s)
+                _has_any_rebuild = (
+                    s.index_builder_fn or s.weight_builder_fn  # старый стиль
+                    or s.enrich_fn or s.ENRICHED_TABLE          # новый стиль
+                )
                 if (s.REBUILD_INTERVAL > 0
-                        and (s.index_builder_fn or s.weight_builder_fn)
+                        and _has_any_rebuild
                         and (s.last_rebuild is None or
                              (datetime.now() - s.last_rebuild).total_seconds()
                              >= s.REBUILD_INTERVAL)):
@@ -1968,8 +2399,10 @@ def build_app(model_module) -> FastAPI:
                 "last_reload":        s.last_reload.isoformat() if s.last_reload else None,
                 "last_rebuild":       s.last_rebuild.isoformat() if s.last_rebuild else None,
                 "rebuild_auto":       s.REBUILD_INTERVAL > 0 and bool(
-                    s.index_builder_fn or s.weight_builder_fn),
+                    s.index_builder_fn or s.weight_builder_fn
+                    or s.enrich_fn or s.ENRICHED_TABLE),
                 "rebuild_interval_s": s.REBUILD_INTERVAL,
+                "enriched_table":     s.ENRICHED_TABLE,
                 "ml_mode": ({
                     "enabled":          True,
                     "init_mode":        s.ML_INIT_MODE,
@@ -2374,11 +2807,12 @@ def build_app(model_module) -> FastAPI:
 
     @app.get("/rebuild_index")
     async def ep_rebuild_index():
-        if not s.index_builder_fn and not s.weight_builder_fn:
+        if (not s.index_builder_fn and not s.weight_builder_fn
+                and not s.enrich_fn and not s.ENRICHED_TABLE):
             return err_response(
                 "Rebuild не настроен. "
-                "Добавь context_idx.py (build_index) и/или weights.py (build_weights) "
-                "рядом с model.py.")
+                "Добавь context_idx.py + weights.py (старый стиль) "
+                "или enrich_dataset() + ENRICHED_TABLE в model.py (новый стиль).")
         result = await _do_rebuild()
         if "error" in result:
             return err_response(result["error"])
@@ -2696,30 +3130,49 @@ def build_app(model_module) -> FastAPI:
             return {"status": "error",
                     "error": f"[Тест 3 — Покрытие] {' | '.join(_failures3)}"}
 
-        # ── Тест 4: rebuild_index ─────────────────────────────────────────────
-        if s.index_builder_fn is not None or s.weight_builder_fn is not None:
-            log("  [Тест 4] проверяем rebuild_index / обновление весов...",
-                s.NODE_NAME, force=True)
-            try:
-                _rb4 = await _do_rebuild()
-                if "error" in _rb4:
-                    log(f" Тест 4: rebuild вернул ошибку: {_rb4['error']}",
-                        s.NODE_NAME, force=True)
-                    return {"status": "error",
-                            "error": f"[Тест 4 — Rebuild] {_rb4['error']}"}
-                log(f"   Тест 4: rebuild OK — "
-                    f"ctx={_rb4.get('ctx_total')} "
-                    f"weights={_rb4.get('weights_total')} "
-                    f"url_map={_rb4.get('url_map_total')}",
-                    s.NODE_NAME, force=True)
-            except Exception as _e4:
-                log(f" Тест 4: exception: {_e4}", s.NODE_NAME, force=True)
-                return {"status": "error", "error": f"[Тест 4 — Rebuild] {_e4}"}
-        else:
-            log("   Тест 4: rebuild не настроен, пропуск", s.NODE_NAME, force=True)
+            # ── Тест 4: rebuild_index ─────────────────────────────────────────────
+            _has_any_rebuild4 = (
+                    s.index_builder_fn is not None or s.weight_builder_fn is not None  # старый стиль
+                    or s.enrich_fn is not None or bool(s.ENRICHED_TABLE)  # новый стиль
+            )
+            if _has_any_rebuild4:
+                log("  [Тест 4] проверяем rebuild_index...", s.NODE_NAME, force=True)
+                try:
+                    _rb4 = await _do_rebuild()
+                    if "error" in _rb4:
+                        log(f" Тест 4: rebuild вернул ошибку: {_rb4['error']}",
+                            s.NODE_NAME, force=True)
+                        return {"status": "error",
+                                "error": f"[Тест 4 — Rebuild] {_rb4['error']}"}
 
-        log(" PRETEST PASSED", s.NODE_NAME, force=True)
-        return {"status": "ok", "var_range": s.VAR_RANGE, "np_built": s.np_built}
+                    # Для новых сервисов проверяем что _indexes таблица не пустая
+                    if s.ENRICHED_TABLE:
+                        _idx_table = f"{s.ENRICHED_TABLE}_indexes"
+                        try:
+                            async with s.engine_vlad.connect() as _conn4:
+                                _cnt4 = (await _conn4.execute(
+                                    text(f"SELECT COUNT(*) FROM `{_idx_table}`")
+                                )).scalar()
+                            if not _cnt4:
+                                return {"status": "error",
+                                        "error": f"[Тест 4 — Rebuild] {_idx_table} пуста после rebuild"}
+                            log(f"   Тест 4: {_idx_table} — {_cnt4} строк",
+                                s.NODE_NAME, force=True)
+                        except Exception as _e4chk:
+                            return {"status": "error",
+                                    "error": f"[Тест 4 — Rebuild] проверка {_idx_table}: {_e4chk}"}
+
+                    log(f"   Тест 4: rebuild OK — "
+                        f"ctx={_rb4.get('ctx_total')} "
+                        f"weights={_rb4.get('weights_total')} "
+                        f"enrich={_rb4.get('enrich')} "
+                        f"indexer={_rb4.get('dataset_indexer')}",
+                        s.NODE_NAME, force=True)
+                except Exception as _e4:
+                    log(f" Тест 4: exception: {_e4}", s.NODE_NAME, force=True)
+                    return {"status": "error", "error": f"[Тест 4 — Rebuild] {_e4}"}
+            else:
+                log("   Тест 4: rebuild не настроен, пропуск", s.NODE_NAME, force=True)
 
     @app.get("/posttest")
     async def ep_posttest(
