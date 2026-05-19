@@ -37,7 +37,6 @@ log = logging.getLogger(__name__)
 # КОНФИГУРАЦИЯ СЕРВИСА
 # ══════════════════════════════════════════════════════════════════════════════
 
-
 CTX_TABLE        = CTX_TABLE
 CTX_KEY_COLUMNS  = ["fingerprint_hash"]   # ключ ctx_index = (fingerprint,)
 WEIGHTS_TABLE    = WEIGHTS_TABLE
@@ -45,11 +44,6 @@ WEIGHTS_TABLE    = WEIGHTS_TABLE
 TYPES_RANGE  = [0, 1, 2, 3]
 VAR_RANGE    = [0, 3, 5, 7, 10]
 SHIFT_WINDOW = SHIFT_MAX
-
-# brain_rates таблицы живут в engine_brain — указываем движок явно
-DATASET_ENGINE      = "brain"
-DATASET_QUERY       = "SELECT date FROM brain_rates_btc_usd_day ORDER BY date"
-
 
 # Говорим фреймворку что нам нужен ctx_index в dataset_index
 model_needs_index       = True
@@ -71,12 +65,11 @@ _D_MIN_PERIOD   = 4
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _extract_prices(rates, dataset_index) -> np.ndarray:
-    if dataset_index:
-        np_r = dataset_index.get('np_rates')
-        if np_r is not None:
-            close = np_r.get('close')
-            if close is not None and len(close) > 0:
-                return close.astype(np.float64)
+    """
+    Цены ВСЕГДА из rates (исторический срез до текущей даты).
+    np_rates НЕ используется для цен — он содержит весь текущий массив,
+    что приводит к одинаковому fingerprint для всех исторических баров.
+    """
     prices = []
     for r in rates:
         v = r.get('close') or r.get('open') or r.get('value')
@@ -86,6 +79,33 @@ def _extract_prices(rates, dataset_index) -> np.ndarray:
             except (TypeError, ValueError):
                 pass
     return np.array(prices, dtype=np.float64)
+
+
+def _extract_t1(rates, dataset_index) -> float:
+    """
+    T1 — последнее значение из rates (текущий бар).
+    Фолбэк: np_rates['t1'][-1] если в rates нет поля t1.
+    """
+    # Попробовать из последней записи rates
+    if rates:
+        last = rates[-1]
+        v = last.get('t1')
+        if v is not None:
+            try:
+                return round(float(v), 6)
+            except (TypeError, ValueError):
+                pass
+    # Фолбэк: np_rates
+    if dataset_index:
+        np_r = dataset_index.get('np_rates')
+        if np_r is not None:
+            t1_arr = np_r.get('t1')
+            if t1_arr is not None and len(t1_arr) > 0:
+                try:
+                    return round(float(t1_arr[-1]), 6)
+                except (TypeError, ValueError):
+                    pass
+    return 0.0
 
 
 def _parse_params(param: str) -> dict:
@@ -236,7 +256,7 @@ def model(
             k_damp      = k_damp,
             method      = method,
             min_period  = min_period,
-            n_forward   = SHIFT_MAX,
+            n_forward   = SHIFT_MAX + 1,      # +1: fwd_vals[0..SHIFT_MAX] все валидны
         )
     except Exception as exc:
         log.error("wave_resonance _compute error: %s", exc, exc_info=True)
@@ -264,16 +284,8 @@ def model(
     occ        = ctx_row.get('occurrence_count', 0) or 0
     shift_max  = SHIFT_MAX if occ >= RECURRING_MIN else 0
 
-    # ── T1 из np_rates — осциллятор текущего бара (mode=0, только shift=0) ──
-    # Аналог mode=0 в экстремум-сервисе: значение T1 при активной конфигурации.
-    # Shift не нужен — это мгновенный снимок состояния рынка.
-    t1_val = 0.0
-    if dataset_index:
-        np_r = dataset_index.get('np_rates')
-        if np_r is not None and np_r.get('t1') is not None:
-            t1_arr = np_r['t1']
-            if len(t1_arr) > 0:
-                t1_val = round(float(t1_arr[-1]), 6)
+    # ── T1 текущего бара (mode=0) ──────────────────────────────────────────────
+    t1_val = _extract_t1(rates, dataset_index)
 
     result: dict[str, float] = {}
 
