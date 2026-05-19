@@ -2963,6 +2963,7 @@ def build_app(model_module) -> FastAPI:
                 "ctx_index": s.ctx_index,
                 "url_map": s.url_map,
                 "dataset_timestamps": getattr(s, "_dataset_ts_arr", None),
+                "rates_table": s.RATES_TABLE,
             }
 
         try:
@@ -3077,6 +3078,7 @@ def build_app(model_module) -> FastAPI:
                             "ctx_index": s.ctx_index,
                             "url_map": s.url_map,
                             "dataset_timestamps": getattr(s, "_dataset_ts_arr", None),
+                            "rates_table": _tbl3,
                         }
 
                     def _mk3(_r=_rf3, _d=_ds3, _t=_td3):
@@ -3128,49 +3130,52 @@ def build_app(model_module) -> FastAPI:
             return {"status": "error",
                     "error": f"[Тест 3 — Покрытие] {' | '.join(_failures3)}"}
 
-            # ── Тест 4: rebuild_index ─────────────────────────────────────────────
-            _has_any_rebuild4 = (
-                    s.index_builder_fn is not None or s.weight_builder_fn is not None  # старый стиль
-                    or s.enrich_fn is not None or bool(s.ENRICHED_TABLE)  # новый стиль
-            )
-            if _has_any_rebuild4:
-                log("  [Тест 4] проверяем rebuild_index...", s.NODE_NAME, force=True)
-                try:
-                    _rb4 = await _do_rebuild()
-                    if "error" in _rb4:
-                        log(f" Тест 4: rebuild вернул ошибку: {_rb4['error']}",
-                            s.NODE_NAME, force=True)
-                        return {"status": "error",
-                                "error": f"[Тест 4 — Rebuild] {_rb4['error']}"}
-
-                    # Для новых сервисов проверяем что _indexes таблица не пустая
-                    if s.ENRICHED_TABLE:
-                        _idx_table = f"{s.ENRICHED_TABLE}_indexes"
-                        try:
-                            async with s.engine_vlad.connect() as _conn4:
-                                _cnt4 = (await _conn4.execute(
-                                    text(f"SELECT COUNT(*) FROM `{_idx_table}`")
-                                )).scalar()
-                            if not _cnt4:
-                                return {"status": "error",
-                                        "error": f"[Тест 4 — Rebuild] {_idx_table} пуста после rebuild"}
-                            log(f"   Тест 4: {_idx_table} — {_cnt4} строк",
-                                s.NODE_NAME, force=True)
-                        except Exception as _e4chk:
-                            return {"status": "error",
-                                    "error": f"[Тест 4 — Rebuild] проверка {_idx_table}: {_e4chk}"}
-
-                    log(f"   Тест 4: rebuild OK — "
-                        f"ctx={_rb4.get('ctx_total')} "
-                        f"weights={_rb4.get('weights_total')} "
-                        f"enrich={_rb4.get('enrich')} "
-                        f"indexer={_rb4.get('dataset_indexer')}",
+        # ── Тест 4: rebuild_index ─────────────────────────────────────────────
+        _has_any_rebuild4 = (
+                s.index_builder_fn is not None or s.weight_builder_fn is not None  # старый стиль
+                or s.enrich_fn is not None or bool(s.ENRICHED_TABLE)  # новый стиль
+        )
+        if _has_any_rebuild4:
+            log("  [Тест 4] проверяем rebuild_index...", s.NODE_NAME, force=True)
+            try:
+                _rb4 = await _do_rebuild()
+                if "error" in _rb4:
+                    log(f" Тест 4: rebuild вернул ошибку: {_rb4['error']}",
                         s.NODE_NAME, force=True)
-                except Exception as _e4:
-                    log(f" Тест 4: exception: {_e4}", s.NODE_NAME, force=True)
-                    return {"status": "error", "error": f"[Тест 4 — Rebuild] {_e4}"}
-            else:
-                log("   Тест 4: rebuild не настроен, пропуск", s.NODE_NAME, force=True)
+                    return {"status": "error",
+                            "error": f"[Тест 4 — Rebuild] {_rb4['error']}"}
+
+                # Для новых сервисов проверяем что _indexes таблица не пустая
+                if s.ENRICHED_TABLE:
+                    _idx_table = f"{s.ENRICHED_TABLE}_indexes"
+                    try:
+                        async with s.engine_vlad.connect() as _conn4:
+                            _cnt4 = (await _conn4.execute(
+                                text(f"SELECT COUNT(*) FROM `{_idx_table}`")
+                            )).scalar()
+                        if not _cnt4:
+                            return {"status": "error",
+                                    "error": f"[Тест 4 — Rebuild] {_idx_table} пуста после rebuild"}
+                        log(f"   Тест 4: {_idx_table} — {_cnt4} строк",
+                            s.NODE_NAME, force=True)
+                    except Exception as _e4chk:
+                        return {"status": "error",
+                                "error": f"[Тест 4 — Rebuild] проверка {_idx_table}: {_e4chk}"}
+
+                log(f"   Тест 4: rebuild OK — "
+                    f"ctx={_rb4.get('ctx_total')} "
+                    f"weights={_rb4.get('weights_total')} "
+                    f"enrich={_rb4.get('enrich')} "
+                    f"indexer={_rb4.get('dataset_indexer')}",
+                    s.NODE_NAME, force=True)
+            except Exception as _e4:
+                log(f" Тест 4: exception: {_e4}", s.NODE_NAME, force=True)
+                return {"status": "error", "error": f"[Тест 4 — Rebuild] {_e4}"}
+        else:
+            log("   Тест 4: rebuild не настроен, пропуск", s.NODE_NAME, force=True)
+
+        log(" PRETEST OK", s.NODE_NAME, force=True)
+        return {"status": "ok"}
 
     @app.get("/posttest")
     async def ep_posttest(
