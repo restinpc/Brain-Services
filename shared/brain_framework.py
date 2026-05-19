@@ -1,7 +1,12 @@
 """
-brain_framework.py v14 — IS_SIMPLE режим + опциональный ML (USE_ML_VALUES).
-Все оптимизации применены: bulk upsert, searchsorted, threadpool executor.
-ДОПОЛНЕНО: конфиг-лоадер (config.toml/json), run_standard_model, auto-build weights.
+brain_framework.py v15 — fill_cache optimizations.
+
+Оптимизации над v14:
+  OPT-1: единый prefetch cached_dates на инструмент (1 SELECT вместо N_slots×SELECT).
+  OPT-2: параллельный запуск type_var_slots через asyncio.gather (для не-ML пути).
+  OPT-3: insert_events — bulk executemany вместо N одиночных INSERT IGNORE.
+  OPT-4: DROPPED — np.searchsorted медленнее bisect для datetime-list (overhead конвертации).
+  OPT-5: авто batch_size=len(to_fetch) для batch_model (один вызов на весь слот).
 """
 
 from __future__ import annotations
@@ -503,23 +508,30 @@ async def ensure_events_table(engine, table: str, extra_columns: str = "") -> No
 
 
 async def insert_events(engine, table, events: list[dict]) -> int:
+    """Bulk INSERT IGNORE — одна транзакция, чанки по 500 строк вместо N запросов."""
     if not events:
         return 0
     _reserved  = {"ctx_id", "event_date"}
     extra_cols = [k for k in events[0] if k not in _reserved]
     extra_insert = (", ".join(f"`{c}`" for c in extra_cols) + ", ") if extra_cols else ""
     extra_vals   = (", ".join(f":{c}" for c in extra_cols) + ", ") if extra_cols else ""
+
+    all_params = []
+    for ev in events:
+        p = {"cid": ev["ctx_id"], "ed": ev.get("event_date")}
+        for c in extra_cols:
+            p[c] = ev.get(c)
+        all_params.append(p)
+
     added = 0
+    sql = text(f"""
+        INSERT IGNORE INTO `{table}`
+            ({extra_insert}`ctx_id`, `event_date`)
+        VALUES ({extra_vals}:cid, :ed)
+    """)
     async with engine.begin() as conn:
-        for ev in events:
-            params = {"cid": ev["ctx_id"], "ed": ev.get("event_date")}
-            for c in extra_cols:
-                params[c] = ev.get(c)
-            r = await conn.execute(text(f"""
-                INSERT IGNORE INTO `{table}`
-                    ({extra_insert}`ctx_id`, `event_date`)
-                VALUES ({extra_vals}:cid, :ed)
-            """), params)
+        for i in range(0, len(all_params), 500):
+            r = await conn.execute(sql, all_params[i: i + 500])
             added += r.rowcount
     return added
 
@@ -1943,6 +1955,26 @@ def build_app(model_module) -> FastAPI:
                 log(f"  [{instr_label}] {len(candles)} свечей × "
                     f"{len(type_var_slots)} type/var слотов", s.NODE_NAME, force=True)
 
+                # OPT-1: один prefetch всех cached_dates для данного инструмента
+                # вместо N отдельных SELECT на каждый (calc_type, var) слот.
+                _tbl_c = s.cache_table
+                cached_by_hash: dict[str, set] = {}
+                try:
+                    async with s.engine_vlad.connect() as conn:
+                        _res_ch = await conn.execute(text(f"""
+                            SELECT params_hash, date_val FROM `{_tbl_c}`
+                            WHERE service_url=:url AND pair=:pair AND day_flag=:day
+                        """), {"url": s.service_url, "pair": pair_id, "day": day_flag})
+                        for _ph, _dv in _res_ch.fetchall():
+                            cached_by_hash.setdefault(_ph, set()).add(_dv)
+                    log(f"  [{instr_label}] cached prefetch: "
+                        f"{sum(len(v) for v in cached_by_hash.values())} строк "
+                        f"по {len(cached_by_hash)} hash-слотам",
+                        s.NODE_NAME, force=True)
+                except Exception as _ce:
+                    log(f"  [{instr_label}] cached prefetch failed: {_ce}",
+                        s.NODE_NAME, level="warning")
+
                 # ── Прогрев ML-кеша через batch_model ────────────────────────────
                 # Если модель имеет batch_model и USE_ML_VALUES=True — вычисляем
                 # активные коды для всех экстремумов одним вызовом.
@@ -1954,34 +1986,35 @@ def build_app(model_module) -> FastAPI:
                         log(f"  [{instr_label}] ML-кеш прогрет: {warmed} экстремумов",
                             s.NODE_NAME, force=True)
 
-                for calc_type, var in type_var_slots:
-                    if s.fill_cancel.is_set():
-                        break
+                # OPT-2: параллельный запуск type_var_slots через asyncio.gather
+                # (только для не-ML пути — ML-обучение state-dependent, нельзя параллелить).
+                # Счётчики done/skipped/errors защищены asyncio-lock (однопоточный event loop).
+                _slot_lock = asyncio.Lock()
+
+                async def _fill_one_slot(calc_type: int, var: int) -> None:
+                    nonlocal done, skipped, errors
 
                     extra       = {"type": calc_type, "var": var, "param": ""}
                     p_hash      = _params_hash(extra)
                     params_json = _json.dumps(extra, ensure_ascii=False)
-                    _tbl_c      = s.cache_table
 
-                    try:
-                        async with s.engine_vlad.connect() as conn:
-                            res = await conn.execute(text(f"""
-                                SELECT date_val FROM `{_tbl_c}`
-                                WHERE service_url=:url AND pair=:pair
-                                  AND day_flag=:day AND params_hash=:ph
-                            """), {"url": s.service_url, "pair": pair_id,
-                                   "day": day_flag, "ph": p_hash})
-                            cached = {r[0] for r in res.fetchall()}
-                    except Exception:
-                        cached = set()
+                    # OPT-1: используем prefetch вместо отдельного SELECT
+                    cached   = cached_by_hash.get(p_hash, set())
 
                     to_fetch  = [c for c in candles if c["date"] not in cached]
-                    skipped  += len(candles) - len(to_fetch)
+                    async with _slot_lock:
+                        skipped_local = len(candles) - len(to_fetch)
+                        skipped += skipped_local
 
-                    for i in range(0, len(to_fetch), batch_size):
+                    # OPT-5: для batch_model один большой батч выгоднее
+                    # (стоимость вызова константа, нет смысла дробить).
+                    _eff_bs = (len(to_fetch)
+                               if s.batch_model_fn is not None and not s.USE_ML_VALUES
+                               else batch_size) or batch_size
+                    for i in range(0, len(to_fetch), _eff_bs):
                         if s.fill_cancel.is_set():
                             break
-                        batch = to_fetch[i:i + batch_size]
+                        batch = to_fetch[i:i + _eff_bs]
 
                         if s.USE_ML_VALUES:
                             # Refresh rates once per batch, not per candle.
@@ -2140,10 +2173,28 @@ def build_app(model_module) -> FastAPI:
                                     """), insert_rows)
                             except Exception as e:
                                 log(f"   bulk insert: {e}", s.NODE_NAME, level="warning")
-                        done += len(batch)
-                        s.fill_status.update({"done": done, "skipped": skipped, "errors": errors})
+                        async with _slot_lock:
+                            done += len(batch)
+                            s.fill_status.update({"done": done, "skipped": skipped, "errors": errors})
                         log(f"  [{instr_label} t={calc_type}/v={var}] "
                             f"{done}/{total} err={errors}", s.NODE_NAME, force=True)
+
+                # ── Запуск слотов ─────────────────────────────────────────────────
+                # ML-путь: последовательно (обучение зависит от предыдущего состояния).
+                # Остальные: параллельно через gather.
+                if s.USE_ML_VALUES:
+                    for calc_type, var in type_var_slots:
+                        if s.fill_cancel.is_set():
+                            break
+                        await _fill_one_slot(calc_type, var)
+                else:
+                    # asyncio.gather запускает все слоты параллельно.
+                    # DB-записи в разные params_hash — конфликтов нет.
+                    await asyncio.gather(*[
+                        _fill_one_slot(ct, v)
+                        for ct, v in type_var_slots
+                        if not s.fill_cancel.is_set()
+                    ])
 
                 s.fill_status["slots_done"] = slot_idx + 1
 
