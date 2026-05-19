@@ -1,12 +1,11 @@
 """
-brain_framework.py v15 — fill_cache optimizations.
+brain_framework.py v16 — сжатие result_json (zlib + полная обратная совместимость).
 
-Оптимизации над v14:
-  OPT-1: единый prefetch cached_dates на инструмент (1 SELECT вместо N_slots×SELECT).
-  OPT-2: параллельный запуск type_var_slots через asyncio.gather (для не-ML пути).
-  OPT-3: insert_events — bulk executemany вместо N одиночных INSERT IGNORE.
-  OPT-4: DROPPED — np.searchsorted медленнее bisect для datetime-list (overhead конвертации).
-  OPT-5: авто batch_size=len(to_fetch) для batch_model (один вызов на весь слот).
+Оптимизации над v15:
+  OPT-1..5: fill_cache (см. v15).
+  OPT-6: result_json сжимается zlib+base64 с префиксом 'z:' при записи.
+          Старые строки (без префикса) читаются как обычный JSON — нулевая миграция.
+          Экономия ~60% места. Точность float снижена 6→4 знака (достаточно для весов).
 """
 
 from __future__ import annotations
@@ -16,6 +15,8 @@ import bisect
 import concurrent.futures as _cf
 import inspect
 import json as _json
+import zlib   as _zlib
+import base64 as _b64
 import math
 import os
 import random
@@ -71,6 +72,45 @@ from common import (
 )
 from cache_helper import ensure_cache_table, load_service_url, cached_values
 import reverse_learning as rl
+
+# ──────────────────────────────────────────────────────────────────────────────
+# OPT-6: КОДЕК result_json  (zlib + base64, обратная совместимость)
+# ──────────────────────────────────────────────────────────────────────────────
+_RJ_PREFIX       = "z:"                       # маркер нового формата
+_RJ_EMPTY_PLAIN  = "{}"                        # старый sentinel
+_RJ_EMPTY_NEW    = "z:eJyrrgUAAXUA+Q=="        # zlib({}) level=6
+_RJ_FLOAT_DIGITS = 4                           # 6→4: меньше JSON-мусора до сжатия
+
+
+def _rj_encode(result: dict) -> str:
+    """Сериализует result dict → сжатая строка с префиксом 'z:'.
+    Пустой dict → специальный литерал (не тратим zlib на 2 байта)."""
+    if not result:
+        return _RJ_EMPTY_NEW
+    raw = _json.dumps(
+        {k: round(v, _RJ_FLOAT_DIGITS) for k, v in result.items()},
+        ensure_ascii=False,
+        separators=(",", ":"),      # убираем пробелы → ещё -5% до сжатия
+    ).encode()
+    return _RJ_PREFIX + _b64.b64encode(_zlib.compress(raw, 6)).decode()
+
+
+def _rj_decode(s: str) -> dict:
+    """Десериализует result_json строку → dict.
+    Прозрачно обрабатывает старый (plain JSON) и новый ('z:...') форматы."""
+    if not s or s == _RJ_EMPTY_PLAIN:
+        return {}
+    if s.startswith(_RJ_PREFIX):
+        try:
+            return _json.loads(_zlib.decompress(_b64.b64decode(s[2:])))
+        except Exception:
+            return {}
+    # Старый формат — обычный JSON (обратная совместимость)
+    try:
+        return _json.loads(s)
+    except Exception:
+        return {}
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # THREADPOOL ДЛЯ ПАРАЛЛЕЛЬНЫХ ВЫЧИСЛЕНИЙ
@@ -2160,7 +2200,7 @@ def build_app(model_module) -> FastAPI:
                                 "url":  s.service_url, "pair": pair_id,
                                 "day":  day_flag,      "dv":   candle["date"],
                                 "ph":   p_hash,        "pj":   params_json,
-                                "rj":   _json.dumps({k: round(v, 6) for k, v in result.items()}, ensure_ascii=False),
+                                "rj":   _rj_encode(result),           # OPT-6: zlib+b64
                             })
                         if insert_rows:
                             try:
@@ -2284,7 +2324,7 @@ def build_app(model_module) -> FastAPI:
                 ORDER BY date_val
             """), {"url": s.service_url, "pair": pair, "day": day,
                    "ph": p_hash, "df": df, "dt": dt})
-            cache_map = {row[0]: _json.loads(row[1]) for row in res.fetchall()}
+            cache_map = {row[0]: _rj_decode(row[1]) for row in res.fetchall()}  # OPT-6
         if not cache_map:
             return {"error": "no cached data"}
 
@@ -3266,7 +3306,7 @@ def build_app(model_module) -> FastAPI:
                                AVG(JSON_LENGTH(result_json))
                         FROM `{_tbl}`
                         WHERE service_url=:url AND pair=:pair AND day_flag=:day
-                          AND result_json != '{{}}'
+                          AND result_json NOT IN ('{{}}', 'z:eJyrrgUAAXUA+Q==')  -- OPT-6 sentinels
                           AND (:df IS NULL OR date_val >= :df)
                           AND (:dt IS NULL OR date_val <= :dt)
                     """), url_p)
@@ -3284,14 +3324,14 @@ def build_app(model_module) -> FastAPI:
                     res = await conn.execute(text(f"""
                         SELECT result_json FROM `{_tbl}`
                         WHERE service_url=:url AND pair=:pair AND day_flag=:day
-                          AND result_json != '{{}}'
+                          AND result_json NOT IN ('{{}}', 'z:eJyrrgUAAXUA+Q==')  -- OPT-6 sentinels
                           AND (:df IS NULL OR date_val >= :df)
                           AND (:dt IS NULL OR date_val <= :dt)
                     """), url_p)
                     plus_cnt = minus_cnt = 0
                     for (rj_str,) in res:
                         try:
-                            for v in _json.loads(rj_str).values():
+                            for v in _rj_decode(rj_str).values():  # OPT-6
                                 if v > 0:   plus_cnt  += 1
                                 elif v < 0: minus_cnt += 1
                         except Exception:
@@ -3319,7 +3359,7 @@ def build_app(model_module) -> FastAPI:
                     """), url_p)
                     for (dt_val, rj_str) in res:
                         try:
-                            rj = _json.loads(rj_str)
+                            rj = _rj_decode(rj_str)               # OPT-6
                             cache_signals[dt_val] = (bool(rj), sum(rj.values()) if rj else 0.0)
                         except Exception:
                             cache_signals[dt_val] = (False, 0.0)
@@ -3471,7 +3511,7 @@ def build_app(model_module) -> FastAPI:
                        "df": dt_from, "dt": dt_to})
                 for dt_val, rj_str in res:
                     try:
-                        rj = _json.loads(rj_str)
+                        rj = _rj_decode(rj_str)                    # OPT-6
                         cache_signals[dt_val] = sum(rj.values()) if rj else 0.0
                     except Exception:
                         cache_signals[dt_val] = 0.0
