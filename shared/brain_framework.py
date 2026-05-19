@@ -2954,12 +2954,13 @@ def build_app(model_module) -> FastAPI:
 
         dataset_index_dict2 = None
         if s.model_needs_index:
+            _np2 = s.np_rates.get(s.RATES_TABLE) or s.np_simple_rates
             dataset_index_dict2 = {
                 "dates": s.dataset_dates,
                 "by_key": s.dataset_by_key,
                 "key_dates": s.dataset_key_dates,
                 "key_field": s.dataset_key_field,
-                "np_rates": s.np_simple_rates,
+                "np_rates": _np2,
                 "ctx_index": s.ctx_index,
                 "url_map": s.url_map,
                 "dataset_timestamps": getattr(s, "_dataset_ts_arr", None),
@@ -3069,12 +3070,13 @@ def build_app(model_module) -> FastAPI:
 
                     dataset_index_dict3 = None
                     if s.model_needs_index:
+                        _np3 = s.np_rates.get(_tbl3) or s.np_simple_rates
                         dataset_index_dict3 = {
                             "dates": s.dataset_dates,
                             "by_key": s.dataset_by_key,
                             "key_dates": s.dataset_key_dates,
                             "key_field": s.dataset_key_field,
-                            "np_rates": s.np_simple_rates,
+                            "np_rates": _np3,
                             "ctx_index": s.ctx_index,
                             "url_map": s.url_map,
                             "dataset_timestamps": getattr(s, "_dataset_ts_arr", None),
@@ -3132,8 +3134,8 @@ def build_app(model_module) -> FastAPI:
 
         # ── Тест 4: rebuild_index ─────────────────────────────────────────────
         _has_any_rebuild4 = (
-                s.index_builder_fn is not None or s.weight_builder_fn is not None  # старый стиль
-                or s.enrich_fn is not None or bool(s.ENRICHED_TABLE)  # новый стиль
+                s.index_builder_fn is not None or s.weight_builder_fn is not None
+                or s.enrich_fn is not None or bool(s.ENRICHED_TABLE)
         )
         if _has_any_rebuild4:
             log("  [Тест 4] проверяем rebuild_index...", s.NODE_NAME, force=True)
@@ -3145,7 +3147,6 @@ def build_app(model_module) -> FastAPI:
                     return {"status": "error",
                             "error": f"[Тест 4 — Rebuild] {_rb4['error']}"}
 
-                # Для новых сервисов проверяем что _indexes таблица не пустая
                 if s.ENRICHED_TABLE:
                     _idx_table = f"{s.ENRICHED_TABLE}_indexes"
                     try:
