@@ -1731,7 +1731,7 @@ def build_app(model_module) -> FastAPI:
             return set()
 
     # ── _sync_compute для поточной обработки ─────────────────────────────────
-    def _sync_compute(candle, calc_type, calc_var, all_rows, all_dates, np_rates_pd, s_state):
+    def _sync_compute(candle, calc_type, calc_var, all_rows, all_dates, np_rates_pd, s_state, rates_tbl=""):
         td = candle["date"]
         idx = bisect.bisect_right(all_dates, td)
         rates_f = all_rows[:idx]
@@ -1748,6 +1748,7 @@ def build_app(model_module) -> FastAPI:
                 "ctx_index": s_state.ctx_index,
                 "url_map": s_state.url_map,
                 "dataset_timestamps": getattr(s_state, "_dataset_ts_arr", None),
+                "rates_table": rates_tbl or s_state.RATES_TABLE,
             }
 
         try:
@@ -1812,6 +1813,7 @@ def build_app(model_module) -> FastAPI:
                 "dataset_timestamps": getattr(s, "_dataset_ts_arr", None),
                 "filter_dataset_by_date": bool(s.FILTER_DATASET_BY_DATE),
                 "is_daily": bool(day_flag),
+                "rates_table": tbl,
             }
             if s.model_can_filter_dataset_by_date:
                 dataset_index_dict["full_dataset"] = s.dataset
@@ -2110,7 +2112,7 @@ def build_app(model_module) -> FastAPI:
                                     _FILL_EXECUTOR,
                                     _sync_compute,
                                     candle, calc_type, var,
-                                    all_rows, all_dates_pd, np_rates_pd, s
+                                    all_rows, all_dates_pd, np_rates_pd, s, tbl
                                 )
                                 for candle in batch
                             ]
