@@ -431,9 +431,9 @@ async def upsert_ctx_rows(engine, table: str, rows: list[dict]) -> dict[str, int
                 ({extra_insert}`fingerprint_hash`, `occurrence_count`, `first_dt`, `last_dt`)
             VALUES ({extra_vals}:fp, :cnt, :fd, :ld)
             ON DUPLICATE KEY UPDATE
-                occurrence_count = occurrence_count + :cnt,
-                last_dt  = IF(:ld > last_dt  OR last_dt  IS NULL, :ld,  last_dt),
-                first_dt = IF(:fd < first_dt OR first_dt IS NULL, :fd, first_dt)
+                occurrence_count = occurrence_count + VALUES(`occurrence_count`),
+                last_dt  = IF(VALUES(`last_dt`)  > last_dt  OR last_dt  IS NULL, VALUES(`last_dt`),  last_dt),
+                first_dt = IF(VALUES(`first_dt`) < first_dt OR first_dt IS NULL, VALUES(`first_dt`), first_dt)
         """), params_list)
 
     fp_list  = [r["fingerprint_hash"] for r in rows]
