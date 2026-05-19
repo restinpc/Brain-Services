@@ -45,6 +45,10 @@ TYPES_RANGE  = [0, 1, 2, 3]
 VAR_RANGE    = [0, 3, 5, 7, 10]
 SHIFT_WINDOW = SHIFT_MAX
 
+# brain_rates таблицы живут в engine_brain — указываем движок явно
+DATASET_ENGINE      = "brain"
+DATASET_QUERY       = "SELECT date FROM brain_rates_btc_usd_day ORDER BY date"
+
 # Говорим фреймворку что нам нужен ctx_index в dataset_index
 model_needs_index       = True
 model_uses_rate_history = True
