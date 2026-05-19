@@ -1252,9 +1252,7 @@ def build_app(model_module) -> FastAPI:
     s.SERVICE_TEXT =     _get("service", "text", "SERVICE_TEXT", "SERVICE_TEXT", "Brain microservice")
 
     # ── Котировки ─────────────────────────────────────────────────────────────
-    if not hasattr(model_module, "RATES_TABLE") and not _c.get("rates", {}).get("table"):
-        raise RuntimeError("RATES_TABLE должен быть задан в config.toml [rates] table или model.py")
-    s.RATES_TABLE = _get("rates", "table", "RATES_TABLE", "", "brain_rates_eur_usd")
+    s.RATES_TABLE = _get("rates", "table", "RATES_TABLE", "RATES_TABLE", "brain_rates_eur_usd")
 
     # ── Кеш ───────────────────────────────────────────────────────────────────
     s.CACHE_DATE_FROM  =      _get("cache", "date_from",        "CACHE_DATE_FROM",  "", "2025-01-15")
