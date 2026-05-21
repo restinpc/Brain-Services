@@ -15,11 +15,14 @@ from __future__ import annotations
 
 from datetime import date as date_class
 from datetime import datetime, time, timedelta
+import os
+
 
 
 def _dt_to_ts(dt: datetime) -> int:
     return int(dt.timestamp())
-
+  
+USE_ML_VALUES = True
 
 RATES_TABLE = "brain_rates_eur_usd"
 
