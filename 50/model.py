@@ -1,35 +1,41 @@
 """
 model.py — FRED CBBTCUSD (Bitcoin Price in USD)
-
+ 
 Датасет: sasha_fred_cbbtcusd (id, date_iso, value, loaded_at).
-Типы событий:
-  bull_breakout / bull_drift / sideways / bear_drift / bear_drop.
-
+ 
+Типы событий (ОБОГАЩЁННЫЕ, фикс ML-режима): код "{move}.{regime}"
+  move   — знак+величина дневного %-изменения: p3/p2/p1/z0/n1/n2/n3;
+  regime — режим тренда (value vs SMA): ru (вверх) / rd (вниз) / rf (флэт).
+Итого 7×3 = 21 дискриминативный по направлению тип. Старые 5 крупных
+бакетов (bull_breakout/.../bear_drop) горели и на вершинах, и на днах,
+из-за чего обратное обучение не разводило знаки и давало мусорный
+универсум — теперь коды несут направление, и RL обобщает (как на 44/49).
+ 
 Код веса: {ctx_id}_{mode}_{shift}
   mode=0 -> T1
   mode=1 -> Extremum
   shift  -> 0..SHIFT_WINDOW дней
 """
-
+ 
 from __future__ import annotations
-
+ 
 from datetime import date as date_class
 from datetime import datetime, time, timedelta
 import os
-
-
-
+ 
+ 
+ 
 def _dt_to_ts(dt: datetime) -> int:
     return int(dt.timestamp())
   
 USE_ML_VALUES = True
-
+ 
 RATES_TABLE = "brain_rates_eur_usd"
-
-WEIGHTS_TABLE = "sasha_fred_cbbtcusd_weights"
-CTX_TABLE = "sasha_fred_cbbtcusd_context_idx"
+ 
+WEIGHTS_TABLE = "sasha_fred_cbbtcusd_weights_ml"
+CTX_TABLE = "sasha_fred_cbbtcusd_context_idx_ml"
 CTX_KEY_COLUMNS = ["id"]
-
+ 
 DATASET_QUERY = """
     SELECT
         id,
@@ -52,10 +58,10 @@ SHIFT_WINDOW = 30
 CACHE_DATE_FROM = "2025-01-15"
 VAR_RANGE = [0, 1, 2, 3]
 REBUILD_INTERVAL = 7200
-
+ 
 _MIN_OCCURRENCE = 2
-
-
+ 
+ 
 def _as_datetime(value) -> datetime | None:
     if value is None:
         return None
@@ -79,8 +85,8 @@ def _as_datetime(value) -> datetime | None:
             parsed = parsed.replace(tzinfo=None)
         return parsed
     return None
-
-
+ 
+ 
 def _build_reverse(ctx_index: dict) -> dict[str, tuple[int, dict]]:
     reverse: dict[str, tuple[int, dict]] = {}
     for _, info in ctx_index.items():
@@ -89,28 +95,73 @@ def _build_reverse(ctx_index: dict) -> dict[str, tuple[int, dict]]:
         if ctx_id and event_type:
             reverse[event_type] = (int(ctx_id), info)
     return reverse
-
-
-def _event_type(pct_change: float) -> str:
-    if pct_change >= 2.0:
-        return "bull_breakout"
-    if pct_change >= 0.5:
-        return "bull_drift"
-    if pct_change <= -2.0:
-        return "bear_drop"
-    if pct_change <= -0.5:
-        return "bear_drift"
-    return "sideways"
-
-
+ 
+ 
+# ──────────────────────────────────────────────────────────────────────────
+# ОБОГАЩЁННАЯ КЛАССИФИКАЦИЯ (бит-идентична блоку в context_idx.py!).
+# Код = "{move}.{regime}" -> 21 дискриминативный по направлению тип.
+# Это и есть фикс ML-режима: коды теперь несут знак и режим тренда, поэтому
+# обратное обучение разводит вершины/дна и ОБОБЩАЕТ (см. исследование).
+# ──────────────────────────────────────────────────────────────────────────
+_REGIME_WINDOW = 20
+_REGIME_BAND = 0.01
+ 
+ 
+def _move_bucket(pct: float) -> str:
+    if pct >= 2.0:
+        return "p3"
+    if pct >= 0.7:
+        return "p2"
+    if pct >= 0.15:
+        return "p1"
+    if pct <= -2.0:
+        return "n3"
+    if pct <= -0.7:
+        return "n2"
+    if pct <= -0.15:
+        return "n1"
+    return "z0"
+ 
+ 
+def _classify_events(series):
+    """series: list[(datetime, value)] по возрастанию даты.
+    -> list[(datetime, value, pct_change, event_type)] (режим — каузально)."""
+    out = []
+    prev = None
+    win = []
+    wsum = 0.0
+    for dt, value in series:
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            continue
+        if win:
+            sma = wsum / len(win)
+            if sma and v > sma * (1.0 + _REGIME_BAND):
+                regime = "ru"
+            elif sma and v < sma * (1.0 - _REGIME_BAND):
+                regime = "rd"
+            else:
+                regime = "rf"
+        else:
+            regime = "rf"
+        if prev is not None and prev != 0:
+            pct = (v - prev) / prev * 100.0
+            out.append((dt, v, pct, f"{_move_bucket(pct)}.{regime}"))
+        win.append(v)
+        wsum += v
+        if len(win) > _REGIME_WINDOW:
+            wsum -= win.pop(0)
+        prev = v
+    return out
+ 
+ 
 def _prepare_events(dataset: list[dict]) -> list[tuple[datetime, float, str]]:
     """
-    Превращаем ряд BTC в список событий:
-    (event_time, pct_change, event_type).
+    Превращаем ряд BTC в список событий (event_time, pct_change, event_type),
+    где event_type — обогащённый код "{move}.{regime}" (см. _classify_events).
     """
-    events: list[tuple[datetime, float, str]] = []
-    prev_value = None
-
+    series: list[tuple[datetime, float]] = []
     for row in dataset:
         dt = _as_datetime(row.get("event_time") or row.get("date_iso") or row.get("date"))
         if dt is None:
@@ -119,18 +170,14 @@ def _prepare_events(dataset: list[dict]) -> list[tuple[datetime, float, str]]:
             value = float(row.get("value"))
         except (TypeError, ValueError):
             continue
-
-        if prev_value is not None and prev_value != 0:
-            pct_change = ((value - prev_value) / prev_value) * 100.0
-            events.append((dt, pct_change, _event_type(pct_change)))
-        prev_value = value
-
-    return events
-
-
+        series.append((dt, value))
+ 
+    return [(dt, pct, etype) for (dt, _v, pct, etype) in _classify_events(series)]
+ 
+ 
 def _apply_var(signed_t1: float, pct_change: float, var: int, ctx_info: dict) -> float:
     avg_abs_pct = float(ctx_info.get("avg_abs_pct_change") or 0.0)
-
+ 
     if var == 0:
         return signed_t1
     if var == 1:
@@ -146,8 +193,8 @@ def _apply_var(signed_t1: float, pct_change: float, var: int, ctx_info: dict) ->
     if var == 3:
         return signed_t1 if pct_change > 0 else 0.0
     return 0.0
-
-
+ 
+ 
 def model(
     rates: list[dict],
     dataset: list[dict],
@@ -159,28 +206,28 @@ def model(
     dataset_index: dict | None = None,
 ) -> dict[str, float]:
     del param
-
+ 
     if not rates or not dataset:
         return {}
-
+ 
     ctx_index = (dataset_index or {}).get("ctx_index") or {}
     if not ctx_index:
         return {}
     reverse = _build_reverse(ctx_index)
     if not reverse:
         return {}
-
+ 
     last_candle = rates[-1]
     is_daily = last_candle["date"].hour == 0 and last_candle["date"].minute == 0
     is_bull = float(last_candle.get("close") or 0) > float(last_candle.get("open") or 0)
-
+ 
     np_rates = (dataset_index or {}).get("np_rates")
     np_view = None
     if np_rates is not None:
         dates_ns = np_rates.get("dates_ns")
         if dates_ns is not None:
             import numpy as _np
-
+ 
             cut = int(_np.searchsorted(dates_ns, _dt_to_ts(date), side="right"))
             if cut > 0:
                 is_bull = float(np_rates["close"][cut - 1]) > float(np_rates["open"][cut - 1])
@@ -191,7 +238,7 @@ def model(
                 "ext": ext_arr,
                 "cut": cut,
             }
-
+ 
     rates_t1 = {}
     ext_set = set()
     rates_t1_by_day = {}
@@ -217,39 +264,39 @@ def model(
                 for r in rates
             }
             ext_by_day = {d.date(): True for d in ext_set}
-
+ 
     events = _prepare_events(dataset)
     if not events:
         return {}
-
+ 
     result: dict[str, float] = {}
     window_sec = SHIFT_WINDOW * 86400
-
+ 
     for event_time, pct_change, event_type in events:
         lookup = reverse.get(event_type)
         if lookup is None:
             continue
         ctx_id, ctx_info = lookup
         occurrence_count = int(ctx_info.get("occurrence_count") or 0)
-
+ 
         diff_sec = (date - event_time).total_seconds()
         if diff_sec < 0 or diff_sec > window_sec:
             continue
-
+ 
         shift = int(diff_sec // 86400)
         if occurrence_count < _MIN_OCCURRENCE and shift != 0:
             continue
-
+ 
         t_date = event_time + timedelta(days=shift)
         t_date = t_date.replace(hour=0, minute=0, second=0, microsecond=0)
         if is_daily:
             t_date = t_date.replace(hour=0, minute=0, second=0, microsecond=0)
         if t_date > date:
             continue
-
+ 
         if np_view is not None:
             import numpy as _np_i
-
+ 
             t_ts = _dt_to_ts(t_date)
             idx = int(_np_i.searchsorted(np_view["dates_ns"], t_ts, side="left"))
             if idx >= np_view["cut"] or int(np_view["dates_ns"][idx]) != t_ts:
@@ -272,19 +319,19 @@ def model(
             else:
                 t1 = rates_t1.get(t_date, 0.0)
                 ext_hit = t_date in ext_set
-
+ 
         direction = 1.0 if pct_change > 0 else -1.0
         signed_t1 = t1 * direction
         weighted_t1 = _apply_var(signed_t1, pct_change, var, ctx_info)
-
+ 
         if weighted_t1 != 0.0 and type in (0, 1):
             wc = f"{ctx_id}_0_{shift}"
             result[wc] = result.get(wc, 0.0) + round(weighted_t1, 6)
-
+ 
         if type in (0, 2) and occurrence_count > 0 and ext_hit:
             ext = ((1.0 / occurrence_count) * 2 - 1) * direction
             if ext != 0.0:
                 wc = f"{ctx_id}_1_{shift}"
                 result[wc] = result.get(wc, 0.0) + round(ext, 6)
-
+ 
     return {k: v for k, v in result.items() if v != 0.0}
