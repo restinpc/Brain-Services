@@ -5,18 +5,18 @@ async def build_weights(engine_sasha):
     """
     from datetime import datetime
     import traceback
-
+ 
     from sqlalchemy import text
-
+ 
     def _log(stage: str, message: str) -> None:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print(f"[weights][{ts}][{stage}] {message}")
-
-    CTX_TABLE = "sasha_fred_cbbtcusd_context_idx"
-    WEIGHTS_TABLE = "sasha_fred_cbbtcusd_weights"
+ 
+    CTX_TABLE = "sasha_fred_cbbtcusd_context_idx_ml"
+    WEIGHTS_TABLE = "sasha_fred_cbbtcusd_weights_ml"
     SHIFT_WINDOW = 30
     MIN_RECURRING = 2
-
+ 
     _log("START", "build_weights started")
     try:
         _log("DDL", f"Ensuring table `{WEIGHTS_TABLE}` exists and truncating it")
@@ -33,7 +33,7 @@ async def build_weights(engine_sasha):
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """))
             await conn.execute(text(f"TRUNCATE TABLE `{WEIGHTS_TABLE}`"))
-
+ 
         _log("READ", f"Reading context rows from `{CTX_TABLE}`")
         async with engine_sasha.connect() as conn:
             res = await conn.execute(text(
@@ -41,7 +41,7 @@ async def build_weights(engine_sasha):
             ))
             ctx_rows = res.fetchall()
         _log("READ", f"Contexts fetched: {len(ctx_rows)}")
-
+ 
         total = 0
         _log("WRITE", "Generating and inserting weight codes")
         async with engine_sasha.begin() as conn:
@@ -61,15 +61,15 @@ async def build_weights(engine_sasha):
                             "shift": int(shift),
                         })
                         total += 1
-
+ 
         _log("DONE", f"build_weights finished successfully, weights_generated={total}")
         return {"weights_generated": total}
     except Exception as exc:
         _log("ERROR", f"{type(exc).__name__}: {exc}")
         _log("TRACE", traceback.format_exc())
         raise
-
-
+ 
+ 
 if __name__ == "__main__":
     import asyncio
     import os
@@ -77,13 +77,13 @@ if __name__ == "__main__":
     import traceback
     from datetime import datetime
     from pathlib import Path
-
+ 
     from dotenv import load_dotenv
-
+ 
     def _main_log(message: str) -> None:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print(f"[weights][{ts}][MAIN] {message}")
-
+ 
     base_dir = Path(__file__).resolve().parent
     loaded_env_paths = []
     for env_path in (base_dir / ".env", base_dir.parent / ".env"):
@@ -94,12 +94,12 @@ if __name__ == "__main__":
         _main_log(f"Loaded env files: {', '.join(loaded_env_paths)}")
     else:
         _main_log("No .env file found in service or project root")
-
+ 
     shared_dir = base_dir.parent / "shared"
     sys.path.insert(1, str(shared_dir))
-
+ 
     from common import build_engines  # pylint: disable=import-error
-
+ 
     def _fallback_env(target_prefix: str, source_prefix: str) -> None:
         keys = ("HOST", "PORT", "USER", "PASSWORD", "NAME")
         applied = []
@@ -111,10 +111,10 @@ if __name__ == "__main__":
                 applied.append(f"{target}<-{source}")
         if applied:
             _main_log("Applied fallback env: " + ", ".join(applied))
-
+ 
     _fallback_env("MASTER", "DB")
     _fallback_env("SUPER", "DB")
-
+ 
     required_vars = [
         "DB_HOST", "DB_USER", "DB_NAME",
         "MASTER_HOST", "MASTER_USER", "MASTER_NAME",
@@ -127,7 +127,7 @@ if __name__ == "__main__":
             + ". Check .env values before running."
         )
         raise SystemExit(2)
-
+ 
     async def _main():
         _main_log("Creating database engines")
         engine_sasha, engine_brain, engine_super = build_engines()
@@ -145,5 +145,5 @@ if __name__ == "__main__":
             await engine_brain.dispose()
             await engine_super.dispose()
             _main_log("Shutdown complete")
-
+ 
     asyncio.run(_main())
