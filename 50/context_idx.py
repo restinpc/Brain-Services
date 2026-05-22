@@ -12,7 +12,7 @@ async def build_index(engine_sasha, engine_brain):
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print(f"[context_idx][{ts}][{stage}] {message}")
  
-    SOURCE_TABLE = "sasha_fred_cbbtcusd_ml"
+    SOURCE_TABLE = "sasha_fred_cbbtcusd"
     CTX_TABLE = "sasha_fred_cbbtcusd_context_idx_ml"
     # ──────────────────────────────────────────────────────────────────────
     # ОБОГАЩЁННАЯ КЛАССИФИКАЦИЯ КОНТЕКСТА (фикс ML-режима).
