@@ -1,19 +1,23 @@
 """
 wave_resonance.py — Wave Resonance Algorithm
 ==============================================
-Физически корректная суперпозиция синусоид с резонансом.
+Архитектура: ГЛАВНАЯ волна + резонансные поправки от вторичных.
 
 Принципы:
-  - FFT / CWT для автодетекции доминирующих компонент
-  - Попарная проверка резонанса по двум критериям:
-      1. Близость частот (|Δf| / f_mean < freq_thresh)
-      2. Близость мгновенных фаз (непрерывное, через cos(Δφ))
-  - Итоговый коэффициент модуляции — среднее по парам, непрерывное в [-1, 1]
-  - Нормировка выхода: сигнал всегда в [-1, 1]
+  1. Детектируем N волн через FFT / CWT, фильтруем гармоники.
+  2. Выделяем ГЛАВНУЮ волну — доминирующую по амплитуде.
+  3. Вторичные волны влияют на главную только через резонанс:
+       - если частота вторичной БЛИЗКА к главной (|Δf|/f < freq_thresh)
+         → вторичная входит в резонанс и вносит коррекцию к главной
+       - если далека → вторичная игнорируется
+  4. Резонансная поправка на каждом баре (непрерывная, через cos(Δφ)):
+       correction_i = A_sec * cos(Δφ_i) * resonance_weight
+       Δφ = разность мгновенных фаз главной и вторичной
+  5. Итоговый сигнал = главная + сумма поправок от вторичных
+  6. Прогноз = экстраполяция главной волны + резонансных поправок вперёд
 
-Режимы автодетекции:
-  'fft'  — быстрый, хорошо для периодических сигналов
-  'cwt'  — медленнее, но точнее для нестационарных рядов (Morlet)
+  Это физически правильнее чем модуляция суперпозиции: главная волна
+  задаёт "несущую", вторичные её корректируют — как в радиосвязи (AM).
 """
 
 from __future__ import annotations
@@ -262,83 +266,131 @@ def _find_resonant_pairs(
     return pairs
 
 
+def _resonance_weight(
+    f_dom:       float,
+    f_sec:       float,
+    freq_thresh: float,
+) -> float:
+    """
+    Вес резонансного влияния вторичной волны на главную.
+    Максимален когда частоты совпадают (f_dom ≈ f_sec),
+    линейно убывает до 0 на границе freq_thresh.
+    """
+    fmid = (f_dom + f_sec) * 0.5
+    if fmid <= 0:
+        return 0.0
+    rel_diff = abs(f_dom - f_sec) / fmid
+    if rel_diff >= freq_thresh:
+        return 0.0
+    return 1.0 - rel_diff / freq_thresh
+
+
+def compute_resonance_corrections(
+    dom:         dict,
+    secondaries: list[dict],
+    indices:     np.ndarray,
+    freq_thresh: float = 0.15,
+    k_res:       float = 2.0,
+    k_damp:      float = 0.3,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Вычислить резонансные поправки к главной волне от каждой вторичной.
+
+    Физика:
+      Главная волна: S_dom(i) = A_dom * sin(ω_dom * i + φ_dom)
+      Вторичная:     S_sec(j) = A_sec * sin(ω_sec * i + φ_sec)
+
+      Разность мгновенных фаз: Δφ(i) = φ_dom(i) - φ_sec(i)
+      cos(Δφ) = +1 → синфазно → конструктивная поправка (усиление)
+      cos(Δφ) = -1 → противофазно → деструктивная поправка (гашение)
+
+      Поправка от вторичной j на баре i:
+        corr_j(i) = A_sec_j * cos(Δφ_j(i)) * w_j * k_scale
+
+      где w_j = resonance_weight(f_dom, f_sec_j) — близость частот [0..1]
+          k_scale = k_res если cos(Δφ) > 0, k_damp если < 0
+
+      Итоговая поправка = сумма по всем вторичным.
+
+    Возвращает:
+      correction [n] — суммарная поправка (в единицах амплитуды главной)
+      res_type   [n] — +1 усиление, -1 гашение, 0 нейтраль
+    """
+    n = len(indices)
+    correction = np.zeros(n, dtype=np.float64)
+
+    if not secondaries:
+        return correction, np.zeros(n)
+
+    phase_dom = 2.0 * np.pi * indices / dom['period'] + dom['phase']
+
+    for sec in secondaries:
+        w = _resonance_weight(dom['frequency'], sec['frequency'], freq_thresh)
+        if w <= 0.0:
+            continue
+
+        phase_sec = 2.0 * np.pi * indices / sec['period'] + sec['phase']
+        d_phi     = (phase_dom - phase_sec + np.pi) % (2.0 * np.pi) - np.pi
+        cos_dp    = np.cos(d_phi)
+
+        # Амплитуда поправки = A_sec * cos(Δφ) * weight
+        # Масштабируем через k_res/k_damp в зависимости от знака cos
+        k_scale = np.where(cos_dp >= 0, k_res, k_damp)
+        correction += sec['amplitude'] * cos_dp * w * k_scale
+
+    # Тип суммарной поправки
+    res_type = np.zeros(n, dtype=np.float64)
+    res_type[correction >  dom['amplitude'] * 0.05] =  1.0
+    res_type[correction < -dom['amplitude'] * 0.05] = -1.0
+
+    return correction, res_type
+
+
+# Обратная совместимость: старый интерфейс через новые функции
 def compute_resonance_factor(
     waves: list[dict],
     indices: np.ndarray,
-    freq_thresh: float   = 0.15,
-    phase_thresh: float  = 0.8,   # радиан, до π
-    k_res:  float        = 2.0,
-    k_damp: float        = 0.3,
+    freq_thresh: float = 0.15,
+    phase_thresh: float = 0.8,
+    k_res:  float = 2.0,
+    k_damp: float = 0.3,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Вычислить коэффициент модуляции резонанса для каждого бара.
-
-    Физика:
-      - cos(Δφ) = +1 → полный конструктивный резонанс → factor = k_res
-      - cos(Δφ) = -1 → полный деструктивный резонанс → factor = k_damp
-      - cos(Δφ) = 0  → нейтральная зона              → factor = 1.0
-      - Линейная интерполяция между этими точками
-
-    Если пар несколько → среднее значение factor по всем парам.
-
-    Возвращает:
-      factor_arr [n] — float, коэффициент модуляции
-      res_type_arr [n] — +1 конструктив, -1 деструктив, 0 нейтраль
+    Совместимость со старым API.
+    Внутри использует новую архитектуру: главная + поправки от вторичных.
+    Возвращает (factor_arr, res_type_arr) как раньше.
     """
-    n = len(indices)
-    pairs = _find_resonant_pairs(waves, freq_thresh)
+    if not waves:
+        return np.ones(len(indices)), np.zeros(len(indices))
 
-    if not pairs:
-        return np.ones(n), np.zeros(n)
+    dom        = max(waves, key=lambda w: w['amplitude'])
+    secondaries = [w for w in waves if w is not dom]
 
-    # Накопление факторов по всем парам
-    factor_sum = np.zeros(n, dtype=np.float64)
-    pair_count = len(pairs)
+    dom_signal = dom['amplitude'] * np.sin(
+        2.0 * np.pi * indices / dom['period'] + dom['phase']
+    )
+    correction, res_type = compute_resonance_corrections(
+        dom, secondaries, indices,
+        freq_thresh=freq_thresh, k_res=k_res, k_damp=k_damp,
+    )
 
-    for a, b in pairs:
-        wa, wb = waves[a], waves[b]
-        phase_a = 2.0 * np.pi * indices / wa['period'] + wa['phase']
-        phase_b = 2.0 * np.pi * indices / wb['period'] + wb['phase']
+    total = dom_signal + correction
+    dom_max = np.abs(dom_signal).max()
+    scale   = dom_max if dom_max > 1e-12 else 1.0
 
-        # Мгновенная разность фаз → [-π, π]
-        d_phi = (phase_a - phase_b + np.pi) % (2.0 * np.pi) - np.pi
+    # Переводим в factor (для совместимости): total / dom_signal
+    # Защита от деления на ноль
+    with np.errstate(divide='ignore', invalid='ignore'):
+        factor = np.where(
+            np.abs(dom_signal) > scale * 0.01,
+            total / dom_signal,
+            1.0,
+        )
 
-        # cos(Δφ) ∈ [-1, 1]:
-        #   +1 → синфазно (конструктив)
-        #   -1 → противофазно (деструктив)
-        cos_dp = np.cos(d_phi)
+    # Ограничиваем диапазон factor
+    factor = np.clip(factor, k_damp * 0.5, k_res * 1.5)
 
-        # Порог: применяем резонанс только когда |cos| выше порога
-        # phase_thresh ≈ 0.8 рад ↔ cos_thresh ≈ cos(0.8) ≈ 0.697
-        cos_thresh = float(np.cos(phase_thresh))
-
-        # Непрерывное отображение:
-        # factor = 1 + (k_res - 1) * (cos_dp - cos_thresh) / (1 - cos_thresh)  при cos_dp > cos_thresh
-        # factor = 1 + (1 - k_damp) * (cos_dp + cos_thresh) / (1 - cos_thresh) при cos_dp < -cos_thresh
-        # factor = 1 в зоне нейтраль
-        factor = np.ones(n, dtype=np.float64)
-
-        in_res  = cos_dp >  cos_thresh   # конструктивный
-        in_damp = cos_dp < -cos_thresh   # деструктивный
-
-        if np.any(in_res):
-            t = (cos_dp[in_res] - cos_thresh) / (1.0 - cos_thresh)
-            factor[in_res] = 1.0 + (k_res - 1.0) * t
-
-        if np.any(in_damp):
-            t = (-cos_dp[in_damp] - cos_thresh) / (1.0 - cos_thresh)
-            factor[in_damp] = 1.0 - (1.0 - k_damp) * t
-
-        factor_sum += factor
-
-    factor_mean = factor_sum / pair_count
-
-    # Тип резонанса по среднему фактору
-    res_type = np.zeros(n, dtype=np.float64)
-    res_type[factor_mean > 1.05]  =  1.0   # +5% → считаем конструктивом
-    res_type[factor_mean < 0.95]  = -1.0   # -5% → деструктив
-
-    return factor_mean, res_type
+    return factor, res_type
 
 
 # ══════════════════════════════════════════════════════════════════════════════
