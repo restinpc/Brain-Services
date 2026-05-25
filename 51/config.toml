@@ -1,0 +1,69 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# config.toml — brain-trend-combo (сервис 45)
+#
+# Самодостаточный сервис: нет внешнего датасета событий.
+# Индекс строится из котировок силами context_idx.py (build_index).
+# Алгоритм: 10 таймфреймов (1h..3m), 2 верхних + 2 нижних экстремума,
+# средняя трендовая линия → direction bit, weight_code = {prefix}_{dir_bits}.
+#
+# Отличие от enriched_table-сервисов (напр. 47):
+#   • нет [dataset].enriched_table — фреймворк не генерирует CTX_QUERY автоматически;
+#   • CTX_QUERY задаётся напрямую в [ctx].query (читает нашу собственную таблицу);
+#   • DATASET_QUERY пустой — model() работает только на rates.
+#
+# Секреты остаются в .env.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Идентификация ─────────────────────────────────────────────────────────────
+[service]
+id   = 51                                 # brain_models.id — ПОДСТАВИТЬ перед деплоем
+port = 8913                               # TODO: занятые порты проверить
+name = "brain-trend-combo"
+text = "Multi-TF trend line combination indexer (10 timeframes, 512 combo prefixes)"
+
+# ── Котировки ─────────────────────────────────────────────────────────────────
+# pair 1 = EUR/USD (default).  Для BTC/ETH меняется при запросе /values?pair=3/4.
+# Здесь — базовая таблица для reload при старте. model() сам агрегирует все TF.
+[rates]
+table = "brain_rates_eur_usd"
+
+# ── Кеш ───────────────────────────────────────────────────────────────────────
+[cache]
+date_from        = "2025-01-15"           # прогрев 1 год встроен в build_index
+var_range        = [0]                    # один вариант взвешивания (bull_ratio)
+types_range      = [0]                    # type=0 — единственный тип модели
+shift_window     = 0                      # без временного сдвига
+rebuild_interval = 3600                  # пересчёт индекса раз в сутки
+reload_interval  = 4000
+
+# ── Датасет ───────────────────────────────────────────────────────────────────
+# Внешних событий нет. Пустой SELECT — model() игнорирует dataset полностью.
+
+
+# ── Контекстный индекс ────────────────────────────────────────────────────────
+# vlad_trend_combo_svc45_index создаётся и заполняется в context_idx.py::build_index().
+# Фреймворк загружает его в s.ctx_index при старте; model() читает bull_ratio по weight_code.
+[ctx]
+key_columns    = ["id"]
+weights_table  = "vlad_trend_combo_svc51_index"   # ← добавить
+query = """
+    SELECT
+        id,
+        weight_code,
+        combo_prefix,
+        direction_bits,
+        occurrence_count,
+        bull_count,
+        bull_ratio,
+        avg_t1
+    FROM vlad_trend_combo_svc51_index
+    ORDER BY id
+"""
+[dataset]
+engine = "brain"
+query  = "SELECT date FROM brain_rates_eur_usd"
+
+# ── ML ────────────────────────────────────────────────────────────────────────
+# Выключен: детерминированный сервис на чистой статистике.
+[ml]
+enabled = false
