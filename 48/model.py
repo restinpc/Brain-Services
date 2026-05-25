@@ -25,7 +25,7 @@ from wave_resonance import (
     detect_waves_fft, detect_waves_cwt,
     filter_harmonics,
     eval_superposition,
-    compute_resonance_factor,
+    compute_resonance_corrections,
     _find_resonant_pairs,
 )
 from weights import make_weight_code, CTX_TABLE, WEIGHTS_TABLE, SHIFT_MAX, RECURRING_MIN
@@ -36,6 +36,11 @@ log = logging.getLogger(__name__)
 # ══════════════════════════════════════════════════════════════════════════════
 # КОНФИГУРАЦИЯ СЕРВИСА
 # ══════════════════════════════════════════════════════════════════════════════
+
+SERVICE_ID   = 50
+PORT         = 8900
+NODE_NAME    = "brain-wave-resonance-s50"
+SERVICE_TEXT = "Wave Resonance — синусоидная суперпозиция с резонансом"
 
 CTX_TABLE        = CTX_TABLE
 CTX_KEY_COLUMNS  = ["fingerprint_hash"]   # ключ ctx_index = (fingerprint,)
@@ -48,6 +53,8 @@ SHIFT_WINDOW = SHIFT_MAX
 # brain_rates таблицы живут в engine_brain — указываем движок явно
 DATASET_ENGINE      = "brain"
 DATASET_QUERY       = "SELECT date FROM brain_rates_btc_usd_day ORDER BY date"
+
+PRETEST_ALLOW_EMPTY = True
 
 # Говорим фреймворку что нам нужен ctx_index в dataset_index
 model_needs_index       = True
@@ -143,24 +150,34 @@ def _get_table_name(dataset_index) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _compute_config_and_signals(
-    prices:      np.ndarray,
-    n_comp:      int,
-    freq_thresh: float,
+    prices:       np.ndarray,
+    n_comp:       int,
+    freq_thresh:  float,
     phase_thresh: float,
-    k_res:       float,
-    k_damp:      float,
-    method:      str,
-    min_period:  int,
-    n_forward:   int,
+    k_res:        float,
+    k_damp:       float,
+    method:       str,
+    min_period:   int,
+    n_forward:    int,
 ) -> tuple[dict | None, float, list[float]]:
     """
+    Архитектура: главная волна + резонансные поправки от вторичных.
+
+    Шаги:
+      1. FFT/CWT → список волн, фильтр гармоник
+      2. dom = волна с максимальной амплитудой (главная)
+      3. secondaries = остальные волны
+      4. Для каждой вторичной — вычисляем резонансную поправку к главной:
+            correction(i) = A_sec * cos(Δφ(i)) * weight * k_scale
+         где Δφ = разность мгновенных фаз dom и secondary
+      5. Итоговый сигнал = dom_signal + sum(corrections)
+      6. Прогноз: экстраполируем dom + corrections вперёд
+
     Возвращает (config, signal_val, fwd_vals).
-    config = {period_bin, n_pairs, res_dir} или None если волны не найдены.
-    signal_val = нормированный резонансный сигнал на текущем баре.
-    fwd_vals   = прогнозные значения на 0..n_forward баров вперёд.
     """
     n = len(prices)
 
+    # ── 1. Детекция волн ────────────────────────────────────────────────────
     if method == 'cwt' and n >= 32:
         waves = detect_waves_cwt(prices, n_comp, min_period)
     else:
@@ -170,23 +187,35 @@ def _compute_config_and_signals(
         return None, 0.0, [0.0] * n_forward
 
     waves = filter_harmonics(waves)
-    dom   = max(waves, key=lambda w: w['amplitude'])
+
+    # ── 2. Главная и вторичные волны ────────────────────────────────────────
+    dom        = max(waves, key=lambda w: w['amplitude'])
+    secondaries = [w for w in waves if w is not dom]
 
     period_bin = int(round(dom['period'] / BIN_SIZE) * BIN_SIZE)
     period_bin = max(BIN_SIZE, period_bin)
 
-    indices = np.arange(n, dtype=np.float64)
-    superpos = eval_superposition(waves, indices)
-    factor, res_type = compute_resonance_factor(
-        waves, indices,
-        freq_thresh=freq_thresh, phase_thresh=phase_thresh,
-        k_res=k_res, k_damp=k_damp,
+    # ── 3. Сигнал главной волны на исторических барах ───────────────────────
+    indices    = np.arange(n, dtype=np.float64)
+    dom_signal = dom['amplitude'] * np.sin(
+        2.0 * np.pi * indices / dom['period'] + dom['phase']
     )
-    modulated = superpos * factor
-    mod_max   = np.abs(modulated).max()
-    scale     = mod_max if mod_max > 1e-12 else 1.0
-    mod_norm  = modulated / scale
 
+    # ── 4. Резонансные поправки от вторичных ───────────────────────────────
+    correction, res_type = compute_resonance_corrections(
+        dom, secondaries, indices,
+        freq_thresh=freq_thresh, k_res=k_res, k_damp=k_damp,
+    )
+
+    # ── 5. Итоговый сигнал = главная + поправки ─────────────────────────────
+    total_signal = dom_signal + correction
+
+    # Нормировка: max амплитуды главной волны задаёт масштаб
+    dom_max = float(dom['amplitude'])
+    scale   = dom_max if dom_max > 1e-12 else 1.0
+    sig_norm = total_signal / scale
+
+    # Конфигурация для fingerprint
     n_pairs = min(len(_find_resonant_pairs(waves, freq_thresh)), 127)
     res_dir = int(res_type[-1])
 
@@ -196,19 +225,21 @@ def _compute_config_and_signals(
         'res_dir':    res_dir,
     }
 
-    signal_val = float(mod_norm[-1])
+    signal_val = float(sig_norm[-1])
 
-    # Прогноз
+    # ── 6. Прогноз: dom + corrections вперёд ───────────────────────────────
     fwd_n   = n + n_forward
     fwd_idx = np.arange(fwd_n, dtype=np.float64)
-    fwd_sp  = eval_superposition(waves, fwd_idx)
-    fwd_f, _ = compute_resonance_factor(
-        waves, fwd_idx,
-        freq_thresh=freq_thresh, phase_thresh=phase_thresh,
-        k_res=k_res, k_damp=k_damp,
+
+    dom_fwd = dom['amplitude'] * np.sin(
+        2.0 * np.pi * fwd_idx / dom['period'] + dom['phase']
     )
-    fwd_norm = (fwd_sp * fwd_f) / scale
-    fwd_vals = [round(float(fwd_norm[n + i]), 6) for i in range(n_forward)]
+    corr_fwd, _ = compute_resonance_corrections(
+        dom, secondaries, fwd_idx,
+        freq_thresh=freq_thresh, k_res=k_res, k_damp=k_damp,
+    )
+    fwd_total = (dom_fwd + corr_fwd) / scale
+    fwd_vals  = [round(float(fwd_total[n + i]), 6) for i in range(n_forward)]
 
     return config, round(signal_val, 6), fwd_vals
 
