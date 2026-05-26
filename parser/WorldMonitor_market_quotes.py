@@ -1,12 +1,27 @@
 """
+Описание: Finnhub — snapshot рыночных котировок по списку тикеров.
 Таблица: vlad_wm_market_quotes
+
+Важно:
+  В .env должен быть ключ Finnhub:
+    FINNHUB_API_KEY=your_key_here
 
 Запуск:
   python WorldMonitor_market_quotes.py vlad_wm_market_quotes [host] [port] [user] [password] [database]
+
+Примеры:
+  python WorldMonitor_market_quotes.py vlad_wm_market_quotes
+  python WorldMonitor_market_quotes.py vlad_wm_market_quotes 127.0.0.1 3306 root password brain
 """
 
-import os, sys, argparse, json, time, random, traceback
-from datetime import datetime
+import os
+import sys
+import argparse
+import json
+import time
+import random
+import traceback
+from datetime import datetime, timezone
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -16,17 +31,43 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 TRACE_URL = "https://server.brain-project.online/trace.php"
 NODE_NAME = os.getenv("NODE_NAME", "wm_market_quotes")
 EMAIL = os.getenv("ALERT_EMAIL", "vladyurjevitch@yandex.ru")
-WM_API_BASE = os.getenv("WM_API_BASE", "https://api.worldmonitor.app")
+
+# Старый endpoint api.worldmonitor.app начал отдавать HTTP 401 без авторизации.
+# Поэтому берём котировки напрямую из Finnhub.
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY") or os.getenv("FINNHUB_TOKEN")
+FINNHUB_API_BASE = os.getenv("FINNHUB_API_BASE", "https://finnhub.io/api/v1").rstrip("/")
+
+# Пауза между запросами, чтобы не упираться в лимиты free-tier.
+FINNHUB_REQUEST_DELAY = float(os.getenv("FINNHUB_REQUEST_DELAY", "1.1"))
+
 
 def send_error_trace(exc, script_name="WorldMonitor_market_quotes.py"):
-    logs = f"Node: {NODE_NAME}\nScript: {script_name}\nException: {repr(exc)}\n\nTraceback:\n{traceback.format_exc()}"
-    try: requests.post(TRACE_URL, data={"url": "cli_script", "node": NODE_NAME, "email": EMAIL, "logs": logs}, timeout=10)
-    except: pass
+    logs = (
+        f"Node: {NODE_NAME}\n"
+        f"Script: {script_name}\n"
+        f"Exception: {repr(exc)}\n\n"
+        f"Traceback:\n{traceback.format_exc()}"
+    )
+    try:
+        requests.post(
+            TRACE_URL,
+            data={"url": "cli_script", "node": NODE_NAME, "email": EMAIL, "logs": logs},
+            timeout=10,
+        )
+    except Exception:
+        pass
 
-parser = argparse.ArgumentParser(description="WorldMonitor Market Quotes (Finnhub) → MySQL")
+
+parser = argparse.ArgumentParser(description="Finnhub Market Quotes → MySQL")
 parser.add_argument("table_name", help="Имя целевой таблицы в БД")
 parser.add_argument("host", nargs="?", default=os.getenv("DB_HOST"))
 parser.add_argument("port", nargs="?", default=os.getenv("DB_PORT", "3306"))
@@ -36,46 +77,105 @@ parser.add_argument("database", nargs="?", default=os.getenv("DB_NAME"))
 args = parser.parse_args()
 
 if not all([args.host, args.user, args.password, args.database]):
-    print(" Ошибка: не указаны все параметры подключения к БД"); sys.exit(1)
+    print("Ошибка: не указаны все параметры подключения к БД")
+    print("Использование:")
+    print("  python WorldMonitor_market_quotes.py vlad_wm_market_quotes")
+    print("  python WorldMonitor_market_quotes.py vlad_wm_market_quotes 127.0.0.1 3306 root password brain")
+    sys.exit(1)
 
-DB_CONFIG = {'host': args.host, 'port': int(args.port), 'user': args.user, 'password': args.password, 'database': args.database}
+if not FINNHUB_API_KEY:
+    print("Ошибка: не найден FINNHUB_API_KEY в .env")
+    print("Добавь строку в .env:")
+    print("  FINNHUB_API_KEY=your_key_here")
+    sys.exit(1)
 
-DATASETS = {"vlad_wm_market_quotes": {"description": "WorldMonitor: Finnhub market quotes (snapshot)"}}
+DB_CONFIG = {
+    "host": args.host,
+    "port": int(args.port),
+    "user": args.user,
+    "password": args.password,
+    "database": args.database,
+}
 
-# Тикеры по батчам (Finnhub rate-limit ~10 за раз)
-SYMBOL_BATCHES = [
-    ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "JPM", "V", "WMT"],
-    ["BRK.B", "UNH", "XOM", "JNJ", "PG", "MA", "HD", "COST", "ABBV", "BAC"],
+DATASETS = {
+    "vlad_wm_market_quotes": {
+        "description": "Finnhub market quotes snapshot",
+    }
+}
+
+# Тикеры. Finnhub /quote принимает один symbol за запрос.
+SYMBOLS = [
+    "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "JPM", "V", "WMT",
+    "BRK.B", "UNH", "XOM", "JNJ", "PG", "MA", "HD", "COST", "ABBV", "BAC",
 ]
 
-def build_session():
-    s = requests.Session()
-    retry = Retry(total=3, backoff_factor=1.5, status_forcelist=[429, 500, 502, 503, 504], allowed_methods=["GET"])
-    s.mount("https://", HTTPAdapter(max_retries=retry))
-    s.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "application/json",
-        "Origin": "https://worldmonitor.app",
-        "Referer": "https://worldmonitor.app/",
-    })
-    return s
 
-def wm_get(session, path, params=None, timeout=30):
-    url = f"{WM_API_BASE}{path}"
-    for attempt in range(3):
+def build_session():
+    session = requests.Session()
+    retry = Retry(
+        total=3,
+        backoff_factor=1.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+        raise_on_status=False,
+    )
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+    session.headers.update({
+        "User-Agent": "Brain-Services/1.0",
+        "Accept": "application/json",
+        "X-Finnhub-Token": FINNHUB_API_KEY,
+    })
+    return session
+
+
+def finnhub_get_quote(session, symbol, timeout=30):
+    url = f"{FINNHUB_API_BASE}/quote"
+    params = {"symbol": symbol}
+
+    for attempt in range(1, 4):
         try:
-            if attempt > 0: time.sleep(1.5 ** attempt + random.uniform(0.2, 0.8))
-            resp = session.get(url, params=params, timeout=timeout)
-            if resp.status_code == 429:
-                wait = int(resp.headers.get("Retry-After", 10))
-                print(f"   ⏳ Rate-limit, ждём {wait}s...")
-                time.sleep(wait + random.uniform(0, 2)); continue
-            resp.raise_for_status()
-            return resp.json()
-        except requests.exceptions.HTTPError:
-            print(f"    HTTP {resp.status_code} для {path}")
-        except Exception as e:
-            print(f"    {e}")
+            if attempt > 1:
+                time.sleep((1.7 ** attempt) + random.uniform(0.2, 0.8))
+
+            response = session.get(url, params=params, timeout=timeout)
+
+            if response.status_code == 429:
+                wait = int(response.headers.get("Retry-After", 15))
+                print(f"   Rate-limit Finnhub для {symbol}, ждём {wait}s...")
+                time.sleep(wait + random.uniform(0, 2))
+                continue
+
+            if response.status_code in (401, 403):
+                print(f"   HTTP {response.status_code} для {symbol}: проверь FINNHUB_API_KEY")
+                return None
+
+            response.raise_for_status()
+            data = response.json()
+
+            # Finnhub иногда возвращает {'error': '...'} вместо обычной котировки.
+            if isinstance(data, dict) and data.get("error"):
+                print(f"   Ошибка Finnhub для {symbol}: {data.get('error')}")
+                return None
+
+            if not isinstance(data, dict):
+                print(f"   Неожиданный ответ Finnhub для {symbol}: {type(data).__name__}")
+                return None
+
+            # Для невалидного/недоступного тикера Finnhub может вернуть нули.
+            if all(_sf(data.get(k)) in (None, 0.0) for k in ["c", "h", "l", "o", "pc"]):
+                print(f"   Нет данных для {symbol}")
+                return None
+
+            data["symbol"] = symbol
+            return data
+
+        except requests.exceptions.Timeout:
+            print(f"   Timeout для {symbol}, попытка {attempt}/3")
+        except requests.exceptions.RequestException as exc:
+            print(f"   Ошибка запроса для {symbol}: {exc}")
+        except ValueError as exc:
+            print(f"   Ошибка JSON для {symbol}: {exc}")
+
     return None
 
 
@@ -88,7 +188,8 @@ class QuotesCollector:
         return mysql.connector.connect(**DB_CONFIG)
 
     def ensure_table(self):
-        conn = self.get_db_connection(); c = conn.cursor()
+        conn = self.get_db_connection()
+        c = conn.cursor()
         c.execute(f"""
             CREATE TABLE IF NOT EXISTS `{self.table_name}` (
                 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -109,66 +210,76 @@ class QuotesCollector:
                 INDEX idx_symbol (symbol),
                 INDEX idx_snapshot (snapshot_at)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-            COMMENT='WorldMonitor: Finnhub market quotes';
+            COMMENT='Finnhub market quotes';
         """)
-        conn.commit(); c.close(); conn.close()
+        conn.commit()
+        c.close()
+        conn.close()
 
     def process(self):
         self.ensure_table()
-        now = datetime.utcnow()
-        snapshot_at = now.strftime("%Y-%m-%d %H:%M:%S")
-        snapshot_hour = now.replace(minute=0, second=0, microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
+
+        now = datetime.now(timezone.utc)
+        snapshot_at = now.replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
+        snapshot_hour = now.replace(minute=0, second=0, microsecond=0, tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
+
         all_quotes = []
 
-        for batch in SYMBOL_BATCHES:
-            symbols_str = ",".join(batch)
-            print(f"    Запрос: {symbols_str[:60]}...")
-            data = wm_get(self.session, "/api/market/v1/list-market-quotes", params={"symbols": symbols_str})
+        print(f"   Запрос котировок: {len(SYMBOLS)} тикеров")
+        for idx, symbol in enumerate(SYMBOLS, start=1):
+            print(f"   [{idx}/{len(SYMBOLS)}] {symbol}...", end=" ")
+            quote = finnhub_get_quote(self.session, symbol)
+            if quote:
+                all_quotes.append(quote)
+                price = quote.get("c")
+                dp = quote.get("dp")
+                print(f"OK ${price} ({dp}%)")
+            else:
+                print("пропущен")
 
-            if not data:
-                print(f"    Нет ответа для батча")
-                continue
-
-            quotes = data.get("quotes", [])
-            skipped = data.get("finnhubSkipped", [])
-            rate_limited = data.get("rateLimited", False)
-
-            if rate_limited:
-                print(f"   ⏳ Finnhub rate-limited, пауза 15s...")
-                time.sleep(15)
-
-            if skipped:
-                print(f"    Пропущены (Finnhub): {skipped}")
-
-            all_quotes.extend(quotes)
-            time.sleep(random.uniform(1.0, 2.0))  # Между батчами
+            if idx < len(SYMBOLS):
+                time.sleep(FINNHUB_REQUEST_DELAY)
 
         if not all_quotes:
-            print("    Нет котировок")
+            print("   Нет котировок")
             return
 
-        print(f"    Получено {len(all_quotes)} котировок")
+        print(f"   Получено {len(all_quotes)} котировок")
 
-        conn = self.get_db_connection(); c = conn.cursor()
-        sql = f"""INSERT IGNORE INTO `{self.table_name}`
+        conn = self.get_db_connection()
+        c = conn.cursor()
+        sql = f"""
+            INSERT INTO `{self.table_name}`
             (symbol, current_price, change_amount, change_pct, high_price, low_price,
              open_price, prev_close, timestamp_unix, raw_json, snapshot_hour, snapshot_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"""
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                current_price = VALUES(current_price),
+                change_amount = VALUES(change_amount),
+                change_pct = VALUES(change_pct),
+                high_price = VALUES(high_price),
+                low_price = VALUES(low_price),
+                open_price = VALUES(open_price),
+                prev_close = VALUES(prev_close),
+                timestamp_unix = VALUES(timestamp_unix),
+                raw_json = VALUES(raw_json),
+                snapshot_at = VALUES(snapshot_at),
+                loaded_at = CURRENT_TIMESTAMP
+        """
 
         rows = []
         for q in all_quotes:
-            # Finnhub quote format: c=current, d=change, dp=change%, h=high, l=low, o=open, pc=prev_close, t=timestamp
-            symbol = q.get("symbol", q.get("ticker", ""))
+            symbol = q.get("symbol", "")
             rows.append((
                 symbol,
-                _sf(q.get("c", q.get("current", q.get("price")))),
-                _sf(q.get("d", q.get("change"))),
-                _sf(q.get("dp", q.get("changePct", q.get("change_percent")))),
-                _sf(q.get("h", q.get("high"))),
-                _sf(q.get("l", q.get("low"))),
-                _sf(q.get("o", q.get("open"))),
-                _sf(q.get("pc", q.get("previousClose", q.get("prev_close")))),
-                _si(q.get("t", q.get("timestamp"))),
+                _sf(q.get("c")),
+                _sf(q.get("d")),
+                _sf(q.get("dp")),
+                _sf(q.get("h")),
+                _sf(q.get("l")),
+                _sf(q.get("o")),
+                _sf(q.get("pc")),
+                _si(q.get("t")),
                 json.dumps(q, ensure_ascii=False, default=str)[:2000],
                 snapshot_hour,
                 snapshot_at,
@@ -176,48 +287,65 @@ class QuotesCollector:
 
         c.executemany(sql, rows)
         conn.commit()
-        inserted = c.rowcount
-        c.close(); conn.close()
+        affected = c.rowcount
+        c.close()
+        conn.close()
 
-        print(f"    Записано {inserted} котировок")
-        # Показать топ-5
+        print(f"   Обновлено/записано строк: {affected}")
+        print("   Пример:")
         for q in all_quotes[:5]:
-            sym = q.get("symbol", q.get("ticker", "?"))
-            price = q.get("c", q.get("price", "?"))
-            dp = q.get("dp", q.get("changePct", "?"))
-            print(f"      {sym:8s}  ${price}  ({dp}%)")
+            sym = q.get("symbol", "?")
+            price = q.get("c", "?")
+            dp = q.get("dp", "?")
+            print(f"     {sym:8s} ${price} ({dp}%)")
 
 
 def _sf(v):
-    if v is None or v == "": return None
-    try: return float(str(v).replace(",", ""))
-    except: return None
+    if v is None or v == "":
+        return None
+    try:
+        return float(str(v).replace(",", ""))
+    except Exception:
+        return None
+
 
 def _si(v):
-    if v is None or v == "": return None
-    try: return int(float(str(v).replace(",", "")))
-    except: return None
+    if v is None or v == "":
+        return None
+    try:
+        return int(float(str(v).replace(",", "")))
+    except Exception:
+        return None
 
 
 def main():
     if args.table_name not in DATASETS:
-        print(f" Неизвестная таблица '{args.table_name}'. Допустимые:")
-        for n in DATASETS: print(f"  - {n}")
+        print(f"Неизвестная таблица '{args.table_name}'. Допустимые:")
+        for name in DATASETS:
+            print(f"  - {name}")
         sys.exit(1)
 
-    print(f" WorldMonitor Market Quotes Collector (Finnhub)")
+    print("Finnhub Market Quotes Collector")
     print(f"База: {args.host}:{args.port}/{args.database}")
-    print(f" Таблица: {args.table_name}")
+    print(f"Таблица: {args.table_name}")
     print("=" * 60)
 
     QuotesCollector(args.table_name).process()
 
     print("=" * 60)
-    print(" ЗАГРУЗКА ЗАВЕРШЕНА")
+    print("ЗАГРУЗКА ЗАВЕРШЕНА")
 
 
 if __name__ == "__main__":
-    try: main()
-    except SystemExit: raise
-    except KeyboardInterrupt: print("\n Прервано пользователем"); sys.exit(1)
-    except Exception as e: print(f"\n Критическая ошибка: {e!r}"); send_error_trace(e); sys.exit(1)
+    try:
+        main()
+    except SystemExit:
+        raise
+    except KeyboardInterrupt:
+        print("\nПрервано пользователем")
+        sys.exit(1)
+    except Exception as e:
+        print(f"\nКритическая ошибка: {e!r}")
+        traceback.print_exc()
+        send_error_trace(e)
+        sys.exit(1)
