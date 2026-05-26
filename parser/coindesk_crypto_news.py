@@ -1,29 +1,36 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+Загрузчик новостей CoinDesk.com (крипто) в MySQL.
+
+Почему без Playwright:
+  CoinDesk публикует официальный RSS-feed, поэтому для регулярной загрузки
+  новостей не нужно открывать тяжелую JS-страницу браузером. Это устраняет
+  зависания Page.goto/Page.screenshot и снижает нагрузку на сервер.
+
+Запуск:
+  python coindesk_crypto_news.py vlad_coindesk_crypto_news [host] [port] [user] [password] [database]
+
+Опциональные переменные .env:
+  COINDESK_RSS_URL=https://www.coindesk.com/arc/outboundfeeds/rss/
+  COINDESK_REQUEST_TIMEOUT=30
+"""
+
 import os
 import sys
+import re
+import html
 import argparse
-import datetime
+import datetime as dt
 import traceback
-import asyncio
-import pandas as pd
-from sqlalchemy import create_engine, text
+import xml.etree.ElementTree as ET
+from email.utils import parsedate_to_datetime
+from urllib.parse import urljoin
+
 import requests
 from dotenv import load_dotenv
-from playwright.async_api import async_playwright
-import tempfile
-
-# ----------------------------------------------------------------------
-# Настройка временной директории для Playwright
-# ----------------------------------------------------------------------
-TEMP_DIR = os.path.join(os.path.expanduser("~"), ".playwright-tmp")
-os.makedirs(TEMP_DIR, exist_ok=True)
-os.environ["PLAYWRIGHT_TMPDIR"] = TEMP_DIR
-os.environ["TMPDIR"] = TEMP_DIR
-os.environ["TEMP"] = TEMP_DIR
-os.environ["TMP"] = TEMP_DIR
-tempfile.tempdir = TEMP_DIR
-print(f"Временная директория Playwright: {TEMP_DIR}")
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import URL
 
 load_dotenv()
 
@@ -35,28 +42,14 @@ NODE_NAME = os.getenv("NODE_NAME", "vlad_coindesk_crypto_news")
 ALERT_EMAIL = os.getenv("ALERT_EMAIL", "vladyurjevitch@yandex.ru")
 
 # ----------------------------------------------------------------------
-# Параметры парсинга
+# Параметры источника
 # ----------------------------------------------------------------------
-BASE_URL = "https://www.coindesk.com/latest-crypto-news"
-MAX_CLICKS = 20  # лимит кликов "More Stories"
-
-# ----------------------------------------------------------------------
-# Селекторы для элементов на странице (можно легко обновить)
-# ----------------------------------------------------------------------
-SELECTORS = {
-    'news_container': 'div[class*="flex gap-4"]',  # контейнер новости (уточнить!)
-    'title_link': 'a[class*="content-card-title"]',  # ссылка с заголовком
-    'category': 'a[class*="font-title"]',  # категория
-    'description': 'p[class*="font-body"]',  # описание
-    'date': 'span[class*="font-metadata"]',  # дата
-    'more_button': 'button:has-text("More Stories")',  # кнопка "More Stories"
-    'cookie_accept': 'button:has-text("Accept"), button:has-text("I Accept"), button:has-text("Got It")'
-}
+BASE_URL = "https://www.coindesk.com"
+RSS_URL = os.getenv("COINDESK_RSS_URL", "https://www.coindesk.com/arc/outboundfeeds/rss/")
+REQUEST_TIMEOUT = int(os.getenv("COINDESK_REQUEST_TIMEOUT", "30"))
+DEFAULT_LIMIT = int(os.getenv("COINDESK_MAX_ITEMS", "0"))  # 0 = все элементы RSS
 
 
-# ----------------------------------------------------------------------
-# Функция отправки трейса об ошибке
-# ----------------------------------------------------------------------
 def send_error_trace(exc: Exception, script_name: str = "coindesk_crypto_news.py"):
     logs = (
         f"Node: {NODE_NAME}\n"
@@ -64,302 +57,354 @@ def send_error_trace(exc: Exception, script_name: str = "coindesk_crypto_news.py
         f"Exception: {repr(exc)}\n\n"
         f"Traceback:\n{traceback.format_exc()}"
     )
-    payload = {
-        "url": "cli_script",
-        "node": NODE_NAME,
-        "email": ALERT_EMAIL,
-        "logs": logs
-    }
     try:
-        requests.post(TRACE_URL, data=payload, timeout=10)
+        requests.post(
+            TRACE_URL,
+            data={"url": "cli_script", "node": NODE_NAME, "email": ALERT_EMAIL, "logs": logs},
+            timeout=10,
+        )
     except Exception:
         pass
 
 
 # ----------------------------------------------------------------------
-# Парсинг аргументов командной строки
+# Аргументы командной строки
 # ----------------------------------------------------------------------
-parser = argparse.ArgumentParser(
-    description="Загрузчик новостей CoinDesk.com (крипто) в MySQL"
-)
+parser = argparse.ArgumentParser(description="Загрузчик новостей CoinDesk.com (RSS) в MySQL")
 parser.add_argument("table_name", help="Имя целевой таблицы в БД")
 parser.add_argument("host", nargs="?", default=os.getenv("DB_HOST"))
 parser.add_argument("port", nargs="?", default=os.getenv("DB_PORT", "3306"))
 parser.add_argument("user", nargs="?", default=os.getenv("DB_USER"))
 parser.add_argument("password", nargs="?", default=os.getenv("DB_PASSWORD"))
 parser.add_argument("database", nargs="?", default=os.getenv("DB_NAME"))
-parser.add_argument("--max-clicks", type=int, default=None,
-                    help="Максимум кликов на 'More Stories' (по умолчанию: все доступные)")
+parser.add_argument(
+    "--max-clicks",
+    type=int,
+    default=None,
+    help="Совместимость со старым запуском: теперь ограничивает число RSS-новостей, 0/не указано = все",
+)
+parser.add_argument(
+    "--limit",
+    type=int,
+    default=None,
+    help="Максимум RSS-новостей за один запуск, 0/не указано = все",
+)
 args = parser.parse_args()
 
 if not all([args.host, args.user, args.password, args.database]):
     print(" Ошибка: не указаны параметры подключения к БД")
     sys.exit(1)
 
-# ----------------------------------------------------------------------
-# Формируем строку подключения SQLAlchemy
-# ----------------------------------------------------------------------
-SQLALCHEMY_URL = (
-    f"mysql+mysqlconnector://{args.user}:{args.password}@"
-    f"{args.host}:{args.port}/{args.database}"
+if not re.fullmatch(r"[A-Za-z0-9_]+", args.table_name):
+    print(" Ошибка: имя таблицы может содержать только латинские буквы, цифры и подчёркивание")
+    sys.exit(1)
+
+TABLE = f"`{args.table_name}`"
+
+SQLALCHEMY_URL = URL.create(
+    "mysql+mysqlconnector",
+    username=args.user,
+    password=args.password,
+    host=args.host,
+    port=int(args.port),
+    database=args.database,
 )
-engine = create_engine(SQLALCHEMY_URL, pool_recycle=3600)
+engine = create_engine(SQLALCHEMY_URL, pool_recycle=3600, pool_pre_ping=True, future=True)
 
 
 # ----------------------------------------------------------------------
-# Асинхронный парсинг с бесконечным скроллом и загрузкой в БД
+# Вспомогательные функции
 # ----------------------------------------------------------------------
-async def parse_and_save_incrementally(table_name, max_clicks=None):
-    print("[*] Запуск парсера CoinDesk.com (headless mode)...")
+def clean_text(value):
+    if value is None:
+        return ""
+    value = html.unescape(str(value))
+    value = re.sub(r"<[^>]+>", " ", value)
+    value = re.sub(r"\s+", " ", value).strip()
+    return value
+
+
+def strip_cdata(value):
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def parse_datetime(value):
+    if not value:
+        return dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+    try:
+        parsed = parsedate_to_datetime(value)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        return parsed.astimezone(dt.timezone.utc).replace(tzinfo=None)
+    except Exception:
+        return dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+
+
+def first_text(element, names):
+    for name in names:
+        found = element.find(name)
+        if found is not None and found.text:
+            return found.text
+    # fallback для namespaced tags: сравниваем только локальную часть имени
+    wanted = {n.split("}")[-1].split(":")[-1] for n in names}
+    for child in list(element):
+        local = child.tag.split("}")[-1].split(":")[-1]
+        if local in wanted and child.text:
+            return child.text
+    return ""
+
+
+def first_attr(element, tag_names, attr_names):
+    wanted_tags = {n.split("}")[-1].split(":")[-1] for n in tag_names}
+    wanted_attrs = {n.split("}")[-1].split(":")[-1] for n in attr_names}
+    for child in list(element):
+        local = child.tag.split("}")[-1].split(":")[-1]
+        if local not in wanted_tags:
+            continue
+        for attr, value in child.attrib.items():
+            attr_local = attr.split("}")[-1].split(":")[-1]
+            if attr_local in wanted_attrs and value:
+                return value
+    return ""
+
+
+def normalize_link(link):
+    link = strip_cdata(link)
+    if not link:
+        return ""
+    return urljoin(BASE_URL, link)
+
+
+# ----------------------------------------------------------------------
+# Таблица
+# ----------------------------------------------------------------------
+def ensure_table_exists(table_name):
+    with engine.begin() as conn:
+        result = conn.execute(
+            text(
+                """
+                SELECT COUNT(*)
+                FROM information_schema.tables
+                WHERE table_schema = :db AND table_name = :tbl
+                """
+            ),
+            {"db": args.database, "tbl": table_name},
+        )
+        table_exists = result.scalar() > 0
+
+        if not table_exists:
+            conn.execute(
+                text(
+                    f"""
+                    CREATE TABLE {TABLE} (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        datetime DATETIME,
+                        title TEXT,
+                        source VARCHAR(255),
+                        category VARCHAR(255),
+                        description TEXT,
+                        link VARCHAR(500),
+                        published_at VARCHAR(100),
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE KEY unique_link (link)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+                    """
+                )
+            )
+            print(f" Таблица '{table_name}' создана с автоинкрементом")
+            return
+
+        result = conn.execute(
+            text(
+                """
+                SELECT COUNT(*)
+                FROM information_schema.statistics
+                WHERE table_schema = :db
+                  AND table_name = :tbl
+                  AND column_name = 'link'
+                  AND non_unique = 0
+                """
+            ),
+            {"db": args.database, "tbl": table_name},
+        )
+        has_unique = result.scalar() > 0
+
+    if not has_unique:
+        print(f" Внимание: в таблице '{table_name}' нет уникального индекса на поле link")
+        print("Рекомендуется выполнить:")
+        print(f"ALTER TABLE {TABLE} MODIFY link VARCHAR(500), ADD UNIQUE INDEX unique_link (link);")
+
+
+def load_existing_links():
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text(f"SELECT link FROM {TABLE}")).fetchall()
+            return {row[0] for row in rows if row[0]}
+    except Exception as e:
+        print(f"  Ошибка при получении существующих ссылок: {e}")
+        return set()
+
+
+# ----------------------------------------------------------------------
+# RSS
+# ----------------------------------------------------------------------
+def fetch_rss_xml():
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; BrainServices/1.0; +https://brain-project.online)",
+        "Accept": "application/rss+xml, application/xml, text/xml, */*",
+        "Cache-Control": "no-cache",
+    }
+    response = requests.get(RSS_URL, headers=headers, timeout=REQUEST_TIMEOUT)
+    response.raise_for_status()
+    return response.content
+
+
+def parse_rss_items(xml_bytes, limit=0):
+    root = ET.fromstring(xml_bytes)
+    channel = root.find("channel")
+    if channel is None:
+        # Atom fallback
+        items = root.findall("{http://www.w3.org/2005/Atom}entry") or root.findall("entry")
+    else:
+        items = channel.findall("item")
+
+    parsed = []
+    for item in items:
+        title = clean_text(first_text(item, ["title", "{http://www.w3.org/2005/Atom}title"]))
+        link = normalize_link(first_text(item, ["link", "{http://www.w3.org/2005/Atom}link"]))
+        if not link:
+            link = normalize_link(first_attr(item, ["link"], ["href"]))
+        description = clean_text(
+            first_text(
+                item,
+                [
+                    "description",
+                    "summary",
+                    "{http://www.w3.org/2005/Atom}summary",
+                    "{http://purl.org/rss/1.0/modules/content/}encoded",
+                ],
+            )
+        )
+        published_raw = clean_text(
+            first_text(
+                item,
+                [
+                    "pubDate",
+                    "published",
+                    "updated",
+                    "{http://www.w3.org/2005/Atom}published",
+                    "{http://www.w3.org/2005/Atom}updated",
+                ],
+            )
+        )
+        category = clean_text(first_text(item, ["category"])) or "Crypto News"
+
+        if not title or not link:
+            continue
+
+        parsed.append(
+            {
+                "datetime": parse_datetime(published_raw),
+                "title": title[:2000],
+                "source": "CoinDesk",
+                "category": category[:255],
+                "description": description[:5000],
+                "link": link[:500],
+                "published_at": published_raw[:100],
+            }
+        )
+
+        if limit and len(parsed) >= limit:
+            break
+
+    return parsed
+
+
+def insert_news(rows, existing_links):
+    new_rows = [row for row in rows if row["link"] not in existing_links]
+    if not new_rows:
+        return 0
+
+    sql = text(
+        f"""
+        INSERT IGNORE INTO {TABLE}
+            (`datetime`, title, source, category, description, link, published_at)
+        VALUES
+            (:datetime, :title, :source, :category, :description, :link, :published_at)
+        """
+    )
+    with engine.begin() as conn:
+        result = conn.execute(sql, new_rows)
+
+    inserted = result.rowcount if result.rowcount is not None and result.rowcount >= 0 else len(new_rows)
+    existing_links.update(row["link"] for row in new_rows)
+    return inserted
+
+
+def parse_and_save_incrementally(table_name, limit=0):
+    print("[*] Запуск парсера CoinDesk.com через RSS, без Playwright...")
     ensure_table_exists(table_name)
 
     print("[*] Загрузка существующих ссылок из БД...")
+    existing_links = load_existing_links()
+    print(f"  В БД уже есть {len(existing_links)} новостей")
+
+    print(f"[*] Загрузка RSS: {RSS_URL}")
+    xml_bytes = fetch_rss_xml()
+    news = parse_rss_items(xml_bytes, limit=limit)
+
+    print(f"  Получено из RSS: {len(news)}")
+    if not news:
+        print("  Новостей в RSS не найдено")
+        return 0
+
+    inserted = insert_news(news, existing_links)
+    print(f"  Добавлено в БД: {inserted}")
+
+    print("  Последние элементы RSS:")
+    for item in news[:5]:
+        date_label = item["published_at"] or str(item["datetime"])
+        print(f"   - {date_label} | {item['title'][:90]}")
+
     try:
         with engine.connect() as conn:
-            existing = pd.read_sql(f"SELECT link FROM {table_name}", conn)
-            existing_links = set(existing['link'].tolist()) if not existing.empty else set()
-        print(f"  В БД уже есть {len(existing_links)} новостей")
-    except Exception as e:
-        print(f"  Ошибка при получении существующих ссылок: {e}")
-        existing_links = set()
+            max_id = conn.execute(text(f"SELECT MAX(id) FROM {TABLE}")).scalar()
+            print(f"  Последний ID в таблице: {max_id}")
+    except Exception:
+        pass
 
-    async with async_playwright() as p:
-        # Запускаем браузер (headless=False для отладки, потом можно сменить на True)
-        browser = await p.chromium.launch(
-            headless=True,  # при отладке видим окно, потом можно True
-            args=[
-                '--disable-blink-features=AutomationControlled',
-                '--disable-dev-shm-usage',
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-            ]
-        )
-        context = await browser.new_context(
-            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            viewport={'width': 1920, 'height': 1080},
-            locale='en-US',
-            timezone_id='America/New_York',
-        )
-        page = await context.new_page()
-        # Скрываем автоматизацию
-        await page.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {
-                get: () => undefined
-            });
-        """)
-
-        total_parsed = 0
-        total_added = 0
-        click_num = 0
-        max_limit = max_clicks if max_clicks else MAX_CLICKS
-        consecutive_failures = 0
-        MAX_CONSECUTIVE_FAILURES = 10
-
-        try:
-            print(f"\n Загрузка главной страницы: {BASE_URL}")
-            # Ждём только загрузки DOM, не всех ресурсов (это быстро)
-            await page.goto(BASE_URL, wait_until='domcontentloaded', timeout=120000)
-            print("  DOM загружен. Ожидаем 30 секунд для подгрузки динамического контента...")
-            await asyncio.sleep(30)
-
-            # Закрываем cookie-баннер если есть
-            try:
-                accept_btn = page.locator(SELECTORS['cookie_accept'])
-                if await accept_btn.is_visible(timeout=3000):
-                    await accept_btn.click()
-                    print("  Cookie-баннер закрыт")
-                    await asyncio.sleep(1)
-            except:
-                pass
-
-            # Основной цикл подгрузки новостей
-            while click_num < max_limit and consecutive_failures < MAX_CONSECUTIVE_FAILURES:
-                # Парсим текущие новости (не дожидаясь специально)
-                news_items = await page.locator(SELECTORS['news_container']).all()
-                print(f"   Найдено элементов новостей: {len(news_items)}")
-
-                page_news = []
-                for idx, item in enumerate(news_items, 1):
-                    try:
-                        # Заголовок и ссылка
-                        title_elem = item.locator(SELECTORS['title_link'])
-                        title = await title_elem.inner_text(timeout=1000) if await title_elem.count() > 0 else None
-                        href = await title_elem.get_attribute('href', timeout=1000) if title else None
-
-                        if not title or not href:
-                            continue
-                        title = title.strip()
-                        if len(title) < 10:
-                            continue
-                        if not href.startswith('http'):
-                            href = f"https://www.coindesk.com{href}"
-
-                        # Категория
-                        cat_elem = item.locator(SELECTORS['category'])
-                        category = await cat_elem.inner_text(timeout=1000) if await cat_elem.count() > 0 else "News"
-
-                        # Описание
-                        desc_elem = item.locator(SELECTORS['description'])
-                        description = await desc_elem.inner_text(timeout=1000) if await desc_elem.count() > 0 else ""
-
-                        # Дата
-                        date_elem = item.locator(SELECTORS['date'])
-                        published_at = await date_elem.inner_text(timeout=1000) if await date_elem.count() > 0 else ""
-
-                        dt = datetime.datetime.now()  # можно заменить на парсинг даты
-
-                        page_news.append({
-                            'datetime': dt,
-                            'title': title,
-                            'source': 'CoinDesk',
-                            'category': category.strip(),
-                            'description': description.strip(),
-                            'link': href,
-                            'published_at': published_at.strip()
-                        })
-                    except Exception as e:
-                        print(f"  Ошибка парсинга элемента {idx}: {e}")
-                        continue
-
-                # Сохраняем новые записи в БД
-                if page_news:
-                    df_page = pd.DataFrame(page_news)
-                    df_new = df_page[~df_page['link'].isin(existing_links)]
-                    if not df_new.empty:
-                        try:
-                            df_new.to_sql(
-                                name=table_name,
-                                con=engine,
-                                if_exists='append',
-                                index=False,
-                                chunksize=100,
-                                method='multi'
-                            )
-                            existing_links.update(df_new['link'].tolist())
-                            total_added += len(df_new)
-                            print(f"  Добавлено в БД: {len(df_new)} из {len(page_news)} (новые) на клике {click_num}")
-                        except Exception as e:
-                            print(f"  Ошибка записи в БД: {e}")
-                    else:
-                        print(f" ℹ Все {len(page_news)} новостей уже есть в БД на клике {click_num}")
-                    total_parsed += len(page_news)
-                    consecutive_failures = 0
-
-                # Кликаем на "More Stories"
-                try:
-                    load_more_btn = page.locator(SELECTORS['more_button'])
-                    # Проверяем видимость кнопки
-                    if not await load_more_btn.is_visible(timeout=5000):
-                        print(" ℹ Кнопка 'More Stories' больше не видна. Остановка.")
-                        break
-                    await load_more_btn.click()
-
-                    # Ждём фиксированное время для загрузки новых статей
-                    await asyncio.sleep(5)
-
-                    click_num += 1
-                    print(f"  Клик на 'More Stories' {click_num}/{max_limit}")
-                except Exception as e:
-                    consecutive_failures += 1
-                    print(f"  Ошибка клика (неудача {consecutive_failures}/{MAX_CONSECUTIVE_FAILURES}): {e}")
-                    # Делаем скриншот при ошибке клика
-                    await page.screenshot(path=f"error_click_{click_num}.png")
-                    await asyncio.sleep(2)
-                    continue
-
-        except Exception as e:
-            print(f"  Критическая ошибка в цикле: {e}")
-            await page.screenshot(path="critical_error.png")
-            send_error_trace(e)
-
-        await browser.close()
-
-        # Итоговая статистика
-        print(f"\n{'=' * 60}")
-        if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-            print(f" Остановлено: {MAX_CONSECUTIVE_FAILURES} последовательных неудач")
-        elif click_num >= max_limit:
-            print(f"ℹ Достигнут лимит кликов: {max_limit}")
-        else:
-            print(f" Все новости загружены")
-        print(f" Обработано кликов: {click_num}")
-        print(f" Спарсено новостей: {total_parsed}")
-        print(f" Добавлено в БД: {total_added}")
-        try:
-            with engine.connect() as conn:
-                result = conn.execute(text(f"SELECT MAX(id) FROM {table_name}"))
-                max_id = result.scalar()
-                print(f" Последний ID в таблице: {max_id}")
-        except:
-            pass
-        return total_added
-
-
-# ----------------------------------------------------------------------
-# Функция для создания таблицы
-# ----------------------------------------------------------------------
-def ensure_table_exists(table_name):
-    with engine.connect() as conn:
-        result = conn.execute(text(f"""
-            SELECT COUNT(*) FROM information_schema.tables
-            WHERE table_schema = '{args.database}' AND table_name = '{table_name}'
-        """))
-        table_exists = result.scalar() > 0
-
-    if not table_exists:
-        create_query = text(f"""
-        CREATE TABLE {table_name} (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            datetime DATETIME,
-            title TEXT,
-            source VARCHAR(255),
-            category VARCHAR(255),
-            description TEXT,
-            link VARCHAR(500),
-            published_at VARCHAR(100),
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE KEY unique_link (link)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-        """)
-        with engine.connect() as conn:
-            conn.execute(create_query)
-            conn.commit()
-        print(f" Таблица '{table_name}' создана с автоинкрементом")
-    else:
-        with engine.connect() as conn:
-            result = conn.execute(text(f"""
-                SELECT COUNT(*) FROM information_schema.statistics
-                WHERE table_schema = '{args.database}'
-                AND table_name = '{table_name}'
-                AND column_name = 'link'
-                AND non_unique = 0
-            """))
-            has_unique = result.scalar() > 0
-        if not has_unique:
-            print(f" Внимание: в таблице '{table_name}' нет уникального индекса на поле link")
-            print("Рекомендуется добавить уникальный индекс командой:")
-            print(f"ALTER TABLE {table_name} MODIFY link VARCHAR(500), ADD UNIQUE INDEX unique_link (link);")
+    return inserted
 
 
 # ----------------------------------------------------------------------
 # Основная логика
 # ----------------------------------------------------------------------
 def main():
-    print(f" Загрузчик новостей CoinDesk.com (крипто)")
+    # Совместимость: --max-clicks теперь работает как лимит RSS-элементов,
+    # потому что браузерные клики больше не используются.
+    limit = args.limit
+    if limit is None:
+        limit = args.max_clicks
+    if limit is None:
+        limit = DEFAULT_LIMIT
+    if limit < 0:
+        limit = 0
+
+    print(" Загрузчик новостей CoinDesk.com (крипто)")
     print(f"База: {args.host}:{args.port}/{args.database}")
     print(f" Целевая таблица: {args.table_name}")
-    if args.max_clicks:
-        print(f" Лимит кликов: {args.max_clicks}")
-    else:
-        print(f" Лимит кликов: все доступные (макс. {MAX_CLICKS})")
+    print(" Режим: RSS без Playwright")
+    print(f" Лимит RSS-новостей: {'все элементы RSS' if not limit else limit}")
     print("=" * 60)
-    total_added = asyncio.run(
-        parse_and_save_incrementally(args.table_name, max_clicks=args.max_clicks)
-    )
+
+    total_added = parse_and_save_incrementally(args.table_name, limit=limit)
+
     print("=" * 60)
     print(" Загрузка завершена")
     if total_added == 0:
-        print("ℹ Все новости уже были в БД")
+        print("ℹ Новых новостей нет или все элементы RSS уже были в БД")
     else:
         print(f" Успешно добавлено {total_added} новых записей")
 
@@ -374,5 +419,6 @@ if __name__ == "__main__":
         sys.exit(1)
     except Exception as e:
         print(f"\n Критическая ошибка: {e!r}")
+        traceback.print_exc()
         send_error_trace(e)
         sys.exit(1)
