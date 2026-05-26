@@ -90,6 +90,30 @@ def get_connection(host, port, user, password, db):
     )
 
 # ---------------------------------------------------------------------------
+def ensure_table(conn, table: str):
+    """Create table if it doesn't exist yet. Safe to call every run."""
+    sql = f"""
+        CREATE TABLE IF NOT EXISTS `{table}` (
+            `id`             BIGINT          NOT NULL AUTO_INCREMENT,
+            `timestamp`      DATETIME(6)     NULL,
+            `last_update_id` BIGINT          NOT NULL,
+            `spread`         DECIMAL(20, 10) NOT NULL,
+            `best_bid`       DECIMAL(20, 10) NOT NULL,
+            `best_ask`       DECIMAL(20, 10) NOT NULL,
+            `bids_json`      LONGTEXT        NULL,
+            `asks_json`      LONGTEXT        NULL,
+            PRIMARY KEY (`id`),
+            INDEX `idx_timestamp` (`timestamp`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+          COMMENT='Binance orderbook stream for {table.split("vlad_binance_")[1].split("_orderbook")[0].upper() if "vlad_binance_" in table else table}'
+    """
+    cur = conn.cursor()
+    cur.execute(sql)
+    conn.commit()
+    cur.close()
+    log(f'Table `{table}` ready.')
+
+
 def save_snapshot(conn, table: str, symbol: str, ob: dict):
     bids = ob.get('bids', [])
     asks = ob.get('asks', [])
@@ -150,6 +174,7 @@ def main():
 
     try:
         conn = get_connection(host, port, user, password, db)
+        ensure_table(conn, table)
         save_snapshot(conn, table, symbol, ob)
         conn.close()
     except Exception as e:
