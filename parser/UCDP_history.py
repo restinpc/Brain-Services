@@ -1,7 +1,7 @@
 """
 UCDP GED Collector — загружает все события 1989–2024 + candidate.
-Таблица: vlad_ucdp
-Запуск: python UCDP_history.py brain
+Запуск: python UCDP_history.py <table_name> [host] [port] [user] [password] [database]
+Пример: python UCDP_history.py vlad_ucdp 127.0.0.1 3306 root password brain
 """
 
 import os, sys, argparse, time, random, traceback
@@ -32,35 +32,23 @@ def send_error_trace(exc, script_name="UCDP_history.py"):
     except:
         pass
 
-# Аргументы командной строки - positional args
+# Аргументы командной строки — как в Alpha_Vantage.py:
+# python UCDP_history.py <table_name> [host] [port] [user] [password] [database]
 parser = argparse.ArgumentParser(description="UCDP GED Events → MySQL")
-parser.add_argument("database", action="store", nargs="?", default=None, help="MySQL database name")
-parser.add_argument("host", action="store", nargs="?", default=None, help="MySQL host")
-parser.add_argument("port", action="store", nargs="?", default=None, help="MySQL port")
-parser.add_argument("user", action="store", nargs="?", default=None, help="MySQL user")
-parser.add_argument("password", action="store", nargs="?", default=None, help="MySQL password")
+parser.add_argument("table_name", help="Имя целевой таблицы")
+parser.add_argument("host", nargs="?", default=os.getenv("DB_HOST"), help="MySQL host")
+parser.add_argument("port", nargs="?", default=os.getenv("DB_PORT", "3306"), help="MySQL port")
+parser.add_argument("user", nargs="?", default=os.getenv("DB_USER"), help="MySQL user")
+parser.add_argument("password", nargs="?", default=os.getenv("DB_PASSWORD"), help="MySQL password")
+parser.add_argument("database", nargs="?", default=os.getenv("DB_NAME"), help="MySQL database name")
 args = parser.parse_args()
 
-# Отладка: выводим полученные аргументы
-print("DEBUG: Получены аргументы:")
-print(f"  database = {args.database}")
-print(f"  host = {args.host}")
-print(f"  port = {args.port}")
-print(f"  user = {args.user}")
-print(f"  password = {args.password}")
-
-# Берём из аргументов, если не указаны — из .env
-DB_HOST = args.host or os.getenv("DB_HOST")
-DB_PORT = args.port or os.getenv("DB_PORT", "3306")
-DB_USER = args.user or os.getenv("DB_USER")
-DB_PASSWORD = args.password or os.getenv("DB_PASSWORD")
-DB_DATABASE = args.database or os.getenv("DB_NAME")
-
-if not all([DB_HOST, DB_USER, DB_PASSWORD, DB_DATABASE]):
-    print("❌ Ошибка: не указаны параметры подключения")
+if not all([args.host, args.user, args.password, args.database]):
+    print("❌ Ошибка: не указаны параметры подключения к БД")
     print("\nИспользование:")
-    print("  python UCDP_history.py brain")
-    print("  python UCDP_history.py brain 127.0.0.1 3306 root password")
+    print("  python UCDP_history.py <table_name> [host] [port] [user] [password] [database]")
+    print("  python UCDP_history.py vlad_ucdp")
+    print("  python UCDP_history.py vlad_ucdp 127.0.0.1 3306 root password brain")
     print("\nИли через .env файл:")
     print("  DB_HOST=127.0.0.1")
     print("  DB_PORT=3306")
@@ -68,6 +56,13 @@ if not all([DB_HOST, DB_USER, DB_PASSWORD, DB_DATABASE]):
     print("  DB_PASSWORD=yourpass")
     print("  DB_NAME=brain")
     sys.exit(1)
+
+DB_HOST = args.host
+DB_PORT = args.port
+DB_USER = args.user
+DB_PASSWORD = args.password
+DB_DATABASE = args.database
+TABLE_NAME = args.table_name
 
 if not UCDP_TOKEN:
     print("❌ Ошибка: не указан UCDP_TOKEN в .env")
@@ -81,8 +76,6 @@ DB_CONFIG = {
     'password': DB_PASSWORD,
     'database': DB_DATABASE
 }
-
-TABLE_NAME = "vlad_ucdp"
 
 class UCDPCollector:
     def __init__(self):
