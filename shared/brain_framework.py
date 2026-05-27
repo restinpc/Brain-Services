@@ -73,6 +73,10 @@ from common import (
 from cache_helper import ensure_cache_table, load_service_url, cached_values
 import reverse_learning as rl
 
+# Лимит _ml_active_cache: без него _prewarm_ml_active_cache кешировал всю
+# историю (сотни тысяч экстремумов → 1-2 GB RAM → glibc heap corruption).
+_ML_ACTIVE_CACHE_MAX = 100_000
+
 # ──────────────────────────────────────────────────────────────────────────────
 # OPT-6: КОДЕК result_json  (zlib + base64, обратная совместимость)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1832,6 +1836,8 @@ def build_app(model_module) -> FastAPI:
         pair_id: int,
         day_flag: int,
         type_var_slots: list,
+        dt_from: datetime | None = None,
+        dt_to: datetime | None = None,
     ) -> int:
         """
         Прогревает _ml_active_cache для всех экстремумов пары/таймфрейма.
@@ -1842,6 +1848,11 @@ def build_app(model_module) -> FastAPI:
         вычисляла ext_dates один раз с interval=3 и использовала их для всех
         calc_var — для var=5/7/9 кеш был бесполезен, каждый active_codes_at
         запускал model() (~5ms), 50 вызовов × 5ms = 250ms на каждую свечу.
+
+        ИСПРАВЛЕНИЕ 2 (double free): _get_all_extremums возвращает ВСЕ экстремумы
+        за полную историю np_r (до 119k свечей), порождая сотни тысяч записей в
+        _ml_active_cache (574k для pair1/h) и вызывая OOM → glibc heap corruption.
+        Теперь фильтруем ext_dates по окну fill_cache + 90-дневный lookback-буфер.
         """
         if s.batch_model_fn is None:
             return 0
@@ -1889,7 +1900,19 @@ def build_app(model_module) -> FastAPI:
             # _get_all_extremums кеширует результат: O(1) для повторных вызовов.
             try:
                 all_ext, _ = rl._get_all_extremums(np_r, interval=calc_var)
-                ext_dates = [datetime.fromtimestamp(t) for t, _ in all_ext]
+                # FIX: фильтруем по окну fill_cache + 90-дневный lookback-буфер.
+                # collect_extremums_back с limit=50 и interval=9 смотрит назад
+                # не более ~450 свечей ≈ 18 дней ч/б. 90 дней с запасом.
+                if dt_from is not None:
+                    _lb_ts  = int((dt_from - timedelta(days=90)).timestamp())
+                    _end_ts = int((dt_to or datetime.now()).timestamp()) + 86400
+                    ext_dates = [
+                        datetime.fromtimestamp(t)
+                        for t, _ in all_ext
+                        if _lb_ts <= t <= _end_ts
+                    ]
+                else:
+                    ext_dates = [datetime.fromtimestamp(t) for t, _ in all_ext]
             except Exception:
                 # Fallback: если rl недоступен — используем np_r["ext_max"] (interval≈3)
                 ext_max = np_r.get("ext_max")
@@ -1899,6 +1922,11 @@ def build_app(model_module) -> FastAPI:
                     ext_dates_raw += [rows[i]["date"] for i, v in enumerate(ext_max) if v]
                 if ext_min is not None:
                     ext_dates_raw += [rows[i]["date"] for i, v in enumerate(ext_min) if v]
+                # Fallback тоже фильтруем
+                if dt_from is not None:
+                    _lb  = dt_from - timedelta(days=90)
+                    _end = dt_to or datetime.now()
+                    ext_dates_raw = [d for d in ext_dates_raw if _lb <= d <= _end + timedelta(days=1)]
                 ext_dates = sorted(set(ext_dates_raw))
 
             if not ext_dates:
@@ -1933,6 +1961,11 @@ def build_app(model_module) -> FastAPI:
                                calc_type, calc_var, "")
                         s._ml_active_cache[key] = list(result.keys())
                         warmed += 1
+                    # FIX: страховочный лимит на _ml_active_cache (без него нет eviction)
+                    if len(s._ml_active_cache) > _ML_ACTIVE_CACHE_MAX:
+                        _evict = len(s._ml_active_cache) - _ML_ACTIVE_CACHE_MAX
+                        for _k in list(s._ml_active_cache.keys())[:_evict]:
+                            del s._ml_active_cache[_k]
                 except Exception as _e:
                     log(f"   prewarm pair{pair_id}/{'d' if day_flag else 'h'} "
                         f"t={calc_type} v={calc_var}: {_e}",
@@ -2021,7 +2054,10 @@ def build_app(model_module) -> FastAPI:
                 # maybe_retrain() будет получать _active_codes_at из кеша (O(1))
                 # вместо пересчёта срезов rates на каждый экстремум.
                 if s.USE_ML_VALUES and s.batch_model_fn is not None:
-                    warmed = await _prewarm_ml_active_cache(pair_id, day_flag, type_var_slots)
+                    warmed = await _prewarm_ml_active_cache(
+                        pair_id, day_flag, type_var_slots,
+                        dt_from=dt_from, dt_to=dt_to,
+                    )
                     if warmed:
                         log(f"  [{instr_label}] ML-кеш прогрет: {warmed} экстремумов",
                             s.NODE_NAME, force=True)
