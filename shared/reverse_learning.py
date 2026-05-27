@@ -252,11 +252,17 @@ def _build_csr(records: list[ExtremumRecord], code_to_idx: dict[str, int]):
     Важно: code_to_idx строится в порядке вставки старого dict-universe.
     Поэтому обход rec.codes сохраняет старую семантику и порядок суммирования.
 
-    OPT-A: результат кешируется по (id(records_tuple), id(code_to_idx)).
-    records — Python list; превращаем в tuple-ключ через id каждого элемента,
-    потому что ExtremumRecord неизменен в ходе одного train-цикла.
+    OPT-A: результат кешируется по (id(records_tuple), keys(code_to_idx)).
+
+    ИСПРАВЛЕНИЕ (heap corruption / free(): invalid next size):
+    Раньше ключ содержал id(code_to_idx). Python re-use адресов памяти после
+    освобождения объектов (refcount=0) приводил к cache hit для ДРУГОГО
+    code_to_idx с тем же адресом, но другим содержимым — JIT получал индексы
+    из старого CSR (0..499) для weights_arr нового размера (300) и делал
+    out-of-bounds write в heap. Заменяем на tuple(code_to_idx.keys()):
+    content-based ключ, учитывающий набор и порядок кодов (dict ordered).
     """
-    cache_key = (tuple(id(r) for r in records), id(code_to_idx))
+    cache_key = (tuple(id(r) for r in records), tuple(code_to_idx.keys()))
     cached = _build_csr_cache.get(cache_key)
     if cached is not None:
         return cached
