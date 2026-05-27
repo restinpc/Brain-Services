@@ -170,7 +170,11 @@ async def _cache_get(
         async with engine_vlad.connect() as conn:
             try:
                 row = (await conn.execute(query, params)).fetchone()
-                return json.loads(row[0]) if row else None
+                if not row or not row[0]:
+                    # Битая запись (пустой result_json) — считаем cache miss,
+                    # сервис пересчитает и перезапишет через INSERT IGNORE.
+                    return None
+                return json.loads(row[0])
             except InternalError:
                 await conn.invalidate()
                 raise
