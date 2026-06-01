@@ -1,0 +1,54 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# config.toml — brain-atomic-extremum (сервис 50)
+#
+# 22 датасета (FRED, Alpha Vantage, ECB, IMF, USGS и др.) → daily feature_matrix
+# Обнаруживает локальные MAX/MIN BTC/ETH/EUR, считает lift каждого сигнала.
+# model() возвращает {weight_code: bull_ratio} — вход в PHP-нейросеть.
+#
+# Отличие от hourly-сервисов (напр. 51):
+#   • данные суточные → rebuild_interval = 86400 (1 раз в сутки);
+#   • цифровой отпечаток устраняется пересчётом на полной истории;
+#   • [dataset].query читает vlad_atomic_feature_matrix (готовый дневной срез).
+# ══════════════════════════════════════════════════════════════════════════════
+
+[service]
+id   = 52                                  # brain_models.id — ПОДСТАВИТЬ перед деплоем
+port = 8914                                # TODO: занятые порты проверить
+name = "brain-atomic-extremum"
+text = "22-dataset atomic extremum indexer: lift-based daily signals (BTC/ETH/EUR)"
+
+[rates]
+table = "brain_rates_btc_usd"
+
+[cache]
+date_from        = "2020-01-01"
+var_range        = [0, 1, 2]     # 0=lift>1.15  1=lift>1.5  2=lift>2.0
+types_range      = [0, 1, 2, 3]  # 0=авто  1=BTC  2=ETH  3=EUR
+shift_window     = 0
+rebuild_interval = 86400
+reload_interval  = 3700
+
+[ctx]
+key_columns   = ["id"]
+weights_table = "vlad_atomic_svc52_index"
+query = """
+    SELECT id, weight_code, feature_col, bucket_val,
+           btc_max_lift, btc_min_lift, eth_max_lift, eth_min_lift,
+           eur_max_lift, eur_min_lift,
+           btc_bull_ratio, eth_bull_ratio, eur_bull_ratio,
+           support, occurrence_count
+    FROM vlad_atomic_svc52_index
+    ORDER BY id
+"""
+
+[dataset]
+engine = "vlad"
+query  = """
+    SELECT record_date AS date, record_date AS record_date,
+           btc_ext, eth_ext, eur_ext
+    FROM vlad_atomic_feature_matrix
+    ORDER BY record_date DESC LIMIT 730
+"""
+
+[ml]
+enabled = false
