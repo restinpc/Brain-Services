@@ -1,7 +1,7 @@
 """
 Описание: Парсинг биржевых стаканов (Order Book) с Binance
-Запуск:   python binance_orderbook.py <table_name> [host] [port] [user] [password] [database] [tickers_json]
-Пример:   python binance_orderbook.py sasha_binance_orderbook ["BTCUSDT","ETHUSDT","SOLUSDT"]
+Запуск:   python crypto_orderbook_binance.py <table_name> [host] [port] [user] [password] [database] [tickers_json]
+Пример:   python crypto_orderbook_binance.py sasha_binance_orderbook ["BTCUSDT","ETHUSDT","SOLUSDT"]
 """
 
 # ── 1. ИМПОРТЫ ─────────────────────────────────────────────────────────────────
@@ -30,7 +30,7 @@ BINANCE_HTTP = requests.Session()
 BINANCE_HTTP.trust_env = False
 
 # ── 3. ТРАССИРОВКА ОШИБОК ─────────────────────────────────────────────────────
-def send_error_trace(exc: Exception, script_name: str = "binance_orderbook.py"):
+def send_error_trace(exc: Exception, script_name: str = "crypto_orderbook_binance.py"):
     import threading
     logs = f"Node: {NODE_NAME}\nScript: {script_name}\nException: {repr(exc)}\n\nTraceback:\n{traceback.format_exc()}"
 
