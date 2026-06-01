@@ -10,8 +10,8 @@ import requests
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
+import socks
 from telethon import TelegramClient, events
-from telethon import connection
 
 # ==================== НАСТРОЙКИ ====================
 load_dotenv()
@@ -25,17 +25,16 @@ SESSIONS = [
     os.getenv("SESSION_FILE_3", "/brain/Brain-Services/parser/session_3"),
 ]
 
-# ============= НАСТРОЙКИ MTProto ПРОКСИ =============
-MTPROTO_HOST   = "77.110.121.105"      # IP
-MTPROTO_PORT   = 8443                     # порт прокси
-MTPROTO_SECRET = "22029ceb10bf65d1e998a57a698afd1a"      # hex-строка
-# ========================================================================
+# ============= НАСТРОЙКИ WEB (HTTP) ПРОКСИ =============
+HTTP_PROXY_HOST = os.getenv("HTTP_PROXY_HOST", "10.10.11.1")
+HTTP_PROXY_PORT = int(os.getenv("HTTP_PROXY_PORT", 3128))
+# ========================================================
 
 # Формируем прокси только если хост указан
-if MTPROTO_HOST and MTPROTO_HOST != "":
-    MTPROTO_PROXY = (MTPROTO_HOST, MTPROTO_PORT, MTPROTO_SECRET)
+if HTTP_PROXY_HOST and HTTP_PROXY_HOST != "":
+    HTTP_PROXY = (socks.HTTP, HTTP_PROXY_HOST, HTTP_PROXY_PORT)
 else:
-    MTPROTO_PROXY = None
+    HTTP_PROXY = None
 
 # Квоты по активу: сколько запросов каждый аккаунт отправляет за цикл (24 запуска)
 QUOTAS = {
@@ -231,15 +230,14 @@ async def run_query(asset: str, query: str, engine, table_name: str):
         f"(квота акк. {QUOTAS[asset][acc_idx]}): {query}"
     )
 
-    # Создаём клиент с поддержкой MTProto прокси (если настроен)
-    if MTPROTO_PROXY:
-        log.info(f"Используем MTProto прокси: {MTPROTO_HOST}:{MTPROTO_PORT}")
+    # Создаём клиент с поддержкой HTTP прокси (если настроен)
+    if HTTP_PROXY:
+        log.info(f"Используем HTTP прокси: {HTTP_PROXY_HOST}:{HTTP_PROXY_PORT}")
         client = TelegramClient(
             SESSIONS[acc_idx],
             API_ID,
             API_HASH,
-            connection=connection.ConnectionTcpMTProxyRandomizedIntermediate,
-            proxy=MTPROTO_PROXY
+            proxy=HTTP_PROXY
         )
     else:
         log.info("Работаем без прокси (прямое подключение)")
@@ -364,10 +362,10 @@ def main():
     if asset != 'UNKNOWN':
         log.info(f"Квоты акк.:    {QUOTAS[asset]}")
         log.info(f"Файл счётчика: {COUNTER_FILES[asset]}")
-    if MTPROTO_PROXY:
-        log.info(f"MTProto прокси: {MTPROTO_HOST}:{MTPROTO_PORT}")
+    if HTTP_PROXY:
+        log.info(f"HTTP прокси: {HTTP_PROXY_HOST}:{HTTP_PROXY_PORT}")
     else:
-        log.info("MTProto прокси: не используется")
+        log.info("HTTP прокси: не используется")
     log.info("=" * 60)
 
     try:
