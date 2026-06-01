@@ -21,7 +21,7 @@ text = "22-dataset atomic extremum indexer: lift-based daily signals (BTC/ETH/EU
 table = "brain_rates_btc_usd"
 
 [cache]
-date_from        = "2020-01-01"
+date_from        = "2025-01-15"
 var_range        = [0, 1, 2]     # 0=lift>1.15  1=lift>1.5  2=lift>2.0
 types_range      = [0, 1, 2, 3]  # 0=авто  1=BTC  2=ETH  3=EUR
 shift_window     = 0
