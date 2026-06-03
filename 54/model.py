@@ -417,15 +417,18 @@ def model(
     lows   = np.array([float(r.get("min")   or 0.0) for r in tail], dtype=np.float64)
 
     # ── Кеш предвычисления: один раз на уникальное состояние котировок ─────
-    cache_key = (int(ts[-1]), n_raw)
-    if cache_key not in _PRECOMPUTED:
-        _PRECOMPUTED[cache_key] = _precompute_all_orders(ts, opens, closes, highs, lows)
-        # Ограничиваем размер кеша — держим только 5 последних состояний
-        if len(_PRECOMPUTED) > 5:
-            oldest = min(_PRECOMPUTED.keys(), key=lambda k: k[0])
-            del _PRECOMPUTED[oldest]
-
-    precomputed = _PRECOMPUTED[cache_key]
+    precomputed = _PRECOMPUTED.get(cache_key)
+    if precomputed is None:
+        precomputed = _precompute_all_orders(ts, opens, closes, highs, lows)
+        _PRECOMPUTED[cache_key] = precomputed
+        # Удаляем старые ключи — НЕ трогая только что добавленный.
+        # Нельзя использовать min() по всем ключам: при обработке исторических
+        # дат только что добавленный ключ может оказаться самым старым.
+        while len(_PRECOMPUTED) > 5:
+            removable = [k for k in list(_PRECOMPUTED) if k != cache_key]
+            if not removable:
+                break
+            del _PRECOMPUTED[min(removable, key=lambda k: k[0])]
 
     # ── Детектируем события (из кеша — без тяжёлых вычислений) ───────────
     active = detect_events_cached(precomputed, order, confirm_k)
