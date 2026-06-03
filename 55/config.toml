@@ -1,0 +1,53 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# config.toml — brain-extremum-graph (сервис 55)
+#
+# Граф вероятностей переходов между экстремальными уровнями.
+# Уровни: rounded to 3 significant digits (BTC 93211→932, EUR 1.20→120).
+# Среднее кол-во баров между экстремумами: avg_candles = ⌊mean(gaps)⌋.
+#
+# Стратегия: ждём нового экстремума, идём по графу var шагов (чётные: 2-10),
+# если шаг 1 = шаг var по направлению → открываем позицию.
+#
+# type=0 → закрытие через avg_candles баров (bull_ratio_t0)
+# type=1 → закрытие при формировании нового экстремума (bull_ratio_t1)
+#
+# var=0 → 2 шага  var=1 → 4 шага  var=2 → 6 шагов
+# var=3 → 8 шагов var=4 → 10 шагов
+#
+# Единственный output key: "signal"
+# ══════════════════════════════════════════════════════════════════════════════
+
+[service]
+id   = 55
+port = 8917
+name = "brain-extremum-graph"
+text = "Probability graph of extremum level transitions (3-sig-digit rounding, 5 step depths)"
+
+[rates]
+table = "brain_rates_eur_usd"
+
+[cache]
+date_from           = "2025-01-15"
+var_range           = [0, 1, 2, 3, 4]   # 2,4,6,8,10 шагов по графу
+types_range         = [0, 1]             # t0=N-candles exit, t1=next-extremum exit
+shift_window        = 0
+rebuild_interval    = 86400              # граф обновляем раз в сутки
+reload_interval     = 3700
+
+[ctx]
+key_columns   = ["id"]
+weights_table = "vlad_extremum_lvl_svc55_index"
+query = """
+    SELECT id, weight_code, pair, var, steps,
+           bull_ratio_t0, bull_ratio_t1,
+           occurrence_count, support
+    FROM vlad_extremum_lvl_svc55_index
+    ORDER BY id
+"""
+
+[dataset]
+engine = "brain"
+query  = "SELECT date FROM brain_rates_eur_usd ORDER BY date DESC LIMIT 1"
+
+[ml]
+enabled = false
