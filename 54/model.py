@@ -136,9 +136,109 @@ def find_extrema_levels(
     return resistance, support
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Детектор событий — параметризованный
-# ══════════════════════════════════════════════════════════════════════════════
+def _precompute_all_orders(
+    ts: np.ndarray, opens: np.ndarray, closes: np.ndarray,
+    highs: np.ndarray, lows: np.ndarray,
+) -> dict:
+    """
+    Предвычисляет ВСЕ нужные данные для detect_events за ОДИН проход:
+      - ATR
+      - Агрегированные массивы для каждого TF
+      - Уровни (resistance/support) для каждой (period, order) пары
+
+    Вызывается ОДИН раз на уникальное состояние котировок.
+    Результат кешируется и переиспользуется для всех 36 комбинаций var/type.
+
+    36 вызовов detect_events → 1 тяжёлый + 35 мгновенных.
+    """
+    from scipy.signal import argrelextrema
+
+    n  = len(ts)
+    orders = [cfg[0] for cfg in set(VAR_CONFIGS.values())]  # [2, 5, 10]
+
+    result: dict = {}
+
+    # ATR на обрезанном хвосте
+    atr_arr       = compute_atr(highs, lows, closes, ATR_PERIOD)
+    result["atr"] = float(atr_arr[-1]) or 1e-8
+
+    # Текущий и предыдущий бар
+    result["curr_close"] = float(closes[-1])
+    result["curr_high"]  = float(highs[-1])
+    result["curr_low"]   = float(lows[-1])
+    result["prev_close"] = float(closes[-2]) if n >= 2 else float(closes[-1])
+
+    # Агрегация + экстремумы для каждой (period, order) пары
+    for period in TIMEFRAMES:
+        if n < period * MIN_AGG_BARS:
+            continue
+
+        _, _, _, agg_h, agg_l = aggregate_ohlc(ts, opens, closes, highs, lows, period)
+        m = len(agg_h)
+        if m < MIN_AGG_BARS:
+            continue
+
+        for order in orders:
+            if m < order * 2 + 1:
+                resistance, support = [], []
+            else:
+                res_idx = argrelextrema(agg_h[:m], np.greater, order=order)[0]
+                sup_idx = argrelextrema(agg_l[:m], np.less,    order=order)[0]
+                resistance = [float(agg_h[i]) for i in res_idx[-N_LEVELS:]]
+                support    = [float(agg_l[i]) for i in sup_idx[-N_LEVELS:]]
+
+            result[(period, order)] = (resistance, support)
+
+    return result
+
+
+def detect_events_cached(
+    precomputed: dict,
+    order: int,
+    confirm_k: float,
+) -> list[str]:
+    """
+    Детектирует события используя предвычисленные данные.
+    Не делает никаких scipy/numpy вызовов — только арифметика.
+    """
+    atr        = precomputed["atr"]
+    proximity  = PROXIMITY_K * atr
+    confirm    = confirm_k   * atr
+    curr_close = precomputed["curr_close"]
+    curr_high  = precomputed["curr_high"]
+    curr_low   = precomputed["curr_low"]
+    prev_close = precomputed["prev_close"]
+
+    events: list[str] = []
+
+    for period in TIMEFRAMES:
+        key = (period, order)
+        if key not in precomputed:
+            continue
+
+        resistance, support = precomputed[key]
+        pfx = f"tf{period}"
+
+        for lvl in resistance:
+            if abs(curr_close - lvl) > proximity * 2:
+                continue
+            if prev_close < lvl and curr_close > lvl + confirm:
+                events.append(f"{pfx}_bo_bull"); break
+            if curr_high >= lvl - proximity and curr_close < lvl - confirm:
+                events.append(f"{pfx}_rb_bear"); break
+
+        for lvl in support:
+            if abs(curr_close - lvl) > proximity * 2:
+                continue
+            if prev_close > lvl and curr_close < lvl - confirm:
+                events.append(f"{pfx}_bo_bear"); break
+            if curr_low <= lvl + proximity and curr_close > lvl + confirm:
+                events.append(f"{pfx}_rb_bull"); break
+
+    return events
+
+
+
 
 def detect_events(
     ts: np.ndarray, opens: np.ndarray, closes: np.ndarray,
@@ -203,6 +303,16 @@ def detect_events(
 # Кеш индекса: (var, type_col) → lookup dict
 # Сбрасывается при перезапуске процесса (раз в reload_interval)
 _INDEX_CACHE: dict[tuple, dict[str, float]] = {}
+
+# Кеш предвычисленных экстремумов: (last_ts, n_rates) → precomputed dict
+# Для одного состояния котировок model() вызывается N раз (9 var × 4 type).
+# Тяжёлые вычисления делаем один раз, остальные 35 вызовов берут из кеша.
+_PRECOMPUTED: dict[tuple, dict] = {}
+
+# Максимальная история баров для нахождения уровней.
+# 120K баров не нужны — для order=10, TF=20 достаточно ~2000 баров.
+# Ускорение агрегации: 119868 / 3000 ≈ 40×
+MAX_RATES_FOR_LEVELS = 3000
 
 
 def _load_index_from_db(var: int, type_col: str) -> dict[str, float]:
@@ -272,6 +382,12 @@ def model(
     """
     Детектирует пробои/отскоки с параметрами из VAR_CONFIGS[var].
     Возвращает {weight_code: bull_ratio} для активных событий.
+
+    Оптимизация скорости cache fill:
+      - Обрезаем историю до последних MAX_RATES_FOR_LEVELS баров (~40× быстрее)
+      - Кешируем предвычисление по (last_ts, n): один раз на состояние котировок,
+        остальные 35 вызовов (9 var × 4 type) берут из кеша (~35× быстрее)
+      - Итого: ожидаемое ускорение ~40-100×
     """
     if not rates or len(rates) < MIN_AGG_BARS * max(TIMEFRAMES):
         return {}
@@ -281,15 +397,38 @@ def model(
         var = 4
     order, confirm_k = VAR_CONFIGS[var]
 
-    # ── Котировки → numpy ──────────────────────────────────────────────────
-    ts     = np.array([int(r["date"].timestamp())    for r in rates], dtype=np.int64)
-    opens  = np.array([float(r.get("open")  or 0.0) for r in rates], dtype=np.float64)
-    closes = np.array([float(r.get("close") or 0.0) for r in rates], dtype=np.float64)
-    highs  = np.array([float(r.get("max")   or 0.0) for r in rates], dtype=np.float64)
-    lows   = np.array([float(r.get("min")   or 0.0) for r in rates], dtype=np.float64)
+    # ── Обрезаем историю — для уровней не нужно 120K баров ────────────────
+    tail  = rates[-MAX_RATES_FOR_LEVELS:]
+    n_raw = len(tail)
 
-    # ── Детектируем события для этого var ─────────────────────────────────
-    active = detect_events(ts, opens, closes, highs, lows, order, confirm_k)
+    # ── Конвертируем в numpy ───────────────────────────────────────────────
+    try:
+        ts = np.array([
+            int(r["date"].timestamp()) if hasattr(r["date"], "timestamp")
+            else int(r["date"])
+            for r in tail
+        ], dtype=np.int64)
+    except Exception:
+        return {}
+
+    opens  = np.array([float(r.get("open")  or 0.0) for r in tail], dtype=np.float64)
+    closes = np.array([float(r.get("close") or 0.0) for r in tail], dtype=np.float64)
+    highs  = np.array([float(r.get("max")   or 0.0) for r in tail], dtype=np.float64)
+    lows   = np.array([float(r.get("min")   or 0.0) for r in tail], dtype=np.float64)
+
+    # ── Кеш предвычисления: один раз на уникальное состояние котировок ─────
+    cache_key = (int(ts[-1]), n_raw)
+    if cache_key not in _PRECOMPUTED:
+        _PRECOMPUTED[cache_key] = _precompute_all_orders(ts, opens, closes, highs, lows)
+        # Ограничиваем размер кеша — держим только 5 последних состояний
+        if len(_PRECOMPUTED) > 5:
+            oldest = min(_PRECOMPUTED.keys(), key=lambda k: k[0])
+            del _PRECOMPUTED[oldest]
+
+    precomputed = _PRECOMPUTED[cache_key]
+
+    # ── Детектируем события (из кеша — без тяжёлых вычислений) ───────────
+    active = detect_events_cached(precomputed, order, confirm_k)
     if not active:
         return {}
 
