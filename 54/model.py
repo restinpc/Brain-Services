@@ -417,6 +417,7 @@ def model(
     lows   = np.array([float(r.get("min")   or 0.0) for r in tail], dtype=np.float64)
 
     # ── Кеш предвычисления: один раз на уникальное состояние котировок ─────
+    cache_key   = (int(ts[-1]), n_raw)
     precomputed = _PRECOMPUTED.get(cache_key)
     if precomputed is None:
         precomputed = _precompute_all_orders(ts, opens, closes, highs, lows)
