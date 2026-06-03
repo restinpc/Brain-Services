@@ -52,6 +52,7 @@ BATCH_SIZE   = 500
 
 async def _ensure_index_table(engine) -> None:
     async with engine.begin() as conn:
+        # Создаём таблицу если не существует
         await conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS `{INDEX_TABLE}` (
                 `id`               INT               NOT NULL AUTO_INCREMENT,
@@ -70,6 +71,34 @@ async def _ensure_index_table(engine) -> None:
                 INDEX `idx_var_prefix`  (`var_id`, `combo_prefix`)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """))
+
+        # Миграция: добавляем var_id если таблица существовала без неё
+        res = await conn.execute(text(f"""
+            SELECT COUNT(*) FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME   = '{INDEX_TABLE}'
+              AND COLUMN_NAME  = 'var_id'
+        """))
+        if res.scalar() == 0:
+            log.info(f"[{INDEX_TABLE}] migration: adding var_id column")
+            await conn.execute(text(f"""
+                ALTER TABLE `{INDEX_TABLE}`
+                ADD COLUMN `var_id` TINYINT UNSIGNED NOT NULL DEFAULT 0
+                AFTER `weight_code`
+            """))
+            # Добавляем индекс если не существует
+            idx_res = await conn.execute(text(f"""
+                SELECT COUNT(*) FROM information_schema.STATISTICS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME   = '{INDEX_TABLE}'
+                  AND INDEX_NAME   = 'idx_var_prefix'
+            """))
+            if idx_res.scalar() == 0:
+                await conn.execute(text(f"""
+                    ALTER TABLE `{INDEX_TABLE}`
+                    ADD INDEX `idx_var_prefix` (`var_id`, `combo_prefix`)
+                """))
+            log.info(f"[{INDEX_TABLE}] migration done")
 
 
 async def _load_rates(engine, table: str) -> list[dict]:
