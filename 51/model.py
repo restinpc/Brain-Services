@@ -20,6 +20,7 @@ from datetime import datetime
 from typing import Optional
 
 import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
 
 from brain_framework import get_service_config
 
@@ -30,10 +31,8 @@ RATES_TABLE = "brain_rates_eur_usd"
 VAR_RANGE   = [0, 1, 2, 3]
 TYPES_RANGE = [0, 1, 2]
 
-# Минимальное кол-во вхождений паттерна для type=1
 MIN_OCC = 30
 
-# Окно поиска экстремумов по var
 EXTREMA_WINDOWS: dict[int, int] = {0: 1, 1: 3, 2: 5, 3: 7}
 
 # ── Таймфреймы ────────────────────────────────────────────────────────────────
@@ -55,6 +54,13 @@ N_ADD_TF    = N_TF - 1
 MAX_PREFIX  = 1 << N_ADD_TF   # 512
 MIN_CANDLES = 20
 
+# ── Предвычисленная таблица prefix → active TF indices ────────────────────────
+# Вместо пересчёта active = [0] + [...] на каждой итерации build_weight_codes
+_PREFIX_ACTIVE: list[list[int]] = [
+    [0] + [bit + 1 for bit in range(N_ADD_TF) if prefix & (1 << bit)]
+    for prefix in range(MAX_PREFIX)
+]
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # АГРЕГАЦИЯ OHLC
@@ -69,11 +75,13 @@ def aggregate_ohlc(
     change  = np.concatenate(([True], np.diff(groups) != 0))
     starts  = np.where(change)[0]
     ends    = np.concatenate((starts[1:], [len(groups)]))
+
     agg_ts     = groups[starts] * period_sec
     agg_opens  = opens[starts]
     agg_closes = closes[ends - 1]
-    agg_highs  = np.array([np.max(highs[s:e]) for s, e in zip(starts, ends)])
-    agg_lows   = np.array([np.min(lows[s:e])  for s, e in zip(starts, ends)])
+    # ── OPT: reduceat вместо Python-цикла со списочными comprehensions ────────
+    agg_highs  = np.maximum.reduceat(highs, starts)
+    agg_lows   = np.minimum.reduceat(lows,  starts)
     return agg_ts, agg_opens, agg_closes, agg_highs, agg_lows
 
 
@@ -87,9 +95,10 @@ def find_all_extrema(
     window: int = 1,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    window=1: adjacent-bar (векторизованный, быстрый).
-    window=3,5,7: точка является экстремумом если она строго больше/меньше
-                  всех соседей в радиусе window. Даёт более значимые свинги.
+    window=1 : adjacent-bar, полностью векторизован.
+    window>1 : ── OPT: sliding_window_view вместо Python-цикла O(n).
+               Точка — экстремум если строго больше/меньше всех соседей
+               в радиусе window с обеих сторон.
     """
     n = len(highs)
     if n < 2 * window + 1:
@@ -100,14 +109,18 @@ def find_all_extrema(
         lower = np.where((lows[1:-1]  < lows[:-2])  & (lows[1:-1]  < lows[2:]))[0]  + 1
         return upper, lower
 
-    upper_list, lower_list = [], []
-    for i in range(window, n - window):
-        h_i, l_i = highs[i], lows[i]
-        if h_i > np.max(highs[i - window:i]) and h_i > np.max(highs[i + 1:i + window + 1]):
-            upper_list.append(i)
-        if l_i < np.min(lows[i - window:i]) and l_i < np.min(lows[i + 1:i + window + 1]):
-            lower_list.append(i)
-    return np.array(upper_list, dtype=np.intp), np.array(lower_list, dtype=np.intp)
+    # shape: (n - 2*window, 2*window+1)
+    h_win = sliding_window_view(highs, 2 * window + 1)
+    l_win = sliding_window_view(lows,  2 * window + 1)
+
+    c      = window                         # индекс центра в окне
+    h_c    = h_win[:, c];   l_c = l_win[:, c]
+    h_left = h_win[:, :c].max(axis=1);  h_right = h_win[:, c + 1:].max(axis=1)
+    l_left = l_win[:, :c].min(axis=1);  l_right = l_win[:, c + 1:].min(axis=1)
+
+    upper = np.where((h_c > h_left) & (h_c > h_right))[0] + window
+    lower = np.where((l_c < l_left) & (l_c < l_right))[0] + window
+    return upper.astype(np.intp), lower.astype(np.intp)
 
 
 def last_n_before(
@@ -152,7 +165,7 @@ def compute_directions_at(
     highs: np.ndarray, lows: np.ndarray,
     window: int = 1,
 ) -> list[Optional[int]]:
-    """Вычисляет направление тренда для всех 10 TF. window = var → EXTREMA_WINDOWS."""
+    """Вычисляет направление тренда для всех 10 TF."""
     n = len(ts)
     if n < MIN_CANDLES:
         return [None] * N_TF
@@ -185,16 +198,20 @@ def build_weight_codes(
     """
     weight_code = f"{var}_{prefix}_{dir_bits}"
     Возвращает {wc: 0.5} — neutral default, перезаписывается из ctx_index.
+    ── OPT: active-индексы берём из предвычисленной таблицы _PREFIX_ACTIVE.
     """
     if directions[0] is None:
         return {}
+
     result: dict[str, float] = {}
-    for prefix in range(MAX_PREFIX):
-        active = [0] + [bit + 1 for bit in range(N_ADD_TF) if prefix & (1 << bit)]
+    var_str = str(var)
+
+    for prefix, active in enumerate(_PREFIX_ACTIVE):
         if any(directions[i] is None for i in active):
             continue
-        dir_bits = "".join(str(directions[i]) for i in active)
-        result[f"{var}_{prefix}_{dir_bits}"] = 0.5
+        dir_bits = "".join(str(directions[i]) for i in active)   # type: ignore[arg-type]
+        result[f"{var_str}_{prefix}_{dir_bits}"] = 0.5
+
     return result
 
 
@@ -216,11 +233,19 @@ def model(
     if not rates:
         return {}
 
-    ts     = np.array([int(r["date"].timestamp())   for r in rates], dtype=np.int64)
-    opens  = np.array([float(r.get("open")  or 0.0) for r in rates], dtype=np.float64)
-    closes = np.array([float(r.get("close") or 0.0) for r in rates], dtype=np.float64)
-    highs  = np.array([float(r.get("max")   or 0.0) for r in rates], dtype=np.float64)
-    lows   = np.array([float(r.get("min")   or 0.0) for r in rates], dtype=np.float64)
+    # ── OPT: один проход по rates вместо четырёх отдельных list comprehensions
+    n_r = len(rates)
+    ts     = np.empty(n_r, dtype=np.int64)
+    opens  = np.empty(n_r, dtype=np.float64)
+    closes = np.empty(n_r, dtype=np.float64)
+    highs  = np.empty(n_r, dtype=np.float64)
+    lows   = np.empty(n_r, dtype=np.float64)
+    for i, r in enumerate(rates):
+        ts[i]     = int(r["date"].timestamp())
+        opens[i]  = float(r.get("open")  or 0.0)
+        closes[i] = float(r.get("close") or 0.0)
+        highs[i]  = float(r.get("max")   or 0.0)
+        lows[i]   = float(r.get("min")   or 0.0)
 
     window     = EXTREMA_WINDOWS.get(var, 1)
     directions = compute_directions_at(ts, opens, closes, highs, lows, window)
@@ -230,7 +255,7 @@ def model(
 
     ctx_index = (dataset_index or {}).get("ctx_index") or {}
     if not ctx_index:
-        return wc_base   # нет индекса — возвращаем neutral 0.5
+        return wc_base
 
     reverse: dict[str, dict] = {
         info["weight_code"]: info
@@ -243,24 +268,18 @@ def model(
         entry = reverse.get(wc)
         if not entry:
             continue
-        occ       = int(entry.get("occurrence_count") or 0)
+        occ        = int(entry.get("occurrence_count") or 0)
         bull_ratio = float(entry.get("bull_ratio") or 0.5)
-        avg_t1     = float(entry.get("avg_t1") or 0.0)
 
         if occ == 0:
             continue
 
         if type == 0:
-            # Сырой bull_ratio (вероятность бычьей следующей свечи)
             result[wc] = bull_ratio
-
         elif type == 1:
-            # Только надёжные паттерны — отфильтрованы по MIN_OCC вхождений
             if occ >= MIN_OCC:
                 result[wc] = bull_ratio
-
         elif type == 2:
-            # Центрированный сигнал: 0=нейтраль, >0=бычий, <0=медвежий
             result[wc] = round(2.0 * bull_ratio - 1.0, 6)
 
     return result
