@@ -1,0 +1,30 @@
+# Service configuration for sasha_fred_dgs10 model with ml.
+
+[service]
+id = 53
+port = 8915
+name = "brain-sasha_fred_dgs10-s53"
+text = "10-Year Treasury yield context model"
+
+[rates]
+table = "brain_rates_eur_usd"
+
+[cache]
+date_from = "2025-01-15"
+var_range = [0, 1, 2, 3]
+types_range = [0, 1, 2]
+shift_window = 30
+rebuild_interval = 7200
+
+[dataset]
+parser_table = "sasha_fred_dgs10"
+enriched_table = "sasha_fred_dgs10_enriched"
+index_fields = ["event_type"]
+date_field = "date_dt"
+engine = "vlad"
+
+[ctx]
+key_columns = ["id"]
+
+[ml]
+enabled = true
