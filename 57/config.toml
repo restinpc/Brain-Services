@@ -2,7 +2,7 @@
 
 [service]
 id = 57
-port = 8918
+port = 8919
 name = "brain-sasha_fred_dgs10-s57-with-ml"
 text = "10-Year Treasury yield context model"
 
