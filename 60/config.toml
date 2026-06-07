@@ -1,0 +1,55 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# config.toml — brain-candle-graph (сервис 60, port 8922)
+#
+# Третья экспериментальная модель графа вероятностей.
+# Граф строится из ВСЕХ свечей (не только экстремумов).
+#
+# Отличие от сервиса 59 (extremum-graph):
+#   59: граф из экстремумов  → сигнал при формировании нового экстремума
+#   60: граф из всех свечей → сигнал на каждом баре (где есть движение)
+#
+# Self-transitions (round(close_i) == round(close_{i+1})) пропускаются.
+#
+# type=0  Жадный путь (1 нитка, наибольшая вероятность)
+# type=1  Квантовый обход (дерево, sum(mean_ветки × P_нитки))
+#
+# var → глубина дерева для type=1:
+#   var=0 → 10   var=1 → 20   var=2 → 30
+#   var=3 → 40   var=4 → 50
+#
+# Единственный выходной ключ: "output"
+# ══════════════════════════════════════════════════════════════════════════════
+
+[service]
+id   = 60
+port = 8922
+name = "brain-candle-graph"
+text = "Candle probability graph v3: all candles (no extremum filter), greedy and quantum walk"
+
+[rates]
+table = "brain_rates_eur_usd"
+
+[cache]
+date_from           = "2025-01-15"
+var_range           = [0, 1, 2, 3, 4]   # max_depth: 10/20/30/40/50
+types_range         = [0, 1]             # type=0 greedy, type=1 quantum tree
+shift_window        = 0
+rebuild_interval    = 86400
+reload_interval     = 3700
+pretest_allow_empty = true               # {} при шуме (MIN_MODIFICATION фильтр) — норма
+
+[ctx]
+key_columns   = ["id"]
+weights_table = "vlad_candle_lvl_svc60_index"
+query = """
+    SELECT id, weight_code, pair, bull_ratio, occurrence_count
+    FROM vlad_candle_lvl_svc60_index
+    ORDER BY id
+"""
+
+[dataset]
+engine = "brain"
+query  = "SELECT date FROM brain_rates_eur_usd ORDER BY date DESC LIMIT 1"
+
+[ml]
+enabled = false
