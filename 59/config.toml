@@ -1,0 +1,51 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# config.toml — brain-extremum-graph v2 (сервис 59, port 8921)
+#
+# Граф вероятностей переходов между экстремальными уровнями.
+# Уровни: rounded to 3 significant digits (BTC 93211→932, EUR 1.20→120).
+#
+# type=0  Жадный путь (1 нитка):
+#   идём до тупика/петли → mean → сравниваем с close
+#
+# type=1  Квантовый обход (дерево):
+#   sum(mean(ветки) × P(нитки)) → сравниваем с close
+#
+# var → ограничение глубины дерева для type=1:
+#   var=0 → 10   var=1 → 20   var=2 → 30
+#   var=3 → 40   var=4 → 50
+#
+# Единственный выходной ключ: "output"
+# ══════════════════════════════════════════════════════════════════════════════
+
+[service]
+id   = 59
+port = 8921
+name = "brain-extremum-graph"
+text = "Extremum probability graph v2: greedy (type=0) and quantum tree (type=1) walk"
+
+[rates]
+table = "brain_rates_eur_usd"
+
+[cache]
+date_from           = "2025-01-15"
+var_range           = [0, 1, 2, 3, 4]   # max_depth: 10/20/30/40/50
+types_range         = [0, 1]             # type=0 greedy, type=1 quantum tree
+shift_window        = 0
+rebuild_interval    = 86400              # граф обновляем раз в сутки
+reload_interval     = 3700
+
+[ctx]
+key_columns   = ["id"]
+weights_table = "vlad_extremum_lvl_svc59_index"
+query = """
+    SELECT id, weight_code, pair, bull_ratio, occurrence_count
+    FROM vlad_extremum_lvl_svc59_index
+    ORDER BY id
+"""
+
+[dataset]
+engine = "brain"
+query  = "SELECT date FROM brain_rates_eur_usd ORDER BY date DESC LIMIT 1"
+
+[ml]
+enabled = false
