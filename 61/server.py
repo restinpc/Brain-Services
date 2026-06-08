@@ -188,8 +188,8 @@ async def lifespan(app: FastAPI):
     log(f"Cols A ({MODEL_A_ID}): {app.state.cols_A or 'FALLBACK type+var'}", NODE_NAME, force=True)
     log(f"Cols B ({MODEL_B_ID}): {app.state.cols_B or 'FALLBACK type+var'}", NODE_NAME, force=True)
 
-    # 3. Флаги static из brain_models
-    async with engine_brain.connect() as conn:
+    # 3. Флаги static из brain_models (таблица в super/master, не в brain)
+    async with engine_super.connect() as conn:
         res   = await conn.execute(text(
             "SELECT id, static FROM brain_models WHERE id IN (:a, :b)"
         ), {"a": MODEL_A_ID, "b": MODEL_B_ID})
