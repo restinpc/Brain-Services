@@ -61,10 +61,13 @@ def _fetch_weights_from_child(url: str, model_id: int) -> list[str]:
     raise ValueError(f"Model {model_id}: no 'weights' in response")
 
 
-async def _compute_composite(pair, day, date, param_dict, state) -> dict | None:
-    """Вычисляет составной результат: вызывает оба дочерних сервиса."""
+async def _compute_single(pair, day, date, combo: dict, state) -> dict | None:
+    """
+    Вычисляет результат для ОДНОЙ комбинации параметров.
+    combo = {"47": {"type": 0, "var": 0, "k": 0.5}, "53": {"type": 0, "var": 0, "k": 0.5}}
+    """
     combined = {}
-    for model_str, subp in param_dict.items():
+    for model_str, subp in combo.items():
         model_id = int(model_str)
         k = subp.get("k")
         if k is None:
@@ -89,6 +92,48 @@ async def _compute_composite(pair, day, date, param_dict, state) -> dict | None:
             log(f"Child model {model_id} error: {e}", NODE_NAME, level="error", force=True)
             return None
     return combined
+
+
+async def _compute_composite(pair, day, date, param_dict, state) -> dict | None:
+    """
+    Вычисляет составной результат.
+
+    Поддерживает два формата params (в зависимости от того, как PHP создал сигнал):
+
+    1. Одна комбинация (neuronet_x2 стиль — один сигнал на одну комбо):
+       {"47": {"type": 0, "var": 0, "k": 0.5}, "53": {...}}
+       → возвращает значения для этой конкретной комбинации.
+
+    2. Массив комбинаций (neuronet_python стиль — один сигнал на тир):
+       [{"47": {...}, "53": {...}}, {"47": {...}, "53": {...}}, ...]
+       → считает значения для каждой комбинации и усредняет ансамблем.
+    """
+    # Определяем формат
+    if isinstance(param_dict, dict):
+        # Формат 1: одна комбинация
+        return await _compute_single(pair, day, date, param_dict, state)
+
+    if isinstance(param_dict, list):
+        # Формат 2: массив комбинаций — ансамблевое усреднение
+        results: list[dict] = []
+        for combo in param_dict:
+            if not isinstance(combo, dict):
+                continue
+            r = await _compute_single(pair, day, date, combo, state)
+            if r:
+                results.append(r)
+        if not results:
+            return None
+        # Собираем все ключи и усредняем
+        all_keys = set(k for r in results for k in r)
+        averaged = {}
+        n = len(results)
+        for key in all_keys:
+            total = sum(r.get(key, 0.0) for r in results)
+            averaged[key] = round(total / n, 6)
+        return averaged
+
+    return None
 
 
 def _safe_describe_cols(conn_sync_result, model_id: int) -> list[str]:
