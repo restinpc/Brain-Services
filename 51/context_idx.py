@@ -51,8 +51,12 @@ BATCH_SIZE   = 500
 
 
 async def _ensure_index_table(engine) -> None:
+    # ── Шаг 1: CREATE TABLE IF NOT EXISTS ────────────────────────────────────
+    # Каждый DDL-оператор = отдельный begin()-контекст.
+    # DDL в MySQL вызывает implicit COMMIT текущей транзакции, поэтому смешивать
+    # DDL и SELECT/ALTER в одном begin() нельзя: состояние соединения становится
+    # непредсказуемым и ALTER TABLE может не зафиксироваться корректно.
     async with engine.begin() as conn:
-        # Создаём таблицу если не существует
         await conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS `{INDEX_TABLE}` (
                 `id`               INT               NOT NULL AUTO_INCREMENT,
@@ -72,33 +76,45 @@ async def _ensure_index_table(engine) -> None:
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """))
 
-        # Миграция: добавляем var_id если таблица существовала без неё
+    # ── Шаг 2: проверка наличия var_id (отдельный connect после фиксации DDL) ─
+    # Используем connect() (не begin()) — только чтение, транзакция не нужна.
+    async with engine.connect() as conn:
         res = await conn.execute(text(f"""
             SELECT COUNT(*) FROM information_schema.COLUMNS
             WHERE TABLE_SCHEMA = DATABASE()
               AND TABLE_NAME   = '{INDEX_TABLE}'
               AND COLUMN_NAME  = 'var_id'
         """))
-        if res.scalar() == 0:
-            log.info(f"[{INDEX_TABLE}] migration: adding var_id column")
+        has_var_id = res.scalar() > 0
+
+    if not has_var_id:
+        # ── Шаг 3: ALTER TABLE — снова отдельный begin() ─────────────────────
+        log.info(f"[{INDEX_TABLE}] migration: adding var_id column")
+        async with engine.begin() as conn:
             await conn.execute(text(f"""
                 ALTER TABLE `{INDEX_TABLE}`
                 ADD COLUMN `var_id` TINYINT UNSIGNED NOT NULL DEFAULT 0
                 AFTER `weight_code`
             """))
-            # Добавляем индекс если не существует
+
+        # ── Шаг 4: индекс — ещё один отдельный begin() ───────────────────────
+        async with engine.connect() as conn:
             idx_res = await conn.execute(text(f"""
                 SELECT COUNT(*) FROM information_schema.STATISTICS
                 WHERE TABLE_SCHEMA = DATABASE()
                   AND TABLE_NAME   = '{INDEX_TABLE}'
                   AND INDEX_NAME   = 'idx_var_prefix'
             """))
-            if idx_res.scalar() == 0:
+            has_index = idx_res.scalar() > 0
+
+        if not has_index:
+            async with engine.begin() as conn:
                 await conn.execute(text(f"""
                     ALTER TABLE `{INDEX_TABLE}`
                     ADD INDEX `idx_var_prefix` (`var_id`, `combo_prefix`)
                 """))
-            log.info(f"[{INDEX_TABLE}] migration done")
+
+        log.info(f"[{INDEX_TABLE}] migration done")
 
 
 async def _load_rates(engine, table: str) -> list[dict]:
@@ -178,7 +194,9 @@ async def build_index(engine_vlad, engine_brain) -> dict:
     lows   = np.array([r["min"]   for r in raw], dtype=np.float64)
 
     async with engine_vlad.begin() as conn:
-        await conn.execute(text(f"TRUNCATE TABLE `{INDEX_TABLE}`"))
+        # DELETE FROM вместо TRUNCATE TABLE — TRUNCATE = DDL = implicit commit,
+        # что нарушает атомарность. DELETE FROM = DML, транзакционный.
+        await conn.execute(text(f"DELETE FROM `{INDEX_TABLE}`"))
 
     total_written = 0
     stats_per_var = {}
