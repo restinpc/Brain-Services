@@ -394,11 +394,17 @@ async def build_index(engine_vlad, engine_brain) -> dict:
     insert_rows = _to_insert_rows(aggregates)
 
     async with engine_vlad.begin() as conn:
-        await conn.execute(text(f"TRUNCATE TABLE `{CTX_TABLE}`"))
+        # DELETE FROM вместо TRUNCATE TABLE — критически важно:
+        # TRUNCATE = DDL = неявный COMMIT в MySQL, что ломает атомарность блока.
+        # После TRUNCATE sqlalchemy думает, что транзакция активна, но MySQL
+        # уже закоммитил её — INSERT идёт в auto-commit, без защиты от race condition.
+        # DELETE FROM = DML = участвует в транзакции; если INSERT упадёт — откатится
+        # всё вместе, таблица останется с прежними данными.
+        await conn.execute(text(f"DELETE FROM `{CTX_TABLE}`"))
 
         if insert_rows:
             await conn.execute(text(f"""
-                INSERT INTO `{CTX_TABLE}` (
+                INSERT IGNORE INTO `{CTX_TABLE}` (
                     event_id,
                     currency_code,
                     importance,
