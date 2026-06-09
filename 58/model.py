@@ -271,7 +271,7 @@ def model(
         signed_t1 = t1 * direction
         weighted_t1 = _apply_var(signed_t1, delta, var, ctx_info)
 
-        if weighted_t1 != 0.0 and type in (0, 1):
+        if weighted_t1 != 0.0 and type in (0, 1, 3, 4):
             wc = f"{ctx_id}_0_{shift}"
             result[wc] = result.get(wc, 0.0) + round(weighted_t1, 6)
 
