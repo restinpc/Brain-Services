@@ -12,7 +12,7 @@ table = "brain_rates_eur_usd"
 [cache]
 date_from = "2025-01-15"
 var_range = [0, 1, 2, 3]
-types_range = [0, 1, 2]
+types_range = [0, 1, 2, 3, 4]
 shift_window = 30
 rebuild_interval = 7200
 
