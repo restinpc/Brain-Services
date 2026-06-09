@@ -257,7 +257,9 @@ async def build_weights(engine_vlad) -> dict:
 
     async with engine_vlad.begin() as conn:
         if TRUNCATE_OUT:
-            await conn.execute(text(f"TRUNCATE TABLE `{OUT_TABLE}`"))
+            # DELETE FROM вместо TRUNCATE TABLE — TRUNCATE = DDL = implicit commit,
+            # что нарушает атомарность транзакции (INSERT может попасть в auto-commit).
+            await conn.execute(text(f"DELETE FROM `{OUT_TABLE}`"))
 
         if rows:
             await conn.execute(text(f"""
@@ -301,4 +303,3 @@ async def build_weights(engine_vlad) -> dict:
         "shift_max": SHIFT_MAX,
         "truncate": TRUNCATE_OUT,
     }
-
