@@ -93,6 +93,23 @@ def _apply_var(signed_t1: float, pct: float, var: int, ctx_info: dict) -> float:
     return 0.0
 
 
+def _signal_fn(
+    type: int, ctx_id: int, shift: int,
+    weighted_t1: float, ext_hit: bool,
+    pct: float, occ: int, direction: float, ctx_info: dict,
+):
+    """
+    ML-типы 3/4: возвращаем T1-коды (как type 1).
+    reverse_learning обучит их с train_mode=3 (forward+amplitude) / 4 (strict).
+    Для 0/1/2 возвращаем None — используется встроенная логика _std_signal.
+    """
+    if type in (3, 4):
+        if weighted_t1 != 0.0:
+            return {f"{ctx_id}_0_{shift}": round(weighted_t1, 6)}
+        return {}
+    return None
+
+
 def model(rates, dataset, date, *, type=0, var=0, param="", dataset_index=None):
     cfg = get_service_config()
     return run_standard_model(
@@ -104,4 +121,5 @@ def model(rates, dataset, date, *, type=0, var=0, param="", dataset_index=None):
         dataset_index=dataset_index,
         shift_window=cfg["cache"]["shift_window"],
         apply_var_fn=_apply_var,
+        signal_fn=_signal_fn,
     )
