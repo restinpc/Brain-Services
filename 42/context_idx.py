@@ -10,14 +10,26 @@ context_idx.py — framework builder for brain_calendar_context_idx.
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any
 
 from sqlalchemy import text
 
+log = logging.getLogger(__name__)
+
 
 SRC_TABLE = os.getenv("SRC_TABLE", "brain_calendar")
 CTX_TABLE = os.getenv("CTX_TABLE", "brain_calendar_context_idx")
+
+# brain_calendar_context_idx — ОБЩАЯ таблица для s42/s44/s49 (все три
+# используют дефолтный CTX_TABLE без переопределения в .env). Имя advisory
+# lock привязано к имени таблицы, чтобы сериализовать rebuild между ВСЕМИ
+# сервисами, делящими эту таблицу — иначе DELETE+INSERT(10708 строк) одного
+# сервиса конфликтует с другим: 1062 Duplicate entry (race на UNIQUE KEY)
+# или 1205 Lock wait timeout (если транзакции пересекаются по времени).
+REBUILD_LOCK_NAME = f"rebuild_{CTX_TABLE}"
+REBUILD_LOCK_TIMEOUT = 30  # секунд ожидания лока перед тем как пропустить цикл
 
 # Обычно события берутся из engine_brain.
 # Если нужно строить из engine_vlad, поставь SRC_ENGINE=vlad.
@@ -393,50 +405,82 @@ async def build_index(engine_vlad, engine_brain) -> dict:
     aggregates, stats = _aggregate_rows(rows)
     insert_rows = _to_insert_rows(aggregates)
 
-    async with engine_vlad.begin() as conn:
-        # DELETE FROM вместо TRUNCATE TABLE — критически важно:
-        # TRUNCATE = DDL = неявный COMMIT в MySQL, что ломает атомарность блока.
-        # После TRUNCATE sqlalchemy думает, что транзакция активна, но MySQL
-        # уже закоммитил её — INSERT идёт в auto-commit, без защиты от race condition.
-        # DELETE FROM = DML = участвует в транзакции; если INSERT упадёт — откатится
-        # всё вместе, таблица останется с прежними данными.
-        await conn.execute(text(f"DELETE FROM `{CTX_TABLE}`"))
+    # ── Сериализация rebuild через MySQL advisory lock ───────────────────────
+    # См. комментарий у REBUILD_LOCK_NAME выше: brain_calendar_context_idx
+    # делится между s42/s44/s49. GET_LOCK/RELEASE_LOCK на одной connection —
+    # если другой сервис уже перестраивает таблицу, ждём до
+    # REBUILD_LOCK_TIMEOUT, иначе пропускаем цикл (фреймворк повторит
+    # на следующем rebuild_interval).
+    async with engine_vlad.connect() as conn:
+        got_lock = (await conn.execute(
+            text("SELECT GET_LOCK(:name, :timeout)"),
+            {"name": REBUILD_LOCK_NAME, "timeout": REBUILD_LOCK_TIMEOUT},
+        )).scalar()
 
-        if insert_rows:
-            await conn.execute(text(f"""
-                INSERT IGNORE INTO `{CTX_TABLE}` (
-                    event_id,
-                    currency_code,
-                    importance,
-                    forecast_dir,
-                    surprise_dir,
-                    revision_dir,
-                    occurrence_count,
-                    first_dt,
-                    last_dt,
-                    avg_actual,
-                    avg_surprise_abs,
-                    avg_revision_abs
-                )
-                VALUES (
-                    :event_id,
-                    :currency_code,
-                    :importance,
-                    :forecast_dir,
-                    :surprise_dir,
-                    :revision_dir,
-                    :occurrence_count,
-                    :first_dt,
-                    :last_dt,
-                    :avg_actual,
-                    :avg_surprise_abs,
-                    :avg_revision_abs
-                )
-            """), insert_rows)
+        if not got_lock:
+            log.warning(
+                f"[{CTX_TABLE}] build_index: пропуск цикла — лок "
+                f"'{REBUILD_LOCK_NAME}' занят другим сервисом "
+                f"(>{REBUILD_LOCK_TIMEOUT}с ожидания)"
+            )
+            stats.update({
+                "table": CTX_TABLE,
+                "source": source,
+                "skipped": True,
+                "reason": "rebuild_lock_busy",
+            })
+            return stats
+
+        try:
+            async with conn.begin():
+                # DELETE FROM вместо TRUNCATE TABLE — критически важно:
+                # TRUNCATE = DDL = неявный COMMIT в MySQL, что ломает атомарность блока.
+                # После TRUNCATE sqlalchemy думает, что транзакция активна, но MySQL
+                # уже закоммитил её — INSERT идёт в auto-commit, без защиты от race condition.
+                # DELETE FROM = DML = участвует в транзакции; если INSERT упадёт — откатится
+                # всё вместе, таблица останется с прежними данными.
+                await conn.execute(text(f"DELETE FROM `{CTX_TABLE}`"))
+
+                if insert_rows:
+                    await conn.execute(text(f"""
+                        INSERT IGNORE INTO `{CTX_TABLE}` (
+                            event_id,
+                            currency_code,
+                            importance,
+                            forecast_dir,
+                            surprise_dir,
+                            revision_dir,
+                            occurrence_count,
+                            first_dt,
+                            last_dt,
+                            avg_actual,
+                            avg_surprise_abs,
+                            avg_revision_abs
+                        )
+                        VALUES (
+                            :event_id,
+                            :currency_code,
+                            :importance,
+                            :forecast_dir,
+                            :surprise_dir,
+                            :revision_dir,
+                            :occurrence_count,
+                            :first_dt,
+                            :last_dt,
+                            :avg_actual,
+                            :avg_surprise_abs,
+                            :avg_revision_abs
+                        )
+                    """), insert_rows)
+        finally:
+            await conn.execute(
+                text("SELECT RELEASE_LOCK(:name)"), {"name": REBUILD_LOCK_NAME}
+            )
 
     stats.update({
         "table": CTX_TABLE,
         "source": source,
+        "skipped": False,
         "inserted": len(insert_rows),
     })
 
