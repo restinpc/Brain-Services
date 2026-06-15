@@ -283,6 +283,12 @@ async def build_weights(engine_vlad) -> dict:
             text("SELECT GET_LOCK(:name, :timeout)"),
             {"name": REBUILD_LOCK_NAME, "timeout": REBUILD_LOCK_TIMEOUT},
         )).scalar()
+        # execute() сам открывает транзакцию (autobegin в SQLAlchemy 2.0).
+        # GET_LOCK не транзакционен (сессионный advisory lock), поэтому
+        # просто закрываем эту неявную транзакцию commit'ом — иначе
+        # следующий conn.begin() упадёт с InvalidRequestError
+        # ("already initialized a SQLAlchemy Transaction").
+        await conn.commit()
 
         if not got_lock:
             log.warning(
@@ -339,6 +345,10 @@ async def build_weights(engine_vlad) -> dict:
             await conn.execute(
                 text("SELECT RELEASE_LOCK(:name)"), {"name": REBUILD_LOCK_NAME}
             )
+            # RELEASE_LOCK снова вызывает autobegin — закрываем транзакцию,
+            # чтобы __aexit__ соединения не делал неявный rollback/commit
+            # с предупреждением.
+            await conn.commit()
 
     return {
         "table": OUT_TABLE,
