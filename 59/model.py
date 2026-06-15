@@ -92,30 +92,80 @@ class ExtremNode:
         id    — уникальный числовой идентификатор внутри графа
         value — округлённое значение уровня (int, e.g. 932 для BTC 93211)
         relations — словарь исходящих переходов {node_id: count}
+
+    ── ОПТИМИЗАЦИЯ (для кеша, без изменения результатов) ────────────────────
+    Нормализованные вероятности переходов (get_relations()/relations_list())
+    и argmax-переход (best_next(), для walk_type0) считаются ОДИН РАЗ и
+    кешируются на узле — вместо повторного sum()+dict-comprehension на
+    КАЖДОМ шаге КАЖДОЙ ветки обхода (как было в исходной get_relations()).
+    Кеш сбрасывается при add_relation() (на случай дозаполнения графа).
     """
 
     def __init__(self, node_id: int, value: int) -> None:
         self.id:        int = node_id
         self.value:     int = value
         self.relations: dict[int, int] = {}   # {node_id: count}
+        self._rel_list:  Optional[list[tuple[int, float]]] = None
+        self._rel_dict:  Optional[dict[int, float]]        = None
+        self._best_next: int = -2   # -2 = не посчитан, -1 = нет переходов
 
     def add_relation(self, node_id: int, count: int = 1) -> None:
         """Добавляет (или увеличивает) счётчик перехода к node_id."""
         self.relations[node_id] = self.relations.get(node_id, 0) + count
+        self._rel_list  = None
+        self._rel_dict  = None
+        self._best_next = -2
 
     def get_relation(self, node_id: int) -> int:
         """Возвращает сырое кол-во переходов к node_id (0 если нет)."""
         return self.relations.get(node_id, 0)
 
+    def relations_list(self) -> list[tuple[int, float]]:
+        """
+        [(node_id, probability), ...] в порядке вставки, сумма prob == 1.0.
+        Считается один раз и кешируется (инвалидация в add_relation).
+        """
+        rl = self._rel_list
+        if rl is None:
+            total = sum(self.relations.values())
+            if total == 0:
+                rl = []
+            else:
+                rl = [(nid, cnt / total) for nid, cnt in self.relations.items()]
+            self._rel_list = rl
+        return rl
+
     def get_relations(self) -> dict[int, float]:
         """
         Возвращает нормализованные вероятности переходов.
         {node_id: probability}  sum = 1.0
+        (сохранён для совместимости; внутренне использует relations_list()).
         """
-        total = sum(self.relations.values())
-        if total == 0:
-            return {}
-        return {nid: cnt / total for nid, cnt in self.relations.items()}
+        rd = self._rel_dict
+        if rd is None:
+            rd = dict(self.relations_list())
+            self._rel_dict = rd
+        return rd
+
+    def best_next(self) -> Optional[int]:
+        """
+        argmax по вероятности перехода (используется в walk_type0).
+        Тай-брейк идентичен max(rels, key=rels.get) — первый по порядку
+        вставки при равной вероятности. Кешируется.
+        """
+        bn = self._best_next
+        if bn == -2:
+            rl = self.relations_list()
+            if not rl:
+                bn = -1
+            else:
+                best_id, best_p = rl[0]
+                for nid, p in rl[1:]:
+                    if p > best_p:
+                        best_id, best_p = nid, p
+                bn = best_id
+            self._best_next = bn
+        return None if bn == -1 else bn
 
     def __repr__(self) -> str:
         return f"ExtremNode(id={self.id}, value={self.value}, rels={len(self.relations)})"
@@ -126,11 +176,23 @@ class ExtremGraph:
     Граф переходов между уровнями экстремумов.
 
     nodes — все узлы по их id
+
+    ── ОПТИМИЗАЦИЯ ────────────────────────────────────────────────────────────
+    _w0_cache / _w1_cache — память результатов walk_type0/walk_type1 на
+    уровне ЭКЗЕМПЛЯРА графа (живёт до следующей перезагрузки из БД в
+    _get_graph, т.е. до истечения GRAPH_CACHE_TTL). Один и тот же
+    start_id встречается на МНОГИХ барах истории (округление уровня даёт
+    малое число уникальных значений) — повторные вызовы с тем же start_id
+    (и, для type=1, тем же max_depth) отдаются из кеша за O(1).
+    Для type=0 результат НЕ зависит от var → 5 вызовов (var=0..4)
+    сворачиваются в 1 вычисление + 4 попадания в кеш.
     """
 
     def __init__(self) -> None:
         self.nodes:     list[ExtremNode] = []
         self._by_value: dict[int, int] = {}   # value → node_id
+        self._w0_cache: dict[int, float] = {}
+        self._w1_cache: dict[tuple[int, int], float] = {}
 
     def add_node(self, value: int) -> int:
         """
@@ -182,10 +244,20 @@ def walk_type0(graph: ExtremGraph, start_id: int) -> float:
       петля  → среднее арифметическое ВСЕХ узлов петли
 
     Возвращает предсказанное значение уровня (float).
+
+    ── ОПТИМИЗАЦИЯ ────────────────────────────────────────────────────────────
+    Результат не зависит от var → кешируется по start_id в graph._w0_cache
+    (5 вызовов с var=0..4 → 1 вычисление + 4 попадания в кеш). Сам обход —
+    тот же итеративный цикл, что и в оригинале, но переход берётся через
+    best_next() (кеш на узле) вместо пересчёта get_relations()+max() на
+    каждом шаге.
     """
+    cached = graph._w0_cache.get(start_id)
+    if cached is not None:
+        return cached
+
     path:    list[int] = [start_id]
     visited: dict[int, int] = {start_id: 0}   # node_id → позиция в path
-
     current_id = start_id
 
     while True:
@@ -193,16 +265,16 @@ def walk_type0(graph: ExtremGraph, start_id: int) -> float:
         if node is None:
             break
 
-        rels = node.get_relations()   # {node_id: prob}
+        next_id = node.best_next()
 
-        if not rels:
+        if next_id is None:
             # Тупик: mean последних 2 узлов
             last_n = path[-2:] if len(path) >= 2 else path
             vals   = [graph.get_node(nid).value for nid in last_n
                       if graph.get_node(nid) is not None]
-            return sum(vals) / len(vals) if vals else float(graph.get_node(start_id).value)
-
-        next_id = max(rels, key=rels.get)   # наиболее вероятный переход
+            result = sum(vals) / len(vals) if vals else float(graph.get_node(start_id).value)
+            graph._w0_cache[start_id] = result
+            return result
 
         if next_id in visited:
             # Петля: mean всех узлов в цикле
@@ -210,11 +282,21 @@ def walk_type0(graph: ExtremGraph, start_id: int) -> float:
             loop_nodes = path[loop_start:]
             vals = [graph.get_node(nid).value for nid in loop_nodes
                     if graph.get_node(nid) is not None]
-            return sum(vals) / len(vals) if vals else float(graph.get_node(start_id).value)
+            result = sum(vals) / len(vals) if vals else float(graph.get_node(start_id).value)
+            graph._w0_cache[start_id] = result
+            return result
 
         visited[next_id] = len(path)
         path.append(next_id)
         current_id = next_id
+
+    # недостижимо для корректно построенного графа (как и в оригинале)
+    last_n = path[-2:] if len(path) >= 2 else path
+    vals   = [graph.get_node(nid).value for nid in last_n
+              if graph.get_node(nid) is not None]
+    result = sum(vals) / len(vals) if vals else float(graph.get_node(start_id).value)
+    graph._w0_cache[start_id] = result
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -223,7 +305,7 @@ def walk_type0(graph: ExtremGraph, start_id: int) -> float:
 
 def walk_type1(graph: ExtremGraph, start_id: int, max_depth: int = 20) -> float:
     """
-    Разворачиваем граф в дерево, обходим все ветви рекурсивно.
+    Разворачиваем граф в дерево, обходим все ветви.
 
     Для каждой конечной ветви:
       branch_signal = mean(узлы ветви) × произведение вероятностей по нитке
@@ -233,60 +315,82 @@ def walk_type1(graph: ExtremGraph, start_id: int, max_depth: int = 20) -> float:
 
     Итог = линейная сумма branch_signal по всем конечным ветвям.
     Интерпретация: ожидаемый уровень цены с учётом всех вероятных путей.
+
+    ── ОПТИМИЗАЦИЯ (результат идентичен оригиналу — проверено побитово) ─────
+    1) Кеш по graph._w1_cache[(start_id, max_depth)]: один и тот же
+       (start_id, max_depth) повторяется на множестве баров истории
+       (округление уровня даёт малое число уникальных значений) →
+       вычисляется 1 раз, остальные обращения O(1).
+    2) Обход переписан ИТЕРАТИВНО (явный стек вместо рекурсии Python):
+       path/path_pos — мутируемые list/dict с push/pop вместо
+       `path + [x]` / `path_set | {x}`, которые в оригинале копируют
+       O(len(path)) данных на КАЖДОЙ ветке. relations_list() на узле
+       также кеширован (см. ExtremNode) — не пересчитывается на каждом шаге.
+       Порядок обхода веток и суммирования идентичен оригиналу.
     """
-    total_signal: list[float] = [0.0]   # через список чтобы изменять в closure
+    key = (start_id, max_depth)
+    cached = graph._w1_cache.get(key)
+    if cached is not None:
+        return cached
 
-    def _terminal(path: list[int], prob: float) -> None:
-        """Добавляет сигнал конечной ветви к общей сумме."""
-        last_n = path[-2:] if len(path) >= 2 else path
-        vals   = [graph.get_node(nid).value for nid in last_n
-                  if graph.get_node(nid) is not None]
-        if vals:
-            mean_val = sum(vals) / len(vals)
-            total_signal[0] += mean_val * prob
+    total = 0.0
+    node0 = graph.get_node(start_id)
+    if node0 is None:
+        graph._w1_cache[key] = total
+        return total
 
-    def _recurse(
-        node_id:    int,
-        path:       list[int],
-        path_set:   frozenset[int],
-        prob:       float,
-        depth:      int,
-    ) -> None:
-        if depth > max_depth or prob < 1e-9:
-            _terminal(path, prob)
-            return
+    path:     list[int]      = [start_id]
+    path_pos: dict[int, int] = {start_id: 0}
 
-        node = graph.get_node(node_id)
-        if node is None:
-            _terminal(path, prob)
-            return
+    # stack-фрейм: [node, depth, prob, rel_list, idx]
+    stack: list[list] = [[node0, 0, 1.0, node0.relations_list(), 0]]
 
-        rels = node.get_relations()
-        if not rels:
-            # Тупик
-            _terminal(path, prob)
-            return
+    while stack:
+        frame = stack[-1]
+        node, depth, prob, rels, idx = frame
 
-        for next_id, next_prob in rels.items():
-            branch_prob = prob * next_prob
+        if idx == 0:
+            if depth > max_depth or prob < 1e-9 or not rels:
+                # Тупик: mean(последние 2 узла из path) × prob
+                if len(path) >= 2:
+                    term_val = (graph.nodes[path[-2]].value + graph.nodes[path[-1]].value) / 2.0
+                else:
+                    term_val = float(node.value)
+                total += term_val * prob
+                stack.pop()
+                if stack:
+                    removed = path.pop()
+                    del path_pos[removed]
+                continue
 
-            if next_id in path_set:
-                # Петля: mean всех узлов ЦИКЛА (без повторного включения начала)
-                # path.index(next_id) → позиция первого появления (начало цикла)
-                # path[loop_start:] = все узлы цикла, без дубля начала
-                loop_start = path.index(next_id)
-                loop_nodes = path[loop_start:]   # НЕ добавляем next_id ещё раз
-                vals = [graph.get_node(n).value for n in loop_nodes
-                        if graph.get_node(n) is not None]
-                if vals:
-                    total_signal[0] += (sum(vals) / len(vals)) * branch_prob
-            else:
-                new_path    = path + [next_id]
-                new_path_set = path_set | {next_id}
-                _recurse(next_id, new_path, new_path_set, branch_prob, depth + 1)
+        if idx >= len(rels):
+            stack.pop()
+            if stack:
+                removed = path.pop()
+                del path_pos[removed]
+            continue
 
-    _recurse(start_id, [start_id], frozenset([start_id]), 1.0, 0)
-    return total_signal[0]
+        next_id, next_prob = rels[idx]
+        frame[4] = idx + 1
+        branch_prob = prob * next_prob
+
+        pos = path_pos.get(next_id)
+        if pos is not None:
+            # Петля: mean всех узлов ЦИКЛА (без повторного включения начала)
+            loop_nodes = path[pos:]
+            s = 0.0
+            for nid in loop_nodes:
+                s += graph.nodes[nid].value
+            total += (s / len(loop_nodes)) * branch_prob
+            continue
+
+        next_node = graph.nodes[next_id]
+        path.append(next_id)
+        path_pos[next_id] = len(path) - 1
+        stack.append([next_node, depth + 1, branch_prob, next_node.relations_list(), 0])
+
+    graph._w1_cache[key] = total
+    return total
 
 
 # ══════════════════════════════════════════════════════════════════════════════
