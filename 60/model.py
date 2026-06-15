@@ -78,28 +78,70 @@ GRAPH_CACHE_TTL = 3600.0
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ExtremNode:
+    # ── ОПТИМИЗАЦИЯ: нормализованные relations и argmax-переход считаются
+    # один раз и кешируются (инвалидация при add_relation). Без этого
+    # get_relations() пересчитывал sum()+dict-comprehension на каждом
+    # шаге каждой ветки walk_type1 — основная причина медленного кеша.
     def __init__(self, node_id: int, value: int) -> None:
         self.id:        int = node_id
         self.value:     int = value
         self.relations: dict[int, int] = {}
+        self._rel_list:  Optional[list[tuple[int, float]]] = None
+        self._rel_dict:  Optional[dict[int, float]]        = None
+        self._best_next: int = -2  # -2=не посчитан, -1=нет переходов
 
     def add_relation(self, node_id: int, count: int = 1) -> None:
         self.relations[node_id] = self.relations.get(node_id, 0) + count
+        self._rel_list  = None
+        self._rel_dict  = None
+        self._best_next = -2
 
     def get_relation(self, node_id: int) -> int:
         return self.relations.get(node_id, 0)
 
+    def relations_list(self) -> list[tuple[int, float]]:
+        """[(node_id, prob), ...], сумма prob==1.0. Кешируется."""
+        rl = self._rel_list
+        if rl is None:
+            total = sum(self.relations.values())
+            rl = [] if total == 0 else [(nid, cnt / total) for nid, cnt in self.relations.items()]
+            self._rel_list = rl
+        return rl
+
     def get_relations(self) -> dict[int, float]:
-        total = sum(self.relations.values())
-        if total == 0:
-            return {}
-        return {nid: cnt / total for nid, cnt in self.relations.items()}
+        rd = self._rel_dict
+        if rd is None:
+            rd = dict(self.relations_list())
+            self._rel_dict = rd
+        return rd
+
+    def best_next(self) -> Optional[int]:
+        """argmax по вероятности (для walk_type0), тай-брейк как у max(rels, key=rels.get)."""
+        bn = self._best_next
+        if bn == -2:
+            rl = self.relations_list()
+            if not rl:
+                bn = -1
+            else:
+                best_id, best_p = rl[0]
+                for nid, p in rl[1:]:
+                    if p > best_p:
+                        best_id, best_p = nid, p
+                bn = best_id
+            self._best_next = bn
+        return None if bn == -1 else bn
 
 
 class ExtremGraph:
+    # ── ОПТИМИЗАЦИЯ: _w0_cache/_w1_cache — память walk_type0/walk_type1 на
+    # уровне экземпляра графа (живёт до следующей перезагрузки из БД).
+    # entry_level повторяется на многих барах → повтор отдаётся из кеша.
+    # type=0 не зависит от var → 5 вызовов (var=0..4) = 1 вычисление + 4 хита.
     def __init__(self) -> None:
         self.nodes:     list[ExtremNode] = []
         self._by_value: dict[int, int]   = {}
+        self._w0_cache: dict[int, float] = {}
+        self._w1_cache: dict[tuple[int, int], float] = {}
 
     def add_node(self, value: int) -> int:
         if value in self._by_value:
@@ -130,8 +172,13 @@ class ExtremGraph:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def walk_type0(graph: ExtremGraph, start_id: int) -> float:
-    """Жадный путь: следуем наибольшей вероятности до тупика или петли."""
-    path:    list[int]     = [start_id]
+    """Жадный путь: следуем наибольшей вероятности до тупика или петли.
+    Не зависит от var → кешируется по start_id (graph._w0_cache)."""
+    cached = graph._w0_cache.get(start_id)
+    if cached is not None:
+        return cached
+
+    path:    list[int]      = [start_id]
     visited: dict[int, int] = {start_id: 0}
     current_id = start_id
 
@@ -140,18 +187,20 @@ def walk_type0(graph: ExtremGraph, start_id: int) -> float:
         if node is None:
             break
 
-        rels = node.get_relations()
-        if not rels:
+        next_id = node.best_next()
+        if next_id is None:
             last_n = path[-2:] if len(path) >= 2 else path
             vals   = [graph.get_node(n).value for n in last_n if graph.get_node(n)]
-            return sum(vals) / len(vals) if vals else float(graph.get_node(start_id).value)
-
-        next_id = max(rels, key=rels.get)
+            result = sum(vals) / len(vals) if vals else float(graph.get_node(start_id).value)
+            graph._w0_cache[start_id] = result
+            return result
 
         if next_id in visited:
             loop_nodes = path[visited[next_id]:]
             vals = [graph.get_node(n).value for n in loop_nodes if graph.get_node(n)]
-            return sum(vals) / len(vals) if vals else float(graph.get_node(start_id).value)
+            result = sum(vals) / len(vals) if vals else float(graph.get_node(start_id).value)
+            graph._w0_cache[start_id] = result
+            return result
 
         visited[next_id] = len(path)
         path.append(next_id)
@@ -159,45 +208,78 @@ def walk_type0(graph: ExtremGraph, start_id: int) -> float:
 
     last_n = path[-2:] if len(path) >= 2 else path
     vals   = [graph.get_node(n).value for n in last_n if graph.get_node(n)]
-    return sum(vals) / len(vals) if vals else float(graph.get_node(start_id).value)
+    result = sum(vals) / len(vals) if vals else float(graph.get_node(start_id).value)
+    graph._w0_cache[start_id] = result
+    return result
 
 
 def walk_type1(graph: ExtremGraph, start_id: int, max_depth: int = 20) -> float:
-    """Квантовый обход: sum(mean_ветки × P_нитки) по всем конечным ветвям."""
-    total = [0.0]
+    """Квантовый обход: sum(mean_ветки × P_нитки) по всем конечным ветвям.
 
-    def _terminal(path: list[int], prob: float) -> None:
-        last_n = path[-2:] if len(path) >= 2 else path
-        vals   = [graph.get_node(n).value for n in last_n if graph.get_node(n)]
-        if vals:
-            total[0] += (sum(vals) / len(vals)) * prob
+    ── ОПТИМИЗАЦИЯ (результат идентичен оригиналу — проверено побитово) ─────
+    Кеш по (start_id, max_depth) в graph._w1_cache + итеративный обход
+    (явный стек, без копий path/path_set на каждой ветке, без пересчёта
+    get_relations() на каждом шаге — см. ExtremNode.relations_list()).
+    """
+    key = (start_id, max_depth)
+    cached = graph._w1_cache.get(key)
+    if cached is not None:
+        return cached
 
-    def _recurse(node_id: int, path: list[int],
-                 path_set: frozenset, prob: float, depth: int) -> None:
-        if depth > max_depth or prob < 1e-9:
-            _terminal(path, prob)
-            return
-        node = graph.get_node(node_id)
-        if node is None:
-            _terminal(path, prob)
-            return
-        rels = node.get_relations()
-        if not rels:
-            _terminal(path, prob)
-            return
+    total = 0.0
+    node0 = graph.get_node(start_id)
+    if node0 is None:
+        graph._w1_cache[key] = total
+        return total
 
-        for next_id, next_prob in rels.items():
-            bp = prob * next_prob
-            if next_id in path_set:
-                loop_nodes = path[path.index(next_id):]  # без дубля начала цикла
-                vals = [graph.get_node(n).value for n in loop_nodes if graph.get_node(n)]
-                if vals:
-                    total[0] += (sum(vals) / len(vals)) * bp
-            else:
-                _recurse(next_id, path + [next_id], path_set | {next_id}, bp, depth + 1)
+    path:     list[int]      = [start_id]
+    path_pos: dict[int, int] = {start_id: 0}
+    stack: list[list] = [[node0, 0, 1.0, node0.relations_list(), 0]]
 
-    _recurse(start_id, [start_id], frozenset([start_id]), 1.0, 0)
-    return total[0]
+    while stack:
+        frame = stack[-1]
+        node, depth, prob, rels, idx = frame
+
+        if idx == 0:
+            if depth > max_depth or prob < 1e-9 or not rels:
+                if len(path) >= 2:
+                    term_val = (graph.nodes[path[-2]].value + graph.nodes[path[-1]].value) / 2.0
+                else:
+                    term_val = float(node.value)
+                total += term_val * prob
+                stack.pop()
+                if stack:
+                    removed = path.pop()
+                    del path_pos[removed]
+                continue
+
+        if idx >= len(rels):
+            stack.pop()
+            if stack:
+                removed = path.pop()
+                del path_pos[removed]
+            continue
+
+        next_id, next_prob = rels[idx]
+        frame[4] = idx + 1
+        bp = prob * next_prob
+
+        pos = path_pos.get(next_id)
+        if pos is not None:
+            loop_nodes = path[pos:]
+            s = 0.0
+            for nid in loop_nodes:
+                s += graph.nodes[nid].value
+            total += (s / len(loop_nodes)) * bp
+            continue
+
+        next_node = graph.nodes[next_id]
+        path.append(next_id)
+        path_pos[next_id] = len(path) - 1
+        stack.append([next_node, depth + 1, bp, next_node.relations_list(), 0])
+
+    graph._w1_cache[key] = total
+    return total
 
 
 # ══════════════════════════════════════════════════════════════════════════════
