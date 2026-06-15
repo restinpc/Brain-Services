@@ -11,13 +11,24 @@ weights.py — framework builder for brain_calendar_weights.
 
 from __future__ import annotations
 
+import logging
 import os
 
 from sqlalchemy import text
 
+log = logging.getLogger(__name__)
+
 
 CTX_TABLE = os.getenv("CTX_TABLE", "brain_calendar_context_idx")
 OUT_TABLE = os.getenv("OUT_TABLE", "brain_calendar_weights")
+
+# brain_calendar_weights / brain_calendar_context_idx — ОБЩИЕ таблицы,
+# в которые независимо пишут несколько сервисов (s42/s44/s49,
+# все с дефолтным CTX_TABLE/OUT_TABLE, без переопределения в .env).
+# Имя advisory lock привязано к имени таблицы, а не к SERVICE_ID,
+# чтобы сериализовать rebuild между ВСЕМИ сервисами, делящими эту таблицу.
+REBUILD_LOCK_NAME = f"rebuild_{OUT_TABLE}"
+REBUILD_LOCK_TIMEOUT = 30  # секунд ожидания лока перед тем как пропустить цикл
 
 SHIFT_MIN = int(os.getenv("SHIFT_MIN", "-12"))
 SHIFT_MAX = int(os.getenv("SHIFT_MAX", "12"))
@@ -255,45 +266,84 @@ async def build_weights(engine_vlad) -> dict:
 
         rows.extend(_generate_rows(ctx))
 
-    async with engine_vlad.begin() as conn:
-        if TRUNCATE_OUT:
-            # DELETE FROM вместо TRUNCATE TABLE — TRUNCATE = DDL = implicit commit,
-            # что нарушает атомарность транзакции (INSERT может попасть в auto-commit).
-            await conn.execute(text(f"DELETE FROM `{OUT_TABLE}`"))
+    # ── Сериализация rebuild через MySQL advisory lock ───────────────────────
+    # brain_calendar_weights — общая таблица для s42/s44/s49. Если их
+    # rebuild_interval совпадают по времени (например, после рестарта всех
+    # сервисов), DELETE FROM от одного блокируется строковыми/gap-локами
+    # открытой транзакции другого на ~10000 строк INSERT → 1205 Lock wait
+    # timeout exceeded (50с по умолчанию в InnoDB).
+    #
+    # GET_LOCK/RELEASE_LOCK — сессионный advisory lock: захватываем на той же
+    # connection, на которой потом делаем DELETE+INSERT, и держим ровно на
+    # время транзакции. Если другой сервис уже перестраивает таблицу —
+    # ждём до REBUILD_LOCK_TIMEOUT, и если не получили лок — пропускаем
+    # цикл (не зависаем до 1205); фреймворк повторит на следующем интервале.
+    async with engine_vlad.connect() as conn:
+        got_lock = (await conn.execute(
+            text("SELECT GET_LOCK(:name, :timeout)"),
+            {"name": REBUILD_LOCK_NAME, "timeout": REBUILD_LOCK_TIMEOUT},
+        )).scalar()
 
-        if rows:
-            await conn.execute(text(f"""
-                INSERT INTO `{OUT_TABLE}` (
-                    weight_code,
-                    event_id,
-                    currency_code,
-                    importance,
-                    forecast_dir,
-                    surprise_dir,
-                    revision_dir,
-                    mode_val,
-                    hour_shift,
-                    occurrence_count
-                )
-                VALUES (
-                    :weight_code,
-                    :event_id,
-                    :currency_code,
-                    :importance,
-                    :forecast_dir,
-                    :surprise_dir,
-                    :revision_dir,
-                    :mode_val,
-                    :hour_shift,
-                    :occurrence_count
-                )
-                ON DUPLICATE KEY UPDATE
-                    occurrence_count = VALUES(occurrence_count)
-            """), rows)
+        if not got_lock:
+            log.warning(
+                f"[{OUT_TABLE}] build_weights: пропуск цикла — лок "
+                f"'{REBUILD_LOCK_NAME}' занят другим сервисом "
+                f"(>{REBUILD_LOCK_TIMEOUT}с ожидания)"
+            )
+            return {
+                "table": OUT_TABLE,
+                "ctx_table": CTX_TABLE,
+                "skipped": True,
+                "reason": "rebuild_lock_busy",
+                "contexts": len(ctx_rows),
+                "weights": len(rows),
+            }
+
+        try:
+            async with conn.begin():
+                if TRUNCATE_OUT:
+                    # DELETE FROM вместо TRUNCATE TABLE — TRUNCATE = DDL = implicit commit,
+                    # что нарушает атомарность транзакции (INSERT может попасть в auto-commit).
+                    await conn.execute(text(f"DELETE FROM `{OUT_TABLE}`"))
+
+                if rows:
+                    await conn.execute(text(f"""
+                        INSERT INTO `{OUT_TABLE}` (
+                            weight_code,
+                            event_id,
+                            currency_code,
+                            importance,
+                            forecast_dir,
+                            surprise_dir,
+                            revision_dir,
+                            mode_val,
+                            hour_shift,
+                            occurrence_count
+                        )
+                        VALUES (
+                            :weight_code,
+                            :event_id,
+                            :currency_code,
+                            :importance,
+                            :forecast_dir,
+                            :surprise_dir,
+                            :revision_dir,
+                            :mode_val,
+                            :hour_shift,
+                            :occurrence_count
+                        )
+                        ON DUPLICATE KEY UPDATE
+                            occurrence_count = VALUES(occurrence_count)
+                    """), rows)
+        finally:
+            await conn.execute(
+                text("SELECT RELEASE_LOCK(:name)"), {"name": REBUILD_LOCK_NAME}
+            )
 
     return {
         "table": OUT_TABLE,
         "ctx_table": CTX_TABLE,
+        "skipped": False,
         "contexts": len(ctx_rows),
         "recurring": recurring,
         "non_recurring": non_recurring,
