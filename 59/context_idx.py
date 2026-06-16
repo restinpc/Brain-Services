@@ -28,6 +28,7 @@ context_idx.py — brain-extremum-graph v2 (сервис 59)
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import os
@@ -69,48 +70,65 @@ BATCH_SIZE      = 500
 # ── DDL ───────────────────────────────────────────────────────────────────────
 
 async def _create_tables(engine) -> None:
-    async with engine.begin() as conn:
+    # Retry-логика для "Packet sequence number wrong" — транзиентная ошибка
+    # пула aiomysql при создании нового соединения. pool_pre_ping=False
+    # намеренно (см. common.py), поэтому retry вручную (аналогично model.py s56).
+    from sqlalchemy.exc import InternalError
+    for attempt in range(1, 4):
+        try:
+            async with engine.begin() as conn:
 
-        await conn.execute(text(f"""
-            CREATE TABLE IF NOT EXISTS `{GRAPH_TABLE}` (
-                `id`               INT     NOT NULL AUTO_INCREMENT,
-                `pair`             TINYINT NOT NULL,
-                `from_level`       INT     NOT NULL,
-                `to_level`         INT     NOT NULL,
-                `direction`        TINYINT NOT NULL COMMENT '+1=up -1=down',
-                `transition_count` INT     NOT NULL DEFAULT 1,
-                `probability`      FLOAT   NOT NULL DEFAULT 0.0,
-                `date_updated`     DATETIME NULL,
-                PRIMARY KEY (`id`),
-                UNIQUE KEY `uk_edge` (`pair`, `from_level`, `to_level`),
-                INDEX `idx_pair_from` (`pair`, `from_level`)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-        """))
+                await conn.execute(text(f"""
+                    CREATE TABLE IF NOT EXISTS `{GRAPH_TABLE}` (
+                        `id`               INT     NOT NULL AUTO_INCREMENT,
+                        `pair`             TINYINT NOT NULL,
+                        `from_level`       INT     NOT NULL,
+                        `to_level`         INT     NOT NULL,
+                        `direction`        TINYINT NOT NULL COMMENT '+1=up -1=down',
+                        `transition_count` INT     NOT NULL DEFAULT 1,
+                        `probability`      FLOAT   NOT NULL DEFAULT 0.0,
+                        `date_updated`     DATETIME NULL,
+                        PRIMARY KEY (`id`),
+                        UNIQUE KEY `uk_edge` (`pair`, `from_level`, `to_level`),
+                        INDEX `idx_pair_from` (`pair`, `from_level`)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """))
 
-        await conn.execute(text(f"""
-            CREATE TABLE IF NOT EXISTS `{STATS_TABLE}` (
-                `pair`             TINYINT  NOT NULL,
-                `avg_candles`      INT      NOT NULL DEFAULT 50,
-                `min_candles`      INT      NOT NULL DEFAULT 10,
-                `total_extremums`  INT      NOT NULL DEFAULT 0,
-                `sig_digits`       TINYINT  NOT NULL DEFAULT 3,
-                `date_updated`     DATETIME NULL,
-                PRIMARY KEY (`pair`)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-        """))
+                await conn.execute(text(f"""
+                    CREATE TABLE IF NOT EXISTS `{STATS_TABLE}` (
+                        `pair`             TINYINT  NOT NULL,
+                        `avg_candles`      INT      NOT NULL DEFAULT 50,
+                        `min_candles`      INT      NOT NULL DEFAULT 10,
+                        `total_extremums`  INT      NOT NULL DEFAULT 0,
+                        `sig_digits`       TINYINT  NOT NULL DEFAULT 3,
+                        `date_updated`     DATETIME NULL,
+                        PRIMARY KEY (`pair`)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """))
 
-        await conn.execute(text(f"""
-            CREATE TABLE IF NOT EXISTS `{INDEX_TABLE}` (
-                `id`               INT          NOT NULL AUTO_INCREMENT,
-                `weight_code`      VARCHAR(20)  NOT NULL DEFAULT 'output',
-                `pair`             TINYINT      NOT NULL,
-                `bull_ratio`       FLOAT        NOT NULL DEFAULT 0.5,
-                `occurrence_count` INT          NOT NULL DEFAULT 0,
-                `date_updated`     DATETIME NULL,
-                PRIMARY KEY (`id`),
-                UNIQUE KEY `uk_pair_wc` (`pair`, `weight_code`)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-        """))
+                await conn.execute(text(f"""
+                    CREATE TABLE IF NOT EXISTS `{INDEX_TABLE}` (
+                        `id`               INT          NOT NULL AUTO_INCREMENT,
+                        `weight_code`      VARCHAR(20)  NOT NULL DEFAULT 'output',
+                        `pair`             TINYINT      NOT NULL,
+                        `bull_ratio`       FLOAT        NOT NULL DEFAULT 0.5,
+                        `occurrence_count` INT          NOT NULL DEFAULT 0,
+                        `date_updated`     DATETIME NULL,
+                        PRIMARY KEY (`id`),
+                        UNIQUE KEY `uk_pair_wc` (`pair`, `weight_code`)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """))
+            break  # успех — выходим из цикла retry
+        except InternalError as e:
+            if attempt < 3:
+                log.warning(
+                    f"[{GRAPH_TABLE}] _create_tables: attempt {attempt} failed "
+                    f"(InternalError), retry in {0.3 * attempt:.1f}s: {e}"
+                )
+                await asyncio.sleep(0.3 * attempt)
+            else:
+                log.error(f"[{GRAPH_TABLE}] _create_tables: failed after {attempt} attempts: {e}")
+                raise
 
 
 async def on_startup(engine_vlad, engine_brain) -> None:
