@@ -22,6 +22,10 @@ HEADLESS = os.getenv("PLAYWRIGHT_HEADLESS", "true").lower() == "true"
 PROXY_SERVER = os.getenv("PLAYWRIGHT_PROXY_SERVER", "").strip()
 PROXY_USERNAME = os.getenv("PLAYWRIGHT_PROXY_USERNAME", "").strip()
 PROXY_PASSWORD = os.getenv("PLAYWRIGHT_PROXY_PASSWORD", "").strip()
+HTTP_PROXY_HOST = os.getenv("HTTP_PROXY_HOST", "").strip()
+HTTP_PROXY_PORT = os.getenv("HTTP_PROXY_PORT", "3128").strip()
+HTTP_PROXY_USERNAME = os.getenv("HTTP_PROXY_USERNAME", "").strip()
+HTTP_PROXY_PASSWORD = os.getenv("HTTP_PROXY_PASSWORD", "").strip()
 
 
 def send_error_trace(exc: Exception, script_name: str = "whaleAlert_clean.py"):
@@ -73,12 +77,25 @@ DATASETS = {"sasha_whale_btc_eth_transactions": {"type": "transactions", "url": 
 
 def _browser_launch_kwargs() -> dict:
     kwargs = {"headless": HEADLESS}
+    proxy = None
+
+    # Приоритет: явные PLAYWRIGHT_PROXY_* переменные.
     if PROXY_SERVER:
         proxy = {"server": PROXY_SERVER}
         if PROXY_USERNAME:
             proxy["username"] = PROXY_USERNAME
         if PROXY_PASSWORD:
             proxy["password"] = PROXY_PASSWORD
+
+    # Fallback на тот же прокси, что используется в Bybit_Tg_Bot.py.
+    elif HTTP_PROXY_HOST:
+        proxy = {"server": f"http://{HTTP_PROXY_HOST}:{HTTP_PROXY_PORT}"}
+        if HTTP_PROXY_USERNAME:
+            proxy["username"] = HTTP_PROXY_USERNAME
+        if HTTP_PROXY_PASSWORD:
+            proxy["password"] = HTTP_PROXY_PASSWORD
+
+    if proxy:
         kwargs["proxy"] = proxy
     return kwargs
 
@@ -286,7 +303,7 @@ def main():
     if args.table_name not in DATASETS:
         print(f"[ERROR] Неизвестная таблица. Доступны: {list(DATASETS.keys())}")
         sys.exit(1)
-    print("Whale Alert Parser (чистый, без дублей кода)")
+    print("Whale Alert Parser")
     print(f"   Таблица: {args.table_name}")
     print("=" * 70)
     process(args.table_name)
