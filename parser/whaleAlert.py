@@ -22,6 +22,10 @@ HEADLESS = os.getenv("PLAYWRIGHT_HEADLESS", "true").lower() == "true"
 PROXY_SERVER = os.getenv("PLAYWRIGHT_PROXY_SERVER", "").strip()
 PROXY_USERNAME = os.getenv("PLAYWRIGHT_PROXY_USERNAME", "").strip()
 PROXY_PASSWORD = os.getenv("PLAYWRIGHT_PROXY_PASSWORD", "").strip()
+HTTP_PROXY_HOST = os.getenv("HTTP_PROXY_HOST", "").strip()
+HTTP_PROXY_PORT = os.getenv("HTTP_PROXY_PORT", "3128").strip()
+HTTP_PROXY_USERNAME = os.getenv("HTTP_PROXY_USERNAME", "").strip()
+HTTP_PROXY_PASSWORD = os.getenv("HTTP_PROXY_PASSWORD", "").strip()
 
 
 def send_error_trace(exc: Exception, script_name: str = "whaleAlert_clean.py"):
@@ -73,12 +77,25 @@ DATASETS = {"sasha_whale_btc_eth_transactions": {"type": "transactions", "url": 
 
 def _browser_launch_kwargs() -> dict:
     kwargs = {"headless": HEADLESS}
+    proxy = None
+
+    # Приоритет: явные PLAYWRIGHT_PROXY_* переменные.
     if PROXY_SERVER:
         proxy = {"server": PROXY_SERVER}
         if PROXY_USERNAME:
             proxy["username"] = PROXY_USERNAME
         if PROXY_PASSWORD:
             proxy["password"] = PROXY_PASSWORD
+
+    # Fallback на тот же прокси, что используется в Bybit_Tg_Bot.py.
+    elif HTTP_PROXY_HOST:
+        proxy = {"server": f"http://{HTTP_PROXY_HOST}:{HTTP_PROXY_PORT}"}
+        if HTTP_PROXY_USERNAME:
+            proxy["username"] = HTTP_PROXY_USERNAME
+        if HTTP_PROXY_PASSWORD:
+            proxy["password"] = HTTP_PROXY_PASSWORD
+
+    if proxy:
         kwargs["proxy"] = proxy
     return kwargs
 
@@ -175,20 +192,51 @@ def _build_tx_hash(symbol: str, amount: int, usd_value: int, from_addr: str, to_
 
 async def fetch_transactions() -> list:
     print("[INFO] Загружаем whale-alert.io через браузер...")
+    max_attempts = 3
+    body_text = ""
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(**_browser_launch_kwargs())
-        context = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/134.0.0.0 Safari/537.36"
-            )
-        )
-        page = await context.new_page()
-        await page.goto("https://whale-alert.io/", wait_until="networkidle", timeout=90000)
-        await page.wait_for_timeout(5000)
-        body_text = await page.inner_text("body")
-        await browser.close()
+        for attempt in range(1, max_attempts + 1):
+            browser = None
+            try:
+                browser = await pw.chromium.launch(**_browser_launch_kwargs())
+                context = await browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/134.0.0.0 Safari/537.36"
+                    )
+                )
+                page = await context.new_page()
+                response = await page.goto(
+                    "https://whale-alert.io/",
+                    wait_until="domcontentloaded",
+                    timeout=90000,
+                )
+                if response and response.status >= 400:
+                    raise RuntimeError(f"whale-alert.io вернул HTTP {response.status}")
+
+                await page.wait_for_selector("body", state="attached", timeout=20000)
+                await page.wait_for_timeout(4000)
+                body_text = await page.inner_text("body")
+                if len(" ".join(body_text.split())) < 300:
+                    raise RuntimeError("Пустой/слишком короткий ответ от whale-alert.io")
+
+                await browser.close()
+                break
+            except Exception:
+                if browser:
+                    try:
+                        await browser.close()
+                    except Exception:
+                        pass
+                if attempt == max_attempts:
+                    raise
+                delay_seconds = attempt * 3
+                print(
+                    f"[WARN] Попытка {attempt}/{max_attempts} неудачна, "
+                    f"повтор через {delay_seconds} сек..."
+                )
+                await asyncio.sleep(delay_seconds)
 
     normalized = " ".join(body_text.split())
     pattern = re.compile(
@@ -255,7 +303,7 @@ def main():
     if args.table_name not in DATASETS:
         print(f"[ERROR] Неизвестная таблица. Доступны: {list(DATASETS.keys())}")
         sys.exit(1)
-    print("Whale Alert Parser (чистый, без дублей кода)")
+    print("Whale Alert Parser")
     print(f"   Таблица: {args.table_name}")
     print("=" * 70)
     process(args.table_name)
