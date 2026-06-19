@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, UTC
 import requests
 import mysql.connector
 from dotenv import load_dotenv
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 load_dotenv()
 
@@ -26,6 +26,7 @@ HTTP_PROXY_HOST = os.getenv("HTTP_PROXY_HOST", "").strip()
 HTTP_PROXY_PORT = os.getenv("HTTP_PROXY_PORT", "3128").strip()
 HTTP_PROXY_USERNAME = os.getenv("HTTP_PROXY_USERNAME", "").strip()
 HTTP_PROXY_PASSWORD = os.getenv("HTTP_PROXY_PASSWORD", "").strip()
+NAV_TIMEOUT_MS = int(os.getenv("PLAYWRIGHT_NAV_TIMEOUT_MS", "150000"))
 
 
 def send_error_trace(exc: Exception, script_name: str = "whaleAlert_clean.py"):
@@ -98,6 +99,30 @@ def _browser_launch_kwargs() -> dict:
     if proxy:
         kwargs["proxy"] = proxy
     return kwargs
+
+
+async def _goto_with_fallback(page, url: str):
+    """Пробуем несколько стратегий ожидания, чтобы переживать медленный прокси/сеть."""
+    strategies = ("domcontentloaded", "commit", "load")
+    last_exc = None
+
+    for wait_until in strategies:
+        try:
+            print(
+                f"[INFO] Переход на {url} (wait_until={wait_until}, timeout={NAV_TIMEOUT_MS}ms)"
+            )
+            return await page.goto(url, wait_until=wait_until, timeout=NAV_TIMEOUT_MS)
+        except PlaywrightTimeoutError as exc:
+            last_exc = exc
+            print(
+                f"[WARN] Таймаут навигации при wait_until={wait_until}. "
+                "Пробую следующий режим..."
+            )
+
+    raise RuntimeError(
+        f"Не удалось открыть {url}: таймаут после {len(strategies)} попыток "
+        f"(по {NAV_TIMEOUT_MS}ms)."
+    ) from last_exc
 
 
 def ensure_table(table_name: str):
@@ -207,11 +232,7 @@ async def fetch_transactions() -> list:
                     )
                 )
                 page = await context.new_page()
-                response = await page.goto(
-                    "https://whale-alert.io/",
-                    wait_until="domcontentloaded",
-                    timeout=90000,
-                )
+                response = await _goto_with_fallback(page, "https://whale-alert.io/")
                 if response and response.status >= 400:
                     raise RuntimeError(f"whale-alert.io вернул HTTP {response.status}")
 
@@ -303,7 +324,7 @@ def main():
     if args.table_name not in DATASETS:
         print(f"[ERROR] Неизвестная таблица. Доступны: {list(DATASETS.keys())}")
         sys.exit(1)
-    print("Whale Alert Parser")
+    print("Whale Alert Parser (чистый, без дублей кода)")
     print(f"   Таблица: {args.table_name}")
     print("=" * 70)
     process(args.table_name)
