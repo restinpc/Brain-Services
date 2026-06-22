@@ -5,7 +5,6 @@ import argparse
 import asyncio
 import traceback
 import hashlib
-import tempfile
 from datetime import datetime, timedelta, UTC
 
 import requests
@@ -29,6 +28,7 @@ HTTP_PROXY_USERNAME = os.getenv("HTTP_PROXY_USERNAME", "").strip()
 HTTP_PROXY_PASSWORD = os.getenv("HTTP_PROXY_PASSWORD", "").strip()
 NAV_TIMEOUT_MS = int(os.getenv("PLAYWRIGHT_NAV_TIMEOUT_MS", "150000"))
 PLAYWRIGHT_TMP_DIR = os.getenv("PLAYWRIGHT_TMP_DIR", "").strip()
+PLAYWRIGHT_TMP_EFFECTIVE_DIR = ""
 
 
 def _prepare_playwright_tmp_dir() -> str:
@@ -40,14 +40,11 @@ def _prepare_playwright_tmp_dir() -> str:
     if PLAYWRIGHT_TMP_DIR:
         tmp_dir = PLAYWRIGHT_TMP_DIR
     else:
-        # Если системный temp указывает на несуществующий путь (например, /tmp),
-        # используем локальную папку в профиле пользователя.
-        system_tmp = tempfile.gettempdir()
-        if os.path.isdir(system_tmp):
-            tmp_dir = system_tmp
-        else:
-            tmp_dir = os.path.join(os.path.expanduser("~"), ".cache", "playwright-temp")
+        # Стабильный fallback: temp-папка внутри проекта.
+        # Это исключает зависимость от /tmp в окружениях, где его нет.
+        tmp_dir = os.path.join(os.getcwd(), ".playwright-temp")
 
+    tmp_dir = os.path.abspath(tmp_dir)
     os.makedirs(tmp_dir, exist_ok=True)
 
     # Синхронизируем переменные окружения, которые использует Playwright/Node.
@@ -126,6 +123,15 @@ def _browser_launch_kwargs() -> dict:
 
     if proxy:
         kwargs["proxy"] = proxy
+
+    # Явно пробрасываем temp-путь в процесс браузера.
+    if PLAYWRIGHT_TMP_EFFECTIVE_DIR:
+        kwargs["env"] = {
+            **os.environ,
+            "TMPDIR": PLAYWRIGHT_TMP_EFFECTIVE_DIR,
+            "TEMP": PLAYWRIGHT_TMP_EFFECTIVE_DIR,
+            "TMP": PLAYWRIGHT_TMP_EFFECTIVE_DIR,
+        }
     return kwargs
 
 
@@ -244,7 +250,9 @@ def _build_tx_hash(symbol: str, amount: int, usd_value: int, from_addr: str, to_
 
 
 async def fetch_transactions() -> list:
-    tmp_dir = _prepare_playwright_tmp_dir()
+    global PLAYWRIGHT_TMP_EFFECTIVE_DIR
+    PLAYWRIGHT_TMP_EFFECTIVE_DIR = _prepare_playwright_tmp_dir()
+    tmp_dir = PLAYWRIGHT_TMP_EFFECTIVE_DIR
     print(f"[INFO] Playwright temp dir: {tmp_dir}")
     print("[INFO] Загружаем whale-alert.io через браузер...")
     max_attempts = 3
