@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import traceback
 import hashlib
+import tempfile
 from datetime import datetime, timedelta, UTC
 
 import requests
@@ -31,21 +32,55 @@ PLAYWRIGHT_TMP_DIR = os.getenv("PLAYWRIGHT_TMP_DIR", "").strip()
 PLAYWRIGHT_TMP_EFFECTIVE_DIR = ""
 
 
+def _is_dir_writable(path: str) -> bool:
+    try:
+        os.makedirs(path, exist_ok=True)
+        with tempfile.NamedTemporaryFile(prefix="wa_tmp_", dir=path, delete=True):
+            pass
+        return True
+    except Exception:
+        return False
+
+
 def _prepare_playwright_tmp_dir() -> str:
     """
     Гарантирует существование рабочей temp-папки для Playwright.
     Это защищает от ошибок вида mkdtemp '/tmp/playwright-artifacts-*' на Windows.
     """
-    # Приоритет: явно заданный путь.
-    if PLAYWRIGHT_TMP_DIR:
-        tmp_dir = PLAYWRIGHT_TMP_DIR
-    else:
-        # Стабильный fallback: temp-папка внутри проекта.
-        # Это исключает зависимость от /tmp в окружениях, где его нет.
-        tmp_dir = os.path.join(os.getcwd(), ".playwright-temp")
+    candidates = []
 
-    tmp_dir = os.path.abspath(tmp_dir)
-    os.makedirs(tmp_dir, exist_ok=True)
+    # 1) Явно заданный путь в env.
+    if PLAYWRIGHT_TMP_DIR:
+        candidates.append(PLAYWRIGHT_TMP_DIR)
+
+    # 2) Текущие temp-пути окружения (если заданы).
+    for env_var in ("TMPDIR", "TEMP", "TMP"):
+        value = os.getenv(env_var, "").strip()
+        if value:
+            candidates.append(value)
+
+    # 3) Папки в профиле пользователя и в проекте.
+    home = os.path.expanduser("~")
+    candidates.extend(
+        [
+            os.path.join(home, ".cache", "playwright-temp"),
+            os.path.join(home, "playwright-temp"),
+            os.path.join(os.getcwd(), ".playwright-temp"),
+        ]
+    )
+
+    checked = []
+    for candidate in candidates:
+        abs_path = os.path.abspath(candidate)
+        checked.append(abs_path)
+        if _is_dir_writable(abs_path):
+            tmp_dir = abs_path
+            break
+    else:
+        raise RuntimeError(
+            "Не удалось подобрать writable temp-директорию для Playwright. "
+            f"Проверены пути: {checked}"
+        )
 
     # Синхронизируем переменные окружения, которые использует Playwright/Node.
     os.environ["TMPDIR"] = tmp_dir
