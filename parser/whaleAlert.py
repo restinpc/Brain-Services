@@ -33,7 +33,7 @@ PLAYWRIGHT_BROWSERS_PATH = os.getenv("PLAYWRIGHT_BROWSERS_PATH", "").strip()
 PLAYWRIGHT_TMP_EFFECTIVE_DIR = ""
 PLAYWRIGHT_BROWSERS_EFFECTIVE_DIR = ""
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-RUNTIME_DIR = os.path.join(SCRIPT_DIR, "runtime")
+RUNTIME_DIR = os.path.join(SCRIPT_DIR, "ForWhaleAlert")
 DEFAULT_TMP_DIR = os.path.join(RUNTIME_DIR, "playwright-temp")
 DEFAULT_BROWSERS_DIR = os.path.join(RUNTIME_DIR, "ms-playwright")
 
