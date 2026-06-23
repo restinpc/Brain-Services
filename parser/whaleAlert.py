@@ -29,7 +29,13 @@ HTTP_PROXY_USERNAME = os.getenv("HTTP_PROXY_USERNAME", "").strip()
 HTTP_PROXY_PASSWORD = os.getenv("HTTP_PROXY_PASSWORD", "").strip()
 NAV_TIMEOUT_MS = int(os.getenv("PLAYWRIGHT_NAV_TIMEOUT_MS", "150000"))
 PLAYWRIGHT_TMP_DIR = os.getenv("PLAYWRIGHT_TMP_DIR", "").strip()
+PLAYWRIGHT_BROWSERS_PATH = os.getenv("PLAYWRIGHT_BROWSERS_PATH", "").strip()
 PLAYWRIGHT_TMP_EFFECTIVE_DIR = ""
+PLAYWRIGHT_BROWSERS_EFFECTIVE_DIR = ""
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+RUNTIME_DIR = os.path.join(SCRIPT_DIR, "runtime")
+DEFAULT_TMP_DIR = os.path.join(RUNTIME_DIR, "playwright-temp")
+DEFAULT_BROWSERS_DIR = os.path.join(RUNTIME_DIR, "ms-playwright")
 
 
 def _is_dir_writable(path: str) -> bool:
@@ -42,12 +48,33 @@ def _is_dir_writable(path: str) -> bool:
         return False
 
 
+def _prepare_runtime_dirs() -> tuple[str, str]:
+    """
+    Создаёт все рабочие директории парсера рядом со скриптом и
+    возвращает (tmp_dir, browsers_dir).
+    """
+    os.makedirs(RUNTIME_DIR, exist_ok=True)
+
+    tmp_dir = os.path.abspath(PLAYWRIGHT_TMP_DIR or DEFAULT_TMP_DIR)
+    browsers_dir = os.path.abspath(PLAYWRIGHT_BROWSERS_PATH or DEFAULT_BROWSERS_DIR)
+
+    os.makedirs(tmp_dir, exist_ok=True)
+    os.makedirs(browsers_dir, exist_ok=True)
+
+    if not _is_dir_writable(tmp_dir):
+        raise RuntimeError(f"TMP директория недоступна для записи: {tmp_dir}")
+    if not _is_dir_writable(browsers_dir):
+        raise RuntimeError(f"Директория браузеров недоступна для записи: {browsers_dir}")
+
+    return tmp_dir, browsers_dir
+
+
 def _prepare_playwright_tmp_dir() -> str:
     """
     Гарантирует существование рабочей temp-папки для Playwright.
     Это защищает от ошибок вида mkdtemp '/tmp/playwright-artifacts-*' на Windows.
     """
-    candidates = []
+    candidates = [DEFAULT_TMP_DIR]
 
     # 1) Явно заданный путь в env.
     if PLAYWRIGHT_TMP_DIR:
@@ -285,10 +312,25 @@ def _build_tx_hash(symbol: str, amount: int, usd_value: int, from_addr: str, to_
 
 
 async def fetch_transactions() -> list:
-    global PLAYWRIGHT_TMP_EFFECTIVE_DIR
-    PLAYWRIGHT_TMP_EFFECTIVE_DIR = _prepare_playwright_tmp_dir()
+    global PLAYWRIGHT_TMP_EFFECTIVE_DIR, PLAYWRIGHT_BROWSERS_EFFECTIVE_DIR
+
+    prepared_tmp_dir, prepared_browsers_dir = _prepare_runtime_dirs()
+    PLAYWRIGHT_BROWSERS_EFFECTIVE_DIR = prepared_browsers_dir
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = PLAYWRIGHT_BROWSERS_EFFECTIVE_DIR
+
+    # Если в env уже задан PLAYWRIGHT_TMP_DIR и он валиден, используется он.
+    # Иначе fallback тоже будет сначала на директорию рядом со скриптом.
+    if PLAYWRIGHT_TMP_DIR:
+        PLAYWRIGHT_TMP_EFFECTIVE_DIR = prepared_tmp_dir
+        os.environ["TMPDIR"] = PLAYWRIGHT_TMP_EFFECTIVE_DIR
+        os.environ["TEMP"] = PLAYWRIGHT_TMP_EFFECTIVE_DIR
+        os.environ["TMP"] = PLAYWRIGHT_TMP_EFFECTIVE_DIR
+    else:
+        PLAYWRIGHT_TMP_EFFECTIVE_DIR = _prepare_playwright_tmp_dir()
+
     tmp_dir = PLAYWRIGHT_TMP_EFFECTIVE_DIR
     print(f"[INFO] Playwright temp dir: {tmp_dir}")
+    print(f"[INFO] Playwright browsers dir: {PLAYWRIGHT_BROWSERS_EFFECTIVE_DIR}")
     print("[INFO] Загружаем whale-alert.io через браузер...")
     max_attempts = 3
     body_text = ""
