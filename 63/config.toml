@@ -1,10 +1,10 @@
-# Service configuration for sasha_fred_vixcls model.
+# Service configuration for sasha_imf_international_reserves model.
 
 [service]
 id = 63
 port = 8925
-name = "brain-sasha_fred_vixcls-s63"
-text = "VIX context model"
+name = "brain-sasha_imf_international_reserves-s63"
+text = "IMF international reserves context model"
 
 [rates]
 table = "brain_rates_eur_usd"
@@ -17,8 +17,8 @@ shift_window = 30
 rebuild_interval = 7200
 
 [dataset]
-parser_table = "sasha_fred_vixcls"
-enriched_table = "sasha_fred_vixcls_enriched"
+parser_table = "sasha_imf_international_reserves"
+enriched_table = "sasha_imf_international_reserves_enriched"
 index_fields = ["event_type"]
 date_field = "date_dt"
 engine = "vlad"

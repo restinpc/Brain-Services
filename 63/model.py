@@ -1,5 +1,5 @@
 """
-model.py — sasha_fred_vixcls (CBOE Volatility Index: VIX)
+model.py — sasha_imf_international_reserves (IMF International Reserves)
 """
 from __future__ import annotations
 
@@ -59,7 +59,7 @@ async def enrich_dataset(engine_vlad, engine_brain) -> dict:
                 `date_dt`    DATETIME    NOT NULL,
                 `value`      DOUBLE      NOT NULL,
                 `pct_change` DOUBLE      NOT NULL DEFAULT 0.0,
-                `event_type` VARCHAR(32) NOT NULL,
+                `event_type` VARCHAR(40) NOT NULL,
                 PRIMARY KEY (`id`),
                 INDEX `idx_date_dt` (`date_dt`),
                 INDEX `idx_event_type` (`event_type`)
@@ -120,14 +120,14 @@ def _build_thresholds(pcts: list[float]) -> dict:
 
 def _classify(pct: float, thresholds: dict) -> str:
     if pct >= float(thresholds["spike_up"]):
-        return "vix_spike_up"
+        return "reserves_spike_up"
     if pct >= float(thresholds["up"]):
-        return "vix_up"
+        return "reserves_up"
     if pct <= float(thresholds["spike_down"]):
-        return "vix_spike_down"
+        return "reserves_spike_down"
     if pct <= float(thresholds["down"]):
-        return "vix_down"
-    return "vix_flat"
+        return "reserves_down"
+    return "reserves_flat"
 
 
 def _apply_var(signed_t1: float, pct: float, var: int, ctx_info: dict) -> float:
