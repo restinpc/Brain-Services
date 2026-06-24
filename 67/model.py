@@ -1,5 +1,5 @@
 """
-model.py — vlad_treasury_nominal_yield (US Treasury curve regime model)
+model.py - vlad_treasury_real_yield (US Treasury real curve regime model)
 """
 from __future__ import annotations
 
@@ -81,20 +81,20 @@ def _classify(row: dict, thresholds: dict) -> str:
     curvature = float(row["curvature"])
 
     if inversion_gap >= 1.0 and value >= float(thresholds["shock"]):
-        return "curve_inversion_shock"
+        return "real_curve_inversion_shock"
     if inversion_gap >= 0.25 and value >= float(thresholds["stress"]):
-        return "curve_inversion_stress"
+        return "real_curve_inversion_stress"
     if value >= float(thresholds["stress"]) and pct >= float(thresholds["accel_up"]):
-        return "curve_stress_accel"
+        return "real_curve_stress_accel"
     if value >= float(thresholds["stress"]) and pct <= -float(thresholds["accel_down"]):
-        return "curve_stress_relief"
+        return "real_curve_stress_relief"
     if value >= float(thresholds["regime"]) and slope_10y_2y > 0.25:
-        return "curve_steepening"
+        return "real_curve_steepening"
     if value >= float(thresholds["regime"]) and slope_10y_2y < -0.25:
-        return "curve_flattening"
+        return "real_curve_flattening"
     if abs(curvature) >= 0.50:
-        return "curve_belly_shift"
-    return "curve_neutral"
+        return "real_curve_belly_shift"
+    return "real_curve_neutral"
 
 
 async def enrich_dataset(engine_vlad, engine_brain) -> dict:
@@ -172,7 +172,7 @@ async def enrich_dataset(engine_vlad, engine_brain) -> dict:
         inversion_gap = max(short_rate - long_rate, 0.0)
         curvature = long_rate - (2.0 * mid_rate) + short_rate
 
-        # Composite curve-tension score in yield points.
+        # Composite real curve-tension score in yield points.
         value = abs(slope_10y_2y) + (abs(curvature) * 0.5) + (inversion_gap * 1.2)
 
         if prev_value is None:
