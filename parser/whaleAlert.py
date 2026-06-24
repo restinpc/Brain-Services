@@ -6,6 +6,7 @@ import asyncio
 import traceback
 import hashlib
 import tempfile
+import subprocess
 from datetime import datetime, timedelta, UTC
 
 import requests
@@ -197,6 +198,36 @@ def _browser_launch_kwargs() -> dict:
     return kwargs
 
 
+def _is_missing_browser_error(exc: Exception) -> bool:
+    msg = str(exc)
+    return "BrowserType.launch: Executable doesn't exist" in msg
+
+
+def _install_playwright_chromium() -> None:
+    env = os.environ.copy()
+    if PLAYWRIGHT_BROWSERS_EFFECTIVE_DIR:
+        env["PLAYWRIGHT_BROWSERS_PATH"] = PLAYWRIGHT_BROWSERS_EFFECTIVE_DIR
+    if PLAYWRIGHT_TMP_EFFECTIVE_DIR:
+        env["TMPDIR"] = PLAYWRIGHT_TMP_EFFECTIVE_DIR
+        env["TEMP"] = PLAYWRIGHT_TMP_EFFECTIVE_DIR
+        env["TMP"] = PLAYWRIGHT_TMP_EFFECTIVE_DIR
+
+    print("[WARN] Браузер Playwright не найден. Пытаюсь установить chromium...")
+    result = subprocess.run(
+        [sys.executable, "-m", "playwright", "install", "chromium"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            "Автоустановка Playwright Chromium завершилась с ошибкой.\n"
+            f"STDOUT:\n{result.stdout}\n\nSTDERR:\n{result.stderr}"
+        )
+    print("[OK] Playwright Chromium установлен.")
+
+
 async def _goto_with_fallback(page, url: str):
     """Пробуем несколько стратегий ожидания, чтобы переживать медленный прокси/сеть."""
     strategies = ("domcontentloaded", "commit", "load")
@@ -333,12 +364,21 @@ async def fetch_transactions() -> list:
     print(f"[INFO] Playwright browsers dir: {PLAYWRIGHT_BROWSERS_EFFECTIVE_DIR}")
     print("[INFO] Загружаем whale-alert.io через браузер...")
     max_attempts = 3
+    browser_install_attempted = False
     body_text = ""
     async with async_playwright() as pw:
         for attempt in range(1, max_attempts + 1):
             browser = None
             try:
-                browser = await pw.chromium.launch(**_browser_launch_kwargs())
+                try:
+                    browser = await pw.chromium.launch(**_browser_launch_kwargs())
+                except Exception as launch_exc:
+                    if _is_missing_browser_error(launch_exc) and not browser_install_attempted:
+                        browser_install_attempted = True
+                        _install_playwright_chromium()
+                        browser = await pw.chromium.launch(**_browser_launch_kwargs())
+                    else:
+                        raise
                 context = await browser.new_context(
                     user_agent=(
                         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
