@@ -10,7 +10,7 @@ text = "Treasury nominal yield curve context model"
 table = "brain_rates_eur_usd"
 
 [cache]
-date_from = "1990-01-02"
+date_from = "2025-01-01"
 var_range = [0, 1, 2, 3]
 types_range = [0, 1, 2]
 shift_window = 30
