@@ -10,7 +10,7 @@ text = "Stablecoin depeg stress context model"
 table = "brain_rates_eur_usd"
 
 [cache]
-date_from = "2025-03-19"
+date_from = "2025-01-01"
 var_range = [0, 1, 2, 3]
 types_range = [0, 1, 2]
 shift_window = 30
