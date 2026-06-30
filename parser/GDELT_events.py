@@ -150,13 +150,40 @@ class GDELTCollector:
         )
         return cursor.fetchone() is not None
 
+    def _drain_cursor_results(self, cursor):
+        """Считывает служебные result set'ы после OPTIMIZE/ANALYZE/ALTER.
+
+        mysql-connector не разрешает выполнить следующий запрос, пока предыдущий
+        result set не прочитан. Иначе появляется InternalError: Unread result found.
+        """
+        try:
+            if getattr(cursor, "with_rows", False):
+                cursor.fetchall()
+        except mysql.connector.Error:
+            pass
+
+        while True:
+            try:
+                has_next = cursor.nextset()
+            except (mysql.connector.Error, AttributeError):
+                break
+            if not has_next:
+                break
+            try:
+                if getattr(cursor, "with_rows", False):
+                    cursor.fetchall()
+            except mysql.connector.Error:
+                pass
+
     def _safe_execute(self, cursor, sql, label):
         try:
             print(f"    {label}...")
             cursor.execute(sql)
+            self._drain_cursor_results(cursor)
             return True
         except mysql.connector.Error as e:
             print(f"    ⚠️ {label}: {e}")
+            self._drain_cursor_results(cursor)
             return False
 
     def ensure_table(self):
