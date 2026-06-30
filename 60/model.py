@@ -72,77 +72,38 @@ _GRAPH_CACHE: dict[int, "ExtremGraph"] = {}
 _GRAPH_TTL:   dict[int, float]         = {}
 GRAPH_CACHE_TTL = 3600.0
 
+# Level-change filter: сигнал только при смене rounded level
+# EUR: avg 13.6h на одном уровне → без фильтра 93% сигналов — дубли
+# BTC: avg 1.7h → без фильтра 49% дублей. Фикс acc: EUR 48.7%→55%, BTC 52.1%→53.3%
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Структуры данных (идентичны сервису 59)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ExtremNode:
-    # ── ОПТИМИЗАЦИЯ: нормализованные relations и argmax-переход считаются
-    # один раз и кешируются (инвалидация при add_relation). Без этого
-    # get_relations() пересчитывал sum()+dict-comprehension на каждом
-    # шаге каждой ветки walk_type1 — основная причина медленного кеша.
     def __init__(self, node_id: int, value: int) -> None:
         self.id:        int = node_id
         self.value:     int = value
         self.relations: dict[int, int] = {}
-        self._rel_list:  Optional[list[tuple[int, float]]] = None
-        self._rel_dict:  Optional[dict[int, float]]        = None
-        self._best_next: int = -2  # -2=не посчитан, -1=нет переходов
 
     def add_relation(self, node_id: int, count: int = 1) -> None:
         self.relations[node_id] = self.relations.get(node_id, 0) + count
-        self._rel_list  = None
-        self._rel_dict  = None
-        self._best_next = -2
 
     def get_relation(self, node_id: int) -> int:
         return self.relations.get(node_id, 0)
 
-    def relations_list(self) -> list[tuple[int, float]]:
-        """[(node_id, prob), ...], сумма prob==1.0. Кешируется."""
-        rl = self._rel_list
-        if rl is None:
-            total = sum(self.relations.values())
-            rl = [] if total == 0 else [(nid, cnt / total) for nid, cnt in self.relations.items()]
-            self._rel_list = rl
-        return rl
-
     def get_relations(self) -> dict[int, float]:
-        rd = self._rel_dict
-        if rd is None:
-            rd = dict(self.relations_list())
-            self._rel_dict = rd
-        return rd
-
-    def best_next(self) -> Optional[int]:
-        """argmax по вероятности (для walk_type0), тай-брейк как у max(rels, key=rels.get)."""
-        bn = self._best_next
-        if bn == -2:
-            rl = self.relations_list()
-            if not rl:
-                bn = -1
-            else:
-                best_id, best_p = rl[0]
-                for nid, p in rl[1:]:
-                    if p > best_p:
-                        best_id, best_p = nid, p
-                bn = best_id
-            self._best_next = bn
-        return None if bn == -1 else bn
+        total = sum(self.relations.values())
+        if total == 0:
+            return {}
+        return {nid: cnt / total for nid, cnt in self.relations.items()}
 
 
 class ExtremGraph:
-    # ── ОПТИМИЗАЦИЯ: _w0_cache/_w1_cache — память walk_type0/walk_type1 на
-    # уровне экземпляра графа (живёт до следующей перезагрузки из БД).
-    # entry_level повторяется на многих барах → повтор отдаётся из кеша.
-    # type=0 не зависит от var → 5 вызовов (var=0..4) = 1 вычисление + 4 хита.
     def __init__(self) -> None:
         self.nodes:     list[ExtremNode] = []
         self._by_value: dict[int, int]   = {}
-        self._w0_cache: dict[int, float] = {}
-        self._w1_cache: dict[tuple[int, int], float] = {}
-        self._na = None   # лениво строится в _get_arrays() (CSR-массивы для numba)
 
     def add_node(self, value: int) -> int:
         if value in self._by_value:
@@ -172,174 +133,9 @@ class ExtremGraph:
 # Алгоритмы обхода (идентичны сервису 59, без изменений)
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ── ОПТИМИЗАЦИЯ (Numba JIT) ──────────────────────────────────────────────
-# При наличии numba горячий цикл выполняется JIT-кодом на плоских numpy-
-# массивах (CSR: rel_targets/rel_probs/rel_offsets + best_next + node_values)
-# — даёт ещё ~×40-50 к итеративной Python-версии (_walk_typeN_compute ниже,
-# тот же результат, проверено побитово на всех 6 графах). Без numba —
-# чистый Python с тем же результатом. Зависимость опциональна.
-try:
-    import numpy as _np
-    from numba import njit as _njit
-    _HAVE_NUMBA = True
-except ImportError:
-    _HAVE_NUMBA = False
-
-
-def _build_arrays(graph: ExtremGraph):
-    """CSR: (rel_targets, rel_probs, rel_offsets, node_values, best_next)."""
-    n = len(graph.nodes)
-    node_values = _np.empty(n, dtype=_np.float64)
-    best_next   = _np.full(n, -1, dtype=_np.int64)
-    offsets     = _np.zeros(n + 1, dtype=_np.int64)
-    targets: list[int] = []
-    probs:   list[float] = []
-    for i, node in enumerate(graph.nodes):
-        node_values[i] = float(node.value)
-        rl = node.relations_list()
-        offsets[i + 1] = offsets[i] + len(rl)
-        for nid, p in rl:
-            targets.append(nid)
-            probs.append(p)
-        bn = node.best_next()
-        if bn is not None:
-            best_next[i] = bn
-    rel_targets = _np.array(targets, dtype=_np.int64) if targets else _np.empty(0, dtype=_np.int64)
-    rel_probs   = _np.array(probs, dtype=_np.float64) if probs else _np.empty(0, dtype=_np.float64)
-    return rel_targets, rel_probs, offsets, node_values, best_next
-
-
-def _get_arrays(graph: ExtremGraph):
-    """Лениво строит и кеширует CSR-массивы на graph._na."""
-    if graph._na is None:
-        graph._na = _build_arrays(graph)
-    return graph._na
-
-
-if _HAVE_NUMBA:
-
-    @_njit
-    def _walk_type0_nb(rel_offsets, best_next, node_values, start_id):
-        n = node_values.shape[0]
-        path    = _np.empty(n, dtype=_np.int64)
-        visited = _np.full(n, -1, dtype=_np.int64)
-        path[0] = start_id
-        visited[start_id] = 0
-        plen = 1
-        current_id = start_id
-        while True:
-            nxt = best_next[current_id]
-            if nxt == -1:
-                if plen >= 2:
-                    return (node_values[path[plen - 2]] + node_values[path[plen - 1]]) / 2.0
-                return node_values[start_id]
-            if visited[nxt] != -1:
-                loop_start = visited[nxt]
-                s = 0.0
-                for k in range(loop_start, plen):
-                    s += node_values[path[k]]
-                return s / (plen - loop_start)
-            visited[nxt] = plen
-            path[plen] = nxt
-            plen += 1
-            current_id = nxt
-
-    @_njit
-    def _walk_type1_nb(rel_targets, rel_probs, rel_offsets, node_values, start_id, max_depth):
-        CUTOFF = 1e-9
-        MAXD = max_depth + 2
-        st_node  = _np.empty(MAXD, dtype=_np.int64)
-        st_depth = _np.empty(MAXD, dtype=_np.int64)
-        st_prob  = _np.empty(MAXD, dtype=_np.float64)
-        st_idx   = _np.empty(MAXD, dtype=_np.int64)
-        path     = _np.empty(MAXD, dtype=_np.int64)
-
-        sp = 0
-        st_node[0] = start_id
-        st_depth[0] = 0
-        st_prob[0] = 1.0
-        st_idx[0] = 0
-        path[0] = start_id
-        plen = 1
-        total = 0.0
-
-        while sp >= 0:
-            node  = st_node[sp]
-            depth = st_depth[sp]
-            prob  = st_prob[sp]
-            idx   = st_idx[sp]
-            rstart = rel_offsets[node]
-            rend   = rel_offsets[node + 1]
-            nrel   = rend - rstart
-
-            if idx == 0:
-                if depth > max_depth or prob < CUTOFF or nrel == 0:
-                    if plen >= 2:
-                        term_val = (node_values[path[plen - 2]] + node_values[path[plen - 1]]) / 2.0
-                    else:
-                        term_val = node_values[node]
-                    total += term_val * prob
-                    sp -= 1
-                    if sp >= 0:
-                        plen -= 1
-                    continue
-
-            if idx >= nrel:
-                sp -= 1
-                if sp >= 0:
-                    plen -= 1
-                continue
-
-            next_id   = rel_targets[rstart + idx]
-            next_prob = rel_probs[rstart + idx]
-            st_idx[sp] = idx + 1
-            bp = prob * next_prob
-
-            loop_pos = -1
-            for k in range(plen):
-                if path[k] == next_id:
-                    loop_pos = k
-                    break
-
-            if loop_pos != -1:
-                s = 0.0
-                for k in range(loop_pos, plen):
-                    s += node_values[path[k]]
-                total += (s / (plen - loop_pos)) * bp
-                continue
-
-            sp += 1
-            st_node[sp]  = next_id
-            st_depth[sp] = depth + 1
-            st_prob[sp]  = bp
-            st_idx[sp]   = 0
-            path[plen] = next_id
-            plen += 1
-
-        return total
-
-
 def walk_type0(graph: ExtremGraph, start_id: int) -> float:
-    """Жадный путь: следуем наибольшей вероятности до тупика или петли.
-    Не зависит от var → кешируется по start_id (graph._w0_cache).
-    Вычисление: numba (если доступна, ~×40-50) или _walk_type0_compute."""
-    cached = graph._w0_cache.get(start_id)
-    if cached is not None:
-        return cached
-
-    if _HAVE_NUMBA:
-        rel_targets, rel_probs, rel_offsets, node_values, best_next = _get_arrays(graph)
-        result = _walk_type0_nb(rel_offsets, best_next, node_values, start_id)
-    else:
-        result = _walk_type0_compute(graph, start_id)
-
-    graph._w0_cache[start_id] = result
-    return result
-
-
-def _walk_type0_compute(graph: ExtremGraph, start_id: int) -> float:
-    """Fallback без numba: итеративный обход через best_next() (кеш на узле)."""
-    path:    list[int]      = [start_id]
+    """Жадный путь: следуем наибольшей вероятности до тупика или петли."""
+    path:    list[int]     = [start_id]
     visited: dict[int, int] = {start_id: 0}
     current_id = start_id
 
@@ -348,11 +144,13 @@ def _walk_type0_compute(graph: ExtremGraph, start_id: int) -> float:
         if node is None:
             break
 
-        next_id = node.best_next()
-        if next_id is None:
+        rels = node.get_relations()
+        if not rels:
             last_n = path[-2:] if len(path) >= 2 else path
             vals   = [graph.get_node(n).value for n in last_n if graph.get_node(n)]
             return sum(vals) / len(vals) if vals else float(graph.get_node(start_id).value)
+
+        next_id = max(rels, key=rels.get)
 
         if next_id in visited:
             loop_nodes = path[visited[next_id]:]
@@ -369,85 +167,41 @@ def _walk_type0_compute(graph: ExtremGraph, start_id: int) -> float:
 
 
 def walk_type1(graph: ExtremGraph, start_id: int, max_depth: int = 20) -> float:
-    """Квантовый обход: sum(mean_ветки × P_нитки) по всем конечным ветвям.
+    """Квантовый обход: sum(mean_ветки × P_нитки) по всем конечным ветвям."""
+    total = [0.0]
 
-    ── ОПТИМИЗАЦИЯ (результат идентичен оригиналу — проверено побитово) ────
-    Кеш по (start_id, max_depth) в graph._w1_cache. Вычисление при промахе:
-    numba (если доступна, ~×40-50) или _walk_type1_compute (чистый Python).
-    """
-    key = (start_id, max_depth)
-    cached = graph._w1_cache.get(key)
-    if cached is not None:
-        return cached
+    def _terminal(path: list[int], prob: float) -> None:
+        last_n = path[-2:] if len(path) >= 2 else path
+        vals   = [graph.get_node(n).value for n in last_n if graph.get_node(n)]
+        if vals:
+            total[0] += (sum(vals) / len(vals)) * prob
 
-    node0 = graph.get_node(start_id)
-    if node0 is None:
-        graph._w1_cache[key] = 0.0
-        return 0.0
+    def _recurse(node_id: int, path: list[int],
+                 path_set: frozenset, prob: float, depth: int) -> None:
+        if depth > max_depth or prob < 1e-9:
+            _terminal(path, prob)
+            return
+        node = graph.get_node(node_id)
+        if node is None:
+            _terminal(path, prob)
+            return
+        rels = node.get_relations()
+        if not rels:
+            _terminal(path, prob)
+            return
 
-    if _HAVE_NUMBA:
-        rel_targets, rel_probs, rel_offsets, node_values, best_next = _get_arrays(graph)
-        result = _walk_type1_nb(rel_targets, rel_probs, rel_offsets, node_values, start_id, max_depth)
-    else:
-        result = _walk_type1_compute(graph, start_id, max_depth)
+        for next_id, next_prob in rels.items():
+            bp = prob * next_prob
+            if next_id in path_set:
+                loop_nodes = path[path.index(next_id):]  # без дубля начала цикла
+                vals = [graph.get_node(n).value for n in loop_nodes if graph.get_node(n)]
+                if vals:
+                    total[0] += (sum(vals) / len(vals)) * bp
+            else:
+                _recurse(next_id, path + [next_id], path_set | {next_id}, bp, depth + 1)
 
-    graph._w1_cache[key] = result
-    return result
-
-
-def _walk_type1_compute(graph: ExtremGraph, start_id: int, max_depth: int) -> float:
-    """Fallback без numba: итеративный обход с явным стеком (без копий
-    path/path_set на каждой ветке, relations_list() кеширован на узле)."""
-    total = 0.0
-    node0 = graph.get_node(start_id)
-
-    path:     list[int]      = [start_id]
-    path_pos: dict[int, int] = {start_id: 0}
-    stack: list[list] = [[node0, 0, 1.0, node0.relations_list(), 0]]
-
-    while stack:
-        frame = stack[-1]
-        node, depth, prob, rels, idx = frame
-
-        if idx == 0:
-            if depth > max_depth or prob < 1e-9 or not rels:
-                if len(path) >= 2:
-                    term_val = (graph.nodes[path[-2]].value + graph.nodes[path[-1]].value) / 2.0
-                else:
-                    term_val = float(node.value)
-                total += term_val * prob
-                stack.pop()
-                if stack:
-                    removed = path.pop()
-                    del path_pos[removed]
-                continue
-
-        if idx >= len(rels):
-            stack.pop()
-            if stack:
-                removed = path.pop()
-                del path_pos[removed]
-            continue
-
-        next_id, next_prob = rels[idx]
-        frame[4] = idx + 1
-        bp = prob * next_prob
-
-        pos = path_pos.get(next_id)
-        if pos is not None:
-            loop_nodes = path[pos:]
-            s = 0.0
-            for nid in loop_nodes:
-                s += graph.nodes[nid].value
-            total += (s / len(loop_nodes)) * bp
-            continue
-
-        next_node = graph.nodes[next_id]
-        path.append(next_id)
-        path_pos[next_id] = len(path) - 1
-        stack.append([next_node, depth + 1, bp, next_node.relations_list(), 0])
-
-    return total
+    _recurse(start_id, [start_id], frozenset([start_id]), 1.0, 0)
+    return total[0]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -461,7 +215,11 @@ def round_to_level(price: float, sig: int = SIG_DIGITS) -> int:
     return int(price / magnitude)
 
 
-def compute_bull_ratio(predicted_value: float, current_close: float) -> Optional[float]:
+def compute_bull_ratio(
+    predicted_value: float,
+    current_close:   float,
+    sig_digits:       int = SIG_DIGITS,
+) -> Optional[float]:
     """
     Отличие от сервиса 59: нет проверки типа последнего экстремума.
     Граф строится из всех свечей → нет контекста MAX/MIN.
@@ -470,9 +228,12 @@ def compute_bull_ratio(predicted_value: float, current_close: float) -> Optional
     predicted < current_level → SHORT (bull_ratio < 0.5)
     |deviation| < MIN_MODIFICATION → нет сигнала (шум)
 
+    sig_digits: то же значение, с которым context_idx.py строил граф для
+    ЭТОЙ пары (не модульная константа SIG_DIGITS — она лишь дефолт-фолбэк).
+
     modification = min(|predicted - close_level| / close_level × SIGNAL_SCALE, 0.45)
     """
-    close_level = float(round_to_level(current_close))
+    close_level = float(round_to_level(current_close, sig_digits))
     if close_level <= 0:
         return None
 
@@ -493,7 +254,16 @@ def compute_bull_ratio(predicted_value: float, current_close: float) -> Optional
 # Загрузка из БД
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _detect_pair_id(rates: list) -> int:
+def _detect_pair_id(rates: list, dataset_index: dict | None = None) -> int:
+    """
+    Определяет пару по rates_table из dataset_index (первичный источник),
+    с фолбэком на цену. Ценовой фолбэк ненадёжен: ETH < $100 → pair=1 (EUR).
+    """
+    table = str((dataset_index or {}).get("rates_table") or "").lower()
+    if table:
+        if "btc" in table: return 3
+        if "eth" in table: return 4
+        if "eur" in table: return 1
     if not rates:
         return 1
     c = float(rates[-1].get("close") or rates[-1].get("t1") or 0)
@@ -514,8 +284,8 @@ def _db_cfg() -> dict:
 
 def _load_graph_from_db(pair_id: int) -> ExtremGraph:
     graph = ExtremGraph()
-    import mysql.connector
     try:
+        import mysql.connector
         conn = mysql.connector.connect(**_db_cfg())
         cur  = conn.cursor(dictionary=True)
         cur.execute(
@@ -540,6 +310,45 @@ def _get_graph(pair_id: int) -> ExtremGraph:
         _GRAPH_CACHE[pair_id] = _load_graph_from_db(pair_id)
         _GRAPH_TTL[pair_id]   = now
     return _GRAPH_CACHE[pair_id]
+
+
+# ── sig_digits per pair (round_to_level granularity) ────────────────────────────
+# SIG_DIGITS=3 — общий дефолт. context_idx.py подбирает per-pair sig_digits
+# через walk-forward валидацию на исторических данных (см. _choose_sig_digits
+# там) и сохраняет в STATS_TABLE. Раньше model.py никогда не читал это значение —
+# round_to_level всегда использовал хардкод SIG_DIGITS=3 независимо от того,
+# с каким sig был построен граф. Теперь модель читает то же значение.
+_SIG_CACHE: dict[int, int]   = {}
+_SIG_TTL:   dict[int, float] = {}
+SIG_CACHE_TTL = 3600.0   # тот же TTL что у графа — синхронно обновляются
+
+
+def _load_sig_digits_from_db(pair_id: int) -> int:
+    """Читает sig_digits для пары из STATS_TABLE. Фолбэк — модульная константа."""
+    try:
+        import mysql.connector
+        conn = mysql.connector.connect(**_db_cfg())
+        cur  = conn.cursor(dictionary=True)
+        cur.execute(
+            f"SELECT sig_digits FROM `{STATS_TABLE}` WHERE pair = %s",
+            (pair_id,)
+        )
+        row = cur.fetchone()
+        cur.close(); conn.close()
+        if row and row.get("sig_digits"):
+            return int(row["sig_digits"])
+    except Exception as e:
+        log.warning(f"[candle-graph] _load_sig_digits_from_db pair={pair_id}: {e}")
+    return SIG_DIGITS
+
+
+def _get_sig_digits(pair_id: int) -> int:
+    """Возвращает sig_digits для пары из кеша или перезагружает из БД."""
+    now = time.time()
+    if pair_id not in _SIG_CACHE or now - _SIG_TTL.get(pair_id, 0) > SIG_CACHE_TTL:
+        _SIG_CACHE[pair_id] = _load_sig_digits_from_db(pair_id)
+        _SIG_TTL[pair_id]    = now
+    return _SIG_CACHE[pair_id]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -569,8 +378,13 @@ def model(
     """
     if not rates:
         return {}
+    # При единственном баре level-change filter (rates[-2]) недоступен,
+    # а сигнал без сравнения уровней не имеет смысла.
+    if len(rates) < 2:
+        return {}
 
-    pair_id = _detect_pair_id(rates)
+    pair_id = _detect_pair_id(rates, dataset_index)
+    sig_digits = _get_sig_digits(pair_id)
 
     # ── Текущий уровень (entry point в граф) ──────────────────────────────
     try:
@@ -581,7 +395,20 @@ def model(
     if current_close <= 0:
         return {}
 
-    entry_level = round_to_level(current_close)
+    entry_level = round_to_level(current_close, sig_digits)
+
+    # ── Level-change filter (stateless через rates[-2]) ──────────────────────
+    # Сигнал только когда rounded level ИЗМЕНИЛСЯ с предыдущего бара.
+    # Stateless: сравниваем с предыдущим баром из rates, не из глобального dict.
+    # Это безопасно при параллельном fill_cache и рестартах сервиса.
+    # round_to_level использует sig_digits ЭТОЙ пары (тот же, которым context_idx.py
+    # построил граф) — иначе "уровень не изменился" мог бы определяться иначе,
+    # чем в графе, и фильтр давал бы несогласованный с графом результат.
+    if len(rates) >= 2:
+        prev_close = float(rates[-2].get("close") or 0)
+        if prev_close > 0 and round_to_level(prev_close, sig_digits) == entry_level:
+            return {}   # уровень не изменился — пропускаем
+
 
     # ── Загружаем граф ─────────────────────────────────────────────────────
     graph = _get_graph(pair_id)
@@ -603,13 +430,13 @@ def model(
         predicted = walk_type1(graph, start_node.id, max_depth=max_depth)
 
     # ── Вычисляем сигнал ───────────────────────────────────────────────────
-    bull_ratio = compute_bull_ratio(predicted, current_close)
+    bull_ratio = compute_bull_ratio(predicted, current_close, sig_digits)
     if bull_ratio is None:
         return {}   # шум, разница слишком мала
 
     direction = "↑ LONG" if bull_ratio > 0.5 else "↓ SHORT"
     log.debug(
-        f"[candle-graph] pair={pair_id} type={type} var={var} "
+        f"[candle-graph] pair={pair_id} type={type} var={var} sig={sig_digits} "
         f"entry={entry_level} predicted={predicted:.1f} → {direction} br={bull_ratio:.4f}"
     )
     return {OUTPUT_KEY: round(bull_ratio, 6)}
