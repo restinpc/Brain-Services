@@ -31,6 +31,7 @@ HTTP_PROXY_PASSWORD = os.getenv("HTTP_PROXY_PASSWORD", "").strip()
 NAV_TIMEOUT_MS = int(os.getenv("PLAYWRIGHT_NAV_TIMEOUT_MS", "150000"))
 PLAYWRIGHT_TMP_DIR = os.getenv("PLAYWRIGHT_TMP_DIR", "").strip()
 PLAYWRIGHT_BROWSERS_PATH = os.getenv("PLAYWRIGHT_BROWSERS_PATH", "").strip()
+DISABLE_PROXY_ON_521 = os.getenv("WHALE_DISABLE_PROXY_ON_521", "true").lower() == "true"
 PLAYWRIGHT_TMP_EFFECTIVE_DIR = ""
 PLAYWRIGHT_BROWSERS_EFFECTIVE_DIR = ""
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -164,12 +165,12 @@ DB_CONFIG = {
 DATASETS = {"sasha_whale_btc_eth_transactions": {"type": "transactions", "url": "https://whale-alert.io/"}}
 
 
-def _browser_launch_kwargs() -> dict:
+def _browser_launch_kwargs(use_proxy: bool = True) -> dict:
     kwargs = {"headless": HEADLESS}
     proxy = None
 
     # Приоритет: явные PLAYWRIGHT_PROXY_* переменные.
-    if PROXY_SERVER:
+    if use_proxy and PROXY_SERVER:
         proxy = {"server": PROXY_SERVER}
         if PROXY_USERNAME:
             proxy["username"] = PROXY_USERNAME
@@ -177,7 +178,7 @@ def _browser_launch_kwargs() -> dict:
             proxy["password"] = PROXY_PASSWORD
 
     # Fallback на тот же прокси, что используется в Bybit_Tg_Bot.py.
-    elif HTTP_PROXY_HOST:
+    elif use_proxy and HTTP_PROXY_HOST:
         proxy = {"server": f"http://{HTTP_PROXY_HOST}:{HTTP_PROXY_PORT}"}
         if HTTP_PROXY_USERNAME:
             proxy["username"] = HTTP_PROXY_USERNAME
@@ -365,18 +366,19 @@ async def fetch_transactions() -> list:
     print("[INFO] Загружаем whale-alert.io через браузер...")
     max_attempts = 3
     browser_install_attempted = False
+    use_proxy = bool(PROXY_SERVER or HTTP_PROXY_HOST)
     body_text = ""
     async with async_playwright() as pw:
         for attempt in range(1, max_attempts + 1):
             browser = None
             try:
                 try:
-                    browser = await pw.chromium.launch(**_browser_launch_kwargs())
+                    browser = await pw.chromium.launch(**_browser_launch_kwargs(use_proxy=use_proxy))
                 except Exception as launch_exc:
                     if _is_missing_browser_error(launch_exc) and not browser_install_attempted:
                         browser_install_attempted = True
                         _install_playwright_chromium()
-                        browser = await pw.chromium.launch(**_browser_launch_kwargs())
+                        browser = await pw.chromium.launch(**_browser_launch_kwargs(use_proxy=use_proxy))
                     else:
                         raise
                 context = await browser.new_context(
@@ -389,6 +391,8 @@ async def fetch_transactions() -> list:
                 page = await context.new_page()
                 response = await _goto_with_fallback(page, "https://whale-alert.io/")
                 if response and response.status >= 400:
+                    if response.status == 521 and use_proxy and DISABLE_PROXY_ON_521:
+                        raise RuntimeError("HTTP_521_PROXY_BLOCK")
                     raise RuntimeError(f"whale-alert.io вернул HTTP {response.status}")
 
                 await page.wait_for_selector("body", state="attached", timeout=20000)
@@ -399,18 +403,25 @@ async def fetch_transactions() -> list:
 
                 await browser.close()
                 break
-            except Exception:
+            except Exception as e:
                 if browser:
                     try:
                         await browser.close()
                     except Exception:
                         pass
+                if str(e) == "HTTP_521_PROXY_BLOCK":
+                    print(
+                        "[WARN] whale-alert.io вернул HTTP 521 через прокси. "
+                        "Переключаюсь на прямое подключение и повторяю..."
+                    )
+                    use_proxy = False
+                    continue
                 if attempt == max_attempts:
                     raise
                 delay_seconds = attempt * 3
                 print(
                     f"[WARN] Попытка {attempt}/{max_attempts} неудачна, "
-                    f"повтор через {delay_seconds} сек..."
+                    f"повтор через {delay_seconds} сек... Причина: {e!r}"
                 )
                 await asyncio.sleep(delay_seconds)
 
