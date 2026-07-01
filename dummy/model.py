@@ -1,0 +1,79 @@
+"""
+model.py — шаблон модели микросервиса.
+
+Эта функция генерируется LLM под конкретный датасет.
+Фреймворк (server.py) сам передаёт котировки строго <= date,
+поэтому семантической ошибки «заглядывания в будущее» быть не может.
+
+Контракт:
+    Вход:
+        rates   — список свечей [{open, close, min, max, date}] до date включительно
+        dataset — список записей датасета до date включительно (произвольная схема)
+        date    — целевая дата (datetime), для которой считаем сигнал
+        type    — int, вариант логики (0=оба, 1=T1, 2=Extremum и т.д.)
+        var     — int, вариация параметров (0..N)
+        param   — str, доп. параметр (передаётся как есть)
+    Выход:
+        dict[str, float] — весовые коды и их значения
+        Пустой dict {} означает «нет сигнала».
+"""
+
+from __future__ import annotations
+from datetime import datetime
+
+
+# 
+# КОНФИГ ФРЕЙМВОРКА
+# Переменные читаются server.py. Критичные (PORT, NODE_NAME и т.д.) — в .env.
+# 
+
+# Таблица с котировками (фреймворк грузит отсюда rates)
+RATES_TABLE = "brain_rates_eur_usd"
+
+# Таблица или запрос с датасетом (None — датасет не нужен)
+DATASET_TABLE = None          # например: "vlad_earthquakes"
+DATASET_QUERY = None          # если нужен кастомный SELECT
+
+# Таблица весов (None — фреймворк не загружает список weight_codes)
+WEIGHTS_TABLE = None          # например: "vlad_eq_weights_table"
+
+# Диапазон вариаций, которые будут посчитаны при fill_cache
+VAR_RANGE = [0]
+
+# Дата начала кэша (fill_cache стартует отсюда если не задана явно)
+CACHE_DATE_FROM = "2025-01-15"
+
+
+# 
+# model() — ОСНОВНАЯ ФУНКЦИЯ
+# Редактируй только эту часть. server.py не трогать.
+# 
+
+def model(
+    rates:   list[dict],   # [{open, close, min, max, date}, ...] строго <= date
+    dataset: list[dict],   # записи датасета <= date (произвольная схема)
+    date:    datetime,     # целевая дата
+    *,
+    type:  int = 0,
+    var:   int = 0,
+    param: str = "",
+) -> dict[str, float]:
+    """
+    Пример: суммируем T1 последних 5 свечей.
+    Замени логику на свою.
+    """
+    if not rates:
+        return {}
+
+    # Последние N свечей (rates уже отфильтрованы <= date фреймворком)
+    window = rates[-5:]
+    t1_sum = sum(
+        (r["close"] - r["open"])
+        for r in window
+        if r["close"] is not None and r["open"] is not None
+    )
+
+    if t1_sum == 0:
+        return {}
+
+    return {"DUMMY_0_0": round(t1_sum, 6)}

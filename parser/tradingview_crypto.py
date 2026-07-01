@@ -69,7 +69,7 @@ parser.add_argument("database", nargs="?", default=os.getenv("DB_NAME"))
 args = parser.parse_args()
 
 if not all([args.host, args.user, args.password, args.database]):
-    print("❌ Ошибка: не указаны параметры подключения к БД")
+    print(" Ошибка: не указаны параметры подключения к БД")
     sys.exit(1)
 
 # ----------------------------------------------------------------------
@@ -125,11 +125,11 @@ def get_news():
         r.raise_for_status()
         data = r.json()
     except Exception as e:
-        print(f"❌ Ошибка запроса списка: {e}")
+        print(f" Ошибка запроса списка: {e}")
         return None
 
     if 'items' not in data or not data['items']:
-        print("⚠️ Нет данных в ответе API.")
+        print(" Нет данных в ответе API.")
         return None
 
     news_list = []
@@ -161,7 +161,7 @@ def get_news():
                 if not description:
                     description = story_data.get('short_description', '')
             except Exception as e:
-                print(f"⚠️ Ошибка при получении истории {item_id}: {e}")
+                print(f" Ошибка при получении истории {item_id}: {e}")
 
             news_list.append({
                 'datetime': dt,
@@ -207,7 +207,7 @@ def ensure_table_exists(table_name):
         with engine.connect() as conn:
             conn.execute(create_query)
             conn.commit()
-        print(f"✅ Таблица '{table_name}' создана")
+        print(f" Таблица '{table_name}' создана")
     else:
         # Проверяем наличие уникального индекса
         with engine.connect() as conn:
@@ -221,7 +221,7 @@ def ensure_table_exists(table_name):
             has_unique = result.scalar() > 0
 
         if not has_unique:
-            print(f"⚠️ Внимание: в таблице '{table_name}' нет уникального индекса на поле link")
+            print(f" Внимание: в таблице '{table_name}' нет уникального индекса на поле link")
             print("Рекомендуется добавить уникальный индекс командой:")
             print(f"ALTER TABLE {table_name} MODIFY link VARCHAR(500), ADD UNIQUE INDEX unique_link (link);")
 
@@ -241,14 +241,14 @@ def save_data(df, table_name):
             existing = pd.read_sql(f"SELECT link FROM {table_name}", conn)
             existing_links = set(existing['link'].tolist()) if not existing.empty else set()
     except Exception as e:
-        print(f"⚠️ Ошибка при получении существующих ссылок: {e}")
+        print(f" Ошибка при получении существующих ссылок: {e}")
         existing_links = set()
 
     # Фильтруем новые
     df_new = df[~df['link'].isin(existing_links)]
 
     if df_new.empty:
-        print("ℹ️ Нет новых новостей для добавления")
+        print("ℹ Нет новых новостей для добавления")
         return
 
     try:
@@ -260,16 +260,16 @@ def save_data(df, table_name):
             chunksize=1000,
             method='multi'
         )
-        print(f"✅ Добавлено {len(df_new)} новых строк из {len(df)} полученных")
+        print(f" Добавлено {len(df_new)} новых строк из {len(df)} полученных")
 
         # Показываем последние добавленные ID
         with engine.connect() as conn:
             result = conn.execute(text(f"SELECT MAX(id) FROM {table_name}"))
             max_id = result.scalar()
-            print(f"📊 Последний ID в таблице: {max_id}")
+            print(f" Последний ID в таблице: {max_id}")
 
     except Exception as e:
-        print(f"❌ Ошибка записи: {e}")
+        print(f" Ошибка записи: {e}")
         sys.exit(1)
 
 
@@ -277,19 +277,19 @@ def save_data(df, table_name):
 # Основная логика
 # ----------------------------------------------------------------------
 def main():
-    print(f"🚀 Загрузчик новостей TradingView (крипто, RU)")
+    print(f" Загрузчик новостей TradingView (крипто, RU)")
     print(f"База: {args.host}:{args.port}/{args.database}")
-    print(f"🎯 Целевая таблица: {args.table_name}")
+    print(f" Целевая таблица: {args.table_name}")
     print("=" * 60)
 
     df_news = get_news()
     if df_news is None:
-        print("⚠️ Нет новостей")
+        print(" Нет новостей")
         return
 
     save_data(df_news, args.table_name)
     print("=" * 60)
-    print("🏁 Загрузка завершена")
+    print(" Загрузка завершена")
 
 
 if __name__ == "__main__":
@@ -298,9 +298,9 @@ if __name__ == "__main__":
     except SystemExit:
         raise
     except KeyboardInterrupt:
-        print("\n🛑 Прервано пользователем")
+        print("\n Прервано пользователем")
         sys.exit(1)
     except Exception as e:
-        print(f"\n❌ Критическая ошибка: {e!r}")
+        print(f"\n Критическая ошибка: {e!r}")
         send_error_trace(e)
         sys.exit(1)

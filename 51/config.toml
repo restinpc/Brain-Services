@@ -1,0 +1,43 @@
+# config.toml — brain-trend-combo (сервис 51)
+
+[service]
+id   = 51
+port = 8913
+name = "brain-trend-combo"
+text = "Multi-TF trend line combination indexer — 4 var × 3 type"
+
+[rates]
+table = "brain_rates_eur_usd"
+
+[cache]
+date_from        = "2025-01-15"
+var_range        = [0, 1, 2, 3]   # окно экстремумов: 1, 3, 5, 7 баров
+types_range      = [0, 1, 2]      # 0=bull_ratio  1=фильтрованный  2=центрированный
+shift_window     = 0
+rebuild_interval = 86400           # раз в сутки
+reload_interval  = 3600
+
+[dataset]
+engine = "brain"
+query  = "SELECT date FROM brain_rates_eur_usd ORDER BY date LIMIT 500"
+
+[ctx]
+key_columns   = ["id"]
+weights_table = "vlad_trend_combo_svc51_index"
+query = """
+    SELECT
+        id,
+        weight_code,
+        var_id,
+        combo_prefix,
+        direction_bits,
+        occurrence_count,
+        bull_count,
+        bull_ratio,
+        avg_t1
+    FROM vlad_trend_combo_svc51_index
+    ORDER BY id
+"""
+
+[ml]
+enabled = false

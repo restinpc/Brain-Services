@@ -44,7 +44,7 @@ parser.add_argument("database", nargs="?", default=os.getenv("DB_NAME"))
 args = parser.parse_args()
 
 if not all([args.host, args.user, args.password, args.database]):
-    print("❌ Ошибка: не указаны параметры подключения к БД")
+    print(" Ошибка: не указаны параметры подключения к БД")
     sys.exit(1)
 
 DB_CONFIG = {
@@ -87,7 +87,7 @@ def get_latest_date_from_db(table_name: str) -> date | None:
         result = cursor.fetchone()
         return result[0] if result and result[0] else None
     except Exception as e:
-        print(f"⚠️ Ошибка БД при получении даты: {e}")
+        print(f" Ошибка БД при получении даты: {e}")
         return None
     finally:
         if 'conn' in locals() and conn.is_connected():
@@ -109,11 +109,11 @@ def download_and_parse_xml(data_type_code: str, year: int):
         if response.status_code == 404:
             return []
         if response.status_code != 200:
-            print(f"⚠️ HTTP {response.status_code} для {year}")
+            print(f" HTTP {response.status_code} для {year}")
             return []
         root = ET.fromstring(response.text)
     except Exception as e:
-        print(f"❌ Ошибка XML за {year}: {e}")
+        print(f" Ошибка XML за {year}: {e}")
         return []
 
     ns = {'atom': 'http://www.w3.org/2005/Atom', 'm': 'http://schemas.microsoft.com/ado/2007/08/dataservices/metadata'}
@@ -167,9 +167,9 @@ def save_to_db_incremental(data, table_name, table_comment=""):
         values = [[row.get('record_date')] + [row.get(k) for k in valid_keys] for row in data]
         cursor.executemany(sql, values)
         conn.commit()
-        print(f"✅ DB: Вставлено {cursor.rowcount} новых строк в {table_name}")
+        print(f" DB: Вставлено {cursor.rowcount} новых строк в {table_name}")
     except mysql.connector.Error as err:
-        print(f"❌ DB Error: {err}")
+        print(f" DB Error: {err}")
     finally:
         if 'conn' in locals() and conn.is_connected():
             cursor.close()
@@ -180,42 +180,42 @@ def process_data_type(table_name: str, config: dict, current_year: int):
     latest_date = get_latest_date_from_db(table_name)
     start_year = config['start_year']
     effective_start = max(start_year, latest_date.year - 1) if latest_date else start_year
-    print(f"🔁 Диапазон загрузки: {effective_start} – {current_year}")
+    print(f" Диапазон загрузки: {effective_start} – {current_year}")
     all_data = []
     for year in range(effective_start, current_year + 1):
-        print(f"📥 Запрос данных за {year}...")
+        print(f" Запрос данных за {year}...")
         parsed = download_and_parse_xml(config['code'], year)
         if parsed:
             all_data.extend(parsed)
         time.sleep(0.5)
     if all_data and latest_date:
         filtered = [r for r in all_data if datetime.strptime(r['record_date'], "%Y-%m-%d").date() > latest_date]
-        print(f"🔍 Отфильтровано: {len(filtered)} новых записей из {len(all_data)}")
+        print(f" Отфильтровано: {len(filtered)} новых записей из {len(all_data)}")
         all_data = filtered
     if all_data:
         save_to_db_incremental(all_data, table_name, config['description'])
     else:
-        print("✅ Новых данных нет")
+        print(" Новых данных нет")
 
 
 def main():
-    # 🔒 КРИТИЧЕСКАЯ ПРОВЕРКА: только одна таблица, никаких циклов!
+    #  КРИТИЧЕСКАЯ ПРОВЕРКА: только одна таблица, никаких циклов!
     if args.table_name not in DATA_TYPES_CONFIG:
-        print(f"❌ Ошибка: неизвестная таблица '{args.table_name}'. Допустимые:")
+        print(f" Ошибка: неизвестная таблица '{args.table_name}'. Допустимые:")
         for name in DATA_TYPES_CONFIG.keys():
             print(f"  - {name}")
         sys.exit(1)
 
-    print(f"🚀 TREASURY.GOV COLLECTOR (ТОЛЬКО: {args.table_name})")
+    print(f" TREASURY.GOV COLLECTOR (ТОЛЬКО: {args.table_name})")
     print(f"База: {args.host}:{args.port}/{args.database}")
-    print(f"🎯 ЦЕЛЕВАЯ ТАБЛИЦА: {args.table_name}")
+    print(f" ЦЕЛЕВАЯ ТАБЛИЦА: {args.table_name}")
     print("=" * 60)
 
     config = DATA_TYPES_CONFIG[args.table_name]
     current_year = datetime.now().year
     process_data_type(args.table_name, config, current_year)
     print("=" * 60)
-    print("🏁 ЗАГРУЗКА ЗАВЕРШЕНА")
+    print(" ЗАГРУЗКА ЗАВЕРШЕНА")
 
 
 if __name__ == "__main__":
@@ -224,9 +224,9 @@ if __name__ == "__main__":
     except SystemExit:
         raise
     except KeyboardInterrupt:
-        print("\n🛑 Прервано пользователем")
+        print("\n Прервано пользователем")
         sys.exit(1)
     except Exception as e:
-        print(f"\n❌ Критическая ошибка: {e!r}")
+        print(f"\n Критическая ошибка: {e!r}")
         send_error_trace(e)
         sys.exit(1)

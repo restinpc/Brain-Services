@@ -35,7 +35,7 @@ parser.add_argument("database", nargs="?", default=os.getenv("DB_NAME"))
 args = parser.parse_args()
 
 if not all([args.host, args.user, args.password, args.database]):
-    print("❌ Ошибка: не все параметры БД"); sys.exit(1)
+    print(" Ошибка: не все параметры БД"); sys.exit(1)
 
 DB_CONFIG = {'host': args.host, 'port': int(args.port), 'user': args.user, 'password': args.password, 'database': args.database}
 DATASETS = {
@@ -84,15 +84,15 @@ class BISCollector:
         url = f"https://stats.bis.org/api/v1/data/{self.dataflow}/all"
         params = {"lastNObservations": "24", "format": "csv"}
 
-        print(f"   📊 BIS API v1 CSV: {self.dataflow}...")
+        print(f"    BIS API v1 CSV: {self.dataflow}...")
         resp = self.session.get(url, params=params, timeout=90)
 
         if resp.status_code != 200:
-            print(f"   ❌ HTTP {resp.status_code}"); return
+            print(f"    HTTP {resp.status_code}"); return
 
         text = resp.text.strip()
         if not text or len(text) < 100:
-            print("   ⚠️ Пустой ответ"); return
+            print("    Пустой ответ"); return
 
         rows = []
         try:
@@ -107,13 +107,13 @@ class BISCollector:
                     country_idx = header_idx[col]
                     break
             if country_idx is None:
-                print("   ⚠️ Нет колонки страны"); return
+                print("    Нет колонки страны"); return
 
             freq_idx    = header_idx.get('FREQ')
             period_idx  = header_idx.get('TIME_PERIOD')
             value_idx   = header_idx.get('OBS_VALUE')
             if None in (freq_idx, period_idx, value_idx):
-                print("   ⚠️ Отсутствуют обязательные колонки"); return
+                print("    Отсутствуют обязательные колонки"); return
 
             cg_dtype_idx = header_idx.get('CG_DTYPE')
 
@@ -151,11 +151,11 @@ class BISCollector:
                 ))
 
         except Exception as e:
-            print(f"   ⚠️ Parse error: {e}")
+            print(f"    Parse error: {e}")
             return
 
         if not rows:
-            print("   ⚠️ Нет данных после парсинга")
+            print("    Нет данных после парсинга")
             return
 
         conn = self.get_db_connection(); c = conn.cursor()
@@ -167,22 +167,22 @@ class BISCollector:
         n = c.rowcount
         c.close(); conn.close()
 
-        print(f"   ✅ Записано {n} новых observations из {len(rows)} total")
+        print(f"    Записано {n} новых observations из {len(rows)} total")
         countries = set(r[0] for r in rows if r[0])
         print(f"      Стран: {len(countries)}: {', '.join(sorted(countries)[:20])}...")
 
 def main():
     if args.table_name not in DATASETS:
-        print(f"❌ Неизвестная таблица. Допустимые:"); [print(f"  - {n}") for n in DATASETS]; sys.exit(1)
+        print(f" Неизвестная таблица. Допустимые:"); [print(f"  - {n}") for n in DATASETS]; sys.exit(1)
     ds = DATASETS[args.table_name]
-    print(f"🚀 BIS Central Bank Collector ({ds['dataflow']})")
+    print(f" BIS Central Bank Collector ({ds['dataflow']})")
     print(f"База: {args.host}:{args.port}/{args.database}")
-    print(f"🎯 Таблица: {args.table_name}"); print("=" * 60)
+    print(f" Таблица: {args.table_name}"); print("=" * 60)
     BISCollector(args.table_name, ds["dataflow"]).process()
-    print("=" * 60); print("🏁 ЗАГРУЗКА ЗАВЕРШЕНА")
+    print("=" * 60); print(" ЗАГРУЗКА ЗАВЕРШЕНА")
 
 if __name__ == "__main__":
     try: main()
     except SystemExit: raise
-    except KeyboardInterrupt: print("\n🛑 Прервано"); sys.exit(1)
-    except Exception as e: print(f"\n❌ {e!r}"); send_error_trace(e); sys.exit(1)
+    except KeyboardInterrupt: print("\n Прервано"); sys.exit(1)
+    except Exception as e: print(f"\n {e!r}"); send_error_trace(e); sys.exit(1)

@@ -13,6 +13,7 @@ FRED API Parser
 """
 
 #  1. ИМПОРТЫ
+#  1. ИМПОРТЫ 
 import os
 import sys
 import argparse
@@ -23,6 +24,7 @@ from dotenv import load_dotenv
 from datetime import datetime, timedelta
 
 #  2. КОНФИГ
+#  2. КОНФИГ 
 load_dotenv()
 
 FRED_API_KEY = os.getenv("FRED_API_KEY")
@@ -33,6 +35,7 @@ NODE_NAME  = os.getenv("NODE_NAME", "FRED")
 EMAIL      = os.getenv("ALERT_EMAIL", "samuray150305@gmail.com")
 
 #  3. ТРАССИРОВКА ОШИБОК
+#  3. ТРАССИРОВКА ОШИБОК 
 def send_error_trace(exc: Exception, script_name: str = "FRED.py"):
     """
     Отправляет трассировку в фоновом потоке — не блокирует основной процесс.
@@ -49,6 +52,7 @@ def send_error_trace(exc: Exception, script_name: str = "FRED.py"):
     threading.Thread(target=_send, daemon=True).start()
 
 #  4. АРГУМЕНТЫ
+#  4. АРГУМЕНТЫ 
 parser = argparse.ArgumentParser(description="FRED Parser → MySQL")
 parser.add_argument("table_name",  help="Имя целевой таблицы в БД")
 parser.add_argument("host",        nargs="?", default=os.getenv("DB_HOST"))
@@ -71,6 +75,7 @@ DB_CONFIG = {
 }
 
 #  5. ТАБЛИЦЫ
+#  5. ТАБЛИЦЫ 
 DATASETS = {
     "sasha_fred_dff": {
         "series_id": "DFF",
@@ -107,6 +112,7 @@ DATASETS = {
 }
 
 #  6. СОЗДАНИЕ ТАБЛИЦЫ
+#  6. СОЗДАНИЕ ТАБЛИЦЫ 
 def ensure_table(table_name: str):
     conn = mysql.connector.connect(**DB_CONFIG)
     c = conn.cursor()
@@ -126,6 +132,7 @@ def ensure_table(table_name: str):
     conn.close()
 
 #  7. ПОСЛЕДНЯЯ ДАТА В БД (для инкрементальной загрузки)
+#  7. ПОСЛЕДНЯЯ ДАТА В БД (для инкрементальной загрузки) 
 def get_latest_date(table_name: str):
     """
     Возвращает максимальную дату из таблицы или None если таблица пуста.
@@ -142,6 +149,7 @@ def get_latest_date(table_name: str):
         return None
 
 #  8. ПОЛУЧЕНИЕ ДАННЫХ
+#  8. ПОЛУЧЕНИЕ ДАННЫХ 
 def fetch_data(config: dict, observation_start: str = None) -> list:
     """
     Запрос к FRED API. Поддерживает observation_start для инкрементальной загрузки.
@@ -176,6 +184,7 @@ def fetch_data(config: dict, observation_start: str = None) -> list:
         return []
 
 #  9. ЗАПИСЬ В БД
+#  9. ЗАПИСЬ В БД 
 def save_rows(table_name: str, rows: list):
     if not rows:
         print("  Нет новых данных для записи")
@@ -196,6 +205,7 @@ def save_rows(table_name: str, rows: list):
     conn.close()
 
 #  10. ОСНОВНАЯ ЛОГИКА
+#  10. ОСНОВНАЯ ЛОГИКА 
 def process(table_name: str):
     config = DATASETS[table_name]
 
@@ -240,6 +250,7 @@ def process(table_name: str):
     save_rows(table_name, rows)
 
 #  11. ТОЧКА ВХОДА
+#  11. ТОЧКА ВХОДА 
 def main():
     if args.table_name not in DATASETS:
         print(f" Неизвестная таблица '{args.table_name}'. Допустимые:")

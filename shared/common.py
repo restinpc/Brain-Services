@@ -10,11 +10,11 @@ import threading
 import traceback
 import requests
 
-# ── Режим запуска ─────────────────────────────────────────────────────────────
+#  Режим запуска 
 MODE   = os.getenv("MODE", "dev").lower()   # "dev" | "prod"
 IS_DEV = MODE == "dev"
 
-# ── Трассировка ошибок ────────────────────────────────────────────────────────
+#  Трассировка ошибок 
 _HANDLER  = os.getenv("HANDLER", "https://server.brain-project.online").rstrip("/")
 TRACE_URL = f"{_HANDLER}/trace.php"
 EMAIL     = os.getenv("ALERT_EMAIL", "vladyurjevitch@yandex.ru")
@@ -24,10 +24,6 @@ def send_error_trace(exc: Exception, node: str, script: str = "server.py") -> No
     """
     Отправляет трассировку ошибки АСИНХРОННО в отдельном потоке,
     чтобы НЕ блокировать asyncio event loop.
-
-    ВАЖНО: раньше здесь был синхронный requests.post(timeout=10), который
-    полностью блокировал event loop на 10 секунд → каскадное исчерпание
-    пула соединений. Теперь отправка идёт в daemon-потоке.
     """
     logs = (
         f"Node: {node}\nScript: {script}\n"
@@ -36,22 +32,22 @@ def send_error_trace(exc: Exception, node: str, script: str = "server.py") -> No
 
     def _send() -> None:
         try:
-            log(f"📤 Sending error trace to {TRACE_URL}", node, force=True)
+            log(f" Sending error trace to {TRACE_URL}", node, force=True)
             r = requests.post(
                 TRACE_URL,
                 data={"url": "fastapi_microservice", "node": node,
                       "email": EMAIL, "logs": logs},
                 timeout=10,
             )
-            log(f"✅ Trace sent, status={r.status_code}", node, force=True)
+            log(f" Trace sent, status={r.status_code}", node, force=True)
         except Exception as e:
-            log(f"⚠️  Failed to send trace: {e}", node, force=True)
+            log(f"  Failed to send trace: {e}", node, force=True)
 
     # daemon=True — поток умрёт вместе с процессом, не задержит shutdown
     threading.Thread(target=_send, daemon=True).start()
 
 
-# ── Логирование ───────────────────────────────────────────────────────────────
+#  Логирование 
 def log(msg: str, node: str = "", level: str = "info", force: bool = False) -> None:
     """
     DEV  — печатает всё.
@@ -62,7 +58,7 @@ def log(msg: str, node: str = "", level: str = "info", force: bool = False) -> N
         print(f"{prefix}{msg}")
 
 
-# ── Стандартные ответы ────────────────────────────────────────────────────────
+#  Стандартные ответы 
 def ok_response(payload: dict | list) -> dict:
     """{"status": "ok", "payLoad": payload}"""
     return {"status": "ok", "payLoad": payload}
@@ -86,7 +82,7 @@ def err_response(
     return {"status": "error", "error": message, "payLoad": {}}
 
 
-# ── Engine builder ────────────────────────────────────────────────────────────
+#  Engine builder 
 def build_engines():
     """
     Создаёт три AsyncEngine из переменных окружения:
@@ -115,9 +111,14 @@ def build_engines():
             os.getenv("DB_NAME",     ""),
         ),
         pool_size=20,
-        max_overflow=20,    # было дефолтные 10 → увеличено, чтобы выдержать всплески
-        pool_pre_ping=True, # автопереподключение при stale-соединениях
-        pool_recycle=1800,  # переиспользовать соединения не дольше 30 мин
+        max_overflow=20,
+        # pool_pre_ping=False — ВАЖНО: pool_pre_ping=True вызывает
+        # "Packet sequence number wrong" в aiomysql при высокой нагрузке.
+        # Pre-ping шлёт запрос на соединение, которое может быть занято
+        # другой корутиной → ломает порядок пакетов протокола MySQL.
+        # Вместо этого используем pool_recycle + явную инвалидацию в cache_helper.
+        pool_pre_ping=False,
+        pool_recycle=900,   # пересоздавать соединения каждые 15 мин
         echo=False,
     )
 
@@ -131,8 +132,8 @@ def build_engines():
         ),
         pool_size=5,
         max_overflow=10,
-        pool_pre_ping=True,
-        pool_recycle=1800,
+        pool_pre_ping=False,
+        pool_recycle=900,
         echo=False,
     )
 
@@ -146,21 +147,27 @@ def build_engines():
         ),
         pool_size=3,
         max_overflow=5,
-        pool_pre_ping=True,
-        pool_recycle=1800,
+        pool_pre_ping=False,
+        pool_recycle=900,
         echo=False,
     )
 
     return engine_vlad, engine_brain, engine_super
 
 
-# ── Workers ───────────────────────────────────────────────────────────────────
+#  Workers 
 async def resolve_workers(engine_super, service_id: int, default: int = 1) -> int:
     """
-    DEV  → всегда 1.
-    PROD → читает brain_service.workers из engine_super;
-           если =0, использует brain_models.priority.
+    Приоритет:
+      1. WORKERS > 0 в .env  → берём это значение напрямую (хардкод на ноде).
+      2. WORKERS = 0 (или не задан) + DEV → всегда 1.
+      3. WORKERS = 0 (или не задан) + PROD → читает brain_service.workers из engine_super;
+                                              если =0, использует brain_models.priority.
     """
+    env_workers = int(os.getenv("WORKERS", "0"))
+    if env_workers > 0:
+        return env_workers
+
     if IS_DEV:
         return 1
     try:
@@ -181,5 +188,5 @@ async def resolve_workers(engine_super, service_id: int, default: int = 1) -> in
             if row2 and row2[0]:
                 return max(1, int(row2[0]))
     except Exception as e:
-        print(f"⚠️  resolve_workers error: {e}")
+        print(f"  resolve_workers error: {e}")
     return default

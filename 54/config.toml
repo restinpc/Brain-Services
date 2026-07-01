@@ -1,0 +1,48 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# config.toml — brain-extremum-levels (сервис 53)
+#
+# Детектор пробоев и отскоков от экстремумных уровней.
+# Таймфреймы: 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 15, 20 баров.
+# weight_code = "tf{period}_{event}"  event ∈ {bo_bull, bo_bear, rb_bull, rb_bear}
+#
+# type=0 → ATR-based динамический пробой/отскок
+# type=1 → N свечей вперёд (фикс. кол-во, исследование)
+# type=2 → фикс. % движения (исследование)
+# type=3 → формирование нового экстремума
+# ══════════════════════════════════════════════════════════════════════════════
+
+[service]
+id   = 54
+port = 8916
+name = "brain-extremum-levels"
+text = "Multi-TF extremum level breakout/bounce detector (TF 3-20 bars)"
+
+[rates]
+table = "brain_rates_eur_usd"
+
+[cache]
+date_from        = "2025-01-15"
+var_range        = [0, 1, 2, 3, 4, 5, 6, 7, 8]  # 9 вариантов: order×confirm_k
+types_range      = [0, 1, 2, 3]    # 4 метода подтверждения
+shift_window     = 0
+rebuild_interval = 3600             # пересчёт каждый час
+reload_interval  = 3700
+
+[ctx]
+key_columns   = ["id"]
+weights_table = "vlad_extremum_lvl_svc54_index"
+query = """
+    SELECT id, weight_code, var, period, event_type,
+           bull_ratio_t0, bull_ratio_t1, bull_ratio_t2, bull_ratio_t3,
+           t1_forward_bars, t2_forward_pct,
+           occurrence_count, support
+    FROM vlad_extremum_lvl_svc54_index
+    ORDER BY id
+"""
+
+[dataset]
+engine = "brain"
+query  = "SELECT date FROM brain_rates_eur_usd ORDER BY date DESC LIMIT 1"
+
+[ml]
+enabled = false

@@ -1,4 +1,4 @@
-﻿import os
+import os
 import mysql.connector
 from dotenv import load_dotenv
 
@@ -165,12 +165,12 @@ def main():
         cur.execute(f"SELECT COUNT(*) FROM `{CTX_TABLE}`;")
         print(f"  → {cur.fetchone()[0]} строк в `{CTX_TABLE}`")
 
-        print("\n── Распределение по контекстам ──────────────────────────────")
+        print("\n Распределение по контекстам ")
         cur.execute(SQL_DIAG_CONTEXT)
         rows = cur.fetchall()
         print(f"  {'forecast_dir':<14} {'surprise_dir':<14} {'actual_dir':<12}"
               f" {'events':>8} {'occurrences':>12}")
-        print("  " + "─" * 64)
+        print("  " + "" * 64)
         for forecast_d, surprise_d, actual_d, ev, occ in rows:
             print(f"  {forecast_d:<14} {surprise_d:<14} {actual_d:<12}"
                   f" {ev:>8} {occ:>12}")

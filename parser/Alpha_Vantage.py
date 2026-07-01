@@ -24,10 +24,10 @@ try:
 except Exception:
     pass
 
-# ── Конфигурация ─────────────────────────────────────────────────────────────
+#  Конфигурация 
 ALPHA_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY")
 if not ALPHA_API_KEY:
-    print("❌ ALPHA_VANTAGE_API_KEY не найден в .env")
+    print(" ALPHA_VANTAGE_API_KEY не найден в .env")
     sys.exit(1)
 
 _HANDLER   = os.getenv("HANDLER", "https://server.brain-project.online").rstrip("/")
@@ -50,7 +50,7 @@ parser.add_argument("database", nargs="?", default=os.getenv("DB_NAME"))
 args = parser.parse_args()
 
 if not all([args.host, args.user, args.password, args.database]):
-    print("❌ Ошибка: не указаны параметры подключения к БД")
+    print(" Ошибка: не указаны параметры подключения к БД")
     sys.exit(1)
 
 DB_CONFIG = {
@@ -61,7 +61,7 @@ DB_CONFIG = {
     "database": args.database,
 }
 
-# ── Доступные таблицы ─────────────────────
+#  Доступные таблицы 
 DATASETS = {
     "sasha_alpha_daily_eurusd_ind": {
         "description": "Дневные технические индикаторы EUR/USD",
@@ -89,7 +89,7 @@ DATASETS = {
     },
 }
 
-# ── Создание таблицы ─────────────────────────────────────
+#  Создание таблицы 
 def ensure_table(table_name: str):
     conn = mysql.connector.connect(**DB_CONFIG)
     c = conn.cursor()
@@ -114,7 +114,7 @@ def ensure_table(table_name: str):
     c.close()
     conn.close()
 
-# ── Последняя дата в БД ──────────────────────────────────────────────────────
+#  Последняя дата в БД 
 def get_latest_date(table_name: str):
     try:
         conn = mysql.connector.connect(**DB_CONFIG)
@@ -127,7 +127,7 @@ def get_latest_date(table_name: str):
     except:
         return None
 
-# ── Отправка ошибки ─────────────────────────────────────
+#  Отправка ошибки 
 def send_error_trace(exc: Exception):
     import threading
     logs = f"Node: {NODE_NAME}\nScript: Alpha_Vantage.py\nException: {repr(exc)}\n\nTraceback:\n{traceback.format_exc()}"
@@ -144,7 +144,7 @@ def send_error_trace(exc: Exception):
             pass
     threading.Thread(target=_send, daemon=True).start()
 
-# ── Запрос данных из Alpha Vantage ──────────────────
+#  Запрос данных из Alpha Vantage 
 def fetch_indicator(config: dict, indicator: str = None, time_period_override: int = None):
     try:
         global _LAST_AV_CALL_TS
@@ -198,14 +198,14 @@ def fetch_indicator(config: dict, indicator: str = None, time_period_override: i
 
             if "Note" in data or "Information" in data:
                 msg = data.get("Note") or data.get("Information")
-                print(f"⚠️ Alpha Vantage throttle/info (attempt {attempt}/3): {msg}")
+                print(f" Alpha Vantage throttle/info (attempt {attempt}/3): {msg}")
                 if attempt < 3:
                     time.sleep(_MIN_AV_INTERVAL_SEC)
                     continue
             break
 
         if "Error Message" in data or "Note" in data or "Information" in data:
-            print(f"⚠️ Alpha Vantage: {data.get('Error Message') or data.get('Note') or data.get('Information')}")
+            print(f" Alpha Vantage: {data.get('Error Message') or data.get('Note') or data.get('Information')}")
             return {}
 
         # Находим временной ряд
@@ -215,22 +215,22 @@ def fetch_indicator(config: dict, indicator: str = None, time_period_override: i
         return {}
 
     except Exception as e:
-        print(f"❌ Ошибка при запросе {indicator or 'base'}: {e}")
+        print(f" Ошибка при запросе {indicator or 'base'}: {e}")
         return {}
 
-# ── Основная обработка ───────────────────────────────────────────────────────
+#  Основная обработка 
 def process(table_name: str):
     config = DATASETS[table_name]
     ensure_table(table_name)
 
     latest = get_latest_date(table_name)
-    print(f"📅 Последняя дата в БД: {latest or 'таблица пуста'}")
+    print(f" Последняя дата в БД: {latest or 'таблица пуста'}")
 
     # Качаем каждый индикатор отдельно
     indicator_data = {}
     indicators_to_fetch = config.get("indicators", [])
     for ind in indicators_to_fetch:
-        print(f"📥 Загрузка индикатора {ind}...")
+        print(f" Загрузка индикатора {ind}...")
         if ind == "EMA":
             ema12 = fetch_indicator(config, "EMA", time_period_override=12)
             ema26 = fetch_indicator(config, "EMA", time_period_override=26)
@@ -244,7 +244,7 @@ def process(table_name: str):
                 indicator_data[ind] = ind_data
 
     if not indicator_data:
-        print("⚠️ Не удалось получить данные индикаторов")
+        print(" Не удалось получить данные индикаторов")
         return
 
     # Объединяем данные по датам
@@ -280,10 +280,10 @@ def process(table_name: str):
         except Exception:
             continue
 
-    print(f"🆕 Найдено новых дней: {len(rows)}")
+    print(f" Найдено новых дней: {len(rows)}")
 
     if not rows:
-        print("✅ Нет новых данных")
+        print(" Нет новых данных")
         return
 
     # Запись в БД
@@ -296,32 +296,32 @@ def process(table_name: str):
     """
     c.executemany(sql, rows)
     conn.commit()
-    print(f"✅ Записано {c.rowcount} новых строк")
+    print(f" Записано {c.rowcount} новых строк")
     c.close()
     conn.close()
 
-# ── Запуск ───────────────────────────────────────────────────────────────────
+#  Запуск 
 def main():
     if args.table_name not in DATASETS:
-        print(f"❌ Неизвестная таблица '{args.table_name}'.")
+        print(f" Неизвестная таблица '{args.table_name}'.")
         print("Доступные:")
         for name in DATASETS:
             print(f"  - {name}")
         sys.exit(1)
 
-    print(f"🚀 Alpha Vantage Daily Indicators (Free Tier Only)")
+    print(f" Alpha Vantage Daily Indicators (Free Tier Only)")
     print(f"   Таблица: {args.table_name}")
     print("=" * 65)
 
     try:
         process(args.table_name)
     except Exception as e:
-        print(f"\n❌ Критическая ошибка: {e!r}")
+        print(f"\n Критическая ошибка: {e!r}")
         send_error_trace(e)
         sys.exit(1)
 
     print("=" * 65)
-    print("🏁 ГОТОВО")
+    print(" ГОТОВО")
 
 
 if __name__ == "__main__":

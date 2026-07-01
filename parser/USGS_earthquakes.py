@@ -35,7 +35,7 @@ parser.add_argument("database", nargs="?", default=os.getenv("DB_NAME"))
 args = parser.parse_args()
 
 if not all([args.host, args.user, args.password, args.database]):
-    print("❌ Ошибка: не указаны параметры подключения"); sys.exit(1)
+    print(" Ошибка: не указаны параметры подключения"); sys.exit(1)
 
 DB_CONFIG = {'host': args.host, 'port': int(args.port), 'user': args.user, 'password': args.password, 'database': args.database}
 DATASETS = {"vlad_usgs_earthquakes": {"description": "USGS earthquakes M4.5+ (full history + incremental)"}}
@@ -143,7 +143,7 @@ class USGSCollector:
 
         if last_time is None:
             # BACKFILL: по годам
-            print(f"   📥 BACKFILL: {BACKFILL_START_YEAR}–{datetime.utcnow().year}")
+            print(f"    BACKFILL: {BACKFILL_START_YEAR}–{datetime.utcnow().year}")
             total_inserted = 0
             for year in range(BACKFILL_START_YEAR, datetime.utcnow().year + 1):
                 start = f"{year}-01-01"
@@ -161,10 +161,10 @@ class USGSCollector:
                 total_inserted += n
                 print(f"{len(features)} events → {n} new")
                 time.sleep(random.uniform(1.5, 3.0))
-            print(f"   ✅ BACKFILL: {total_inserted} total inserted")
+            print(f"    BACKFILL: {total_inserted} total inserted")
         else:
             # INCREMENTAL: feed (последний месяц) + query (от last_time - 2 дня)
-            print(f"   📥 INCREMENTAL от {last_time}")
+            print(f"    INCREMENTAL от {last_time}")
             # Fast path: month feed
             resp = self.session.get(
                 f"https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/{MIN_MAGNITUDE}_month.geojson",
@@ -174,20 +174,20 @@ class USGSCollector:
             features = resp.json().get("features", [])
             rows = self._parse_features(features)
             n = self._insert_rows(rows)
-            print(f"   ✅ Feed: {len(features)} events → {n} new")
+            print(f"    Feed: {len(features)} events → {n} new")
 
 
 def main():
     if args.table_name not in DATASETS:
-        print(f"❌ Неизвестная таблица. Допустимые:"); [print(f"  - {n}") for n in DATASETS]; sys.exit(1)
-    print(f"🚀 USGS Earthquake Direct Collector")
+        print(f" Неизвестная таблица. Допустимые:"); [print(f"  - {n}") for n in DATASETS]; sys.exit(1)
+    print(f" USGS Earthquake Direct Collector")
     print(f"База: {args.host}:{args.port}/{args.database}")
-    print(f"🎯 Таблица: {args.table_name}"); print("=" * 60)
+    print(f" Таблица: {args.table_name}"); print("=" * 60)
     USGSCollector(args.table_name).process()
-    print("=" * 60); print("🏁 ЗАГРУЗКА ЗАВЕРШЕНА")
+    print("=" * 60); print(" ЗАГРУЗКА ЗАВЕРШЕНА")
 
 if __name__ == "__main__":
     try: main()
     except SystemExit: raise
-    except KeyboardInterrupt: print("\n🛑 Прервано"); sys.exit(1)
-    except Exception as e: print(f"\n❌ {e!r}"); send_error_trace(e); sys.exit(1)
+    except KeyboardInterrupt: print("\n Прервано"); sys.exit(1)
+    except Exception as e: print(f"\n {e!r}"); send_error_trace(e); sys.exit(1)

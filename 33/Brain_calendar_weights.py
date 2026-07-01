@@ -13,7 +13,7 @@ SHIFT_MIN = int(os.getenv("SHIFT_MIN", "-12"))
 SHIFT_MAX = int(os.getenv("SHIFT_MAX",  "12"))
 
 
-# ── Однобуквенное кодирование ─────────────────────────────────────────────────
+#  Однобуквенное кодирование 
 
 FORECAST_MAP = {
     "UNKNOWN": "X",
@@ -51,7 +51,7 @@ REVISION_MAP_REV  = {v: k for k, v in REVISION_MAP.items()}
 IMPORTANCE_MAP_REV = {v: k for k, v in IMPORTANCE_MAP.items()}
 
 
-# ── DDL ───────────────────────────────────────────────────────────────────────
+#  DDL 
 
 DDL = f"""
 CREATE TABLE IF NOT EXISTS `{OUT_TABLE}` (
@@ -79,7 +79,7 @@ CREATE TABLE IF NOT EXISTS `{OUT_TABLE}` (
 """
 
 
-# ── Подключение ───────────────────────────────────────────────────────────────
+#  Подключение 
 
 def get_db_connection():
     return mysql.connector.connect(
@@ -92,7 +92,7 @@ def get_db_connection():
     )
 
 
-# ── Кодирование / декодирование ───────────────────────────────────────────────
+#  Кодирование / декодирование 
 
 def encode(value: str, direction_type: str) -> str:
     maps = {
@@ -159,7 +159,7 @@ def decode_weight_code(code: str) -> dict:
     }
 
 
-# ── Генерация строк ───────────────────────────────────────────────────────────
+#  Генерация строк 
 
 def generate_rows(event_id: int, currency: str, importance: str,
                   fcd: str, scd: str, rcd: str, occ: int):
@@ -188,7 +188,7 @@ def generate_rows(event_id: int, currency: str, importance: str,
                 )
 
 
-# ── Вставка ───────────────────────────────────────────────────────────────────
+#  Вставка 
 
 def insert_rows(cur, rows):
     sql = f"""
@@ -215,7 +215,7 @@ def insert_rows(cur, rows):
     return total
 
 
-# ── main ──────────────────────────────────────────────────────────────────────
+#  main 
 
 def main():
     conn = get_db_connection()
@@ -262,7 +262,7 @@ def main():
         (cnt,) = cur.fetchone()
         print(f"\nOK: contexts={len(ctx_rows)}, inserted={written}, table_rows={cnt}")
 
-        print(f"\n── Строк по валютам ──────────────────────────────────────────────")
+        print(f"\n Строк по валютам ")
         cur.execute(f"""
             SELECT currency_code,
                    SUM(hour_shift IS NULL)     AS base_rows,
@@ -273,11 +273,11 @@ def main():
             ORDER BY total DESC
         """)
         print(f"  {'currency':<10} {'base':>8} {'shifted':>10} {'total':>8}")
-        print("  " + "─" * 40)
+        print("  " + "" * 40)
         for cur_code, base, shifted, total in cur.fetchall():
             print(f"  {cur_code:<10} {base:>8} {shifted:>10} {total:>8}")
 
-        print(f"\n── Первые 20 weight_codes ──────────────────────────────────────")
+        print(f"\n Первые 20 weight_codes ")
         cur.execute(f"""
             SELECT weight_code, event_id, currency_code, importance,
                    forecast_dir, surprise_dir, revision_dir,
@@ -291,14 +291,14 @@ def main():
         rows = cur.fetchall()
         print(f"  {'weight_code':<38} {'evt':>7} {'curr':<5} {'imp':<5} "
               f"{'fcd':<7} {'scd':<7} {'rcd':<6} {'mode':>4} {'shift':>6} {'occ':>5}")
-        print("  " + "─" * 96)
+        print("  " + "" * 96)
         for wc, eid, cur_c, imp, fcd, scd, rcd, mv, ds, oc in rows:
             print(f"  {wc:<38} {eid:>7} {cur_c:<5} {imp:<5} "
                   f"{fcd:<7} {scd:<7} {rcd:<6} {mv:>4} {str(ds):>6} {str(oc):>5}")
 
         if rows:
             sample = rows[0][0]
-            print(f"\n── Пример декодирования ────────────────────────────────────────")
+            print(f"\n Пример декодирования ")
             print(f"  Код: {sample}")
             print(f"  Расшифровка: {decode_weight_code(sample)}")
 

@@ -33,7 +33,7 @@ TRACE_URL  = f"{_HANDLER}/trace.php"
 NODE_NAME  = os.getenv("NODE_NAME", "SEC_EDGAR")
 EMAIL      = os.getenv("ALERT_EMAIL", "samuray150305@gmail.com")
 
-# ── RATE LIMITER (≤ 9 запросов в секунду) ─────────────────────────────────────
+#  RATE LIMITER (≤ 9 запросов в секунду) 
 class RateLimiter:
     def __init__(self, max_per_second: float = 9.0):
         self.max_per_second = max_per_second
@@ -49,7 +49,7 @@ class RateLimiter:
 
 rate_limiter = RateLimiter(max_per_second=9.0)
 
-# ── ТРАССИРОВКА ОШИБОК ───────────────────────────────────────────────────────
+#  ТРАССИРОВКА ОШИБОК 
 def send_error_trace(exc: Exception, script_name: str = "SEC_EDGAR.py"):
     import threading
     logs = f"Node: {NODE_NAME}\nScript: {script_name}\nException: {repr(exc)}\n\nTraceback:\n{traceback.format_exc()}"
@@ -60,7 +60,7 @@ def send_error_trace(exc: Exception, script_name: str = "SEC_EDGAR.py"):
             pass
     threading.Thread(target=_send, daemon=True).start()
 
-# ── АРГУМЕНТЫ ────────────────────────────────────────────────────────────────
+#  АРГУМЕНТЫ 
 parser = argparse.ArgumentParser(description="EDGAR Parser с парсингом содержимого документов")
 parser.add_argument("table_name",  help="Имя таблицы в БД")
 parser.add_argument("host",        nargs="?", default=os.getenv("DB_HOST"))
@@ -71,7 +71,7 @@ parser.add_argument("database",    nargs="?", default=os.getenv("DB_NAME"))
 args = parser.parse_args()
 
 if not all([args.host, args.user, args.password, args.database]):
-    print("❌ Ошибка: не указаны параметры БД")
+    print(" Ошибка: не указаны параметры БД")
     sys.exit(1)
 
 DB_CONFIG = {
@@ -80,7 +80,7 @@ DB_CONFIG = {
     "database": args.database,
 }
 
-# ── DATASETS (можно добавлять новые CIK) ─────────────────────────────────────
+#  DATASETS (можно добавлять новые CIK) 
 DATASETS = {
     "sec_mstr_filings":      {"description": "MicroStrategy (BTC)",                     "cik": "0001050446"},
     "sec_coinbase_filings":  {"description": "Coinbase Global",                        "cik": "0001679788"},
@@ -89,7 +89,7 @@ DATASETS = {
     "sec_grayscale_eth_filings": {"description": "Grayscale Ethereum Trust",           "cik": "0001725210"},
 }
 
-# ── СОЗДАНИЕ ТАБЛИЦЫ (с полным текстом и ключами) ────────────────────────────
+#  СОЗДАНИЕ ТАБЛИЦЫ (с полным текстом и ключами) 
 def ensure_table(table_name: str):
     conn = mysql.connector.connect(**DB_CONFIG)
     c = conn.cursor()
@@ -162,7 +162,7 @@ def ensure_table(table_name: str):
     c.close()
     conn.close()
 
-# ── ВОДОРАЗДЕЛ ИНКРЕМЕНТА ──────────────────────────────────────────────────────
+#  ВОДОРАЗДЕЛ ИНКРЕМЕНТА 
 def get_latest_watermark(table_name: str):
     try:
         conn = mysql.connector.connect(**DB_CONFIG)
@@ -189,7 +189,7 @@ def parse_acceptance_datetime(value: str):
             continue
     return None
 
-# ── СКАЧИВАНИЕ ДОКУМЕНТА ─────────────────────────────────────────────────────
+#  СКАЧИВАНИЕ ДОКУМЕНТА 
 def download_document(cik_clean: str, accession: str, primary_doc: str) -> str:
     if not primary_doc:
         return ""
@@ -203,7 +203,7 @@ def download_document(cik_clean: str, accession: str, primary_doc: str) -> str:
     try:
         resp = requests.get(url, headers=headers, timeout=60)
         if resp.status_code != 200:
-            print(f"   ⚠️ Не удалось скачать документ: HTTP {resp.status_code}")
+            print(f"    Не удалось скачать документ: HTTP {resp.status_code}")
             return ""
 
         # Парсим HTML или TXT
@@ -225,10 +225,10 @@ def download_document(cik_clean: str, accession: str, primary_doc: str) -> str:
         return text[:500000]  # ограничиваем размер для БД (при необходимости увеличь)
 
     except Exception as e:
-        print(f"   ❌ Ошибка скачивания: {e}")
+        print(f"    Ошибка скачивания: {e}")
         return ""
 
-# ── ПАРСИНГ КЛЮЧЕВОЙ ИНФОРМАЦИИ ─────────────────────────────────────────────
+#  ПАРСИНГ КЛЮЧЕВОЙ ИНФОРМАЦИИ 
 def classify_event(form: str, text_lower: str) -> tuple[str, int]:
     form_u = (form or "").upper()
     if form_u == "8-K":
@@ -284,7 +284,7 @@ def parse_content(text: str, form: str) -> dict:
         "crypto_relevance_score": crypto_relevance_score,
     }
 
-# ── FETCH METADATA ───────────────────────────────────────────────────────────
+#  FETCH METADATA 
 def fetch_data(config: dict) -> list:
     cik = config.get("cik")
     if not cik:
@@ -298,7 +298,7 @@ def fetch_data(config: dict) -> list:
     try:
         response = requests.get(url, headers=headers, timeout=30)
         if response.status_code != 200:
-            print(f"❌ HTTP {response.status_code} для CIK {cik}")
+            print(f" HTTP {response.status_code} для CIK {cik}")
             return []
 
         data = response.json()
@@ -332,13 +332,13 @@ def fetch_data(config: dict) -> list:
             })
         return rows
     except Exception as e:
-        print(f"❌ Ошибка metadata: {e}")
+        print(f" Ошибка metadata: {e}")
         return []
 
-# ── ЗАПИСЬ В БД ──────────────────────────────────────────────────────────────
+#  ЗАПИСЬ В БД 
 def save_rows(table_name: str, rows: list):
     if not rows:
-        print("⚠️ Нет данных для записи")
+        print(" Нет данных для записи")
         return
 
     conn = mysql.connector.connect(**DB_CONFIG)
@@ -357,21 +357,21 @@ def save_rows(table_name: str, rows: list):
     """
     c.executemany(sql, rows)
     conn.commit()
-    print(f"✅ Записано {c.rowcount} новых записей")
+    print(f" Записано {c.rowcount} новых записей")
     c.close()
     conn.close()
 
-# ── ОСНОВНАЯ ЛОГИКА ──────────────────────────────────────────────────────────
+#  ОСНОВНАЯ ЛОГИКА 
 def process(table_name: str):
     config = DATASETS[table_name]
     ensure_table(table_name)
     latest_acceptance, latest_date = get_latest_watermark(table_name)
-    print(f"📅 Последняя дата в БД: {latest_date or 'пуста'}")
-    print(f"⏱️ Последний acceptance_datetime: {latest_acceptance or 'нет'}")
+    print(f" Последняя дата в БД: {latest_date or 'пуста'}")
+    print(f"⏱ Последний acceptance_datetime: {latest_acceptance or 'нет'}")
 
     raw = fetch_data(config)
     if not raw:
-        print("⚠️ Нет метаданных")
+        print(" Нет метаданных")
         return
 
     filtered = []
@@ -424,31 +424,31 @@ def process(table_name: str):
             parsed["crypto_relevance_score"],
         ))
 
-    print(f"🆕 Новых обработанных filings: {len(filtered)}")
+    print(f" Новых обработанных filings: {len(filtered)}")
     save_rows(table_name, filtered)
 
-# ── MAIN ─────────────────────────────────────────────────────────────────────
+#  MAIN 
 def main():
     if args.table_name not in DATASETS:
-        print("❌ Неизвестная таблица. Доступные:")
+        print(" Неизвестная таблица. Доступные:")
         for k, v in DATASETS.items():
             print(f"   {k} — {v['description']}")
         sys.exit(1)
 
-    print("🚀 EDGAR Parser с парсингом содержимого (BTC/ETH keys)")
+    print(" EDGAR Parser с парсингом содержимого (BTC/ETH keys)")
     print(f"   Таблица: {args.table_name}")
     print("=" * 80)
 
     process(args.table_name)
 
     print("=" * 80)
-    print("🏁 ГОТОВО")
+    print(" ГОТОВО")
 
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        print(f"❌ Критическая ошибка: {e}")
+        print(f" Критическая ошибка: {e}")
         send_error_trace(e)
         sys.exit(1)

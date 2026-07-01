@@ -47,7 +47,7 @@ parser.add_argument("database", nargs="?", default=os.getenv("DB_NAME"))
 args = parser.parse_args()
 
 if not all([args.host, args.user, args.password, args.database]):
-    print("❌ Ошибка: не указаны параметры подключения"); sys.exit(1)
+    print(" Ошибка: не указаны параметры подключения"); sys.exit(1)
 
 DB_CONFIG = {'host': args.host, 'port': int(args.port), 'user': args.user, 'password': args.password, 'database': args.database}
 DATASETS = {
@@ -104,12 +104,12 @@ class FearGreedCollector:
 
         if last_date is None:
             # BACKFILL: вся история (limit=0 = все данные)
-            print("   📥 BACKFILL: загрузка всей истории с 2018...")
+            print("    BACKFILL: загрузка всей истории с 2018...")
             url = "https://api.alternative.me/fng/?limit=0&format=json"
         else:
             # INCREMENTAL: последние 10 дней (перекрытие для safety)
             days_diff = (datetime.utcnow().date() - last_date).days + 5
-            print(f"   📥 INCREMENTAL: последние {days_diff} дней (от {last_date})")
+            print(f"    INCREMENTAL: последние {days_diff} дней (от {last_date})")
             url = f"https://api.alternative.me/fng/?limit={days_diff}&format=json"
 
         resp = self.session.get(url, timeout=30)
@@ -118,9 +118,9 @@ class FearGreedCollector:
         entries = data.get("data", [])
 
         if not entries:
-            print("   ⚠️ Нет данных"); return
+            print("    Нет данных"); return
 
-        print(f"   📊 Получено {len(entries)} записей")
+        print(f"    Получено {len(entries)} записей")
 
         conn = self.get_db_connection(); c = conn.cursor()
         sql = f"""INSERT IGNORE INTO `{self.table_name}`
@@ -137,7 +137,7 @@ class FearGreedCollector:
         c.executemany(sql, rows)
         conn.commit(); inserted = c.rowcount; c.close(); conn.close()
 
-        print(f"   ✅ Записано {inserted} новых дней")
+        print(f"    Записано {inserted} новых дней")
         # Последние 3 дня
         for e in entries[:3]:
             ts = int(e.get("timestamp", 0))
@@ -218,29 +218,29 @@ class BTCHashrateCollector:
             c.close();
             conn.close()
 
-            print(f"   ✅ BTC Hashrate: {hr_eh:.2f} EH/s | Difficulty: {current_diff:,.0f} | Записано: {inserted}")
+            print(f"    BTC Hashrate: {hr_eh:.2f} EH/s | Difficulty: {current_diff:,.0f} | Записано: {inserted}")
 
         except requests.exceptions.RequestException as e:
-            print(f"   ❌ Ошибка API mempool.space: {e}")
+            print(f"    Ошибка API mempool.space: {e}")
             raise
         except Exception as e:
-            print(f"   ❌ Неизвестная ошибка в hashrate: {e}")
+            print(f"    Неизвестная ошибка в hashrate: {e}")
             raise
 
 
 def main():
     if args.table_name not in DATASETS:
-        print(f"❌ Неизвестная таблица. Допустимые:"); [print(f"  - {n}") for n in DATASETS]; sys.exit(1)
+        print(f" Неизвестная таблица. Допустимые:"); [print(f"  - {n}") for n in DATASETS]; sys.exit(1)
     ds = DATASETS[args.table_name]
-    print(f"🚀 {ds['description']}")
+    print(f" {ds['description']}")
     print(f"База: {args.host}:{args.port}/{args.database}")
-    print(f"🎯 Таблица: {args.table_name}"); print("=" * 60)
+    print(f" Таблица: {args.table_name}"); print("=" * 60)
     if args.table_name == "vlad_fear_greed_index": FearGreedCollector(args.table_name).process()
     elif args.table_name == "vlad_btc_hashrate": BTCHashrateCollector(args.table_name).process()
-    print("=" * 60); print("🏁 ЗАГРУЗКА ЗАВЕРШЕНА")
+    print("=" * 60); print(" ЗАГРУЗКА ЗАВЕРШЕНА")
 
 if __name__ == "__main__":
     try: main()
     except SystemExit: raise
-    except KeyboardInterrupt: print("\n🛑 Прервано"); sys.exit(1)
-    except Exception as e: print(f"\n❌ {e!r}"); send_error_trace(e); sys.exit(1)
+    except KeyboardInterrupt: print("\n Прервано"); sys.exit(1)
+    except Exception as e: print(f"\n {e!r}"); send_error_trace(e); sys.exit(1)

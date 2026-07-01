@@ -3,7 +3,7 @@
 Запуск:   python IMF.py sasha_imf_international_reserves [host] [port] [user] [password] [database]
 """
 
-# ── 1. ИМПОРТЫ ─────────────────────────────────────────────────────────────────
+#  1. ИМПОРТЫ 
 import os
 import sys
 import argparse
@@ -17,7 +17,7 @@ import io
 import time
 import re
 
-# ── 2. КОНФИГ ─────────────────────────────────────────────────────────────────
+#  2. КОНФИГ 
 load_dotenv()
 
 # включаем UTF-8, чтобы не падать на emoji.
@@ -32,7 +32,7 @@ TRACE_URL  = f"{_HANDLER}/trace.php"
 NODE_NAME  = os.getenv("NODE_NAME", "IMF")
 EMAIL      = os.getenv("ALERT_EMAIL", "samuray150305@gmail.com")
 
-# ── 3. ТРАССИРОВКА ОШИБОК ─────────────────────────────────────────────────────
+#  3. ТРАССИРОВКА ОШИБОК 
 def send_error_trace(exc: Exception, script_name: str = "IMF.py"):
     import threading
     logs = f"Node: {NODE_NAME}\nScript: {script_name}\nException: {repr(exc)}\n\nTraceback:\n{traceback.format_exc()}"
@@ -45,7 +45,7 @@ def send_error_trace(exc: Exception, script_name: str = "IMF.py"):
 
     threading.Thread(target=_send, daemon=True).start()
 
-# ── 4. АРГУМЕНТЫ ──────────────────────────────────────────────────────────────
+#  4. АРГУМЕНТЫ 
 parser = argparse.ArgumentParser(description="IMF Data Parser → MySQL (SDMX 2.1 API)")
 parser.add_argument("table_name",  help="Имя целевой таблицы в БД")
 parser.add_argument("host",        nargs="?", default=os.getenv("DB_HOST"))
@@ -56,7 +56,7 @@ parser.add_argument("database",    nargs="?", default=os.getenv("DB_NAME"))
 args = parser.parse_args()
 
 if not all([args.host, args.user, args.password, args.database]):
-    print("❌ Ошибка: не указаны параметры подключения к БД")
+    print(" Ошибка: не указаны параметры подключения к БД")
     sys.exit(1)
 
 DB_CONFIG = {
@@ -67,7 +67,7 @@ DB_CONFIG = {
     "database": args.database,
 }
 
-# ── 5. ТАБЛИЦЫ (table_name → конфиг запроса к IMF SDMX API) ─────────────────────
+#  5. ТАБЛИЦЫ (table_name → конфиг запроса к IMF SDMX API) 
 # Ключ = имя таблицы в БД
 DATASETS = {
     "sasha_imf_international_reserves": {
@@ -80,7 +80,7 @@ DATASETS = {
     },
 }
 
-# ── 6. СОЗДАНИЕ ТАБЛИЦЫ (универсальная под несколько серий) ───────────────────
+#  6. СОЗДАНИЕ ТАБЛИЦЫ (универсальная под несколько серий) 
 def ensure_table(table_name: str):
     conn = mysql.connector.connect(**DB_CONFIG)
     c = conn.cursor()
@@ -101,7 +101,7 @@ def ensure_table(table_name: str):
     c.close()
     conn.close()
 
-# ── 7. ПОСЛЕДНЯЯ ДАТА В БД (для инкрементальной загрузки) ─────────────────────
+#  7. ПОСЛЕДНЯЯ ДАТА В БД (для инкрементальной загрузки) 
 def get_latest_date(table_name: str):
     try:
         conn = mysql.connector.connect(**DB_CONFIG)
@@ -114,7 +114,7 @@ def get_latest_date(table_name: str):
     except:
         return None
 
-# ── 8. ПОЛУЧЕНИЕ ДАННЫХ ─────────────────────────────────
+#  8. ПОЛУЧЕНИЕ ДАННЫХ 
 def _parse_time_period(raw_value) -> date | None:
     """
     IMF может отдавать TIME_PERIOD в форматах:
@@ -173,7 +173,7 @@ def fetch_data(config: dict, start_date: str = None) -> list:
 
         for dataflow in dataflow_candidates:
             url = f"{base_url}/{dataflow}/{config.get('key', '...')}"
-            print(f"🌐 Запрос: {url} | params={params}")
+            print(f" Запрос: {url} | params={params}")
 
             # IMF API иногда отдает chunked-ошибки; ретраим с небольшим backoff
             for attempt in range(1, 4):
@@ -182,21 +182,21 @@ def fetch_data(config: dict, start_date: str = None) -> list:
                     break
                 except requests.exceptions.RequestException as req_exc:
                     if attempt == 3:
-                        print(f"❌ Ошибка запроса ({dataflow}) после {attempt} попыток: {req_exc}")
+                        print(f" Ошибка запроса ({dataflow}) после {attempt} попыток: {req_exc}")
                     else:
                         wait_s = attempt * 2
-                        print(f"⚠️ Сбой сети ({dataflow}), попытка {attempt}/3, повтор через {wait_s}с...")
+                        print(f" Сбой сети ({dataflow}), попытка {attempt}/3, повтор через {wait_s}с...")
                         time.sleep(wait_s)
 
             if response is None:
                 continue
 
             if response.status_code == 403:
-                print(f"⚠️ HTTP 403 для dataflow={dataflow}, пробуем следующий candidate...")
+                print(f" HTTP 403 для dataflow={dataflow}, пробуем следующий candidate...")
                 continue
 
             if response.status_code != 200:
-                print(f"❌ HTTP {response.status_code} ({dataflow}): {response.text[:500]}")
+                print(f" HTTP {response.status_code} ({dataflow}): {response.text[:500]}")
                 continue
 
             break
@@ -208,7 +208,7 @@ def fetch_data(config: dict, start_date: str = None) -> list:
         df = pd.read_csv(io.StringIO(response.text), low_memory=False)
 
         if df.empty or 'TIME_PERIOD' not in df.columns or 'OBS_VALUE' not in df.columns:
-            print("⚠️  Нет колонок TIME_PERIOD / OBS_VALUE")
+            print("  Нет колонок TIME_PERIOD / OBS_VALUE")
             return []
 
         # Приводим данные
@@ -219,17 +219,17 @@ def fetch_data(config: dict, start_date: str = None) -> list:
         # Оставляем только данные с частотой до 24 часов (daily)
         if config.get("require_daily_frequency", False):
             if "FREQUENCY" not in df.columns:
-                print("⚠️  В ответе нет колонки FREQUENCY, daily-фильтр не может быть применен")
+                print("  В ответе нет колонки FREQUENCY, daily-фильтр не может быть применен")
                 return []
             before_daily = len(df)
             df = df[df["FREQUENCY"].astype(str).str.upper() == "D"]
-            print(f"⏱️ Фильтр daily (FREQUENCY=D): {before_daily} → {len(df)}")
+            print(f"⏱ Фильтр daily (FREQUENCY=D): {before_daily} → {len(df)}")
 
         # Оставляем только ряды, относящиеся к USD/EUR
         filter_cols = config.get("usd_eur_filter_columns", [])
         existing_filter_cols = [c for c in filter_cols if c in df.columns]
         if not existing_filter_cols:
-            print("⚠️  Не найдены колонки для USD/EUR фильтрации")
+            print("  Не найдены колонки для USD/EUR фильтрации")
             return []
 
         usd_eur_mask = pd.Series(False, index=df.index)
@@ -238,7 +238,7 @@ def fetch_data(config: dict, start_date: str = None) -> list:
 
         before_fx = len(df)
         df = df[usd_eur_mask]
-        print(f"💱 Фильтр USD/EUR: {before_fx} → {len(df)}")
+        print(f" Фильтр USD/EUR: {before_fx} → {len(df)}")
 
         # Формируем series_key из ключевых измерений; не включаем справочные текстовые поля
         ignored_cols = {
@@ -272,21 +272,21 @@ def fetch_data(config: dict, start_date: str = None) -> list:
         if series_regex:
             before = len(df)
             df = df[df['series_key'].str.contains(series_regex, case=False, na=False)]
-            print(f"🔎 Фильтр series_regex='{series_regex}': {before} → {len(df)}")
+            print(f" Фильтр series_regex='{series_regex}': {before} → {len(df)}")
 
         # Оставляем только нужное
         result = df[['date_iso', 'series_key', 'value']].dropna(subset=['date_iso', 'value']).values.tolist()
-        print(f"📦 Получено строк: {len(result)}")
+        print(f" Получено строк: {len(result)}")
         return result
 
     except Exception as e:
-        print(f"❌ Ошибка запроса: {e}")
+        print(f" Ошибка запроса: {e}")
         return []
 
-# ── 9. ЗАПИСЬ В БД ────────────────────────────────────────────────────────────
+#  9. ЗАПИСЬ В БД 
 def save_rows(table_name: str, rows: list):
     if not rows:
-        print("⚠️  Нет данных для записи")
+        print("  Нет данных для записи")
         return
 
     sql = f"""
@@ -315,10 +315,10 @@ def save_rows(table_name: str, rows: list):
                 break
             except mysql.connector.Error as db_exc:
                 if attempt == 3:
-                    print(f"❌ Batch {chunk_no}/{total_chunks} не записан после 3 попыток: {db_exc}")
+                    print(f" Batch {chunk_no}/{total_chunks} не записан после 3 попыток: {db_exc}")
                 else:
                     wait_s = attempt * 2
-                    print(f"⚠️ Ошибка БД на batch {chunk_no}/{total_chunks}: {db_exc}. Повтор через {wait_s}с...")
+                    print(f" Ошибка БД на batch {chunk_no}/{total_chunks}: {db_exc}. Повтор через {wait_s}с...")
                     time.sleep(wait_s)
             finally:
                 try:
@@ -333,16 +333,16 @@ def save_rows(table_name: str, rows: list):
             # Продолжаем со следующими батчами, чтобы сохранить максимум возможного.
             continue
 
-    print(f"✅ Записано {total_inserted} новых строк из {len(rows)} total")
+    print(f" Записано {total_inserted} новых строк из {len(rows)} total")
 
-# ── 10. ОСНОВНАЯ ЛОГИКА ────────────────────────────────────────────────────────
+#  10. ОСНОВНАЯ ЛОГИКА 
 def process(table_name: str):
     config = DATASETS[table_name]
 
     ensure_table(table_name)
 
     latest = get_latest_date(table_name)
-    print(f"📅 Последняя дата в БД: {latest or 'таблица пуста'}")
+    print(f" Последняя дата в БД: {latest or 'таблица пуста'}")
 
     # Если есть последняя дата — качаем только новые
     start_date = None
@@ -351,26 +351,26 @@ def process(table_name: str):
     else:
         start_date = config.get("default_start_date")
         if start_date:
-            print(f"📉 Первичная загрузка ограничена: startPeriod={start_date}")
+            print(f" Первичная загрузка ограничена: startPeriod={start_date}")
 
     raw = fetch_data(config, start_date)
     if not raw:
-        print("⚠️  Данных нет")
+        print("  Данных нет")
         return
 
     # raw уже содержит (date_iso, series_key, value)
-    print(f"🆕 Новых строк: {len(raw)}")
+    print(f" Новых строк: {len(raw)}")
     save_rows(table_name, raw)
 
-# ── 11. ТОЧКА ВХОДА ────────────────────────────────────────────────────────────
+#  11. ТОЧКА ВХОДА 
 def main():
     if args.table_name not in DATASETS:
-        print(f"❌ Неизвестная таблица '{args.table_name}'. Допустимые:")
+        print(f" Неизвестная таблица '{args.table_name}'. Допустимые:")
         for name in DATASETS:
             print(f"  - {name}")
         sys.exit(1)
 
-    print(f"🚀 IMF Parser")
+    print(f" IMF Parser")
     print(f"   База: {args.host}:{args.port}/{args.database}")
     print(f"   Таблица: {args.table_name} → {DATASETS[args.table_name]['description']}")
     print("=" * 80)
@@ -378,7 +378,7 @@ def main():
     process(args.table_name)
 
     print("=" * 80)
-    print("🏁 ГОТОВО")
+    print(" ГОТОВО")
 
 
 if __name__ == "__main__":
@@ -387,9 +387,9 @@ if __name__ == "__main__":
     except SystemExit:
         raise
     except KeyboardInterrupt:
-        print("\n🛑 Прервано")
+        print("\n Прервано")
         sys.exit(1)
     except Exception as e:
-        print(f"\n❌ Критическая ошибка: {e!r}")
+        print(f"\n Критическая ошибка: {e!r}")
         send_error_trace(e)
         sys.exit(1)
