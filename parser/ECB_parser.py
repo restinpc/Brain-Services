@@ -37,6 +37,20 @@ BASE_URL_RSS = "https://www.ecb.europa.eu/home/html/rss.en.html"
 ZIP_URL = "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-hist.zip"
 CSV_URL = "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-hist.csv"
 
+# ECB SDW / Data API monetary datasets (доп. режим, не влияет на rates/items).
+MONETARY_DATASETS = {
+    "sasha_ecb_emission": {
+        "flow_ref": "BSI",
+        "series_key": "M.U2.Y.V.L10.X.1.U2.2300.Z01.E",
+        "description": "ECB Currency in circulation (Euro area, monthly)"
+    },
+    "sasha_ecb_m3": {
+        "flow_ref": "BSI",
+        "series_key": "M.U2.Y.V.M30.X.1.U2.2300.Z01.E",
+        "description": "ECB M3 monetary aggregate (Euro area, monthly)"
+    },
+}
+
 
 def send_error_trace(exc: Exception):
     logs = f"Node: {NODE_NAME}\nScript: ECB_parser.py\nException: {repr(exc)}\n\nTraceback:\n{traceback.format_exc()}"
@@ -186,6 +200,116 @@ DB_CONFIG = {
     'password': args.password,
     'database': args.database,
 }
+
+def ensure_monetary_table(table_name: str):
+    with mysql.connector.connect(**DB_CONFIG) as conn:
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            CREATE TABLE IF NOT EXISTS `{table_name}` (
+                id         INT AUTO_INCREMENT PRIMARY KEY,
+                date_iso   DATE NOT NULL,
+                value      DOUBLE,
+                loaded_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE KEY uq_date (date_iso),
+                INDEX idx_date (date_iso)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            COMMENT='{MONETARY_DATASETS[table_name]["description"]}';
+        """)
+        conn.commit()
+
+
+def get_monetary_latest_date(table_name: str):
+    try:
+        with mysql.connector.connect(**DB_CONFIG) as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"SELECT MAX(date_iso) FROM `{table_name}`")
+            row = cursor.fetchone()
+            return row[0] if row and row[0] else None
+    except Exception:
+        return None
+
+
+def fetch_monetary_series(config: dict, start_period: str = None) -> pd.DataFrame:
+    params = {"format": "csvdata"}
+    if start_period:
+        params["startPeriod"] = start_period
+
+    flow_ref = config.get("flow_ref")
+    series_key = config.get("series_key")
+    if not flow_ref or not series_key:
+        raise RuntimeError("Некорректная конфигурация датасета: нужны flow_ref и series_key")
+
+    url = f"https://data-api.ecb.europa.eu/service/data/{flow_ref}/{series_key}"
+
+    # Игнорируем env-прокси, чтобы не падать на SOCKS alias без PySocks.
+    session = requests.Session()
+    session.trust_env = False
+
+    try:
+        response = session.get(url, params=params, timeout=45)
+        response.raise_for_status()
+    except Exception as e:
+        raise RuntimeError(f"Ошибка запроса к ECB API ({flow_ref}.{series_key}): {e}")
+
+    try:
+        df = pd.read_csv(io.StringIO(response.text))
+    except Exception as e:
+        raise RuntimeError(f"Не удалось распарсить CSV ECB ({flow_ref}.{series_key}): {e}")
+
+    if "TIME_PERIOD" not in df.columns or "OBS_VALUE" not in df.columns:
+        raise RuntimeError("ECB API вернул неожиданный формат: нет TIME_PERIOD/OBS_VALUE")
+
+    return df
+
+
+def run_monetary_dataset(table_name: str):
+    config = MONETARY_DATASETS[table_name]
+    print(f"\n ECB monetary dataset: {table_name} ({config['flow_ref']}.{config['series_key']})")
+
+    ensure_monetary_table(table_name)
+    latest = get_monetary_latest_date(table_name)
+    print(f" Последняя дата в БД: {latest or 'таблица пуста'}")
+
+    start_period = None
+    if latest:
+        start_period = latest.strftime("%Y-%m")
+        print(f" Запрашиваем данные начиная с периода: {start_period}")
+
+    df = fetch_monetary_series(config, start_period=start_period)
+    print(f" Получено строк от ECB API: {len(df)}")
+
+    rows = []
+    for _, row in df.iterrows():
+        tp = str(row.get("TIME_PERIOD", "")).strip()
+        val = row.get("OBS_VALUE")
+
+        if not tp or pd.isna(val):
+            continue
+
+        try:
+            date_iso = pd.to_datetime(tp).date()
+            value = float(val)
+        except Exception:
+            continue
+
+        if latest and date_iso <= latest:
+            continue
+
+        rows.append((date_iso.strftime("%Y-%m-%d"), value))
+
+    print(f" Новых строк после фильтра: {len(rows)}")
+    if not rows:
+        print(" Нет новых данных для записи")
+        return
+
+    with mysql.connector.connect(**DB_CONFIG) as conn:
+        cursor = conn.cursor()
+        cursor.executemany(f"""
+            INSERT IGNORE INTO `{table_name}` (date_iso, value)
+            VALUES (%s, %s)
+        """, rows)
+        conn.commit()
+        print(f" Записано {cursor.rowcount} новых строк в {table_name}")
 
 
 class ECBParser:
@@ -453,7 +577,10 @@ class ECBParser:
 
 if __name__ == "__main__":
     try:
-        ECBParser(args.table_name).run()
+        if args.table_name in MONETARY_DATASETS:
+            run_monetary_dataset(args.table_name)
+        else:
+            ECBParser(args.table_name).run()
     except Exception as e:
         print(f" Критическая ошибка: {e}")
         send_error_trace(e)

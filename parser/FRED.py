@@ -8,8 +8,11 @@ FRED API Parser
     sasha_fred_dexuseu
     sasha_fred_t10yie
     sasha_fred_cbbtcusd
+    sasha_fred_currcir
+    sasha_fred_wm2ns
 """
 
+#  1. ИМПОРТЫ
 #  1. ИМПОРТЫ 
 import os
 import sys
@@ -20,6 +23,7 @@ import mysql.connector
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 
+#  2. КОНФИГ
 #  2. КОНФИГ 
 load_dotenv()
 
@@ -30,6 +34,7 @@ TRACE_URL  = f"{_HANDLER}/trace.php"
 NODE_NAME  = os.getenv("NODE_NAME", "FRED")
 EMAIL      = os.getenv("ALERT_EMAIL", "samuray150305@gmail.com")
 
+#  3. ТРАССИРОВКА ОШИБОК
 #  3. ТРАССИРОВКА ОШИБОК 
 def send_error_trace(exc: Exception, script_name: str = "FRED.py"):
     """
@@ -46,6 +51,7 @@ def send_error_trace(exc: Exception, script_name: str = "FRED.py"):
 
     threading.Thread(target=_send, daemon=True).start()
 
+#  4. АРГУМЕНТЫ
 #  4. АРГУМЕНТЫ 
 parser = argparse.ArgumentParser(description="FRED Parser → MySQL")
 parser.add_argument("table_name",  help="Имя целевой таблицы в БД")
@@ -68,6 +74,7 @@ DB_CONFIG = {
     "database": args.database,
 }
 
+#  5. ТАБЛИЦЫ
 #  5. ТАБЛИЦЫ 
 DATASETS = {
     "sasha_fred_dff": {
@@ -94,8 +101,17 @@ DATASETS = {
         "series_id": "CBBTCUSD",
         "description": "BTC — Цена Bitcoin от Coinbase (USD)"
     },
+    "sasha_fred_currcir": {
+        "series_id": "CURRCIR",
+        "description": "Currency in Circulation — Объем денежных средств в обращении (эмиссия)"
+    },
+    "sasha_fred_wm2ns": {
+        "series_id": "WM2NS",
+        "description": "M2 Money Stock — Недельный M2"
+    },
 }
 
+#  6. СОЗДАНИЕ ТАБЛИЦЫ
 #  6. СОЗДАНИЕ ТАБЛИЦЫ 
 def ensure_table(table_name: str):
     conn = mysql.connector.connect(**DB_CONFIG)
@@ -115,6 +131,7 @@ def ensure_table(table_name: str):
     c.close()
     conn.close()
 
+#  7. ПОСЛЕДНЯЯ ДАТА В БД (для инкрементальной загрузки)
 #  7. ПОСЛЕДНЯЯ ДАТА В БД (для инкрементальной загрузки) 
 def get_latest_date(table_name: str):
     """
@@ -131,6 +148,7 @@ def get_latest_date(table_name: str):
     except:
         return None
 
+#  8. ПОЛУЧЕНИЕ ДАННЫХ
 #  8. ПОЛУЧЕНИЕ ДАННЫХ 
 def fetch_data(config: dict, observation_start: str = None) -> list:
     """
@@ -165,6 +183,7 @@ def fetch_data(config: dict, observation_start: str = None) -> list:
         print(f" Ошибка запроса к FRED: {e}")
         return []
 
+#  9. ЗАПИСЬ В БД
 #  9. ЗАПИСЬ В БД 
 def save_rows(table_name: str, rows: list):
     if not rows:
@@ -185,6 +204,7 @@ def save_rows(table_name: str, rows: list):
     c.close()
     conn.close()
 
+#  10. ОСНОВНАЯ ЛОГИКА
 #  10. ОСНОВНАЯ ЛОГИКА 
 def process(table_name: str):
     config = DATASETS[table_name]
@@ -229,6 +249,7 @@ def process(table_name: str):
     print(f" Новых строк после фильтра: {len(rows)}")
     save_rows(table_name, rows)
 
+#  11. ТОЧКА ВХОДА
 #  11. ТОЧКА ВХОДА 
 def main():
     if args.table_name not in DATASETS:
