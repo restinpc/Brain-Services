@@ -12,7 +12,7 @@ FRED API Parser
     sasha_fred_wm2ns
 """
 
-# ── 1. ИМПОРТЫ ─────────────────────────────────────────────────────────────────
+#  1. ИМПОРТЫ
 import os
 import sys
 import argparse
@@ -22,7 +22,7 @@ import mysql.connector
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 
-# ── 2. КОНФИГ ─────────────────────────────────────────────────────────────────
+#  2. КОНФИГ
 load_dotenv()
 
 FRED_API_KEY = os.getenv("FRED_API_KEY")
@@ -32,7 +32,7 @@ TRACE_URL  = f"{_HANDLER}/trace.php"
 NODE_NAME  = os.getenv("NODE_NAME", "FRED")
 EMAIL      = os.getenv("ALERT_EMAIL", "samuray150305@gmail.com")
 
-# ── 3. ТРАССИРОВКА ОШИБОК ─────────────────────────────────────────────────────
+#  3. ТРАССИРОВКА ОШИБОК
 def send_error_trace(exc: Exception, script_name: str = "FRED.py"):
     """
     Отправляет трассировку в фоновом потоке — не блокирует основной процесс.
@@ -48,7 +48,7 @@ def send_error_trace(exc: Exception, script_name: str = "FRED.py"):
 
     threading.Thread(target=_send, daemon=True).start()
 
-# ── 4. АРГУМЕНТЫ ──────────────────────────────────────────────────────────────
+#  4. АРГУМЕНТЫ
 parser = argparse.ArgumentParser(description="FRED Parser → MySQL")
 parser.add_argument("table_name",  help="Имя целевой таблицы в БД")
 parser.add_argument("host",        nargs="?", default=os.getenv("DB_HOST"))
@@ -59,7 +59,7 @@ parser.add_argument("database",    nargs="?", default=os.getenv("DB_NAME"))
 args = parser.parse_args()
 
 if not all([args.host, args.user, args.password, args.database]):
-    print("Ошибка: не указаны параметры подключения к БД")
+    print(" Ошибка: не указаны параметры подключения к БД")
     sys.exit(1)
 
 DB_CONFIG = {
@@ -70,7 +70,7 @@ DB_CONFIG = {
     "database": args.database,
 }
 
-# ── 5. ТАБЛИЦЫ ─────────────────────────────────
+#  5. ТАБЛИЦЫ
 DATASETS = {
     "sasha_fred_dff": {
         "series_id": "DFF",
@@ -106,7 +106,7 @@ DATASETS = {
     },
 }
 
-# ── 6. СОЗДАНИЕ ТАБЛИЦЫ ────────────────────────────────────────────────────────
+#  6. СОЗДАНИЕ ТАБЛИЦЫ
 def ensure_table(table_name: str):
     conn = mysql.connector.connect(**DB_CONFIG)
     c = conn.cursor()
@@ -125,7 +125,7 @@ def ensure_table(table_name: str):
     c.close()
     conn.close()
 
-# ── 7. ПОСЛЕДНЯЯ ДАТА В БД (для инкрементальной загрузки) ─────────────────────
+#  7. ПОСЛЕДНЯЯ ДАТА В БД (для инкрементальной загрузки)
 def get_latest_date(table_name: str):
     """
     Возвращает максимальную дату из таблицы или None если таблица пуста.
@@ -141,7 +141,7 @@ def get_latest_date(table_name: str):
     except:
         return None
 
-# ── 8. ПОЛУЧЕНИЕ ДАННЫХ ───────────────────────────────────────────────────────
+#  8. ПОЛУЧЕНИЕ ДАННЫХ
 def fetch_data(config: dict, observation_start: str = None) -> list:
     """
     Запрос к FRED API. Поддерживает observation_start для инкрементальной загрузки.
@@ -162,23 +162,23 @@ def fetch_data(config: dict, observation_start: str = None) -> list:
         )
 
         if response.status_code != 200:
-            print(f"HTTP error {response.status_code} (series: {config['series_id']})")
+            print(f" HTTP {response.status_code} (series: {config['series_id']})")
             print(response.text[:500])
             return []
 
         data = response.json()
         observations = data.get("observations", [])
-        print(f"Получено наблюдений от FRED: {len(observations)}")
+        print(f" Получено наблюдений от FRED: {len(observations)}")
         return observations
 
     except Exception as e:
-        print(f"Ошибка запроса к FRED: {e}")
+        print(f" Ошибка запроса к FRED: {e}")
         return []
 
-# ── 9. ЗАПИСЬ В БД ────────────────────────────────────────────────────────────
+#  9. ЗАПИСЬ В БД
 def save_rows(table_name: str, rows: list):
     if not rows:
-        print("Внимание: нет новых данных для записи")
+        print("  Нет новых данных для записи")
         return
 
     conn = mysql.connector.connect(**DB_CONFIG)
@@ -191,18 +191,18 @@ def save_rows(table_name: str, rows: list):
     c.executemany(sql, rows)
     conn.commit()
 
-    print(f"Записано {c.rowcount} новых строк")
+    print(f" Записано {c.rowcount} новых строк")
     c.close()
     conn.close()
 
-# ── 10. ОСНОВНАЯ ЛОГИКА ────────────────────────────────────────────────────────
+#  10. ОСНОВНАЯ ЛОГИКА
 def process(table_name: str):
     config = DATASETS[table_name]
 
     ensure_table(table_name)
 
     latest = get_latest_date(table_name)
-    print(f"Последняя дата в БД: {latest or 'таблица пуста'}")
+    print(f" Последняя дата в БД: {latest or 'таблица пуста'}")
 
     # просим FRED только новые данные
     observation_start = None
@@ -210,13 +210,13 @@ def process(table_name: str):
         try:
             start_date = latest + timedelta(days=1)
             observation_start = start_date.strftime("%Y-%m-%d")
-            print(f"Запрашиваем данные начиная с {observation_start}")
+            print(f" Запрашиваем данные начиная с {observation_start}")
         except Exception as e:
-            print(f"Внимание: не удалось рассчитать observation_start: {e}")
+            print(f" Не удалось рассчитать observation_start: {e}")
 
     raw = fetch_data(config, observation_start)
     if not raw:
-        print("Внимание: данных от FRED нет")
+        print("  Данных от FRED нет")
         return
 
     # Фильтруем
@@ -236,18 +236,18 @@ def process(table_name: str):
         except (ValueError, TypeError):
             continue
 
-    print(f"Новых строк после фильтра: {len(rows)}")
+    print(f" Новых строк после фильтра: {len(rows)}")
     save_rows(table_name, rows)
 
-# ── 11. ТОЧКА ВХОДА ────────────────────────────────────────────────────────────
+#  11. ТОЧКА ВХОДА
 def main():
     if args.table_name not in DATASETS:
-        print(f"Ошибка: неизвестная таблица '{args.table_name}'. Допустимые:")
+        print(f" Неизвестная таблица '{args.table_name}'. Допустимые:")
         for name, cfg in DATASETS.items():
             print(f"  - {name} → {cfg['description']}")
         sys.exit(1)
 
-    print("FRED Parser")
+    print(f" FRED Parser")
     print(f"   База: {args.host}:{args.port}/{args.database}")
     print(f"   Таблица: {args.table_name} ({DATASETS[args.table_name]['series_id']})")
     print("=" * 70)
@@ -255,7 +255,7 @@ def main():
     process(args.table_name)
 
     print("=" * 70)
-    print("ГОТОВО")
+    print(" ГОТОВО")
 
 
 if __name__ == "__main__":
@@ -264,9 +264,9 @@ if __name__ == "__main__":
     except SystemExit:
         raise
     except KeyboardInterrupt:
-        print("\nПрервано пользователем")
+        print("\n Прервано пользователем")
         sys.exit(1)
     except Exception as e:
-        print(f"\nКритическая ошибка: {e!r}")
+        print(f"\n Критическая ошибка: {e!r}")
         send_error_trace(e)
         sys.exit(1)
