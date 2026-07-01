@@ -8,6 +8,8 @@ FRED API Parser
     sasha_fred_dexuseu
     sasha_fred_t10yie
     sasha_fred_cbbtcusd
+    sasha_fred_currcir
+    sasha_fred_wm2ns
 """
 
 # ── 1. ИМПОРТЫ ─────────────────────────────────────────────────────────────────
@@ -57,7 +59,7 @@ parser.add_argument("database",    nargs="?", default=os.getenv("DB_NAME"))
 args = parser.parse_args()
 
 if not all([args.host, args.user, args.password, args.database]):
-    print("❌ Ошибка: не указаны параметры подключения к БД")
+    print("Ошибка: не указаны параметры подключения к БД")
     sys.exit(1)
 
 DB_CONFIG = {
@@ -93,6 +95,14 @@ DATASETS = {
     "sasha_fred_cbbtcusd": {
         "series_id": "CBBTCUSD",
         "description": "BTC — Цена Bitcoin от Coinbase (USD)"
+    },
+    "sasha_fred_currcir": {
+        "series_id": "CURRCIR",
+        "description": "Currency in Circulation — Объем денежных средств в обращении (эмиссия)"
+    },
+    "sasha_fred_wm2ns": {
+        "series_id": "WM2NS",
+        "description": "M2 Money Stock — Недельный M2"
     },
 }
 
@@ -152,23 +162,23 @@ def fetch_data(config: dict, observation_start: str = None) -> list:
         )
 
         if response.status_code != 200:
-            print(f"❌ HTTP {response.status_code} (series: {config['series_id']})")
+            print(f"HTTP error {response.status_code} (series: {config['series_id']})")
             print(response.text[:500])
             return []
 
         data = response.json()
         observations = data.get("observations", [])
-        print(f"📥 Получено наблюдений от FRED: {len(observations)}")
+        print(f"Получено наблюдений от FRED: {len(observations)}")
         return observations
 
     except Exception as e:
-        print(f"❌ Ошибка запроса к FRED: {e}")
+        print(f"Ошибка запроса к FRED: {e}")
         return []
 
 # ── 9. ЗАПИСЬ В БД ────────────────────────────────────────────────────────────
 def save_rows(table_name: str, rows: list):
     if not rows:
-        print("⚠️  Нет новых данных для записи")
+        print("Внимание: нет новых данных для записи")
         return
 
     conn = mysql.connector.connect(**DB_CONFIG)
@@ -181,7 +191,7 @@ def save_rows(table_name: str, rows: list):
     c.executemany(sql, rows)
     conn.commit()
 
-    print(f"✅ Записано {c.rowcount} новых строк")
+    print(f"Записано {c.rowcount} новых строк")
     c.close()
     conn.close()
 
@@ -192,7 +202,7 @@ def process(table_name: str):
     ensure_table(table_name)
 
     latest = get_latest_date(table_name)
-    print(f"📅 Последняя дата в БД: {latest or 'таблица пуста'}")
+    print(f"Последняя дата в БД: {latest or 'таблица пуста'}")
 
     # просим FRED только новые данные
     observation_start = None
@@ -200,13 +210,13 @@ def process(table_name: str):
         try:
             start_date = latest + timedelta(days=1)
             observation_start = start_date.strftime("%Y-%m-%d")
-            print(f"🔄 Запрашиваем данные начиная с {observation_start}")
+            print(f"Запрашиваем данные начиная с {observation_start}")
         except Exception as e:
-            print(f"⚠️ Не удалось рассчитать observation_start: {e}")
+            print(f"Внимание: не удалось рассчитать observation_start: {e}")
 
     raw = fetch_data(config, observation_start)
     if not raw:
-        print("⚠️  Данных от FRED нет")
+        print("Внимание: данных от FRED нет")
         return
 
     # Фильтруем
@@ -226,18 +236,18 @@ def process(table_name: str):
         except (ValueError, TypeError):
             continue
 
-    print(f"🆕 Новых строк после фильтра: {len(rows)}")
+    print(f"Новых строк после фильтра: {len(rows)}")
     save_rows(table_name, rows)
 
 # ── 11. ТОЧКА ВХОДА ────────────────────────────────────────────────────────────
 def main():
     if args.table_name not in DATASETS:
-        print(f"❌ Неизвестная таблица '{args.table_name}'. Допустимые:")
+        print(f"Ошибка: неизвестная таблица '{args.table_name}'. Допустимые:")
         for name, cfg in DATASETS.items():
             print(f"  - {name} → {cfg['description']}")
         sys.exit(1)
 
-    print(f"🚀 FRED Parser")
+    print("FRED Parser")
     print(f"   База: {args.host}:{args.port}/{args.database}")
     print(f"   Таблица: {args.table_name} ({DATASETS[args.table_name]['series_id']})")
     print("=" * 70)
@@ -245,7 +255,7 @@ def main():
     process(args.table_name)
 
     print("=" * 70)
-    print("🏁 ГОТОВО")
+    print("ГОТОВО")
 
 
 if __name__ == "__main__":
@@ -254,9 +264,9 @@ if __name__ == "__main__":
     except SystemExit:
         raise
     except KeyboardInterrupt:
-        print("\n🛑 Прервано пользователем")
+        print("\nПрервано пользователем")
         sys.exit(1)
     except Exception as e:
-        print(f"\n❌ Критическая ошибка: {e!r}")
+        print(f"\nКритическая ошибка: {e!r}")
         send_error_trace(e)
         sys.exit(1)

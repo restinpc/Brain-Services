@@ -27,7 +27,7 @@ load_dotenv()
 # Создаём рабочую директорию в домашней папке
 WORK_DIR = os.path.join(os.path.expanduser("~"), ".ecb_parser")
 os.makedirs(WORK_DIR, exist_ok=True)
-print(f"📁 Рабочая директория: {WORK_DIR}")
+print(f" Рабочая директория: {WORK_DIR}")
 
 TRACE_URL = "https://server.brain-project.online/trace.php"
 NODE_NAME = os.getenv("NODE_NAME", "ecb_parser")
@@ -36,6 +36,20 @@ EMAIL = os.getenv("ALERT_EMAIL", "vladyurjevitch@yandex.ru")
 BASE_URL_RSS = "https://www.ecb.europa.eu/home/html/rss.en.html"
 ZIP_URL = "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-hist.zip"
 CSV_URL = "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-hist.csv"
+
+# ECB SDW / Data API monetary datasets (доп. режим, не влияет на rates/items).
+MONETARY_DATASETS = {
+    "sasha_ecb_emission": {
+        "flow_ref": "BSI",
+        "series_key": "M.U2.Y.V.L10.X.1.U2.2300.Z01.E",
+        "description": "ECB Currency in circulation (Euro area, monthly)"
+    },
+    "sasha_ecb_m3": {
+        "flow_ref": "BSI",
+        "series_key": "M.U2.Y.V.M30.X.1.U2.2300.Z01.E",
+        "description": "ECB M3 monetary aggregate (Euro area, monthly)"
+    },
+}
 
 
 def send_error_trace(exc: Exception):
@@ -78,7 +92,7 @@ def download_and_read_zip_csv(url):
                 df = pd.read_csv(csv_file)
 
         num_rows = df.shape[0]
-        print(f"   ✅ CSV загружен, строк: {num_rows}")
+        print(f"    CSV загружен, строк: {num_rows}")
         print(f"   Последняя дата: {df['Date'].max()}")
 
         if df['Date'].max() < '2026-01-01':
@@ -87,13 +101,13 @@ def download_and_read_zip_csv(url):
         return df
 
     except requests.exceptions.RequestException as e:
-        print(f"❌ Ошибка при скачивании: {e}")
+        print(f" Ошибка при скачивании: {e}")
         raise
     except zipfile.BadZipFile:
-        print("❌ Ошибка: скачанный файл не является ZIP архивом или повреждён.")
+        print(" Ошибка: скачанный файл не является ZIP архивом или повреждён.")
         raise
     except Exception as e:
-        print(f"❌ Произошла ошибка: {e}")
+        print(f" Произошла ошибка: {e}")
         raise
 
 
@@ -121,7 +135,7 @@ def download_and_read_zip_csv_memory(url):
                 df = pd.read_csv(csv_file)
 
         num_rows = df.shape[0]
-        print(f"   ✅ CSV загружен, строк: {num_rows}")
+        print(f"    CSV загружен, строк: {num_rows}")
         print(f"   Последняя дата: {df['Date'].max()}")
 
         if df['Date'].max() < '2026-01-01':
@@ -130,13 +144,13 @@ def download_and_read_zip_csv_memory(url):
         return df
 
     except requests.exceptions.RequestException as e:
-        print(f"❌ Ошибка при скачивании: {e}")
+        print(f" Ошибка при скачивании: {e}")
         raise
     except zipfile.BadZipFile:
-        print("❌ Ошибка: скачанный файл не является ZIP архивом или повреждён.")
+        print(" Ошибка: скачанный файл не является ZIP архивом или повреждён.")
         raise
     except Exception as e:
-        print(f"❌ Произошла ошибка: {e}")
+        print(f" Произошла ошибка: {e}")
         raise
 
 
@@ -186,6 +200,116 @@ DB_CONFIG = {
     'password': args.password,
     'database': args.database,
 }
+
+def ensure_monetary_table(table_name: str):
+    with mysql.connector.connect(**DB_CONFIG) as conn:
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            CREATE TABLE IF NOT EXISTS `{table_name}` (
+                id         INT AUTO_INCREMENT PRIMARY KEY,
+                date_iso   DATE NOT NULL,
+                value      DOUBLE,
+                loaded_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE KEY uq_date (date_iso),
+                INDEX idx_date (date_iso)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            COMMENT='{MONETARY_DATASETS[table_name]["description"]}';
+        """)
+        conn.commit()
+
+
+def get_monetary_latest_date(table_name: str):
+    try:
+        with mysql.connector.connect(**DB_CONFIG) as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"SELECT MAX(date_iso) FROM `{table_name}`")
+            row = cursor.fetchone()
+            return row[0] if row and row[0] else None
+    except Exception:
+        return None
+
+
+def fetch_monetary_series(config: dict, start_period: str = None) -> pd.DataFrame:
+    params = {"format": "csvdata"}
+    if start_period:
+        params["startPeriod"] = start_period
+
+    flow_ref = config.get("flow_ref")
+    series_key = config.get("series_key")
+    if not flow_ref or not series_key:
+        raise RuntimeError("Некорректная конфигурация датасета: нужны flow_ref и series_key")
+
+    url = f"https://data-api.ecb.europa.eu/service/data/{flow_ref}/{series_key}"
+
+    # Игнорируем env-прокси, чтобы не падать на SOCKS alias без PySocks.
+    session = requests.Session()
+    session.trust_env = False
+
+    try:
+        response = session.get(url, params=params, timeout=45)
+        response.raise_for_status()
+    except Exception as e:
+        raise RuntimeError(f"Ошибка запроса к ECB API ({flow_ref}.{series_key}): {e}")
+
+    try:
+        df = pd.read_csv(io.StringIO(response.text))
+    except Exception as e:
+        raise RuntimeError(f"Не удалось распарсить CSV ECB ({flow_ref}.{series_key}): {e}")
+
+    if "TIME_PERIOD" not in df.columns or "OBS_VALUE" not in df.columns:
+        raise RuntimeError("ECB API вернул неожиданный формат: нет TIME_PERIOD/OBS_VALUE")
+
+    return df
+
+
+def run_monetary_dataset(table_name: str):
+    config = MONETARY_DATASETS[table_name]
+    print(f"\n ECB monetary dataset: {table_name} ({config['flow_ref']}.{config['series_key']})")
+
+    ensure_monetary_table(table_name)
+    latest = get_monetary_latest_date(table_name)
+    print(f" Последняя дата в БД: {latest or 'таблица пуста'}")
+
+    start_period = None
+    if latest:
+        start_period = latest.strftime("%Y-%m")
+        print(f" Запрашиваем данные начиная с периода: {start_period}")
+
+    df = fetch_monetary_series(config, start_period=start_period)
+    print(f" Получено строк от ECB API: {len(df)}")
+
+    rows = []
+    for _, row in df.iterrows():
+        tp = str(row.get("TIME_PERIOD", "")).strip()
+        val = row.get("OBS_VALUE")
+
+        if not tp or pd.isna(val):
+            continue
+
+        try:
+            date_iso = pd.to_datetime(tp).date()
+            value = float(val)
+        except Exception:
+            continue
+
+        if latest and date_iso <= latest:
+            continue
+
+        rows.append((date_iso.strftime("%Y-%m-%d"), value))
+
+    print(f" Новых строк после фильтра: {len(rows)}")
+    if not rows:
+        print(" Нет новых данных для записи")
+        return
+
+    with mysql.connector.connect(**DB_CONFIG) as conn:
+        cursor = conn.cursor()
+        cursor.executemany(f"""
+            INSERT IGNORE INTO `{table_name}` (date_iso, value)
+            VALUES (%s, %s)
+        """, rows)
+        conn.commit()
+        print(f" Записано {cursor.rowcount} новых строк в {table_name}")
 
 
 class ECBParser:
@@ -245,10 +369,10 @@ class ECBParser:
                 print(f"   → Таблица {self.items_table} (с автоинкрементом id)")
 
             conn.commit()
-            print(f"✅ Таблицы готовы (режим {self.mode})")
+            print(f" Таблицы готовы (режим {self.mode})")
 
     def run_rates(self):
-        print("\n📊 Скачиваем полную историю курсов из eurofxref-hist.zip...")
+        print("\n Скачиваем полную историю курсов из eurofxref-hist.zip...")
         try:
             df = download_and_read_zip_csv(ZIP_URL)
 
@@ -289,15 +413,15 @@ class ECBParser:
                     total_inserted += len(batch)
                     print(f"      Загружено {total_inserted:,} / {len(df_melted):,} записей...")
 
-            print(f"\n✅ Успешно загружено {total_inserted:,} записей в {self.rates_table}")
+            print(f"\n Успешно загружено {total_inserted:,} записей в {self.rates_table}")
 
         except Exception as e:
-            print(f"❌ Ошибка в run_rates: {e}")
+            print(f" Ошибка в run_rates: {e}")
             traceback.print_exc()
             raise
 
     def fetch_rss_feeds(self):
-        print(f"\n📡 Сканируем RSS-страницу → {BASE_URL_RSS}")
+        print(f"\n Сканируем RSS-страницу → {BASE_URL_RSS}")
         resp = self.session.get(BASE_URL_RSS, timeout=30)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
@@ -337,7 +461,7 @@ class ECBParser:
         return feeds
 
     def run_items(self):
-        print("\n📰 Собираем RSS-статьи...")
+        print("\n Собираем RSS-статьи...")
         feeds = self.fetch_rss_feeds()
         count_new = 0
 
@@ -425,13 +549,13 @@ class ECBParser:
                             continue
 
                     conn.commit()
-                    print(f"      ✅ Обработано {len(d.entries)} записей")
+                    print(f"       Обработано {len(d.entries)} записей")
 
             except Exception as e:
-                print(f"      ❌ Ошибка: {e}")
+                print(f"       Ошибка: {e}")
             time.sleep(1.5)
 
-        print(f"\n✅ Добавлено/обновлено {count_new} статей в {self.items_table}")
+        print(f"\n Добавлено/обновлено {count_new} статей в {self.items_table}")
 
     def _get_feed_type(self, url: str) -> str:
         u = url.lower()
@@ -443,18 +567,21 @@ class ECBParser:
         return 'other'
 
     def run(self):
-        print(f"\n🚀 ECB Parser запущен | префикс: {self.prefix} | режим: {self.mode.upper()}")
+        print(f"\n ECB Parser запущен | префикс: {self.prefix} | режим: {self.mode.upper()}")
         if self.mode in ("all", "rates"):
             self.run_rates()
         if self.mode in ("all", "items"):
             self.run_items()
-        print("\n🏁 Завершено!")
+        print("\n Завершено!")
 
 
 if __name__ == "__main__":
     try:
-        ECBParser(args.table_name).run()
+        if args.table_name in MONETARY_DATASETS:
+            run_monetary_dataset(args.table_name)
+        else:
+            ECBParser(args.table_name).run()
     except Exception as e:
-        print(f"❌ Критическая ошибка: {e}")
+        print(f" Критическая ошибка: {e}")
         send_error_trace(e)
         sys.exit(1)
