@@ -5,7 +5,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared"))
 import uvicorn
 import asyncio
 import json
-import requests
+import httpx
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query
@@ -24,14 +24,14 @@ from cache_helper import ensure_cache_table, cached_values
 # ═══════════════════════════════════════════════════════════════════════════
 #  ЕДИНСТВЕННОЕ, ЧТО НУЖНО МЕНЯТЬ ДЛЯ НОВОЙ СОСТАВНОЙ МОДЕЛИ
 # ═══════════════════════════════════════════════════════════════════════════
-MODEL_A_ID = 44        # ID первой дочерней модели
-MODEL_B_ID = 31        # ID второй дочерней модели
-SERVICE_ID = 45        # ID самой составной модели (новый, свободный)
-PORT       = 8898      # свободный порт
+CHILD_MODEL_IDS = [44, 31]   # ID дочерних моделей (2, 3, N — сколько угодно)
+SERVICE_ID      = 45         # ID самой составной модели (новый, свободный)
+PORT            = 8898       # свободный порт
 # ═══════════════════════════════════════════════════════════════════════════
 
-BEST_URL  = "https://server.brain-project.online/best.php"
-NODE_NAME = f"brain-complex-{MODEL_A_ID}-{MODEL_B_ID}-microservice"
+BEST_URL     = "https://server.brain-project.online/best.php"
+NODE_NAME    = f"brain-complex-{'-'.join(map(str, CHILD_MODEL_IDS))}-microservice"
+HTTP_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
 
 load_dotenv()
 
@@ -41,28 +41,19 @@ log(f"MODE={MODE}", NODE_NAME, force=True)
 log(f"engines built via build_engines()", NODE_NAME)
 
 
-def _fetch_weights_from_child(url: str, model_id: int) -> list[str]:
+def _extract_weights_payload(data: dict, model_id: int) -> list[str]:
     """
-    Синхронный запрос /weights у дочернего сервиса.
-    Универсально поддерживает оба формата ответа:
-
-      Legacy-стиль:
-        {"status":"ok","payLoad": ["type1_var0_...", "type1_var1_...", ...]}
-        {"weights": [...]}
-
-      Framework-стиль (brain_framework.py):
-        {"status":"ok","payLoad": {"codes": [...], "var_range": [...], ...}}
+    Универсально достаёт список кодов весов из ответа /weights.
+    Поддерживает:
+      Legacy-стиль:    {"status":"ok","payLoad": [...]}
+      Framework-стиль: {"status":"ok","payLoad": {"codes": [...], ...}}
+      Fallback:        {"weights": [...]}
     """
-    r = requests.get(f"{url}/weights", timeout=10)
-    r.raise_for_status()
-    data = r.json()
-
     payload = data.get("payLoad")
     if payload is not None:
         if isinstance(payload, list):
             return payload
         if isinstance(payload, dict):
-            # framework обычно кладёт список кодов в "codes"
             for key in ("codes", "weights", "keys"):
                 if isinstance(payload.get(key), list):
                     return payload[key]
@@ -81,8 +72,6 @@ def _fetch_weights_from_child(url: str, model_id: int) -> list[str]:
 def _extract_result_dict(res: dict, model_id: int) -> dict:
     """
     Универсально достаёт словарь {key: value} из ответа дочернего /values.
-    Поддерживает как {"payLoad": {...}}, так и {...} напрямую,
-    а также явную ошибку в ответе.
     """
     if "error" in res:
         raise ValueError(f"Model {model_id} returned error: {res['error']}")
@@ -93,105 +82,154 @@ def _extract_result_dict(res: dict, model_id: int) -> dict:
         return payload
     if "status" in res and res.get("status") != "ok":
         raise ValueError(f"Model {model_id}: status not ok: {res}")
-    # fallback: сам res уже плоский словарь значений
     return {k: v for k, v in res.items() if k not in ("status", "error")}
 
 
-async def _compute_composite(pair, day, date, param_dict, state) -> dict | None:
-    """Логика вычисления составной модели — вызывает дочерние сервисы."""
-    combined = {}
+async def _fetch_weights_from_child(client: httpx.AsyncClient, url: str, model_id: int) -> list[str]:
+    """Асинхронный запрос /weights у одного дочернего сервиса."""
+    r = await client.get(f"{url}/weights", timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    return _extract_weights_payload(r.json(), model_id)
+
+
+async def _fetch_all_weights(client: httpx.AsyncClient, state) -> dict[int, list[str] | Exception]:
+    """
+    Параллельно опрашивает /weights у ВСЕХ дочерних сервисов разом.
+    Возвращает {model_id: list_of_weights | Exception}.
+    """
+    ids = CHILD_MODEL_IDS
+    results = await asyncio.gather(
+        *[_fetch_weights_from_child(client, state.child_urls[mid], mid) for mid in ids],
+        return_exceptions=True,
+    )
+    return dict(zip(ids, results))
+
+
+async def _fetch_one_child_values(
+    client: httpx.AsyncClient,
+    model_id: int,
+    url: str,
+    pair: int,
+    day: int,
+    date: str,
+    subp: dict,
+) -> dict:
+    """Один асинхронный запрос /values к дочернему сервису + масштабирование на k."""
+    k = subp.get("k")
+    if k is None:
+        raise ValueError(f"Model {model_id}: missing 'k' in params")
+
+    query_params = {key: val for key, val in subp.items() if key != "k"}
+    query_params.update({"pair": pair, "day": day, "date": date})
+
+    r   = await client.get(f"{url}/values", params=query_params, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    res = r.json()
+    values = _extract_result_dict(res, model_id)
+    return {f"{model_id}_{key}": round(val * k, 6) for key, val in values.items()}
+
+
+async def _compute_composite(client: httpx.AsyncClient, pair, day, date, param_dict, state) -> dict | None:
+    """
+    Логика вычисления составной модели.
+    КЛЮЧЕВОЕ: все обращения к дочерним моделям запускаются ОДНОВРЕМЕННО
+    через asyncio.gather, а не последовательно друг за другом.
+    Это критично при вложенных составных моделях (composite of composite) —
+    иначе задержка растёт линейно с глубиной вложенности и числом детей.
+    """
+    tasks = []
+    task_model_ids = []
+
     for model_str, subp in param_dict.items():
         model_id = int(model_str)
-        k = subp.get("k")
-        if k is None:
-            return None
-        url = (state.URL_A if model_id == MODEL_A_ID
-               else state.URL_B if model_id == MODEL_B_ID
-               else None)
+        url = state.child_urls.get(model_id)
         if url is None:
+            log(f" Unknown child model {model_id} in params — skipped", NODE_NAME,
+                level="warn", force=True)
             continue
-        query_params = {key: val for key, val in subp.items() if key != "k"}
-        query_params.update({"pair": pair, "day": day, "date": date})
-        try:
-            r   = requests.get(f"{url}/values", params=query_params, timeout=10)
-            res = r.json()
-            values = _extract_result_dict(res, model_id)
-            for key, val in values.items():
-                combined[f"{model_id}_{key}"] = round(val * k, 6)
-        except Exception as e:
-            log(f" Child model {model_id} error: {e}", NODE_NAME, level="error", force=True)
+        tasks.append(_fetch_one_child_values(client, model_id, url, pair, day, date, subp))
+        task_model_ids.append(model_id)
+
+    if not tasks:
+        return None
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    combined: dict = {}
+    for model_id, result in zip(task_model_ids, results):
+        if isinstance(result, Exception):
+            log(f" Child model {model_id} error: {result}", NODE_NAME,
+                level="error", force=True)
             return None
+        combined.update(result)
+
     return combined
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 1. URL-ы из brain_service
+    app.state.http_client = httpx.AsyncClient(timeout=HTTP_TIMEOUT)
+
+    # 1. URL-ы всех дочерних моделей из brain_service — одним запросом
     async with engine_super.connect() as conn:
+        placeholders = ", ".join(f":id{i}" for i in range(len(CHILD_MODEL_IDS)))
+        params = {f"id{i}": mid for i, mid in enumerate(CHILD_MODEL_IDS)}
         res  = await conn.execute(text(
-            "SELECT id, url FROM brain_service WHERE id IN (:a, :b) AND active = 1"
-        ), {"a": MODEL_A_ID, "b": MODEL_B_ID})
+            f"SELECT id, url FROM brain_service WHERE id IN ({placeholders}) AND active = 1"
+        ), params)
         urls = {row[0]: row[1].rstrip("/") for row in res.fetchall()}
 
-    app.state.URL_A = urls.get(MODEL_A_ID)
-    app.state.URL_B = urls.get(MODEL_B_ID)
-
-    if not app.state.URL_A:
-        raise RuntimeError(f"URL for model {MODEL_A_ID} not found in brain_service (active=1)")
-    if not app.state.URL_B:
-        raise RuntimeError(f"URL for model {MODEL_B_ID} not found in brain_service (active=1)")
-
-    log(f"URL_A ({MODEL_A_ID}): {app.state.URL_A}", NODE_NAME, force=True)
-    log(f"URL_B ({MODEL_B_ID}): {app.state.URL_B}", NODE_NAME, force=True)
+    app.state.child_urls = {}
+    for mid in CHILD_MODEL_IDS:
+        url = urls.get(mid)
+        if not url:
+            raise RuntimeError(f"URL for model {mid} not found in brain_service (active=1)")
+        app.state.child_urls[mid] = url
+        log(f"URL[{mid}]: {url}", NODE_NAME, force=True)
 
     # 2. Колонки параметров сигналов (для /params — если таблица есть)
-    app.state.cols_A = []
-    app.state.cols_B = []
+    app.state.cols = {}
     async with engine_brain.connect() as conn:
-        try:
-            result_a = await conn.execute(text(f"DESCRIBE `brain_signal{MODEL_A_ID}`"))
-            app.state.cols_A = [row[0] for row in result_a.fetchall()
-                                if row[0] in ("type", "var", "param")]
-        except Exception as e:
-            log(f"  DESCRIBE brain_signal{MODEL_A_ID} failed: {e}", NODE_NAME, level="warn", force=True)
-        try:
-            result_b = await conn.execute(text(f"DESCRIBE `brain_signal{MODEL_B_ID}`"))
-            app.state.cols_B = [row[0] for row in result_b.fetchall()
-                                if row[0] in ("type", "var", "param")]
-        except Exception as e:
-            log(f"  DESCRIBE brain_signal{MODEL_B_ID} failed: {e}", NODE_NAME, level="warn", force=True)
+        for mid in CHILD_MODEL_IDS:
+            try:
+                result = await conn.execute(text(f"DESCRIBE `brain_signal{mid}`"))
+                app.state.cols[mid] = [row[0] for row in result.fetchall()
+                                        if row[0] in ("type", "var", "param")]
+            except Exception as e:
+                app.state.cols[mid] = []
+                log(f"  DESCRIBE brain_signal{mid} failed: {e}", NODE_NAME,
+                    level="warn", force=True)
+    log(f"Cols: {app.state.cols}", NODE_NAME)
 
-    log(f"Cols A: {app.state.cols_A}", NODE_NAME)
-    log(f"Cols B: {app.state.cols_B}", NODE_NAME)
-
-    # 3. Флаги static
+    # 3. Флаги static — одним запросом
     async with engine_brain.connect() as conn:
+        placeholders = ", ".join(f":id{i}" for i in range(len(CHILD_MODEL_IDS)))
+        params = {f"id{i}": mid for i, mid in enumerate(CHILD_MODEL_IDS)}
         res   = await conn.execute(text(
-            "SELECT id, static FROM brain_models WHERE id IN (:a, :b)"
-        ), {"a": MODEL_A_ID, "b": MODEL_B_ID})
+            f"SELECT id, static FROM brain_models WHERE id IN ({placeholders})"
+        ), params)
         flags = {row[0]: bool(row[1]) for row in res.fetchall()}
 
-    app.state.static_A = flags.get(MODEL_A_ID, True)
-    app.state.static_B = flags.get(MODEL_B_ID, True)
-    log(f"static_A={app.state.static_A}, static_B={app.state.static_B}", NODE_NAME, force=True)
+    app.state.child_static = {mid: flags.get(mid, True) for mid in CHILD_MODEL_IDS}
+    log(f"static: {app.state.child_static}", NODE_NAME, force=True)
 
-    # 4. Предзагрузка весов для нестатичных моделей
-    app.state.weights_A = None
-    app.state.weights_B = None
-
-    for model_id, url, is_static, attr in [
-        (MODEL_A_ID, app.state.URL_A, app.state.static_A, "weights_A"),
-        (MODEL_B_ID, app.state.URL_B, app.state.static_B, "weights_B"),
-    ]:
-        if not is_static:
-            try:
-                w = _fetch_weights_from_child(url, model_id)
-                setattr(app.state, attr, w)
-                log(f"Pre-loaded {len(w)} weights for model {model_id}", NODE_NAME, force=True)
-            except Exception as e:
-                log(f"  Pre-load weights model {model_id}: {e}", NODE_NAME,
+    # 4. Предзагрузка весов для нестатичных моделей — ПАРАЛЛЕЛЬНО
+    app.state.child_weights = {mid: None for mid in CHILD_MODEL_IDS}
+    nonstatic_ids = [mid for mid in CHILD_MODEL_IDS if not app.state.child_static[mid]]
+    if nonstatic_ids:
+        results = await asyncio.gather(
+            *[_fetch_weights_from_child(app.state.http_client, app.state.child_urls[mid], mid)
+              for mid in nonstatic_ids],
+            return_exceptions=True,
+        )
+        for mid, result in zip(nonstatic_ids, results):
+            if isinstance(result, Exception):
+                log(f"  Pre-load weights model {mid}: {result}", NODE_NAME,
                     level="error", force=True)
-                send_error_trace(e, NODE_NAME)
+                send_error_trace(result, NODE_NAME)
+            else:
+                app.state.child_weights[mid] = result
+                log(f"Pre-loaded {len(result)} weights for model {mid}", NODE_NAME, force=True)
 
     # 5. URL этого сервиса и таблица кеша
     async with engine_super.connect() as conn:
@@ -203,6 +241,8 @@ async def lifespan(app: FastAPI):
     log(f"SERVICE_URL (self): {app.state.service_url}", NODE_NAME, force=True)
 
     yield
+
+    await app.state.http_client.aclose()
     await engine_vlad.dispose()
     await engine_brain.dispose()
     await engine_super.dispose()
@@ -225,60 +265,54 @@ async def get_metadata():
         "version": f"1.{version}.0",
         "name":    NODE_NAME,
         "mode":    MODE,
-        "text":    f"Composite model {MODEL_A_ID} + {MODEL_B_ID}",
-        "child_urls": {
-            str(MODEL_A_ID): app.state.URL_A,
-            str(MODEL_B_ID): app.state.URL_B,
-        },
-        "static": {
-            str(MODEL_A_ID): app.state.static_A,
-            str(MODEL_B_ID): app.state.static_B,
-        },
-        "weights_cached": {
-            str(MODEL_A_ID): app.state.weights_A is not None,
-            str(MODEL_B_ID): app.state.weights_B is not None,
-        },
-        "metadata": {"child_models": [MODEL_A_ID, MODEL_B_ID]},
+        "text":    f"Composite model {'+'.join(map(str, CHILD_MODEL_IDS))}",
+        "child_urls":     {str(mid): app.state.child_urls[mid] for mid in CHILD_MODEL_IDS},
+        "static":         {str(mid): app.state.child_static[mid] for mid in CHILD_MODEL_IDS},
+        "weights_cached": {str(mid): app.state.child_weights[mid] is not None for mid in CHILD_MODEL_IDS},
+        "metadata": {"child_models": CHILD_MODEL_IDS},
     }
 
 
 @app.get("/weights")
 async def get_weights():
+    client = app.state.http_client
+    to_fetch = [mid for mid in CHILD_MODEL_IDS
+                if app.state.child_static[mid] or app.state.child_weights[mid] is None]
     try:
-        w_a = (
-            app.state.weights_A
-            if (not app.state.static_A and app.state.weights_A is not None)
-            else _fetch_weights_from_child(app.state.URL_A, MODEL_A_ID)
-        )
-        w_b = (
-            app.state.weights_B
-            if (not app.state.static_B and app.state.weights_B is not None)
-            else _fetch_weights_from_child(app.state.URL_B, MODEL_B_ID)
-        )
+        if to_fetch:
+            fetched = await asyncio.gather(
+                *[_fetch_weights_from_child(client, app.state.child_urls[mid], mid) for mid in to_fetch]
+            )
+            fetched_map = dict(zip(to_fetch, fetched))
+        else:
+            fetched_map = {}
     except Exception as e:
         send_error_trace(e, node=NODE_NAME, script="get_weights")
         return err_response(f"Child service unreachable: {e}")
-    combined = [f"{MODEL_A_ID}_" + w for w in w_a] + [f"{MODEL_B_ID}_" + w for w in w_b]
-    deduped  = list(dict.fromkeys(combined))
+
+    combined = []
+    for mid in CHILD_MODEL_IDS:
+        w = fetched_map.get(mid, app.state.child_weights.get(mid))
+        combined += [f"{mid}_" + code for code in w]
+    deduped = list(dict.fromkeys(combined))
     return ok_response(deduped)
 
 
 @app.get("/new_weights")
 async def new_weights():
     try:
+        results = await _fetch_all_weights(app.state.http_client, app.state)
         all_weights: list[str] = []
-        for model_id, url, is_static, attr in [
-            (MODEL_A_ID, app.state.URL_A, app.state.static_A, "weights_A"),
-            (MODEL_B_ID, app.state.URL_B, app.state.static_B, "weights_B"),
-        ]:
-            try:
-                weights = _fetch_weights_from_child(url, model_id)
-                if not is_static:
-                    setattr(app.state, attr, weights)
-            except Exception as e:
-                send_error_trace(e, NODE_NAME)
-                weights = getattr(app.state, attr) or []
-            all_weights += [f"{model_id}_" + w for w in weights]
+        for mid in CHILD_MODEL_IDS:
+            result = results[mid]
+            if isinstance(result, Exception):
+                send_error_trace(result, NODE_NAME)
+                weights = app.state.child_weights.get(mid) or []
+            else:
+                weights = result
+                if not app.state.child_static[mid]:
+                    app.state.child_weights[mid] = weights
+            all_weights += [f"{mid}_" + w for w in weights]
         deduped = list(dict.fromkeys(all_weights))
         return ok_response(deduped)
     except Exception as e:
@@ -298,7 +332,6 @@ async def get_values(
     except Exception:
         return err_response("Invalid JSON in params")
 
-    # Кешируем весь составной результат: ключ кеша включает params JSON
     try:
         return await cached_values(
             engine_vlad=engine_vlad,
@@ -306,8 +339,10 @@ async def get_values(
             pair         = pair,
             day          = day,
             date         = date,
-            extra_params = param_dict,   # весь params как ключ
-            compute_fn   = lambda: _compute_composite(pair, day, date, param_dict, app.state),
+            extra_params = param_dict,
+            compute_fn   = lambda: _compute_composite(
+                app.state.http_client, pair, day, date, param_dict, app.state
+            ),
             node         = NODE_NAME,
         )
     except Exception as e:
@@ -322,24 +357,33 @@ async def get_params(
     tier: int = Query(..., ge=0, le=1),
 ):
     """
-    Автогенерация комбинаций параметров для обучения (используется реже —
-    основной путь для заведения новой составной модели — это ручной
-    complex_json в brain_models, см. документацию).
+    Автогенерация комбинаций параметров для обучения. Поддерживает ровно
+    2 дочерние модели (декартово произведение type/var A × B). Для N>2
+    детей используйте ручной complex_json в brain_models.
     """
+    if len(CHILD_MODEL_IDS) != 2:
+        return err_response("/params auto-generation supports exactly 2 child models")
+    model_a_id, model_b_id = CHILD_MODEL_IDS
     max_per_model = 4 if tier == 0 else 3
+
+    client = app.state.http_client
     try:
-        best_a = requests.get(
-            f"{BEST_URL}?neuronet_id={MODEL_A_ID}&pair={pair}&day={day}", timeout=10).json()
-        best_b = requests.get(
-            f"{BEST_URL}?neuronet_id={MODEL_B_ID}&pair={pair}&day={day}", timeout=10).json()
+        best_a, best_b = await asyncio.gather(
+            client.get(f"{BEST_URL}?neuronet_id={model_a_id}&pair={pair}&day={day}", timeout=HTTP_TIMEOUT),
+            client.get(f"{BEST_URL}?neuronet_id={model_b_id}&pair={pair}&day={day}", timeout=HTTP_TIMEOUT),
+        )
+        best_a = best_a.json()
+        best_b = best_b.json()
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"best.php error: {e}")
 
     sorted_a = sorted(best_a, key=best_a.get, reverse=True)
     sorted_b = sorted(best_b, key=best_b.get, reverse=True)
 
-    TABLE_A = f"brain_signal{MODEL_A_ID}"
-    TABLE_B = f"brain_signal{MODEL_B_ID}"
+    TABLE_A = f"brain_signal{model_a_id}"
+    TABLE_B = f"brain_signal{model_b_id}"
+    cols_a  = app.state.cols.get(model_a_id, [])
+    cols_b  = app.state.cols.get(model_b_id, [])
 
     params_a, params_b = [], []
 
@@ -347,8 +391,8 @@ async def get_params(
         for sid in sorted_a:
             if len(params_a) >= max_per_model:
                 break
-            if app.state.cols_A:
-                cols_str = ", ".join(app.state.cols_A)
+            if cols_a:
+                cols_str = ", ".join(cols_a)
                 res = await conn.execute(
                     text(f"SELECT {cols_str} FROM `{TABLE_A}` "
                          f"WHERE id = :sid AND tier = :tier AND is_day = :day"),
@@ -358,15 +402,15 @@ async def get_params(
                 if row:
                     param_obj = {
                         col: ([row[i]] if col == "param" and row[i] is not None else row[i])
-                        for i, col in enumerate(app.state.cols_A)
+                        for i, col in enumerate(cols_a)
                     }
                     params_a.append(param_obj)
 
         for sid in sorted_b:
             if len(params_b) >= max_per_model:
                 break
-            if app.state.cols_B:
-                cols_str = ", ".join(app.state.cols_B)
+            if cols_b:
+                cols_str = ", ".join(cols_b)
                 res = await conn.execute(
                     text(f"SELECT {cols_str} FROM `{TABLE_B}` "
                          f"WHERE id = :sid AND tier = :tier AND is_day = :day"),
@@ -376,7 +420,7 @@ async def get_params(
                 if row:
                     param_obj = {
                         col: ([row[i]] if col == "param" and row[i] is not None else row[i])
-                        for i, col in enumerate(app.state.cols_B)
+                        for i, col in enumerate(cols_b)
                     }
                     params_b.append(param_obj)
 
@@ -385,8 +429,8 @@ async def get_params(
         for pa in params_a:
             for pb in params_b:
                 combs.append({
-                    str(MODEL_A_ID): {**pa, "k": 0.5},
-                    str(MODEL_B_ID): {**pb, "k": 0.5},
+                    str(model_a_id): {**pa, "k": 0.5},
+                    str(model_b_id): {**pb, "k": 0.5},
                 })
     else:
         for pa in params_a:
@@ -394,8 +438,8 @@ async def get_params(
                 for ki in range(1, 10):
                     k = round(ki / 10, 1)
                     combs.append({
-                        str(MODEL_A_ID): {**pa, "k": k},
-                        str(MODEL_B_ID): {**pb, "k": round(1 - k, 1)},
+                        str(model_a_id): {**pa, "k": k},
+                        str(model_b_id): {**pb, "k": round(1 - k, 1)},
                     })
 
     return combs[:150]
