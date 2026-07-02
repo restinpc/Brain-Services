@@ -37,6 +37,20 @@ BASE_URL_RSS = "https://www.ecb.europa.eu/home/html/rss.en.html"
 ZIP_URL = "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-hist.zip"
 CSV_URL = "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-hist.csv"
 
+# ============= НАСТРОЙКИ WEB (HTTP) ПРОКСИ =============
+HTTP_PROXY_HOST = os.getenv("HTTP_PROXY_HOST", "10.10.11.1")
+HTTP_PROXY_PORT = int(os.getenv("HTTP_PROXY_PORT", 3128))
+# ========================================================
+
+# Формируем прокси только если хост указан
+if HTTP_PROXY_HOST and HTTP_PROXY_HOST != "":
+    HTTP_PROXY = {
+        "http": f"http://{HTTP_PROXY_HOST}:{HTTP_PROXY_PORT}",
+        "https": f"http://{HTTP_PROXY_HOST}:{HTTP_PROXY_PORT}",
+    }
+else:
+    HTTP_PROXY = None
+
 # ECB SDW / Data API monetary datasets (доп. режим, не влияет на rates/items).
 MONETARY_DATASETS = {
     "sasha_ecb_emission": {
@@ -241,9 +255,14 @@ def fetch_monetary_series(config: dict, start_period: str = None) -> pd.DataFram
 
     url = f"https://data-api.ecb.europa.eu/service/data/{flow_ref}/{series_key}"
 
-    # Игнорируем env-прокси, чтобы не падать на SOCKS alias без PySocks.
+    # Используем HTTP proxy (если настроен), как в Bybit_Tg_Bot.py.
     session = requests.Session()
     session.trust_env = False
+    if HTTP_PROXY:
+        print(f" ECB monetary: используем HTTP proxy {HTTP_PROXY_HOST}:{HTTP_PROXY_PORT}")
+        session.proxies.update(HTTP_PROXY)
+    else:
+        print(" ECB monetary: работаем без proxy")
 
     try:
         response = session.get(url, params=params, timeout=45)
