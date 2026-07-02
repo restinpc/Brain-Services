@@ -53,6 +53,7 @@ SERVICE_ID     = _m.SERVICE_ID       # 60
 RATES_TABLES   = _m.RATES_TABLES
 SIG_DIGITS     = _m.SIG_DIGITS
 round_to_level = _m.round_to_level
+level_to_price = _m.level_to_price
 
 GRAPH_TABLE = _m.GRAPH_TABLE   # vlad_candle_graph_svc60
 STATS_TABLE = _m.STATS_TABLE   # vlad_candle_stats_svc60
@@ -165,12 +166,38 @@ async def _load_rates(
 
 def _vectorized_levels(prices: np.ndarray, sig: int = SIG_DIGITS) -> np.ndarray:
     """
-    Векторизованный аналог round_to_level для numpy-массива.
-    93211 → 932, 1.2016 → 120, 3521 → 352 (те же результаты, но в 50× быстрее).
+    Векторизованный аналог round_to_level (см. model.py) для numpy-массива.
+
+    Использует ТУ ЖЕ exp*bucket_size+(mantissa-lo) кодировку для глобальной
+    монотонности (без разрыва на границах степеней десяти) — см. подробное
+    обоснование в model.py:round_to_level. Здесь только векторизация: должна
+    давать ПОБИТОВО ТЕ ЖЕ уровни, что скалярная round_to_level на каждой
+    цене отдельно, иначе граф (построенный через эту функцию) разойдётся
+    с live-детектором в model.py — именно такой класс рассинхронизации мы
+    уже чинили ранее для сервиса 59.
     """
     safe = np.where(prices > 0, prices, 1e-10)
-    magnitudes = 10.0 ** (np.floor(np.log10(safe)) - sig + 1)
-    return (prices / magnitudes).astype(np.int64)
+    lo, hi = 10 ** (sig - 1), 10 ** sig
+    exp = np.floor(np.log10(safe)).astype(np.int64)
+    magnitude = 10.0 ** (exp - sig + 1)
+    mantissa  = (safe / magnitude).astype(np.int64)
+
+    # Клэмп на случай пограничной ошибки округления float вблизи точной
+    # степени десяти (тот же клэмп, что в скалярной версии).
+    too_high = mantissa >= hi
+    exp = np.where(too_high, exp + 1, exp)
+    magnitude = np.where(too_high, 10.0 ** (exp - sig + 1), magnitude)
+    mantissa  = np.where(too_high, (safe / magnitude).astype(np.int64), mantissa)
+
+    too_low = mantissa < lo
+    exp = np.where(too_low, exp - 1, exp)
+    magnitude = np.where(too_low, 10.0 ** (exp - sig + 1), magnitude)
+    mantissa  = np.where(too_low, (safe / magnitude).astype(np.int64), mantissa)
+
+    bucket_size = hi - lo
+    levels = exp * bucket_size + (mantissa - lo)
+    # Цены <=0 -> level 0 (как в скалярной версии)
+    return np.where(prices > 0, levels, 0).astype(np.int64)
 
 
 def _build_candle_graph(closes: np.ndarray, sig: int = SIG_DIGITS) -> tuple[dict, dict]:
@@ -277,16 +304,18 @@ def _eval_sig_candidate(
     graph:      dict[int, list],
     sig_digits: int,
     holds:      tuple[int, ...],
-    min_mod:    float = None,
 ) -> Optional[float]:
     """
-    Прогоняет валидационный отрезок через РЕАЛЬНЫЙ walk_type0 (из model.py)
-    с тем же level-change filter, что в живой model(), для нескольких
-    hold-периодов, усредняя Sharpe (mean/std по сделкам).
-    """
-    if min_mod is None:
-        min_mod = _m.MIN_MODIFICATION
+    Прогоняет валидационный отрезок через РЕАЛЬНЫЙ walk_type0 И РЕАЛЬНЫЙ
+    compute_bull_ratio (оба — из model.py, вызываются напрямую, без
+    дублирования логики) с тем же level-change filter, что в живой
+    model(), для нескольких hold-периодов, усредняя Sharpe.
 
+    Использование _m.compute_bull_ratio напрямую гарантирует, что подбор
+    sig_digits оценивает ТОЧНО ТУ ЖЕ функцию, что работает в live model() —
+    включая round_to_level/level_to_price фикс глобальной монотонности.
+    Раньше здесь была inline-копия старой формулы сравнения уровней.
+    """
     eg = _dict_graph_to_extremgraph(graph)
     n  = len(closes_val)
     sharpes: list[float] = []
@@ -298,22 +327,15 @@ def _eval_sig_candidate(
             prev_level = round_to_level(closes_val[i-1], sig_digits)
             if cur_level == prev_level:
                 continue   # level-change filter — как в живой model()
-            if cur_level <= 0:
-                continue
             node = eg.get_node_by_value(cur_level) or eg.find_nearest(cur_level)
             if node is None:
                 continue
             predicted = _m.walk_type0(eg, node.id)
-            close_level = float(cur_level)
-            if close_level <= 0:
+            current_close = closes_val[i]
+            bull_ratio = _m.compute_bull_ratio(predicted, current_close, sig_digits)
+            if bull_ratio is None:
                 continue
-            diff = predicted - close_level
-            if abs(diff) < 1e-9:
-                continue
-            mod = min(abs(diff) / close_level * _m.SIGNAL_SCALE, 0.45)
-            if mod < min_mod:
-                continue
-            sgn = +1 if diff > 0 else -1
+            sgn = +1 if bull_ratio > 0.5 else -1
             ret = (closes_val[i+hold] - closes_val[i]) / closes_val[i] * 100
             trades.append(ret * sgn)
 
@@ -344,18 +366,28 @@ def _choose_sig_digits(
     эмпирически проверено: при валидации только на lookback-окне (1 год →
     ~20% val ≈ 2.5 месяца) Sharpe-оценка слишком шумная и нестабильная
     (для BTC давала противоречащий результат при разных val_frac).
-    На полной истории (8+ лет EUR, 6+ лет BTC/ETH) оценка устойчиво даёт
-    sig=3 для всех трёх пар. Сам production-граф (build_index) всё равно
-    строится только на lookback_years-окне — выбор sig и выбор данных для
-    финального графа здесь разделены намеренно.
+    Сам production-граф (build_index) всё равно строится только на
+    lookback_years-окне — выбор sig и выбор данных для финального графа
+    здесь разделены намеренно.
 
     Алгоритм:
-      1. train(1-val_frac)/val(val_frac) по позиции на ПОЛНОЙ истории.
-      2. support = len(train)/unique_levels(train); < min_support → отбрасываем
-         (анти-оверфит: candle-граф должен иметь много визитов на узел).
-      3. Граф на train → ExtremGraph → реальный walk_type0 на val,
-         level-change filter + несколько hold, усредняем Sharpe.
+      1. support = len(ВСЯ_история)/unique_levels(ВСЯ) — оценивается на
+         ПОЛНОЙ доступной истории, т.к. именно с таким объёмом данных
+         (в пределах LOOKBACK_YEARS) будет построен финальный граф.
+         < min_support → отбрасываем (анти-оверфит: candle-граф должен
+         иметь много визитов на узел).
+      2. Для Sharpe-оценки ОТДЕЛЬНО train(1-val_frac)/val(val_frac) по
+         позиции — здесь срез нужен, чтобы избежать look-ahead в оценке
+         производительности.
+      3. Граф на train → ExtremGraph → реальный walk_type0 + реальный
+         compute_bull_ratio на val, level-change filter + несколько hold,
+         усредняем Sharpe.
       4. Лучший Sharpe среди валидных кандидатов; иначе default_sig.
+
+    ВАЖНО (исправление): support ранее считался на train-срезе, что
+    искусственно занижало оценку и отсекало валидные sig на границе
+    порога (см. аналогичный фикс в egr59_context_idx.py — тот же класс
+    проблемы). Теперь support считается на 100% доступной истории.
     """
     if len(closes) < 500:
         return default_sig, {"reason": "insufficient_data", "n": len(closes)}
@@ -370,14 +402,16 @@ def _choose_sig_digits(
     valid_found = False
 
     for sig in candidates:
-        train_levels = _vectorized_levels(train, sig)
-        n_unique = len(set(train_levels.tolist()))
-        support  = len(train_levels) / n_unique if n_unique else 0.0
-        diag[sig] = {"support": round(support, 1), "valid": support >= min_support}
+        # Support на ПОЛНОЙ истории — отражает реальный production-граф
+        all_levels = _vectorized_levels(closes, sig)
+        n_unique   = len(set(all_levels.tolist()))
+        support    = len(all_levels) / n_unique if n_unique else 0.0
+        diag[sig]  = {"support": round(support, 1), "valid": support >= min_support}
 
         if support < min_support:
             continue
 
+        # Sharpe-оценка — ТОЛЬКО на train-срезе, чтобы val остался honest hold-out
         transitions, _stats = _build_candle_graph(train, sig)
         if not transitions:
             continue
