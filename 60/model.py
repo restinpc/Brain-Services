@@ -209,10 +209,64 @@ def walk_type1(graph: ExtremGraph, start_id: int, max_depth: int = 20) -> float:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def round_to_level(price: float, sig: int = SIG_DIGITS) -> int:
+    """
+    Округляет цену до целочисленного уровня графа, МОНОТОННОГО ГЛОБАЛЬНО —
+    без разрыва на границах степеней десяти.
+
+    Кодирование: level = exp * bucket_size + (mantissa - lo)
+      exp      = floor(log10(price))              — порядок величины
+      mantissa = int(price / 10^(exp-sig+1))       — первые `sig` значащих
+                 цифр, диапазон [lo, hi) = [10^(sig-1), 10^sig)
+      bucket_size = hi - lo                        — сдвигаем mantissa на lo,
+                 чтобы соседние декады стыковались БЕЗ ЗАЗОРА
+
+    БАГ СТАРОЙ ВЕРСИИ (level = mantissa напрямую, без exp): на границе
+    декады уровень проваливался, а не рос:
+      BTC $99,999  -> level 99   (sig=2)
+      BTC $100,000 -> level 10   (sig=2)   ← падение на -89!
+    Это разрывало граф свечей на несвязные кластеры (продакшн-инцидент
+    2026-07-01: from_level для BTC содержал изолированные {10,11,12} и
+    {58..97} без единого ребра между ними).
+
+    Новая кодировка внутри ОДНОЙ декады даёт ТЕ ЖЕ относительные расстояния
+    что и раньше — вся ранее проведённая калибровка sig_digits через
+    backtest остаётся методологически применимой.
+    """
     if price <= 0:
         return 0
-    magnitude = 10 ** (math.floor(math.log10(price)) - sig + 1)
-    return int(price / magnitude)
+    exp = math.floor(math.log10(price))
+    lo, hi = 10 ** (sig - 1), 10 ** sig
+    magnitude = 10 ** (exp - sig + 1)
+    mantissa  = int(price / magnitude)
+    # Клэмп: log10 вблизи ТОЧНОЙ степени десяти может дать exp на 1 не в ту
+    # сторону из-за погрешности float.
+    if mantissa >= hi:
+        exp += 1
+        magnitude = 10 ** (exp - sig + 1)
+        mantissa  = int(price / magnitude)
+    elif mantissa < lo:
+        exp -= 1
+        magnitude = 10 ** (exp - sig + 1)
+        mantissa  = int(price / magnitude)
+    bucket_size = hi - lo
+    return exp * bucket_size + (mantissa - lo)
+
+
+def level_to_price(level: float, sig: int = SIG_DIGITS) -> float:
+    """
+    Обратное преобразование level -> price (приближённое).
+    Нужно, чтобы compute_bull_ratio считал величину отклонения через
+    РЕАЛЬНУЮ цену, а не через разность целочисленных уровней (которая
+    перестала быть напрямую пропорциональна цене после введения
+    exp-смещения — это и есть цена за устранение разрыва на границе декады).
+    Поддерживает дробный level (после mean() в walk_type0 при обработке циклов).
+    """
+    lo, hi = 10 ** (sig - 1), 10 ** sig
+    bucket_size = hi - lo
+    exp = math.floor(level / bucket_size)
+    mantissa = (level - exp * bucket_size) + lo
+    magnitude = 10 ** (exp - sig + 1)
+    return mantissa * magnitude
 
 
 def compute_bull_ratio(
@@ -224,27 +278,36 @@ def compute_bull_ratio(
     Отличие от сервиса 59: нет проверки типа последнего экстремума.
     Граф строится из всех свечей → нет контекста MAX/MIN.
 
-    predicted > current_level → LONG  (bull_ratio > 0.5)
-    predicted < current_level → SHORT (bull_ratio < 0.5)
+    Сравниваем предсказанный уровень с текущей ценой через РЕАЛЬНУЮ цену
+    (не через разность целочисленных уровней) — decode predicted_value
+    обратно в цену через level_to_price и сравниваем НАПРЯМУЮ с
+    current_close. Это устраняет зависимость знака и величины сигнала
+    от особенностей кодирования уровней.
+
+    predicted_price > current_close → LONG  (bull_ratio > 0.5)
+    predicted_price < current_close → SHORT (bull_ratio < 0.5)
     |deviation| < MIN_MODIFICATION → нет сигнала (шум)
 
     sig_digits: то же значение, с которым context_idx.py строил граф для
     ЭТОЙ пары (не модульная константа SIG_DIGITS — она лишь дефолт-фолбэк).
 
-    modification = min(|predicted - close_level| / close_level × SIGNAL_SCALE, 0.45)
+    modification = min(|predicted_price - current_close| / current_close × SIGNAL_SCALE, 0.45)
     """
-    close_level = float(round_to_level(current_close, sig_digits))
-    if close_level <= 0:
+    if current_close <= 0:
         return None
 
-    deviation    = abs(predicted_value - close_level) / close_level
+    predicted_price = level_to_price(predicted_value, sig_digits)
+    if predicted_price <= 0:
+        return None
+
+    deviation    = abs(predicted_price - current_close) / current_close
     modification = min(deviation * SIGNAL_SCALE, 0.45)
 
     # Фильтр шума: слишком малая разница → не сигнализируем
     if modification < MIN_MODIFICATION:
         return None
 
-    if predicted_value > close_level:
+    if predicted_price > current_close:
         return 0.5 + modification   # LONG
     else:
         return 0.5 - modification   # SHORT
