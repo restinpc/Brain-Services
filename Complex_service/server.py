@@ -21,12 +21,17 @@ from common import (
 )
 from cache_helper import ensure_cache_table, cached_values
 
-MODEL_A_ID = 32
-MODEL_B_ID = 31
-SERVICE_ID = 34
-PORT       = 8897
-BEST_URL   = "https://server.brain-project.online/best.php"
-NODE_NAME  = f"brain-complex-{MODEL_A_ID}-{MODEL_B_ID}-microservice"
+# ═══════════════════════════════════════════════════════════════════════════
+#  ЕДИНСТВЕННОЕ, ЧТО НУЖНО МЕНЯТЬ ДЛЯ НОВОЙ СОСТАВНОЙ МОДЕЛИ
+# ═══════════════════════════════════════════════════════════════════════════
+MODEL_A_ID = 44        # ID первой дочерней модели
+MODEL_B_ID = 31        # ID второй дочерней модели
+SERVICE_ID = 45        # ID самой составной модели (новый, свободный)
+PORT       = 8898      # свободный порт
+# ═══════════════════════════════════════════════════════════════════════════
+
+BEST_URL  = "https://server.brain-project.online/best.php"
+NODE_NAME = f"brain-complex-{MODEL_A_ID}-{MODEL_B_ID}-microservice"
 
 load_dotenv()
 
@@ -37,15 +42,59 @@ log(f"engines built via build_engines()", NODE_NAME)
 
 
 def _fetch_weights_from_child(url: str, model_id: int) -> list[str]:
-    """Синхронный запрос /weights у дочернего сервиса."""
+    """
+    Синхронный запрос /weights у дочернего сервиса.
+    Универсально поддерживает оба формата ответа:
+
+      Legacy-стиль:
+        {"status":"ok","payLoad": ["type1_var0_...", "type1_var1_...", ...]}
+        {"weights": [...]}
+
+      Framework-стиль (brain_framework.py):
+        {"status":"ok","payLoad": {"codes": [...], "var_range": [...], ...}}
+    """
     r = requests.get(f"{url}/weights", timeout=10)
     r.raise_for_status()
     data = r.json()
-    if "payLoad" in data:
-        return data["payLoad"]
-    if "weights" in data:
+
+    payload = data.get("payLoad")
+    if payload is not None:
+        if isinstance(payload, list):
+            return payload
+        if isinstance(payload, dict):
+            # framework обычно кладёт список кодов в "codes"
+            for key in ("codes", "weights", "keys"):
+                if isinstance(payload.get(key), list):
+                    return payload[key]
+            raise ValueError(
+                f"Model {model_id}: payLoad is dict but no list field "
+                f"(codes/weights/keys) found: {list(payload.keys())}"
+            )
+        raise ValueError(f"Model {model_id}: unsupported payLoad type {type(payload)}")
+
+    if isinstance(data.get("weights"), list):
         return data["weights"]
-    raise ValueError(f"Model {model_id}: no 'weights' in response")
+
+    raise ValueError(f"Model {model_id}: cannot extract weights from response: {data}")
+
+
+def _extract_result_dict(res: dict, model_id: int) -> dict:
+    """
+    Универсально достаёт словарь {key: value} из ответа дочернего /values.
+    Поддерживает как {"payLoad": {...}}, так и {...} напрямую,
+    а также явную ошибку в ответе.
+    """
+    if "error" in res:
+        raise ValueError(f"Model {model_id} returned error: {res['error']}")
+    if "payLoad" in res:
+        payload = res["payLoad"]
+        if not isinstance(payload, dict):
+            raise ValueError(f"Model {model_id}: payLoad is not a dict: {payload!r}")
+        return payload
+    if "status" in res and res.get("status") != "ok":
+        raise ValueError(f"Model {model_id}: status not ok: {res}")
+    # fallback: сам res уже плоский словарь значений
+    return {k: v for k, v in res.items() if k not in ("status", "error")}
 
 
 async def _compute_composite(pair, day, date, param_dict, state) -> dict | None:
@@ -66,11 +115,8 @@ async def _compute_composite(pair, day, date, param_dict, state) -> dict | None:
         try:
             r   = requests.get(f"{url}/values", params=query_params, timeout=10)
             res = r.json()
-            if "payLoad" in res:
-                res = res["payLoad"]
-            if "error" in res:
-                return None
-            for key, val in res.items():
+            values = _extract_result_dict(res, model_id)
+            for key, val in values.items():
                 combined[f"{model_id}_{key}"] = round(val * k, 6)
         except Exception as e:
             log(f" Child model {model_id} error: {e}", NODE_NAME, level="error", force=True)
@@ -98,14 +144,22 @@ async def lifespan(app: FastAPI):
     log(f"URL_A ({MODEL_A_ID}): {app.state.URL_A}", NODE_NAME, force=True)
     log(f"URL_B ({MODEL_B_ID}): {app.state.URL_B}", NODE_NAME, force=True)
 
-    # 2. Колонки параметров сигналов
+    # 2. Колонки параметров сигналов (для /params — если таблица есть)
+    app.state.cols_A = []
+    app.state.cols_B = []
     async with engine_brain.connect() as conn:
-        result_a = await conn.execute(text(f"DESCRIBE `brain_signal{MODEL_A_ID}`"))
-        app.state.cols_A = [row[0] for row in result_a.fetchall()
-                            if row[0] in ("type", "var", "param")]
-        result_b = await conn.execute(text(f"DESCRIBE `brain_signal{MODEL_B_ID}`"))
-        app.state.cols_B = [row[0] for row in result_b.fetchall()
-                            if row[0] in ("type", "var", "param")]
+        try:
+            result_a = await conn.execute(text(f"DESCRIBE `brain_signal{MODEL_A_ID}`"))
+            app.state.cols_A = [row[0] for row in result_a.fetchall()
+                                if row[0] in ("type", "var", "param")]
+        except Exception as e:
+            log(f"  DESCRIBE brain_signal{MODEL_A_ID} failed: {e}", NODE_NAME, level="warn", force=True)
+        try:
+            result_b = await conn.execute(text(f"DESCRIBE `brain_signal{MODEL_B_ID}`"))
+            app.state.cols_B = [row[0] for row in result_b.fetchall()
+                                if row[0] in ("type", "var", "param")]
+        except Exception as e:
+            log(f"  DESCRIBE brain_signal{MODEL_B_ID} failed: {e}", NODE_NAME, level="warn", force=True)
 
     log(f"Cols A: {app.state.cols_A}", NODE_NAME)
     log(f"Cols B: {app.state.cols_B}", NODE_NAME)
@@ -140,7 +194,6 @@ async def lifespan(app: FastAPI):
                 send_error_trace(e, NODE_NAME)
 
     # 5. URL этого сервиса и таблица кеша
-    # Для составной модели SERVICE_URL читается из brain_service по SERVICE_ID=34
     async with engine_super.connect() as conn:
         row = (await conn.execute(
             text("SELECT url FROM brain_service WHERE id = :sid"), {"sid": SERVICE_ID}
@@ -268,6 +321,11 @@ async def get_params(
     day:  int = Query(1),
     tier: int = Query(..., ge=0, le=1),
 ):
+    """
+    Автогенерация комбинаций параметров для обучения (используется реже —
+    основной путь для заведения новой составной модели — это ручной
+    complex_json в brain_models, см. документацию).
+    """
     max_per_model = 4 if tier == 0 else 3
     try:
         best_a = requests.get(
