@@ -63,6 +63,11 @@ MONETARY_DATASETS = {
         "series_key": "M.U2.Y.V.M30.X.1.U2.2300.Z01.E",
         "description": "ECB M3 monetary aggregate (Euro area, monthly)"
     },
+    "sasha_ecb_market_cap": {
+        "flow_ref": "CSEC",
+        "series_key": "M.N.U2.W0.S1.S1.N.L.LE.F511._Z._Z.EUR._T.M.V.N._T",
+        "description": "ECB listed shares market capitalization (Euro area, monthly)"
+    },
 }
 
 
