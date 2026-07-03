@@ -497,9 +497,17 @@ def model(
     if bull_ratio is None:
         return {}   # шум, разница слишком мала
 
-    direction = "↑ LONG" if bull_ratio > 0.5 else "↓ SHORT"
+    # Brain Framework/PHP ожидает знаковое значение:
+    #   output > 0 → LONG, output < 0 → SHORT, output = 0/{} → нет сигнала.
+    # Поэтому внутренний bull_ratio переводим в signed score относительно 0.5.
+    score = bull_ratio - 0.5
+    if abs(score) < 1e-9:
+        return {}
+
+    direction = "↑ LONG" if score > 0 else "↓ SHORT"
     log.debug(
         f"[candle-graph] pair={pair_id} type={type} var={var} sig={sig_digits} "
-        f"entry={entry_level} predicted={predicted:.1f} → {direction} br={bull_ratio:.4f}"
+        f"entry={entry_level} predicted={predicted:.1f} → {direction} "
+        f"br={bull_ratio:.4f} score={score:.6f}"
     )
-    return {OUTPUT_KEY: round(bull_ratio, 6)}
+    return {OUTPUT_KEY: round(score, 6)}
