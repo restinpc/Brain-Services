@@ -6,6 +6,7 @@ import uvicorn
 import asyncio
 import json
 import httpx
+from urllib.parse import urlencode
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query
@@ -37,10 +38,14 @@ HTTP_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
 
 # PHP-монолит: используется для дочерних моделей, у которых нет активного URL
 # в brain_service, либо если модель явно указана в CHILD_MODEL_BACKENDS как "monolith".
-MONOLITH_BASE_URL = os.getenv("MONOLITH_BASE_URL", os.getenv("BRAIN_MONOLITH_URL", "http://localhost")).rstrip("/")
-MONOLITH_CACHE_ENDPOINT = os.getenv("MONOLITH_CACHE_ENDPOINT", "neuronet_cache.php").lstrip("/")
+# ВАЖНО: по задаче #172 монолит вызывается НЕ по HTTP, а через штатный shell-wrapper:
+#   bash /brain/Brain-Server/centos/php.sh 'neuronet_cache.php?neuronet_id=...&signal_id=...'
+# В Python мы НЕ используем shell=True и передаём весь query-string одним argv-аргументом,
+# поэтому амперсанды не нужно экранировать вручную — они не попадают в shell-парсер.
+MONOLITH_PHP_SH = os.getenv("MONOLITH_PHP_SH", "/brain/Brain-Server/centos/php.sh")
+MONOLITH_CACHE_SCRIPT = os.getenv("MONOLITH_CACHE_SCRIPT", "neuronet_cache.php")
 MONOLITH_SECRET = os.getenv("MONOLITH_SECRET", "3m19m1")
-MONOLITH_CACHE_URL = f"{MONOLITH_BASE_URL}/{MONOLITH_CACHE_ENDPOINT}"
+MONOLITH_TIMEOUT_SECONDS = float(os.getenv("MONOLITH_TIMEOUT_SECONDS", "30"))
 
 # Необязательный ручной override. Обычно можно оставить пустым:
 #   {2: "monolith", 44: "microservice"}
@@ -272,6 +277,81 @@ async def _fetch_one_microservice_values(
     return {f"{model_id}_{key}": round(_as_float(val) * k, 6) for key, val in values.items()}
 
 
+def _build_monolith_cache_request(query_params: dict) -> str:
+    """
+    Формирует аргумент для php.sh в виде:
+      neuronet_cache.php?neuronet_id=...&signal_id=...&pair=...&day=...&rate_id=...
+
+    В subprocess аргумент передаётся одним элементом argv, поэтому `&` не становится
+    shell-оператором. Если запускать руками в терминале, строку надо взять в кавычки
+    или экранировать амперсанды.
+    """
+    return f"{MONOLITH_CACHE_SCRIPT}?{urlencode(query_params)}"
+
+
+async def _run_monolith_cache_php(query_params: dict, model_id: int) -> dict:
+    """
+    Запускает PHP-монолит через штатный wrapper php.sh.
+
+    Без shell=True: это защищает от проблем с `&`, пробелами и спецсимволами.
+    Все ошибки wrapper/PHP/JSON поднимаются как exceptions — выше они логируются
+    и превращаются в отсутствие результата комплексной модели.
+    """
+    request_arg = _build_monolith_cache_request(query_params)
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "bash",
+            MONOLITH_PHP_SH,
+            request_arg,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"php.sh not found: {MONOLITH_PHP_SH}") from exc
+    except Exception as exc:
+        raise RuntimeError(
+            f"Cannot start monolith PHP command: bash {MONOLITH_PHP_SH} {request_arg!r}: {exc}"
+        ) from exc
+
+    try:
+        stdout_b, stderr_b = await asyncio.wait_for(
+            proc.communicate(),
+            timeout=MONOLITH_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError as exc:
+        proc.kill()
+        await proc.wait()
+        raise TimeoutError(
+            f"Monolith PHP timeout after {MONOLITH_TIMEOUT_SECONDS}s: {request_arg}"
+        ) from exc
+
+    stdout = stdout_b.decode("utf-8", errors="replace").strip()
+    stderr = stderr_b.decode("utf-8", errors="replace").strip()
+
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "Monolith PHP failed "
+            f"rc={proc.returncode}, request={request_arg!r}, "
+            f"stderr={stderr[:1000]!r}, stdout={stdout[:1000]!r}"
+        )
+
+    # php.sh/engine иногда может напечатать служебные строки до JSON.
+    # Берём JSON-объект с первого символа `{`, иначе показываем короткий вывод.
+    json_text = stdout
+    start = json_text.find("{")
+    if start > 0:
+        json_text = json_text[start:]
+
+    try:
+        return json.loads(json_text)
+    except Exception as exc:
+        raise ValueError(
+            f"Model {model_id}: monolith PHP returned non-JSON output. "
+            f"request={request_arg!r}, stdout={stdout[:1500]!r}, stderr={stderr[:1000]!r}"
+        ) from exc
+
+
 async def _fetch_one_monolith_values(
     client: httpx.AsyncClient,
     model_id: int,
@@ -281,7 +361,8 @@ async def _fetch_one_monolith_values(
     subp: dict,
 ) -> dict:
     """
-    Один запрос к PHP endpoint neuronet_cache.php.
+    Один вызов PHP-монолита через:
+      bash /brain/Brain-Server/centos/php.sh 'neuronet_cache.php?...'
 
     Для монолита нужен конкретный signal_id, потому что cache(rate_id)
     считается внутри конкретного neuronetX(signal_id).
@@ -299,16 +380,15 @@ async def _fetch_one_monolith_values(
     rate_id = await _resolve_rate_id(pair, day, date)
 
     query_params = {
-        "neuronet_id": model_id,
-        "signal_id": signal_id,
-        "pair": pair,
-        "day": day,
-        "rate_id": rate_id,
+        "neuronet_id": int(model_id),
+        "signal_id": int(signal_id),
+        "pair": int(pair),
+        "day": int(day),
+        "rate_id": int(rate_id),
         "secret": MONOLITH_SECRET,
     }
-    r = await client.get(MONOLITH_CACHE_URL, params=query_params, timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-    values = _extract_result_dict(r.json(), model_id)
+    response = await _run_monolith_cache_php(query_params, model_id)
+    values = _extract_result_dict(response, model_id)
 
     # signal_id добавлен в ключ специально: у PHP-монолита input_id часто
     # локален для таблицы brain_inputX_res_<signal_id>, значит без signal_id
@@ -377,7 +457,7 @@ async def lifespan(app: FastAPI):
     app.state.http_client = httpx.AsyncClient(timeout=HTTP_TIMEOUT)
 
     # 1. URL-ы дочерних Python-сервисов из brain_service.
-    # Если активного URL нет, считаем модель PHP-монолитом и дёргаем neuronet_cache.php.
+    # Если активного URL нет, считаем модель PHP-монолитом и дёргаем neuronet_cache.php через php.sh.
     async with engine_super.connect() as conn:
         placeholders = ", ".join(f":id{i}" for i in range(len(CHILD_MODEL_IDS)))
         params = {f"id{i}": mid for i, mid in enumerate(CHILD_MODEL_IDS)}
@@ -399,7 +479,7 @@ async def lifespan(app: FastAPI):
             child_url = url
         elif override == "monolith" or not url:
             backend = "monolith"
-            child_url = MONOLITH_CACHE_URL
+            child_url = f"shell:{MONOLITH_PHP_SH} {MONOLITH_CACHE_SCRIPT}"
         else:
             backend = "microservice"
             child_url = url
@@ -495,7 +575,7 @@ async def get_metadata():
         "child_backends": {str(mid): app.state.child_backends[mid] for mid in CHILD_MODEL_IDS},
         "static":         {str(mid): app.state.child_static[mid] for mid in CHILD_MODEL_IDS},
         "weights_cached": {str(mid): app.state.child_weights[mid] is not None for mid in CHILD_MODEL_IDS},
-        "metadata": {"child_models": CHILD_MODEL_IDS, "monolith_cache_url": MONOLITH_CACHE_URL},
+        "metadata": {"child_models": CHILD_MODEL_IDS, "monolith_php_sh": MONOLITH_PHP_SH, "monolith_cache_script": MONOLITH_CACHE_SCRIPT},
     }
 
 
