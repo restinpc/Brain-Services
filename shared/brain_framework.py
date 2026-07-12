@@ -1,7 +1,13 @@
 """
-brain_framework.py v17 — сжатие result_json (zlib + полная обратная совместимость).
+brain_framework.py v19 — автоматическое ускорение обычного fill_cache без флагов.
 
-Оптимизации над v15:
+Оптимизации над v18:
+  AUTO-1: zero-copy list views вместо rates[:idx] / dataset[:idx] на каждой свече.
+  AUTO-2: run_standard_model автоматически выбирает события только из точного
+          окна [date-shift_window, date] через NumPy searchsorted.
+          MODEL_USES_RATE_HISTORY и MODEL_CAN_FILTER_DATASET_BY_DATE не нужны.
+
+Сохранены оптимизации v18:
   OPT-1..5: fill_cache (см. v15).
   OPT-6: result_json сжимается zlib+base64 с префиксом 'z:' при записи.
           Старые строки (без префикса) читаются как обычный JSON — нулевая миграция.
@@ -36,6 +42,67 @@ from sqlalchemy import text
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ZERO-COPY READ-ONLY VIEWS
+# ──────────────────────────────────────────────────────────────────────────────
+
+class _ListView:
+    """Read-only list-compatible window without copying the underlying rows.
+
+    fill_cache historically built ``rates[:idx]`` for every candle.  On a long
+    H1 history this repeatedly copied millions of Python references.  This view
+    preserves the observable prefix/window semantics used by model.py while
+    making construction O(1).  An explicit slice requested *inside* a model is
+    still returned as a normal list for backward compatibility.
+    """
+    __slots__ = ("_rows", "_start", "_end")
+
+    def __init__(self, rows, start: int = 0, end: int | None = None):
+        n = len(rows)
+        start = max(0, min(int(start), n))
+        end = n if end is None else max(start, min(int(end), n))
+        self._rows = rows
+        self._start = start
+        self._end = end
+
+    def __len__(self):
+        return self._end - self._start
+
+    def __iter__(self):
+        rows = self._rows
+        for i in range(self._start, self._end):
+            yield rows[i]
+
+    def __getitem__(self, item):
+        n = len(self)
+        if isinstance(item, slice):
+            start, stop, step = item.indices(n)
+            if step == 1:
+                return list(_ListView(self._rows, self._start + start, self._start + stop))
+            return [self[i] for i in range(start, stop, step)]
+        idx = int(item)
+        if idx < 0:
+            idx += n
+        if idx < 0 or idx >= n:
+            raise IndexError("list index out of range")
+        return self._rows[self._start + idx]
+
+    def copy(self):
+        return list(self)
+
+    def __repr__(self):
+        return repr(list(self))
+
+
+def _list_view(rows, start: int = 0, end: int | None = None):
+    """Return an O(1) list window; avoid wrapping an already exact full list."""
+    n = len(rows)
+    end = n if end is None else end
+    if start <= 0 and end >= n:
+        return rows
+    return _ListView(rows, start, end)
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Трассировка
@@ -292,7 +359,21 @@ def run_standard_model(
     result: dict[str, float] = {}
     window_sec = shift_window * 86400
 
-    for row in dataset:
+    # All current services 62-70 use the default enriched-event format.  Their
+    # original loop discarded events outside [date-shift_window, date] anyway.
+    # When the framework index is available, select that exact equivalent window
+    # with two searchsorted calls instead of scanning the whole historical set.
+    effective_dataset = dataset
+    if get_event_fn is None and dataset_index:
+        full_dataset = dataset_index.get("full_dataset")
+        dataset_ts = dataset_index.get("dataset_timestamps")
+        if full_dataset is not None and dataset_ts is not None and len(dataset_ts) == len(full_dataset):
+            date_ts = int(date.timestamp())
+            left = int(np.searchsorted(dataset_ts, date_ts - window_sec, side="left"))
+            right = int(np.searchsorted(dataset_ts, date_ts, side="right"))
+            effective_dataset = _list_view(full_dataset, left, right)
+
+    for row in effective_dataset:
         parsed = _get_event(row)
         if parsed is None:
             continue
@@ -761,7 +842,7 @@ def _filter_rates_lte(table: str, date: datetime, s: _State) -> list[dict]:
         dates = [r["date"] for r in rows]
         s.global_rates_dates[table] = dates
     idx = bisect.bisect_right(dates, date)
-    return rows[:idx]
+    return _list_view(rows, 0, idx)
 
 
 # === ПАТЧ 1: _filter_dataset_lte — binary search ===
@@ -769,7 +850,7 @@ def _filter_dataset_lte(date: datetime, s: _State) -> list[dict]:
     if not s.FILTER_DATASET_BY_DATE:
         return s.dataset
     idx = bisect.bisect_right(s.dataset_dates, date)
-    return s.dataset[:idx]
+    return _list_view(s.dataset, 0, idx)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1414,8 +1495,7 @@ def build_app(model_module) -> FastAPI:
         f"ml={'ON' if s.USE_ML_VALUES else 'off'} | "
         f"batch_model={'yes' if s.batch_model_fn else 'no'} | "
         f"enriched_table={s.ENRICHED_TABLE or 'no'} | "
-        f"model_filters_dataset={'yes' if s.model_can_filter_dataset_by_date else 'no'} | "
-        f"rate_history={'yes' if s.model_uses_rate_history else 'no'}",
+        f"normal_cache=zero-copy | standard_window=auto",
         s.NODE_NAME, force=True)
 
     s.engine_vlad, s.engine_brain, s.engine_super = build_engines()
@@ -1466,8 +1546,8 @@ def build_app(model_module) -> FastAPI:
                 "is_daily": bool(day),
                 "rates_table": table,
             }
-            if s.model_can_filter_dataset_by_date:
-                di["full_dataset"] = s.dataset
+            # Safe internal accelerator for run_standard_model(); no model flag required.
+            di["full_dataset"] = s.dataset
             return di
 
         def _model_inputs_for(date_x: datetime):
@@ -1796,9 +1876,22 @@ def build_app(model_module) -> FastAPI:
     # ── _sync_compute для поточной обработки ─────────────────────────────────
     def _sync_compute(candle, calc_type, calc_var, all_rows, all_dates, np_rates_pd, s_state, rates_tbl=""):
         td = candle["date"]
-        idx = bisect.bisect_right(all_dates, td)
-        rates_f = all_rows[:idx]
-        ds_f = _filter_dataset_lte(td, s_state)
+
+        # Обычный fill_cache обязан соблюдать те же capability-флаги, что /values.
+        # Раньше здесь безусловно копировался весь исторический prefix rates[:idx]
+        # и заново создавался срез dataset для КАЖДОЙ свечи, даже когда модель
+        # прямо объявила, что умеет фильтровать данные сама или не использует
+        # историю котировок. На длинной H1-истории это давало O(N^2) копирования.
+        if s_state.model_uses_rate_history:
+            idx = bisect.bisect_right(all_dates, td)
+            rates_f = _list_view(all_rows, 0, idx)
+        else:
+            is_daily = bool(str(rates_tbl or s_state.RATES_TABLE or "").endswith("_day"))
+            marker_dt = td.replace(hour=0, minute=0, second=0, microsecond=0) if is_daily else td
+            rates_f = [{"date": marker_dt}]
+
+        ds_f = (s_state.dataset if s_state.model_can_filter_dataset_by_date
+                else _filter_dataset_lte(td, s_state))
 
         dataset_index_dict = None
         if s_state.model_needs_index:
@@ -1811,8 +1904,13 @@ def build_app(model_module) -> FastAPI:
                 "ctx_index": s_state.ctx_index,
                 "url_map": s_state.url_map,
                 "dataset_timestamps": getattr(s_state, "_dataset_ts_arr", None),
+                "filter_dataset_by_date": bool(s_state.FILTER_DATASET_BY_DATE),
+                "dataset_cutoff_ts": float(td.timestamp()),
+                "is_daily": bool(str(rates_tbl or s_state.RATES_TABLE or "").endswith("_day")),
                 "rates_table": rates_tbl or s_state.RATES_TABLE,
             }
+            # Safe internal accelerator for run_standard_model(); no model flag required.
+            dataset_index_dict["full_dataset"] = s_state.dataset
 
         try:
             res = s_state.model_fn(
@@ -1827,6 +1925,15 @@ def build_app(model_module) -> FastAPI:
             log(f"   fill {td} t={calc_type} v={calc_var}: {_e}\n{_tb.format_exc()}",
                 s_state.NODE_NAME, level="error", force=True)
             return None
+
+    def _sync_compute_chunk(candles_chunk, calc_type, calc_var,
+                            all_rows, all_dates, np_rates_pd, s_state, rates_tbl=""):
+        """Один executor-job обрабатывает пачку свечей вместо job на каждую свечу."""
+        return [
+            _sync_compute(c, calc_type, calc_var,
+                          all_rows, all_dates, np_rates_pd, s_state, rates_tbl)
+            for c in candles_chunk
+        ]
 
     # ── _prewarm_ml_active_cache ──────────────────────────────────────────────
     #
@@ -1885,8 +1992,7 @@ def build_app(model_module) -> FastAPI:
                 "is_daily": bool(day_flag),
                 "rates_table": tbl,
             }
-            if s.model_can_filter_dataset_by_date:
-                dataset_index_dict["full_dataset"] = s.dataset
+            dataset_index_dict["full_dataset"] = s.dataset
 
         # Группируем слоты по calc_var — один batch_model call на интервал
         # (train_mode не влияет на набор дат экстремумов, только на обучение).
@@ -2233,14 +2339,15 @@ def build_app(model_module) -> FastAPI:
                                     "filter_dataset_by_date": bool(s.FILTER_DATASET_BY_DATE),
                                     "is_daily": bool(day_flag),
                                 }
-                                if s.model_can_filter_dataset_by_date:
-                                    dataset_index_dict_b["full_dataset"] = s.dataset
+                                dataset_index_dict_b["full_dataset"] = s.dataset
                             try:
                                 batch_dates = [c["date"] for c in batch]
                                 # Полный срез all_rows до последней целевой даты.
                                 max_batch_date = batch_dates[-1]
                                 idx_end = bisect.bisect_right(all_dates_pd, max_batch_date)
-                                rates_for_batch = all_rows[:idx_end] if s.model_uses_rate_history else [{"date": max_batch_date}]
+                                rates_for_batch = (_list_view(all_rows, 0, idx_end)
+                                                   if s.model_uses_rate_history
+                                                   else [{"date": max_batch_date}])
                                 dataset_f_b = s.dataset if s.model_can_filter_dataset_by_date else _filter_dataset_lte(max_batch_date, s)
 
                                 batch_map = s.batch_model_fn(
@@ -2257,18 +2364,28 @@ def build_app(model_module) -> FastAPI:
                                     s.NODE_NAME, level="error", force=True)
                                 results = [None] * len(batch)
                         else:
-                            # ПАТЧ 5: параллельные потоки внутри батча
-                            loop = asyncio.get_event_loop()
+                            # Обычный model(): дробим батч максимум на число worker-ов.
+                            # Раньше создавался Future на КАЖДУЮ свечу; на лёгких моделях
+                            # диспетчеризация могла занимать больше времени, чем model().
+                            loop = asyncio.get_running_loop()
+                            workers = min(
+                                max(1, getattr(_FILL_EXECUTOR, "_max_workers", 1)),
+                                len(batch),
+                            )
+                            chunk_len = max(1, (len(batch) + workers - 1) // workers)
+                            chunks = [batch[j:j + chunk_len]
+                                      for j in range(0, len(batch), chunk_len)]
                             futs = [
                                 loop.run_in_executor(
                                     _FILL_EXECUTOR,
-                                    _sync_compute,
-                                    candle, calc_type, var,
-                                    all_rows, all_dates_pd, np_rates_pd, s, tbl
+                                    _sync_compute_chunk,
+                                    chunk, calc_type, var,
+                                    all_rows, all_dates_pd, np_rates_pd, s, tbl,
                                 )
-                                for candle in batch
+                                for chunk in chunks
                             ]
-                            results = list(await asyncio.gather(*futs))
+                            chunk_results = await asyncio.gather(*futs)
+                            results = [item for part in chunk_results for item in part]
 
                         insert_rows = []
                         for candle, result in zip(batch, results):
@@ -3136,6 +3253,7 @@ def build_app(model_module) -> FastAPI:
                 "ctx_index": s.ctx_index,
                 "url_map": s.url_map,
                 "dataset_timestamps": getattr(s, "_dataset_ts_arr", None),
+                "full_dataset": s.dataset,
                 "rates_table": s.RATES_TABLE,
             }
 
@@ -3252,6 +3370,7 @@ def build_app(model_module) -> FastAPI:
                             "ctx_index": s.ctx_index,
                             "url_map": s.url_map,
                             "dataset_timestamps": getattr(s, "_dataset_ts_arr", None),
+                            "full_dataset": s.dataset,
                             "rates_table": _tbl3,
                         }
 
