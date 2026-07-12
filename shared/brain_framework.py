@@ -1,7 +1,17 @@
 """
-brain_framework.py v19 — автоматическое ускорение обычного fill_cache без флагов.
+brain_framework.py v20.1 — безопасное развёртывание fused fill_cache.
 
-Оптимизации над v18:
+Оптимизации v20 над v19:
+  AUTO-3: один проход по событиям сразу для всех type/var.
+  AUTO-4: на H1 повторное использование точного результата для одинакового
+          состояния дня (midnight / bull / bear), с автоматической проверкой.
+  AUTO-5: объединённые bulk INSERT и однократная сериализация одинаковых результатов.
+
+Критическое исправление v20.1:
+  SAFE-STATE: модели с глобальным хронологическим состоянием автоматически
+              считаются строго последовательно; fill/pretest/live разделены по scope.
+
+Сохранены оптимизации v19:
   AUTO-1: zero-copy list views вместо rates[:idx] / dataset[:idx] на каждой свече.
   AUTO-2: run_standard_model автоматически выбирает события только из точного
           окна [date-shift_window, date] через NumPy searchsorted.
@@ -300,6 +310,131 @@ def _load_service_config(model_dir: str) -> dict:
 
 
 # ── run_standard_model ────────────────────────────────────────────────────────
+
+
+def _run_standard_model_multi_slots(
+    rates,
+    dataset,
+    date: datetime,
+    *,
+    slots: list[tuple[int, int]],
+    dataset_index: dict | None,
+    shift_window: int,
+    apply_var_fn: Callable[[float, float, int, dict], float],
+    min_occurrence: int = 2,
+) -> dict[tuple[int, int], dict[str, float]]:
+    """Compute many ``type/var`` combinations in one exact event pass."""
+    slot_list = list(dict.fromkeys((int(t), int(v)) for t, v in slots))
+    outputs: dict[tuple[int, int], dict[str, float]] = {
+        slot: {} for slot in slot_list
+    }
+    if not rates or not dataset or not slot_list:
+        return outputs
+
+    ctx_index = (dataset_index or {}).get("ctx_index") or {}
+    if not ctx_index:
+        return outputs
+    reverse: dict[str, tuple[int, dict]] = {
+        str(info.get("event_type") or "").strip().lower(): (int(info["id"]), info)
+        for _, info in ctx_index.items()
+        if info.get("id") and info.get("event_type")
+    }
+    if not reverse:
+        return outputs
+
+    np_rates = (dataset_index or {}).get("np_rates")
+    np_view, is_bull = _std_slice_np(np_rates, date, rates)
+    is_daily = rates[-1]["date"].hour == 0 and rates[-1]["date"].minute == 0
+    r_t1, r_t1d, ext_set, ext_day = _std_rate_dicts(
+        rates, is_bull, is_daily, np_view
+    )
+
+    window_sec = int(shift_window) * 86400
+    effective_dataset = dataset
+    if dataset_index:
+        full_dataset = dataset_index.get("full_dataset")
+        dataset_ts = dataset_index.get("dataset_timestamps")
+        if (
+            full_dataset is not None
+            and dataset_ts is not None
+            and len(dataset_ts) == len(full_dataset)
+        ):
+            date_ts = int(date.timestamp())
+            left = int(np.searchsorted(dataset_ts, date_ts - window_sec, side="left"))
+            right = int(np.searchsorted(dataset_ts, date_ts, side="right"))
+            effective_dataset = _list_view(full_dataset, left, right)
+
+    vars_needed = sorted({v for _, v in slot_list})
+    types_by_var: dict[int, list[int]] = {}
+    for tp, vr in slot_list:
+        types_by_var.setdefault(vr, []).append(tp)
+
+    for row in effective_dataset:
+        parsed = _std_get_event(row)
+        if parsed is None:
+            continue
+        event_time, pct, event_type = parsed
+        lookup = reverse.get(event_type)
+        if lookup is None:
+            continue
+        ctx_id, ctx_info = lookup
+        occ = int(ctx_info.get("occurrence_count") or 0)
+
+        diff_sec = (date - event_time).total_seconds()
+        if diff_sec < 0 or diff_sec > window_sec:
+            continue
+        shift = int(diff_sec // 86400)
+        if occ < min_occurrence and shift != 0:
+            continue
+        t_date = (event_time + timedelta(days=shift)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        if t_date > date:
+            continue
+
+        t1, ext_hit = _std_candle(
+            t_date, np_view, is_daily, r_t1, r_t1d, ext_set, ext_day
+        )
+        direction = 1.0 if pct > 0 else -1.0
+        signed_t1 = t1 * direction
+        for vr in vars_needed:
+            weighted_t1 = apply_var_fn(signed_t1, pct, vr, ctx_info)
+            for tp in types_by_var.get(vr, ()):
+                contribution = _std_signal(
+                    tp, ctx_id, shift, weighted_t1,
+                    ext_hit, pct, occ, direction,
+                )
+                out = outputs[(tp, vr)]
+                for wc, val in contribution.items():
+                    if val != 0.0:
+                        out[wc] = out.get(wc, 0.0) + val
+
+    return {
+        slot: {k: v for k, v in out.items() if v != 0.0}
+        for slot, out in outputs.items()
+    }
+
+
+def _standard_dataset_is_midnight(dataset) -> bool:
+    """True when every parseable standard enriched event is at midnight."""
+    if not dataset:
+        return False
+    seen = False
+    for row in dataset:
+        parsed = _std_get_event(row)
+        if parsed is None:
+            continue
+        seen = True
+        event_time = parsed[0]
+        if (
+            event_time.hour != 0
+            or event_time.minute != 0
+            or event_time.second != 0
+            or event_time.microsecond != 0
+        ):
+            return False
+    return seen
+
 
 def run_standard_model(
     rates: list[dict],
@@ -1545,6 +1680,7 @@ def build_app(model_module) -> FastAPI:
                 "dataset_cutoff_ts": float(date_x.timestamp()),
                 "is_daily": bool(day),
                 "rates_table": table,
+                "execution_scope": "live",
             }
             # Safe internal accelerator for run_standard_model(); no model flag required.
             di["full_dataset"] = s.dataset
@@ -1873,6 +2009,21 @@ def build_app(model_module) -> FastAPI:
         except Exception:
             return set()
 
+    def _ordered_fill_control(s_state):
+        """Return (ordered, reset_fn) for models with chronological global state.
+
+        Such models must not be evaluated by several slot/chunk workers: the output
+        depends on the exact ascending date order.  Detection is automatic and does
+        not require an .env/config flag.  A model may expose
+        ``reset_fill_cache_state(pair, day_flag, type, var)`` to clear only its
+        fill-cache namespace before replaying the complete timeline.
+        """
+        fn_globals = getattr(s_state.model_fn, "__globals__", {}) or {}
+        last_signal_state = fn_globals.get("_LAST_SIGNAL_TS")
+        ordered = isinstance(last_signal_state, dict)
+        reset_fn = fn_globals.get("reset_fill_cache_state")
+        return ordered, reset_fn if callable(reset_fn) else None
+
     # ── _sync_compute для поточной обработки ─────────────────────────────────
     def _sync_compute(candle, calc_type, calc_var, all_rows, all_dates, np_rates_pd, s_state, rates_tbl=""):
         td = candle["date"]
@@ -1908,6 +2059,7 @@ def build_app(model_module) -> FastAPI:
                 "dataset_cutoff_ts": float(td.timestamp()),
                 "is_daily": bool(str(rates_tbl or s_state.RATES_TABLE or "").endswith("_day")),
                 "rates_table": rates_tbl or s_state.RATES_TABLE,
+                "execution_scope": "fill_cache",
             }
             # Safe internal accelerator for run_standard_model(); no model flag required.
             dataset_index_dict["full_dataset"] = s_state.dataset
@@ -1934,6 +2086,304 @@ def build_app(model_module) -> FastAPI:
                           all_rows, all_dates, np_rates_pd, s_state, rates_tbl)
             for c in candles_chunk
         ]
+
+    def _standard_fast_apply_var(s_state):
+        """Detect the exact simple run_standard_model wrapper automatically."""
+        if s_state.USE_ML_VALUES or s_state.batch_model_fn is not None:
+            return None
+        fn = s_state.model_fn
+        code = getattr(fn, "__code__", None)
+        if code is None or "run_standard_model" not in set(code.co_names):
+            return None
+        apply_var = getattr(fn, "__globals__", {}).get("_apply_var")
+        if not callable(apply_var):
+            return None
+        # Custom hooks change semantics; leave them on the generic path.
+        try:
+            import ast as _ast
+            import textwrap as _textwrap
+            tree = _ast.parse(_textwrap.dedent(inspect.getsource(fn)))
+            calls = [
+                node for node in _ast.walk(tree)
+                if isinstance(node, _ast.Call)
+                and ((isinstance(node.func, _ast.Name) and node.func.id == "run_standard_model")
+                     or (isinstance(node.func, _ast.Attribute) and node.func.attr == "run_standard_model"))
+            ]
+            if len(calls) != 1:
+                return None
+            allowed = {
+                "type", "var", "dataset_index", "shift_window", "apply_var_fn"
+            }
+            keyword_names = {kw.arg for kw in calls[0].keywords if kw.arg is not None}
+            if not keyword_names.issubset(allowed):
+                return None
+        except Exception:
+            # Runtime validation below remains the final safety gate.
+            pass
+        return apply_var
+
+    def _standard_fast_compute_dates(
+        candles_chunk,
+        type_var_slots,
+        all_rows,
+        all_dates,
+        np_rates_pd,
+        rates_tbl,
+        apply_var_fn,
+        dataset_midnight,
+        s_state,
+    ):
+        """Compute all requested slots, reusing exact equivalent H1 day states."""
+        dataset_index_dict = {
+            "dates": s_state.dataset_dates,
+            "by_key": s_state.dataset_by_key,
+            "key_dates": s_state.dataset_key_dates,
+            "key_field": s_state.dataset_key_field,
+            "np_rates": np_rates_pd,
+            "ctx_index": s_state.ctx_index,
+            "url_map": s_state.url_map,
+            "dataset_timestamps": getattr(s_state, "_dataset_ts_arr", None),
+            "filter_dataset_by_date": bool(s_state.FILTER_DATASET_BY_DATE),
+            "is_daily": bool(str(rates_tbl or s_state.RATES_TABLE or "").endswith("_day")),
+            "rates_table": rates_tbl or s_state.RATES_TABLE,
+            "full_dataset": s_state.dataset,
+            "execution_scope": "fill_cache",
+        }
+
+        is_hourly_table = not bool(str(rates_tbl or "").endswith("_day"))
+        can_group_day = bool(dataset_midnight and is_hourly_table and np_rates_pd is not None)
+        group_for_date: dict[datetime, tuple] = {}
+        representatives: dict[tuple, dict] = {}
+
+        dn = np_rates_pd.get("dates_ns") if np_rates_pd is not None else None
+        opens = np_rates_pd.get("open") if np_rates_pd is not None else None
+        closes = np_rates_pd.get("close") if np_rates_pd is not None else None
+
+        for candle in candles_chunk:
+            td = candle["date"]
+            cut = bisect.bisect_right(all_dates, td)
+            if cut <= 0:
+                key = ("empty", td)
+            elif can_group_day and dn is not None and opens is not None and closes is not None:
+                # The standard model's output within an H1 day depends on:
+                #   1) midnight-vs-non-midnight (legacy is_daily semantics),
+                #   2) current candle bull/bear (selects max/min extrema),
+                # while all enriched events are fixed at midnight.
+                np_cut = int(np.searchsorted(dn, int(td.timestamp()), side="right"))
+                if np_cut <= 0:
+                    key = ("empty", td)
+                else:
+                    last_dt = all_rows[cut - 1]["date"]
+                    legacy_daily = last_dt.hour == 0 and last_dt.minute == 0
+                    is_bull = float(closes[np_cut - 1]) > float(opens[np_cut - 1])
+                    key = (td.date(), legacy_daily, is_bull)
+            else:
+                key = ("exact", td)
+            group_for_date[td] = key
+            representatives.setdefault(key, candle)
+
+        group_results: dict[tuple, dict | None] = {}
+        for key, candle in representatives.items():
+            td = candle["date"]
+            cut = bisect.bisect_right(all_dates, td)
+            rates_f = _list_view(all_rows, 0, cut)
+            try:
+                group_results[key] = _run_standard_model_multi_slots(
+                    rates_f,
+                    s_state.dataset,
+                    td,
+                    slots=type_var_slots,
+                    dataset_index=dataset_index_dict,
+                    shift_window=s_state.SHIFT_WINDOW,
+                    apply_var_fn=apply_var_fn,
+                )
+            except Exception as exc:
+                import traceback as _tb
+                log(
+                    f"   standard fast batch {td}: {exc}\n{_tb.format_exc()}",
+                    s_state.NODE_NAME,
+                    level="error",
+                    force=True,
+                )
+                group_results[key] = None
+
+        return {
+            candle["date"]: group_results.get(group_for_date[candle["date"]])
+            for candle in candles_chunk
+        }, len(representatives)
+
+    async def _try_fill_standard_fast(
+        pair_id,
+        day_flag,
+        candles,
+        type_var_slots,
+        cached_by_hash,
+        all_rows,
+        all_dates,
+        np_rates_pd,
+        rates_tbl,
+        batch_size,
+    ):
+        """Automatic fused fill for standard services; returns handled + counters."""
+        _ordered_model, _ = _ordered_fill_control(s)
+        if _ordered_model:
+            return False, 0, 0, 0
+        apply_var_fn = _standard_fast_apply_var(s)
+        if apply_var_fn is None or not s.model_needs_index:
+            return False, 0, 0, 0
+
+        slot_meta = []
+        for calc_type, var in type_var_slots:
+            extra = {"type": calc_type, "var": var, "param": ""}
+            p_hash = _params_hash(extra)
+            slot_meta.append((
+                (calc_type, var),
+                p_hash,
+                _json.dumps(extra, ensure_ascii=False),
+                cached_by_hash.get(p_hash, set()),
+            ))
+
+        skipped_inc = 0
+        pending = []
+        for candle in candles:
+            dv = candle["date"]
+            missing_any = False
+            for _slot, _ph, _pj, cached in slot_meta:
+                if dv in cached:
+                    skipped_inc += 1
+                else:
+                    missing_any = True
+            if missing_any:
+                pending.append(candle)
+
+        if not pending:
+            return True, 0, skipped_inc, 0
+
+        dataset_midnight = _standard_dataset_is_midnight(s.dataset)
+
+        # Safety gate: compare the fused implementation with the actual model
+        # on representative first/middle/last dates before using it for a fill.
+        sample_idx = sorted(set((0, len(pending) // 2, len(pending) - 1)))
+        sample = [pending[i] for i in sample_idx]
+        fast_sample, _ = _standard_fast_compute_dates(
+            sample,
+            type_var_slots,
+            all_rows,
+            all_dates,
+            np_rates_pd,
+            rates_tbl,
+            apply_var_fn,
+            dataset_midnight,
+            s,
+        )
+        for candle in sample:
+            td = candle["date"]
+            slot_results = fast_sample.get(td)
+            if slot_results is None:
+                return False, 0, 0, 0
+            for calc_type, var in type_var_slots:
+                expected = _sync_compute(
+                    candle, calc_type, var,
+                    all_rows, all_dates, np_rates_pd, s, rates_tbl,
+                )
+                actual = slot_results.get((calc_type, var))
+                if expected != actual:
+                    log(
+                        f"  [pair{pair_id}/{'d' if day_flag else 'h'}] "
+                        f"standard fast validation mismatch at {td} "
+                        f"t={calc_type} v={var}; generic fallback",
+                        s.NODE_NAME,
+                        level="warning",
+                        force=True,
+                    )
+                    return False, 0, 0, 0
+
+        done_inc = 0
+        errors_inc = 0
+        groups_total = 0
+        eff_batch = max(int(batch_size or 0), 5000)
+        cache_table = s.cache_table
+
+        for i in range(0, len(pending), eff_batch):
+            if s.fill_cancel.is_set():
+                break
+            chunk = pending[i:i + eff_batch]
+            by_date, groups_count = _standard_fast_compute_dates(
+                chunk,
+                type_var_slots,
+                all_rows,
+                all_dates,
+                np_rates_pd,
+                rates_tbl,
+                apply_var_fn,
+                dataset_midnight,
+                s,
+            )
+            groups_total += groups_count
+
+            insert_rows = []
+            # The same group dictionary is shared by all equivalent H1 dates;
+            # serialize each distinct result/slot only once.
+            encoded_cache: dict[tuple[int, tuple[int, int]], str] = {}
+            for candle in chunk:
+                dv = candle["date"]
+                slot_results = by_date.get(dv)
+                for slot, p_hash, params_json, cached in slot_meta:
+                    if dv in cached:
+                        continue
+                    done_inc += 1
+                    result = None if slot_results is None else slot_results.get(slot)
+                    if result is None:
+                        errors_inc += 1
+                        continue
+                    enc_key = (id(result), slot)
+                    result_json = encoded_cache.get(enc_key)
+                    if result_json is None:
+                        result_json = _rj_encode(result)
+                        encoded_cache[enc_key] = result_json
+                    insert_rows.append({
+                        "url": s.service_url,
+                        "pair": pair_id,
+                        "day": day_flag,
+                        "dv": dv,
+                        "ph": p_hash,
+                        "pj": params_json,
+                        "rj": result_json,
+                    })
+
+            if insert_rows:
+                try:
+                    async with s.engine_vlad.begin() as conn:
+                        for j in range(0, len(insert_rows), 5000):
+                            await conn.execute(text(f"""
+                                INSERT IGNORE INTO `{cache_table}`
+                                    (service_url, pair, day_flag, date_val,
+                                     params_hash, params_json, result_json)
+                                VALUES (:url, :pair, :day, :dv, :ph, :pj, :rj)
+                            """), insert_rows[j:j + 5000])
+                except Exception as exc:
+                    log(
+                        f"   standard fast bulk insert: {exc}",
+                        s.NODE_NAME,
+                        level="warning",
+                    )
+
+            log(
+                f"  [pair{pair_id}/{'d' if day_flag else 'h'} fast] "
+                f"processed={min(i + len(chunk), len(pending))}/{len(pending)} "
+                f"groups={groups_total} err={errors_inc}",
+                s.NODE_NAME,
+                force=True,
+            )
+
+        log(
+            f"  [pair{pair_id}/{'d' if day_flag else 'h'}] "
+            f"standard fused path: {len(pending)} dates -> {groups_total} states, "
+            f"slots={len(type_var_slots)}",
+            s.NODE_NAME,
+            force=True,
+        )
+        return True, done_inc, skipped_inc, errors_inc
 
     # ── _prewarm_ml_active_cache ──────────────────────────────────────────────
     #
@@ -2185,6 +2635,34 @@ def build_app(model_module) -> FastAPI:
                     log(f"  [{instr_label}] cached prefetch failed: {_ce}",
                         s.NODE_NAME, level="warning")
 
+                _ordered_model, _ordered_reset_fn = _ordered_fill_control(s)
+                if _ordered_model:
+                    log(
+                        f"  [{instr_label}] stateful model detected: "
+                        "strict date/slot order enabled",
+                        s.NODE_NAME,
+                        force=True,
+                    )
+
+                # AUTO-3/4/5: exact fused path for the standard wrappers used by
+                # services 53, 56 and 62-70. Detection and result validation are automatic;
+                # custom models continue through the generic implementation below.
+                _fast_handled, _fast_done, _fast_skipped, _fast_errors = (
+                    await _try_fill_standard_fast(
+                        pair_id, day_flag, candles, type_var_slots, cached_by_hash,
+                        all_rows, all_dates_pd, np_rates_pd, tbl, batch_size,
+                    )
+                )
+                if _fast_handled:
+                    done += _fast_done
+                    skipped += _fast_skipped
+                    errors += _fast_errors
+                    s.fill_status.update({
+                        "done": done, "skipped": skipped, "errors": errors,
+                        "slots_done": slot_idx + 1,
+                    })
+                    continue
+
                 # ── Прогрев ML-кеша через batch_model ────────────────────────────
                 # Если модель имеет batch_model и USE_ML_VALUES=True — вычисляем
                 # активные коды для всех экстремумов одним вызовом.
@@ -2213,11 +2691,26 @@ def build_app(model_module) -> FastAPI:
                     params_json = _json.dumps(extra, ensure_ascii=False)
 
                     # OPT-1: используем prefetch вместо отдельного SELECT
-                    cached   = cached_by_hash.get(p_hash, set())
+                    cached = cached_by_hash.get(p_hash, set())
 
-                    to_fetch  = [c for c in candles if c["date"] not in cached]
-                    async with _slot_lock:
+                    if _ordered_model:
+                        # Stateful models must replay the complete ascending timeline,
+                        # including already cached dates, to reconstruct their state.
+                        # Existing rows are not reinserted below.
+                        if _ordered_reset_fn is not None:
+                            try:
+                                _ordered_reset_fn(pair_id, day_flag, calc_type, var)
+                            except Exception as _reset_exc:
+                                log(
+                                    f"   state reset t={calc_type} v={var}: {_reset_exc}",
+                                    s.NODE_NAME, level="warning", force=True,
+                                )
+                        to_fetch = sorted(candles, key=lambda c: c["date"])
+                        skipped_local = sum(1 for c in candles if c["date"] in cached)
+                    else:
+                        to_fetch = [c for c in candles if c["date"] not in cached]
                         skipped_local = len(candles) - len(to_fetch)
+                    async with _slot_lock:
                         skipped += skipped_local
 
                     # OPT-5: для batch_model один большой батч выгоднее
@@ -2363,6 +2856,17 @@ def build_app(model_module) -> FastAPI:
                                 log(f"   batch_model t={calc_type} v={var}: {_e}\n{_tb.format_exc()}",
                                     s.NODE_NAME, level="error", force=True)
                                 results = [None] * len(batch)
+                        elif _ordered_model:
+                            # One executor job, one ascending sequence.  Splitting this
+                            # batch into workers would make stateful output depend on
+                            # thread scheduling rather than candle chronology.
+                            loop = asyncio.get_running_loop()
+                            results = await loop.run_in_executor(
+                                _FILL_EXECUTOR,
+                                _sync_compute_chunk,
+                                batch, calc_type, var,
+                                all_rows, all_dates_pd, np_rates_pd, s, tbl,
+                            )
                         else:
                             # Обычный model(): дробим батч максимум на число worker-ов.
                             # Раньше создавался Future на КАЖДУЮ свечу; на лёгких моделях
@@ -2388,9 +2892,18 @@ def build_app(model_module) -> FastAPI:
                             results = [item for part in chunk_results for item in part]
 
                         insert_rows = []
+                        batch_done = sum(
+                            1 for candle in batch
+                            if not (_ordered_model and candle["date"] in cached)
+                        )
                         for candle, result in zip(batch, results):
+                            already_cached = _ordered_model and candle["date"] in cached
                             if result is None:
+                                # A failure while replaying a cached date is still
+                                # relevant because subsequent state may be affected.
                                 errors += 1
+                                continue
+                            if already_cached:
                                 continue
                             insert_rows.append({
                                 "url":  s.service_url, "pair": pair_id,
@@ -2410,7 +2923,7 @@ def build_app(model_module) -> FastAPI:
                             except Exception as e:
                                 log(f"   bulk insert: {e}", s.NODE_NAME, level="warning")
                         async with _slot_lock:
-                            done += len(batch)
+                            done += batch_done
                             s.fill_status.update({"done": done, "skipped": skipped, "errors": errors})
                         log(f"  [{instr_label} t={calc_type}/v={var}] "
                             f"{done}/{total} err={errors}", s.NODE_NAME, force=True)
@@ -2418,7 +2931,7 @@ def build_app(model_module) -> FastAPI:
                 # ── Запуск слотов ─────────────────────────────────────────────────
                 # ML-путь: последовательно (обучение зависит от предыдущего состояния).
                 # Остальные: параллельно через gather.
-                if s.USE_ML_VALUES:
+                if s.USE_ML_VALUES or _ordered_model:
                     for calc_type, var in type_var_slots:
                         if s.fill_cancel.is_set():
                             break
@@ -3255,6 +3768,7 @@ def build_app(model_module) -> FastAPI:
                 "dataset_timestamps": getattr(s, "_dataset_ts_arr", None),
                 "full_dataset": s.dataset,
                 "rates_table": s.RATES_TABLE,
+                "execution_scope": "pretest",
             }
 
         try:
