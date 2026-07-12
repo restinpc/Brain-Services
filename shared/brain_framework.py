@@ -1,5 +1,5 @@
 """
-brain_framework.py v16 — сжатие result_json (zlib + полная обратная совместимость).
+brain_framework.py v17 — сжатие result_json (zlib + полная обратная совместимость).
 
 Оптимизации над v15:
   OPT-1..5: fill_cache (см. v15).
@@ -618,6 +618,8 @@ class _State:
     ML_EXTREMUM_LIMIT:    int   = 50
     ML_ACTIVE_TAIL:       int   = 0
     ML_PRECISION_METRIC:  str   = "mean"
+    FILL_ML_WORKERS:      int   = 1
+    FILL_ML_BATCH_SIZE:   int   = 2000
 
     # Новые поля для enriched-паттерна
     PARSER_TABLE:         str | None = None
@@ -1349,6 +1351,8 @@ def build_app(model_module) -> FastAPI:
     s.ML_EXTREMUM_LIMIT   = int(  _get("ml", "extremum_limit",   "ML_EXTREMUM_LIMIT",   "", 50))
     s.ML_ACTIVE_TAIL      = int(  _get("ml", "active_tail",      "ML_ACTIVE_TAIL",      "", 0))
     s.ML_PRECISION_METRIC =       _get("ml", "precision_metric", "ML_PRECISION_METRIC", "", "mean")
+    s.FILL_ML_WORKERS     = max(1, int(_get("cache", "ml_workers", "FILL_ML_WORKERS", "FILL_ML_WORKERS", getattr(rl, "_RL_TRAIN_WORKERS", 1))))
+    s.FILL_ML_BATCH_SIZE  = max(100, int(_get("cache", "ml_batch_size", "FILL_ML_BATCH_SIZE", "FILL_ML_BATCH_SIZE", 2000)))
 
     # ── Прочее ────────────────────────────────────────────────────────────────
     s.LABEL_FN  = getattr(model_module, "LABEL_FN",  None)
@@ -1568,6 +1572,9 @@ def build_app(model_module) -> FastAPI:
             try:
                 await s.reverse_store.ensure_tables()
                 s._ml_active_cache.clear()
+                _warm_workers = await rl.warmup_train_executor()
+                if _warm_workers:
+                    log(f"   RL process workers ready: {_warm_workers}", s.NODE_NAME)
             except Exception as e:
                 log(f"   reverse tables: {e}", s.NODE_NAME, level="error")
 
@@ -1984,6 +1991,10 @@ def build_app(model_module) -> FastAPI:
         dt_from = _parse_date(date_from_str) if date_from_str else None
         dt_to   = _parse_date(date_to_str)   if date_to_str   else None
 
+        # Build one consistent data snapshot for the whole fill.  The previous
+        # ML path refreshed rates before every batch and repeatedly hit MySQL.
+        await _refresh_simple_rates(s)
+
         pd_slots       = [(p, d) for p in pairs for d in days]
         type_var_slots = [(tp, var) for tp in types for var in s.VAR_RANGE]
         total_slots    = len(pd_slots) * len(type_var_slots)
@@ -2011,7 +2022,8 @@ def build_app(model_module) -> FastAPI:
                 if s.fill_cancel.is_set():
                     break
 
-                tbl      = _rates_table(pair_id, day_flag)
+                tbl = _rates_table(pair_id, day_flag)
+                await _refresh_rates(tbl, s)
                 all_rows = s.global_rates.get(tbl, [])
                 candles  = [r for r in all_rows
                             if (dt_from is None or r["date"] >= dt_from)
@@ -2033,11 +2045,30 @@ def build_app(model_module) -> FastAPI:
                 _tbl_c = s.cache_table
                 cached_by_hash: dict[str, set] = {}
                 try:
+                    _wanted_hashes = [
+                        _params_hash({"type": ct, "var": vv, "param": ""})
+                        for ct, vv in type_var_slots
+                    ]
+                    _where_ch = ["service_url=:url", "pair=:pair", "day_flag=:day"]
+                    _params_ch = {"url": s.service_url, "pair": pair_id, "day": day_flag}
+                    if dt_from is not None:
+                        _where_ch.append("date_val>=:df")
+                        _params_ch["df"] = dt_from
+                    if dt_to is not None:
+                        _where_ch.append("date_val<=:dt")
+                        _params_ch["dt"] = dt_to
+                    if _wanted_hashes:
+                        _ph_marks = []
+                        for _i, _ph in enumerate(_wanted_hashes):
+                            _name = f"ph{_i}"
+                            _ph_marks.append(f":{_name}")
+                            _params_ch[_name] = _ph
+                        _where_ch.append(f"params_hash IN ({','.join(_ph_marks)})")
                     async with s.engine_vlad.connect() as conn:
                         _res_ch = await conn.execute(text(f"""
                             SELECT params_hash, date_val FROM `{_tbl_c}`
-                            WHERE service_url=:url AND pair=:pair AND day_flag=:day
-                        """), {"url": s.service_url, "pair": pair_id, "day": day_flag})
+                            WHERE {' AND '.join(_where_ch)}
+                        """), _params_ch)
                         for _ph, _dv in _res_ch.fetchall():
                             cached_by_hash.setdefault(_ph, set()).add(_dv)
                     log(f"  [{instr_label}] cached prefetch: "
@@ -2066,6 +2097,7 @@ def build_app(model_module) -> FastAPI:
                 # (только для не-ML пути — ML-обучение state-dependent, нельзя параллелить).
                 # Счётчики done/skipped/errors защищены asyncio-lock (однопоточный event loop).
                 _slot_lock = asyncio.Lock()
+                _ml_compute_sem = asyncio.Semaphore(max(1, s.FILL_ML_WORKERS))
 
                 async def _fill_one_slot(calc_type: int, var: int) -> None:
                     nonlocal done, skipped, errors
@@ -2086,16 +2118,16 @@ def build_app(model_module) -> FastAPI:
                     # (стоимость вызова константа, нет смысла дробить).
                     _eff_bs = (len(to_fetch)
                                if s.batch_model_fn is not None and not s.USE_ML_VALUES
-                               else batch_size) or batch_size
+                               else (max(batch_size, s.FILL_ML_BATCH_SIZE)
+                                     if s.USE_ML_VALUES else batch_size)) or batch_size
+                    # Exact extremum-state results can safely cross batch boundaries.
+                    _ml_state_results: dict[tuple, dict | None] = {}
                     for i in range(0, len(to_fetch), _eff_bs):
                         if s.fill_cancel.is_set():
                             break
                         batch = to_fetch[i:i + _eff_bs]
 
                         if s.USE_ML_VALUES:
-                            # Refresh rates once per batch, not per candle.
-                            await _refresh_rates(_rates_table(pair_id, day_flag), s)
-
                             # OPT-ML-BATCH: соседние свечи обычно имеют один и тот же
                             # набор последних N экстремумов. Для таких свечей результат
                             # train_at_date() идентичен, поэтому считаем ML только один
@@ -2124,26 +2156,37 @@ def build_app(model_module) -> FastAPI:
                                         s.NODE_NAME, force=True,
                                     )
 
-                                for _indices in grouped.values():
+                                async def _compute_ml_state(_state_key, _indices):
+                                    if _state_key in _ml_state_results:
+                                        return
                                     if s.fill_cancel.is_set():
-                                        break
+                                        _ml_state_results[_state_key] = None
+                                        return
                                     _rep = batch[_indices[0]]
-                                    try:
-                                        _result = await _call_model(
-                                            pair_id, day_flag,
-                                            _rep["date"].strftime("%Y-%m-%d %H:%M:%S"),
-                                            calc_type=calc_type, calc_var=var, param="",
-                                            _skip_refresh=True,
-                                        )
-                                    except Exception as _e:
-                                        import traceback as _tb
-                                        log(
-                                            f"   ml-fill {_rep['date']} t={calc_type} v={var}: "
-                                            f"{_e}\n{_tb.format_exc()}",
-                                            s.NODE_NAME, level="error", force=True,
-                                        )
-                                        _result = None
+                                    async with _ml_compute_sem:
+                                        try:
+                                            _result = await _call_model(
+                                                pair_id, day_flag,
+                                                _rep["date"].strftime("%Y-%m-%d %H:%M:%S"),
+                                                calc_type=calc_type, calc_var=var, param="",
+                                                _skip_refresh=True,
+                                            )
+                                        except Exception as _e:
+                                            import traceback as _tb
+                                            log(
+                                                f"   ml-fill {_rep['date']} t={calc_type} v={var}: "
+                                                f"{_e}\n{_tb.format_exc()}",
+                                                s.NODE_NAME, level="error", force=True,
+                                            )
+                                            _result = None
+                                    _ml_state_results[_state_key] = _result
 
+                                await asyncio.gather(*(
+                                    _compute_ml_state(_state_key, _indices)
+                                    for _state_key, _indices in grouped.items()
+                                ))
+                                for _state_key, _indices in grouped.items():
+                                    _result = _ml_state_results.get(_state_key)
                                     for _idx in _indices:
                                         results[_idx] = _result
                             except Exception as _e:
