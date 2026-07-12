@@ -52,6 +52,9 @@ import hashlib
 import json as _json
 import os
 import random
+import multiprocessing as _mp
+import threading as _threading
+import time as _time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Awaitable, Callable, Literal
@@ -70,13 +73,72 @@ _NUMBA_ENABLED = (
 )
 
 # CPU-bound training should not block the FastAPI event loop.
-# Keep workers low: the keyed train lock deduplicates identical jobs, while this
-# executor controls CPU pressure for independent universes.
-_RL_TRAIN_WORKERS = max(1, int(os.getenv("RL_TRAIN_WORKERS", "1")))
-_RL_TRAIN_EXECUTOR = _cf.ThreadPoolExecutor(
-    max_workers=_RL_TRAIN_WORKERS,
-    thread_name_prefix="rl_train",
-)
+# Threads do not scale for the Python/NumPy preparation around the Numba kernels,
+# therefore on POSIX we use a persistent process pool by default.  The pool is
+# created lazily so spawned workers do not recursively create their own pools.
+_RL_TRAIN_WORKERS = max(1, int(os.getenv(
+    "RL_TRAIN_WORKERS",
+    str(min(4, max(1, (os.cpu_count() or 2) // 2))),
+)))
+_RL_EXECUTOR_KIND = os.getenv(
+    "RL_EXECUTOR",
+    "process" if os.name == "posix" and _RL_TRAIN_WORKERS > 1 else "thread",
+).strip().lower()
+_RL_PROCESS_START_METHOD = os.getenv(
+    "RL_PROCESS_START_METHOD",
+    "forkserver" if os.name == "posix" else "spawn",
+).strip().lower()
+_RL_TRAIN_EXECUTOR = None
+_RL_EXECUTOR_LOCK = _threading.Lock()
+
+
+def _init_rl_worker() -> None:
+    """Compile the hot Numba signatures once when a process worker starts."""
+    try:
+        base = datetime(2020, 1, 1)
+        records = [
+            ExtremumRecord(base, 1, ["warm_a", "warm_b"]),
+            ExtremumRecord(base, -1, ["warm_b", "warm_c"]),
+        ]
+        _train_records_numba_exact(
+            records,
+            max_iter=2, step=0.1, target_precision=0.99,
+            active_tail=0, metric="mean", rng_seed=1,
+        )
+    except Exception:
+        # Warmup is opportunistic; the real task will still execute normally.
+        pass
+
+
+def _executor_probe(delay: float = 0.02) -> int:
+    """Small picklable task used to start all persistent workers eagerly."""
+    _time.sleep(delay)
+    return os.getpid()
+
+
+def _get_train_executor():
+    global _RL_TRAIN_EXECUTOR
+    if _RL_TRAIN_EXECUTOR is not None:
+        return _RL_TRAIN_EXECUTOR
+    with _RL_EXECUTOR_LOCK:
+        if _RL_TRAIN_EXECUTOR is not None:
+            return _RL_TRAIN_EXECUTOR
+        if _RL_EXECUTOR_KIND == "process" and _RL_TRAIN_WORKERS > 1:
+            try:
+                ctx = _mp.get_context(_RL_PROCESS_START_METHOD)
+            except ValueError:
+                ctx = _mp.get_context("spawn")
+            _RL_TRAIN_EXECUTOR = _cf.ProcessPoolExecutor(
+                max_workers=_RL_TRAIN_WORKERS,
+                mp_context=ctx,
+                initializer=_init_rl_worker,
+            )
+        else:
+            _RL_TRAIN_EXECUTOR = _cf.ThreadPoolExecutor(
+                max_workers=_RL_TRAIN_WORKERS,
+                thread_name_prefix="rl_train",
+            )
+        return _RL_TRAIN_EXECUTOR
 
 
 def _stable_seed(key: object) -> int:
@@ -875,35 +937,55 @@ def group_control_dates_by_extremum_state(
     extremum_limit: int = 50,
     extremum_interval: int = 3,
 ) -> tuple[dict[tuple, list[int]], dict[tuple, list[tuple[datetime, int]]]]:
-    """Group control dates by the exact extremum sequence used for training.
+    """Group dates by the exact extremum window used for training.
 
-    This is the exact safe form of incremental fill-cache training: every candle
-    between two consecutive extrema has the same `seq_tuple`, therefore the ML
-    universe is byte-for-byte the same for those candles.  We can train once for
-    the group and copy the result to all dates in the group without changing
-    answers.
-
-    Returns:
-        groups: {seq_tuple: [indexes into control_dates]}
-        seq_by_key: {seq_tuple: original [(date, sign), ...] sequence}
+    Optimized implementation: vectorized ``searchsorted`` finds the extremum
+    cutoff for all candles at once.  The expensive 50-element sequence key is
+    materialized only once per unique window instead of once per candle.
+    Returned keys and sequences are identical to the previous implementation.
     """
     groups: dict[tuple, list[int]] = {}
     seq_by_key: dict[tuple, list[tuple[datetime, int]]] = {}
     if not control_dates:
         return groups, seq_by_key
+    if not np_simple_rates:
+        empty_key: tuple = ()
+        groups[empty_key] = list(range(len(control_dates)))
+        seq_by_key[empty_key] = []
+        return groups, seq_by_key
+
+    all_ext, all_ext_ts = _get_all_extremums(
+        np_simple_rates, interval=extremum_interval
+    )
+    if not all_ext:
+        empty_key: tuple = ()
+        groups[empty_key] = list(range(len(control_dates)))
+        seq_by_key[empty_key] = []
+        return groups, seq_by_key
+
+    control_ts = np.fromiter(
+        (int(dt.timestamp()) for dt in control_dates),
+        dtype=np.int64, count=len(control_dates),
+    )
+    ext_ts_arr = np.asarray(all_ext_ts, dtype=np.int64)
+    cutoffs = np.searchsorted(ext_ts_arr, control_ts, side="right")
+
+    windows: dict[tuple[int, int], list[int]] = {}
+    limit = max(0, int(extremum_limit))
+    for idx, cutoff_raw in enumerate(cutoffs):
+        cutoff = int(cutoff_raw)
+        start = max(0, cutoff - limit)
+        windows.setdefault((start, cutoff), []).append(idx)
 
     forward = train_mode in (1, 3, 4)
-    collect_fn = collect_extremums_forward if forward else collect_extremums_back
-
-    for idx, dt in enumerate(control_dates):
-        seq = collect_fn(
-            np_simple_rates,
-            dt,
-            limit=extremum_limit,
-            extremum_interval=extremum_interval,
-        )
+    for (start, cutoff), indexes in windows.items():
+        chunk = all_ext[start:cutoff]
+        if forward:
+            seq = [(datetime.fromtimestamp(t), sign) for t, sign in chunk]
+        else:
+            seq = [(datetime.fromtimestamp(t), sign) for t, sign in reversed(chunk)]
         key = tuple((int(d.timestamp()), int(sign)) for d, sign in seq)
-        groups.setdefault(key, []).append(idx)
+        groups.setdefault(key, []).extend(indexes)
         if key not in seq_by_key:
             seq_by_key[key] = seq
 
@@ -1023,7 +1105,21 @@ async def _run_train_records(
         metric=metric,
         rng_seed=rng_seed,
     )
-    return await loop.run_in_executor(_RL_TRAIN_EXECUTOR, fn)
+    return await loop.run_in_executor(_get_train_executor(), fn)
+
+
+async def warmup_train_executor() -> int:
+    """Start process workers during service preload instead of first fill batch."""
+    if _RL_EXECUTOR_KIND != "process" or _RL_TRAIN_WORKERS <= 1:
+        return 0
+    loop = asyncio.get_running_loop()
+    executor = _get_train_executor()
+    # More probes than workers makes it very likely every process is scheduled.
+    pids = await asyncio.gather(*(
+        loop.run_in_executor(executor, _executor_probe, 0.05)
+        for _ in range(_RL_TRAIN_WORKERS * 2)
+    ))
+    return len(set(pids))
 
 
 async def train_prebuilt_records(
