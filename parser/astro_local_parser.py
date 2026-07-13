@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """
-Описание: локальный Swiss Ephemeris / pyswisseph parser → одна большая MySQL таблица.
+Описание: локальный Swiss Ephemeris / pyswisseph parser через .se1-файлы → одна большая MySQL таблица.
 Запуск:   python astro_local_parser.py <table_name> [host] [port] [user] [password] [database]
+
+Важно:
+  • расчёт идёт именно через локальные Swiss Ephemeris файлы .se1, которые лежат рядом с этим скриптом;
+  • Moshier fallback специально отключён, чтобы не было скрытой подмены источника расчёта;
+  • нужны минимум sepl_18.se1, semo_18.se1, seas_18.se1 для периода 2007–текущий час.
 
 Логика без дополнительных CLI-флагов:
   • старт истории: 2007-01-01 00:00:00 UTC;
@@ -28,6 +33,7 @@ import math
 import argparse
 import traceback
 import requests
+from pathlib import Path
 try:
     from dotenv import load_dotenv
 except Exception:  # pragma: no cover
@@ -54,8 +60,23 @@ EMAIL      = os.getenv("ALERT_EMAIL", "твоя почта")
 DEFAULT_START = "2007-01-01 00:00:00"
 STEP_HOURS = 1
 BATCH_HOURS = 250
-# Путь к Swiss Ephemeris файлам можно задать только через .env, без CLI-флага.
-EPHE_PATH = os.getenv("ASTRO_EPHE_PATH")
+
+# Расчёт строго через локальные Swiss Ephemeris .se1 файлы.
+# Скрипт ждёт их прямо рядом с собой:
+#   ./sepl_18.se1, ./semo_18.se1, ./seas_18.se1
+# CLI-флага нет — hourly cron остаётся простым и одинаковым.
+SCRIPT_DIR = Path(__file__).resolve().parent
+EPHE_PATH = SCRIPT_DIR
+REQUIRED_SE1_FILES = ("sepl_18.se1", "semo_18.se1", "seas_18.se1")
+
+# Для финансовых рядов по умолчанию используем UTC и нулевую гео-точку.
+# Это нужно только для точек Ascendant/Descendant/MC/IC, которые FreeAstrology тоже отдаёт.
+# Если понадобится повторить конкретный payload FreeAstrology, можно указать в .env без CLI-флагов:
+# ASTRO_LATITUDE=17.38405
+# ASTRO_LONGITUDE=78.45636
+ASTRO_LATITUDE = float(os.getenv("ASTRO_LATITUDE", "0"))
+ASTRO_LONGITUDE = float(os.getenv("ASTRO_LONGITUDE", "0"))
+ASTRO_HOUSE_SYSTEM = os.getenv("ASTRO_HOUSE_SYSTEM", "P")[:1] or "P"
 
 SIGNS = [
     "Aries", "Taurus", "Gemini", "Cancer", "Leo", "Virgo",
@@ -82,8 +103,9 @@ SIGN_META = {
 
 SYNODIC_MONTH_DAYS = 29.53058867
 
-# Набор аспектов близок к тому, что обычно отдают astrology API.
-# orb можно менять, если нужно больше/меньше сигналов.
+# Поддерживаемые аспекты совпадают со списком FreeAstrology western/aspects.
+# Орбы поставлены как практичные дефолты; если FreeAstrology вызывается с другим orb_values,
+# сами углы будут совпадать, но факт попадания в аспект может отличаться.
 ASPECTS = [
     ("Conjunction", 0.0, 8.0),
     ("Opposition", 180.0, 8.0),
@@ -99,23 +121,32 @@ ASPECTS = [
     ("Sesquiquadrate", 135.0, 2.0),
 ]
 
+# Набор тел повторяет FreeAstrology western/planets по числовым полям:
+# Ascendant, Descendant, IC, MC, Sun, Moon, Mars, Mercury, Jupiter, Venus, Saturn,
+# Uranus, Neptune, Pluto, Lilith, Chiron, Mean Node, True Node, Ceres, Vesta, Juno, Pallas.
 PLANET_ORDER = [
+    "Ascendant",
     "Sun",
     "Moon",
-    "Mercury",
-    "Venus",
     "Mars",
+    "Mercury",
     "Jupiter",
+    "Venus",
     "Saturn",
     "Uranus",
     "Neptune",
     "Pluto",
-    "MeanNode",
-    "TrueNode",
-    "SouthNode",
-    "TrueSouthNode",
+    "Ceres",
+    "Vesta",
+    "Juno",
+    "Pallas",
     "Chiron",
-    "BlackMoonLilith",
+    "Lilith",
+    "Mean Node",
+    "True Node",
+    "Descendant",
+    "MC",
+    "IC",
 ]
 
 # ── 3. ТРАССИРОВКА ОШИБОК ─────────────────────────────────────────────────────
@@ -187,15 +218,15 @@ DATASETS = {
 class PlanetPos:
     name: str
     longitude: float
-    latitude: float
-    distance_au: float
-    speed_longitude: float
-    speed_latitude: float
-    speed_distance: float
+    latitude: Optional[float]
+    distance_au: Optional[float]
+    speed_longitude: Optional[float]
+    speed_latitude: Optional[float]
+    speed_distance: Optional[float]
 
     @property
     def is_retrograde(self) -> int:
-        return 1 if self.speed_longitude < 0 else 0
+        return 1 if self.speed_longitude is not None and self.speed_longitude < 0 else 0
 
     @property
     def sign_num(self) -> int:
@@ -222,10 +253,14 @@ def _planet_code(name: str) -> Optional[int]:
         "Uranus": swe.URANUS,
         "Neptune": swe.NEPTUNE,
         "Pluto": swe.PLUTO,
-        "MeanNode": swe.MEAN_NODE,
-        "TrueNode": swe.TRUE_NODE,
+        "Mean Node": swe.MEAN_NODE,
+        "True Node": swe.TRUE_NODE,
         "Chiron": getattr(swe, "CHIRON", 15),
-        "BlackMoonLilith": getattr(swe, "MEAN_APOG", 12),
+        "Lilith": getattr(swe, "MEAN_APOG", 12),
+        "Ceres": getattr(swe, "CERES", 17),
+        "Pallas": getattr(swe, "PALLAS", 18),
+        "Juno": getattr(swe, "JUNO", 19),
+        "Vesta": getattr(swe, "VESTA", 20),
     }
     return mapping.get(name)
 
@@ -298,28 +333,70 @@ def phase_name(angle: float) -> str:
         return "Last Quarter"
     return "Waning Crescent"
 
-_WARNED_CODES = set()
+def setup_ephemeris():
+    """Подключает .se1 рядом со скриптом и жёстко проверяет нужные файлы.
+
+    Здесь намеренно нет Moshier fallback: если .se1 не положены, скрипт должен
+    явно остановиться, а не посчитать часть данных другим алгоритмом.
+    """
+    missing = [name for name in REQUIRED_SE1_FILES if not (EPHE_PATH / name).is_file()]
+    if missing:
+        files = "\n".join(f"  - {name}" for name in missing)
+        raise RuntimeError(
+            "Не найдены Swiss Ephemeris .se1 файлы в папке:\n"
+            f"  {EPHE_PATH}\n\n"
+            "Не хватает:\n"
+            f"{files}\n\n"
+            "Положи файлы прямо рядом с astro_local_parser.py.\n"
+            "Для периода 2007–текущий час обычно нужны: sepl_18.se1, semo_18.se1, seas_18.se1."
+        )
+
+    swe.set_ephe_path(str(EPHE_PATH))
 
 
-def safe_calc_ut(jd: float, code: int, flags: int) -> Optional[Tuple[float, float, float, float, float, float]]:
-    """Пробуем SWIEPH, потом fallback MOSEPH. Если для тела нет эфемерид — пропускаем."""
+def calc_ut_se1(jd: float, code: int, flags: int) -> Tuple[float, float, float, float, float, float]:
+    """Считает тело строго через SWIEPH/.se1. Fallback на MOSEPH отключён."""
+    pos, _ret = swe.calc_ut(jd, code, flags)
+    return tuple(float(x) for x in pos[:6])
+
+
+def _make_angle_point(name: str, longitude: float) -> PlanetPos:
+    """Ascendant/Descendant/MC/IC: FreeAstrology отдаёт их как planet-like точки.
+
+    У них есть fullDegree/normDegree/sign/isRetro, но нет физической скорости/дистанции
+    как у планет, поэтому скорости и дистанция остаются NULL.
+    """
+    return PlanetPos(
+        name=name,
+        longitude=norm360(float(longitude)),
+        latitude=None,
+        distance_au=None,
+        speed_longitude=None,
+        speed_latitude=None,
+        speed_distance=None,
+    )
+
+
+def calc_angle_points(dt: datetime) -> Dict[str, PlanetPos]:
+    jd = julian_day_ut(dt)
     try:
-        pos, _ret = swe.calc_ut(jd, code, flags)
-        return tuple(float(x) for x in pos[:6])
-    except Exception as first_exc:
-        try:
-            fallback_flags = swe.FLG_MOSEPH | swe.FLG_SPEED
-            pos, _ret = swe.calc_ut(jd, code, fallback_flags)
-            return tuple(float(x) for x in pos[:6])
-        except Exception as second_exc:
-            if code not in _WARNED_CODES:
-                print(
-                    f"⚠️ body code {code} skipped; возможно не хватает ephemeris-файлов. "
-                    f"SWIEPH: {first_exc}; MOSEPH: {second_exc}",
-                    file=sys.stderr,
-                )
-                _WARNED_CODES.add(code)
-            return None
+        _cusps, ascmc = swe.houses_ex(
+            jd,
+            ASTRO_LATITUDE,
+            ASTRO_LONGITUDE,
+            ASTRO_HOUSE_SYSTEM.encode("ascii", errors="ignore") or b"P",
+        )
+    except TypeError:
+        _cusps, ascmc = swe.houses_ex(jd, ASTRO_LATITUDE, ASTRO_LONGITUDE, ASTRO_HOUSE_SYSTEM)
+
+    asc = norm360(ascmc[0])
+    mc = norm360(ascmc[1])
+    return {
+        "Ascendant": _make_angle_point("Ascendant", asc),
+        "Descendant": _make_angle_point("Descendant", asc + 180.0),
+        "MC": _make_angle_point("MC", mc),
+        "IC": _make_angle_point("IC", mc + 180.0),
+    }
 
 
 def calc_planets(dt: datetime, selected_planets: List[str]) -> Dict[str, PlanetPos]:
@@ -327,16 +404,14 @@ def calc_planets(dt: datetime, selected_planets: List[str]) -> Dict[str, PlanetP
     flags = swe.FLG_SWIEPH | swe.FLG_SPEED
     out: Dict[str, PlanetPos] = {}
 
+    # Сначала физические тела через .se1.
     for name in selected_planets:
-        if name in ("SouthNode", "TrueSouthNode"):
+        if name in ("Ascendant", "Descendant", "MC", "IC"):
             continue
         code = _planet_code(name)
         if code is None:
             continue
-        calc = safe_calc_ut(jd, code, flags)
-        if calc is None:
-            continue
-        lon, lat, dist, speed_lon, speed_lat, speed_dist = calc
+        lon, lat, dist, speed_lon, speed_lat, speed_dist = calc_ut_se1(jd, code, flags)
         out[name] = PlanetPos(
             name=name,
             longitude=norm360(lon),
@@ -347,32 +422,13 @@ def calc_planets(dt: datetime, selected_planets: List[str]) -> Dict[str, PlanetP
             speed_distance=speed_dist,
         )
 
-    if "SouthNode" in selected_planets and "MeanNode" in out:
-        n = out["MeanNode"]
-        out["SouthNode"] = PlanetPos(
-            name="SouthNode",
-            longitude=norm360(n.longitude + 180.0),
-            latitude=-n.latitude,
-            distance_au=n.distance_au,
-            speed_longitude=n.speed_longitude,
-            speed_latitude=-n.speed_latitude,
-            speed_distance=n.speed_distance,
-        )
-
-    if "TrueSouthNode" in selected_planets and "TrueNode" in out:
-        n = out["TrueNode"]
-        out["TrueSouthNode"] = PlanetPos(
-            name="TrueSouthNode",
-            longitude=norm360(n.longitude + 180.0),
-            latitude=-n.latitude,
-            distance_au=n.distance_au,
-            speed_longitude=n.speed_longitude,
-            speed_latitude=-n.speed_latitude,
-            speed_distance=n.speed_distance,
-        )
+    # Потом угловые точки, которые FreeAstrology western/planets тоже возвращает.
+    angle_points = calc_angle_points(dt)
+    for name in ("Ascendant", "Descendant", "MC", "IC"):
+        if name in selected_planets and name in angle_points:
+            out[name] = angle_points[name]
 
     return {name: out[name] for name in selected_planets if name in out}
-
 
 def nearest_aspect(angle_abs: float) -> Tuple[str, float, float, float, int]:
     """Возвращает name, exact_angle, orb, max_orb, in_orb."""
@@ -437,7 +493,7 @@ def planet_row(dt: datetime, p: PlanetPos) -> dict:
         speed_longitude=p.speed_longitude,
         speed_latitude=p.speed_latitude,
         speed_distance=p.speed_distance,
-        abs_speed_longitude=abs(p.speed_longitude),
+        abs_speed_longitude=abs(p.speed_longitude) if p.speed_longitude is not None else None,
         sign_num=p.sign_num,
         sign_name=p.sign_name,
         degree_in_sign=p.degree_in_sign,
@@ -583,7 +639,7 @@ def event_rows(dt: datetime, planets: Dict[str, PlanetPos], prev: Optional[Dict[
             ))
 
         # Условная зона станции: очень маленькая видимая скорость долготы.
-        if abs(p.speed_longitude) <= 0.005:
+        if p.speed_longitude is not None and abs(p.speed_longitude) <= 0.005:
             out.append(make_row(
                 ts_utc=dt_to_mysql(dt),
                 row_type="event",
@@ -756,8 +812,7 @@ def process(table_name: str):
     config = DATASETS[table_name]
     del config  # конфиг пока простой, оставлено в стиле остальных парсеров
 
-    if EPHE_PATH:
-        swe.set_ephe_path(EPHE_PATH)
+    setup_ephemeris()
 
     selected_planets = PLANET_ORDER[:]
     start = parse_dt(DEFAULT_START)
@@ -783,6 +838,8 @@ def process(table_name: str):
     print(f"🧮 Часов к расчёту: {total_hours}")
     print(f"🪐 Тел: {len(selected_planets)}")
     print("🔁 Режим: полный набор = planet + moon + all pairs + aspects + events")
+    print(f"📁 .se1 путь: {EPHE_PATH}")
+    print(f"🌐 Geo для Asc/MC: lat={ASTRO_LATITUDE}, lon={ASTRO_LONGITUDE}, house_system={ASTRO_HOUSE_SYSTEM}")
     print(f"🕐 Конец расчёта: {dt_to_mysql(end)} UTC")
 
     # Чтобы hourly-cron корректно поймал sign_ingress/retrograde_change в первом новом часе,
@@ -844,6 +901,7 @@ def main():
     print(f"   База: {args.host}:{args.port}/{args.database}")
     print(f"   Таблица: {args.table_name}")
     print(f"   Период UTC: {DEFAULT_START} → current UTC hour")
+    print(f"   Swiss Ephemeris .se1: {EPHE_PATH}")
     print("=" * 60)
 
     process(args.table_name)
