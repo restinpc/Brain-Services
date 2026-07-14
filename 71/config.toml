@@ -1,0 +1,42 @@
+[service]
+id = 71
+port = 8933
+name = "brain-vlad_astro_hypothesis_lab-s71"
+text = "Astrology hypothesis laboratory: 144 causal type/var strategies"
+
+[developer]
+email = "vladyurjevitch@yandex.ru"
+
+[rates]
+table = "brain_rates_eur_usd"
+
+[cache]
+date_from = "2025-01-01"
+var_range = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+types_range = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+shift_window = 0
+rebuild_interval = 0
+reload_interval = 3600
+
+[dataset]
+parser_table = "vlad_astro_hour_features"
+parser_engine = "brain"
+table = "vlad_astro_hour_snapshots_s71"
+query = "SELECT date_dt AS date, body_blob, body_mask, body_count, quality, schema_version FROM vlad_astro_hour_snapshots_s71 ORDER BY date_dt"
+engine = "vlad"
+key_field = "date"
+filter_by_date = false
+rebuild_tail_hours = 48
+enrich_chunk_days = 365
+read_yield_rows = 20000
+write_batch_hours = 5000
+
+[ctx]
+table = "vlad_astro_hypothesis_ctx_s71"
+weights_table = "vlad_astro_hypothesis_weights_s71"
+weights_code_column = "weight_code"
+key_columns = ["id"]
+query = "SELECT id, feature_key, feature_family, name, occurrence_count, date_added FROM vlad_astro_hypothesis_ctx_s71 ORDER BY id"
+
+[ml]
+enabled = false
