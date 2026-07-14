@@ -145,7 +145,7 @@ from common import (
     MODE, IS_DEV,
     log, send_error_trace,
     ok_response, err_response,
-    resolve_workers, build_engines,
+    resolve_workers, build_engines, build_cache_engine,
 )
 from cache_helper import ensure_cache_table, load_service_url, cached_values
 import reverse_learning as rl
@@ -860,6 +860,11 @@ class _State:
         self.engine_vlad  = None
         self.engine_brain = None
         self.engine_super = None
+        # Отдельный пул, но те же SUPER_* реквизиты: общий кеш находится на Brain 1.
+        self.engine_cache = None
+        self.cache_writer: bool | None = None
+        self.cache_role: str = "unknown"
+        self.cache_upstream_url: str = ""
 
         self.weight_codes:  list       = []
         self.ctx_index:     dict       = {}
@@ -958,7 +963,132 @@ def _rates_table(pair_id: int, day_flag: int) -> str:
 
 def _engine_for(name: str, s: _State):
     return {"vlad": s.engine_vlad, "brain": s.engine_brain,
-            "super": s.engine_super}.get(name, s.engine_vlad)
+            "super": s.engine_super, "cache": s.engine_cache}.get(name, s.engine_vlad)
+
+
+def _env_bool_override(name: str) -> bool | None:
+    raw = os.getenv(name, "auto").strip().lower()
+    if raw in {"1", "true", "yes", "on", "writer"}:
+        return True
+    if raw in {"0", "false", "no", "off", "reader"}:
+        return False
+    return None
+
+
+async def _mysql_server_identity(engine) -> tuple | None:
+    """Идентификатор физического MySQL-сервера, независимо от имени схемы."""
+    if engine is None:
+        return None
+    for query, prefix in (
+        ("SELECT @@server_uuid", "uuid"),
+        ("SELECT @@server_id, @@hostname, @@port", "server"),
+        ("SELECT @@hostname, @@port", "host"),
+    ):
+        try:
+            async with engine.connect() as conn:
+                row = (await conn.execute(text(query))).fetchone()
+            if row and row[0] is not None:
+                return (prefix, *tuple(str(v) for v in row))
+        except Exception:
+            continue
+    return None
+
+
+def _build_cache_upstream_url(port: int) -> str:
+    """URL Python-сервиса на Brain 1 для fallback при cache MISS.
+
+    По умолчанию HTTP-хост берётся из SUPER_HOST, поскольку SUPER_* уже ведёт
+    на первую ноду. При необходимости можно задать CACHE_UPSTREAM_URL:
+      http://10.0.0.1          -> порт сервиса добавится автоматически
+      http://cache/{port}      -> подстановка {port}
+      http://10.0.0.1:8916     -> используется как есть
+    """
+    raw = os.getenv("CACHE_UPSTREAM_URL", "").strip().rstrip("/")
+    if raw:
+        if "{port}" in raw:
+            return raw.format(port=port).rstrip("/")
+        try:
+            from urllib.parse import urlsplit
+            parsed = urlsplit(raw if "://" in raw else f"http://{raw}")
+            normalized = raw if "://" in raw else f"http://{raw}"
+            if parsed.port is not None:
+                return normalized.rstrip("/")
+            return f"{normalized.rstrip('/')}:{port}"
+        except Exception:
+            return f"{raw}:{port}"
+
+    host = os.getenv("SUPER_HOST", "").strip()
+    if not host:
+        return ""
+    scheme = os.getenv("CACHE_UPSTREAM_SCHEME", "http").strip() or "http"
+    return f"{scheme}://{host}:{port}"
+
+
+async def _detect_cache_role(s: _State) -> bool:
+    """Определяет, является ли текущая нода единственным cache-writer.
+
+    CACHE_WRITER=1/0 имеет приоритет. В режиме auto Brain 1 определяется по
+    совпадению физического MySQL-сервера DB_* и SUPER_*. При ошибке определения
+    выбирается безопасная роль reader, чтобы дочерняя нода не начала считать.
+    """
+    override = _env_bool_override("CACHE_WRITER")
+    local_id = super_id = None
+    if override is None:
+        local_id = await _mysql_server_identity(s.engine_vlad)
+        super_id = await _mysql_server_identity(s.engine_cache)
+        is_writer = bool(local_id and super_id and local_id == super_id)
+        source = "mysql-auto" if (local_id and super_id) else "safe-reader-fallback"
+    else:
+        is_writer = override
+        source = "CACHE_WRITER env"
+
+    s.cache_writer = is_writer
+    s.cache_role = "writer-brain1" if is_writer else "reader-child"
+    s.cache_upstream_url = _build_cache_upstream_url(s.PORT)
+    log(
+        f" central cache role={s.cache_role} source={source} "
+        f"storage=SUPER_* upstream={s.cache_upstream_url or 'not-configured'} "
+        f"local_mysql={local_id or 'n/a'} super_mysql={super_id or 'n/a'}",
+        s.NODE_NAME, force=True,
+    )
+    return is_writer
+
+
+async def _proxy_values_to_brain1(
+    s: _State, *, pair: int, day: int, date: str,
+    calc_type: int, calc_var: int, param: str,
+) -> dict:
+    """Получает cache MISS с Brain 1, не исполняя локальную model()."""
+    if _requests is None:
+        raise RuntimeError("requests package is not installed")
+    if not s.cache_upstream_url:
+        raise RuntimeError(
+            "CACHE_UPSTREAM_URL is empty and SUPER_HOST is not configured"
+        )
+
+    timeout = max(1.0, float(os.getenv("CACHE_UPSTREAM_TIMEOUT", "120")))
+    url = f"{s.cache_upstream_url.rstrip('/')}/values"
+    params = {
+        "pair": pair, "day": day, "date": date,
+        "type": calc_type, "var": calc_var, "param": param,
+        "_cache_hop": 1,
+    }
+
+    def _request():
+        response = _requests.get(url, params=params, timeout=timeout)
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, dict) or data.get("status") != "ok":
+            raise RuntimeError(
+                data.get("error", "invalid response from Brain 1")
+                if isinstance(data, dict) else "invalid JSON response from Brain 1"
+            )
+        payload = data.get("payLoad")
+        if payload is None:
+            raise RuntimeError("Brain 1 response has no payLoad")
+        return payload
+
+    return await asyncio.to_thread(_request)
 
 
 def _params_hash(params: dict) -> str:
@@ -1634,13 +1764,14 @@ def build_app(model_module) -> FastAPI:
         s.NODE_NAME, force=True)
 
     s.engine_vlad, s.engine_brain, s.engine_super = build_engines()
+    s.engine_cache = build_cache_engine()
 
     # ── Patch connection pool settings ────────────────────────────────────────
     # build_engines() в common.py создаёт движки без pool_pre_ping.
     # Это приводит к "Packet sequence number wrong" при использовании
     # протухших соединений из пула. Патчим pool._pre_ping напрямую
     # (публичный API не позволяет менять это после создания движка).
-    for _eng in (s.engine_vlad, s.engine_brain, s.engine_super):
+    for _eng in (s.engine_vlad, s.engine_brain, s.engine_super, s.engine_cache):
         if _eng is None:
             continue
         try:
@@ -1656,6 +1787,11 @@ def build_app(model_module) -> FastAPI:
 
     async def _call_model(pair, day, date_str, calc_type=0, calc_var=0, param="",
                           _skip_refresh: bool = False):
+        if s.cache_writer is False:
+            raise RuntimeError(
+                "Local model() is disabled on child node; cache MISS must be "
+                "computed by Brain 1"
+            )
         target_date = _parse_date(date_str)
         if not target_date:
             return None
@@ -1758,6 +1894,8 @@ def build_app(model_module) -> FastAPI:
     # ── _preload ──────────────────────────────────────────────────────────────
 
     async def _preload():
+        if s.cache_writer is None:
+            await _detect_cache_role(s)
         log(" FULL DATA RELOAD", s.NODE_NAME, force=True)
         s.np_built = False
         s.weight_codes.clear()
@@ -1779,10 +1917,16 @@ def build_app(model_module) -> FastAPI:
         s.service_url  = f"http://localhost:{s.PORT}"
         s._cache_table = f"vlad_values_cache_svc{s.PORT}"
 
-        try:
-            await ensure_cache_table(s.engine_vlad, s.cache_table)
-        except Exception as e:
-            log(f"   cache table: {e}", s.NODE_NAME, level="error")
+        if s.cache_writer:
+            try:
+                await ensure_cache_table(s.engine_cache, s.cache_table)
+            except Exception as e:
+                log(f"   central cache table: {e}", s.NODE_NAME, level="error")
+        else:
+            log(
+                f" central cache reader: SUPER_* / {s.cache_table}",
+                s.NODE_NAME, force=True,
+            )
 
         if s.USE_ML_VALUES:
             try:
@@ -1999,7 +2143,7 @@ def build_app(model_module) -> FastAPI:
 
     async def _cached_dates(pair, day, p_hash) -> set:
         try:
-            async with s.engine_vlad.connect() as conn:
+            async with s.engine_cache.connect() as conn:
                 res = await conn.execute(text(f"""
                     SELECT date_val FROM `{s.cache_table}`
                     WHERE service_url=:url AND pair=:pair
@@ -2353,7 +2497,7 @@ def build_app(model_module) -> FastAPI:
 
             if insert_rows:
                 try:
-                    async with s.engine_vlad.begin() as conn:
+                    async with s.engine_cache.begin() as conn:
                         for j in range(0, len(insert_rows), 5000):
                             await conn.execute(text(f"""
                                 INSERT IGNORE INTO `{cache_table}`
@@ -2539,6 +2683,13 @@ def build_app(model_module) -> FastAPI:
     # ── _fill_worker ──────────────────────────────────────────────────────────
 
     async def _fill_worker(pairs, days, date_from_str, date_to_str, types, batch_size):
+        if not s.cache_writer:
+            s.fill_status = {
+                "state": "error",
+                "error": "fill_cache разрешён только на Brain 1",
+                "cache_role": s.cache_role,
+            }
+            return
         s.fill_cancel.clear()
         s._fill_cache_active = True   # skip vlad_reverse_universe writes for speed
         # Clear ML universe cache so fill_cache starts fresh
@@ -2620,7 +2771,7 @@ def build_app(model_module) -> FastAPI:
                             _ph_marks.append(f":{_name}")
                             _params_ch[_name] = _ph
                         _where_ch.append(f"params_hash IN ({','.join(_ph_marks)})")
-                    async with s.engine_vlad.connect() as conn:
+                    async with s.engine_cache.connect() as conn:
                         _res_ch = await conn.execute(text(f"""
                             SELECT params_hash, date_val FROM `{_tbl_c}`
                             WHERE {' AND '.join(_where_ch)}
@@ -2913,7 +3064,7 @@ def build_app(model_module) -> FastAPI:
                             })
                         if insert_rows:
                             try:
-                                async with s.engine_vlad.begin() as conn:
+                                async with s.engine_cache.begin() as conn:
                                     await conn.execute(text(f"""
                                         INSERT IGNORE INTO `{_tbl_c}`
                                             (service_url, pair, day_flag, date_val,
@@ -3025,7 +3176,7 @@ def build_app(model_module) -> FastAPI:
             return {"value_score": float(ex[0]), "accuracy": float(ex[1]),
                     "trade_count": int(ex[2]), "params": extra_params, "skipped": True}
 
-        async with s.engine_vlad.connect() as conn:
+        async with s.engine_cache.connect() as conn:
             res = await conn.execute(text(f"""
                 SELECT date_val, result_json FROM `{s.cache_table}`
                 WHERE service_url=:url AND pair=:pair AND day_flag=:day
@@ -3164,7 +3315,7 @@ def build_app(model_module) -> FastAPI:
         yield
         task.cancel()
         s.fill_cancel.set()
-        for eng in (s.engine_vlad, s.engine_brain, s.engine_super):
+        for eng in (s.engine_vlad, s.engine_brain, s.engine_super, s.engine_cache):
             try:
                 await eng.dispose()
             except Exception:
@@ -3196,6 +3347,10 @@ def build_app(model_module) -> FastAPI:
                 "types_range":        s.TYPES_RANGE,
                 "np_built":           s.np_built,
                 "simple_rates":       len(s.simple_rates),
+                "cache_role":         s.cache_role,
+                "cache_storage":      "SUPER_*",
+                "cache_table":        s.cache_table,
+                "cache_upstream":     s.cache_upstream_url if not s.cache_writer else None,
                 "last_reload":        s.last_reload.isoformat() if s.last_reload else None,
                 "last_rebuild":       s.last_rebuild.isoformat() if s.last_rebuild else None,
                 "rebuild_auto":       s.REBUILD_INTERVAL > 0 and bool(
@@ -3329,19 +3484,29 @@ def build_app(model_module) -> FastAPI:
         type: int = Query(0, ge=0, le=4),
         var:  int = Query(0),
         param: str = Query(""),
+        _cache_hop: int = Query(0, ge=0, le=1, include_in_schema=False),
     ):
         if s.TYPES_RANGE and type not in s.TYPES_RANGE:
             return err_response(f"type={type} не входит в TYPES_RANGE={s.TYPES_RANGE}")
         if s.VAR_RANGE and var not in s.VAR_RANGE:
             return err_response(f"var={var} не входит в VAR_RANGE={s.VAR_RANGE}")
         try:
+            if not s.cache_writer and _cache_hop:
+                return err_response(
+                    "Central cache proxy loop detected: upstream service is not Brain 1"
+                )
             resp = await cached_values(
-                engine_vlad=s.engine_vlad, service_url=s.service_url,
+                engine_vlad=s.engine_cache, service_url=s.service_url,
                 pair=pair, day=day, date=date,
                 extra_params={"type": type, "var": var, "param": param},
                 compute_fn=lambda: _call_model(pair, day, date,
                                                calc_type=type, calc_var=var, param=param),
                 node=s.NODE_NAME, table_name=s.cache_table,
+                compute_on_miss=bool(s.cache_writer),
+                miss_fn=(None if s.cache_writer else lambda: _proxy_values_to_brain1(
+                    s, pair=pair, day=day, date=date, calc_type=type,
+                    calc_var=var, param=param,
+                )),
             )
             payload = resp.get("payLoad") or {}
             resp["details"] = _build_narrative(payload, date, 1 if day == 1 else 0, type)
@@ -3356,6 +3521,10 @@ def build_app(model_module) -> FastAPI:
         pair: int = Query(1), day: int = Query(1),
         type: int = Query(0), var: int = Query(0), param: str = Query(""),
     ):
+        if not s.cache_writer:
+            return err_response(
+                "compute_batch разрешён только на Brain 1; дочерняя нода работает cache-only"
+            )
         result = {}
         for date_str in dates:
             try:
@@ -3370,6 +3539,11 @@ def build_app(model_module) -> FastAPI:
 
     async def _start_fill(pairs_str: str, days_str: str,
                           date_from: str, date_to: str, batch_size: int):
+        if not s.cache_writer:
+            return err_response(
+                "fill_cache запрещён на дочерней ноде. Запустите его на Brain 1; "
+                "дочерние ноды читают общий кеш из SUPER_* и проксируют MISS."
+            )
         if s.fill_task and not s.fill_task.done():
             return err_response("Fill already running.")
         try:
@@ -3448,6 +3622,10 @@ def build_app(model_module) -> FastAPI:
             /clear_cache?types=0&vars=0,1       — конкретные type/var слоты
             /clear_cache?also_backtest=true     — + vlad_backtest_results
         """
+        if not s.cache_writer:
+            return err_response(
+                "clear_cache разрешён только на Brain 1; общий кеш находится в SUPER_*"
+            )
         # ── Остановить fill если запущен ──────────────────────────────────────
         was_running = False
         if stop_fill and s.fill_status.get("state") == "running":
@@ -3514,7 +3692,7 @@ def build_app(model_module) -> FastAPI:
         # ── Удаляем из cache-таблицы ──────────────────────────────────────────
         try:
             where, params = _build_where({})
-            async with s.engine_vlad.begin() as conn:
+            async with s.engine_cache.begin() as conn:
                 res = await conn.execute(
                     text(f"DELETE FROM `{s.cache_table}` WHERE {where}"), params
                 )
@@ -4011,7 +4189,7 @@ def build_app(model_module) -> FastAPI:
 
             data_stats = {"min": 0.0, "max": 0.0, "avg": 0.0}
             try:
-                async with s.engine_vlad.connect() as conn:
+                async with s.engine_cache.connect() as conn:
                     res = await conn.execute(text(f"""
                         SELECT MIN(JSON_LENGTH(result_json)),
                                MAX(JSON_LENGTH(result_json)),
@@ -4032,7 +4210,7 @@ def build_app(model_module) -> FastAPI:
 
             values_stats = {"plus": 0, "minus": 0}
             try:
-                async with s.engine_vlad.connect() as conn:
+                async with s.engine_cache.connect() as conn:
                     res = await conn.execute(text(f"""
                         SELECT result_json FROM `{_tbl}`
                         WHERE service_url=:url AND pair=:pair AND day_flag=:day
@@ -4061,7 +4239,7 @@ def build_app(model_module) -> FastAPI:
 
             cache_signals: dict = {}
             try:
-                async with s.engine_vlad.connect() as conn:
+                async with s.engine_cache.connect() as conn:
                     res = await conn.execute(text(f"""
                         SELECT date_val, result_json FROM `{_tbl}`
                         WHERE service_url=:url AND pair=:pair AND day_flag=:day
@@ -4212,7 +4390,7 @@ def build_app(model_module) -> FastAPI:
 
         cache_signals: dict = {}
         try:
-            async with s.engine_vlad.connect() as conn:
+            async with s.engine_cache.connect() as conn:
                 res = await conn.execute(text(f"""
                     SELECT date_val, result_json FROM `{s.cache_table}`
                     WHERE service_url=:url AND pair=:pair AND day_flag=:day
