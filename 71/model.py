@@ -7,8 +7,13 @@ Every pair angle, aspect, lunar phase, sign, ingress and retrograde transition
 is reconstructed from those positions without loading the enormous pair/aspect
 part of the parser table into RAM.
 
-Hypothesis matrix:
-    12 types × 12 vars = 144 independent cache/backtest slots.
+Selected strategy matrix:
+    4 fixed EUR/USD strategies × 1 slot each.
+
+Strategy 0: T7 × V8 — lunar features, change over 24 market bars (Day).
+Strategy 1: T9 × V9 — geometric patterns, second derivative (Day).
+Strategy 2: lunar phase octant 5 × realized volatility × sign delta 6 bars (Day).
+Strategy 3: sin(lunar phase × 623) × absolute delta 13 bars (Hour).
 
 No future market data is used.  Type 11 projects astronomical positions from
 current positions and current Swiss-Ephemeris speeds; that information is known
@@ -34,7 +39,7 @@ from sqlalchemy import text
 SERVICE_ID = 71
 PORT = 8933
 NODE_NAME = "brain-vlad_astro_hypothesis_lab-s71"
-SERVICE_TEXT = "Astrology hypothesis laboratory: 144 independent type/var strategies"
+SERVICE_TEXT = "Astrology strategy model: 4 selected EUR/USD hypotheses"
 DEVELOPER_EMAIL = "vladyurjevitch@yandex.ru"
 
 PARSER_TABLE = "vlad_astro_hour_features"
@@ -153,6 +158,27 @@ VAR_DESCRIPTIONS = {
     9: "second derivative / acceleration",
     10: "rolling 30-bar z-score",
     11: "competitive L1 normalization of strongest features",
+}
+
+# Fixed deployment/research slots.  The public model interface keeps the
+# framework's ``type``/``var`` arguments, but only type 0..3 with var=0 are
+# valid.  This prevents accidental duplication of the same strategy across
+# multiple matrix cells.
+STRATEGY_DESCRIPTIONS = {
+    0: "EUR/USD Day: T7 × V8 — lunar cycle features, change over 24 market bars",
+    1: "EUR/USD Day: T9 × V9 — multi-body geometry, second derivative",
+    2: "EUR/USD Day: lunar phase octant 5 × realized volatility × sign delta 6 bars",
+    3: "EUR/USD Hour: sin(lunar phase harmonic 623) × absolute delta 13 bars",
+}
+STRATEGY_TIMEFRAME = {
+    0: "day",
+    1: "day",
+    2: "day",
+    3: "hour",
+}
+CUSTOM_FEATURE_KEYS = {
+    2: "S71.selected.lunar_octant5_volatility_sign_delta6",
+    3: "S71.selected.lunar_harmonic623_abs_delta13",
 }
 
 # -----------------------------------------------------------------------------
@@ -1490,6 +1516,339 @@ def _process_type_until(
     return captured
 
 
+
+# -----------------------------------------------------------------------------
+# Four selected strategies
+# -----------------------------------------------------------------------------
+class _StrategyTrajectory:
+    __slots__ = (
+        "rates_table", "strategy_id", "dataset_token", "processed", "last_date",
+        "first_date", "slot",
+    )
+
+    def __init__(self, rates_table: str, strategy_id: int, dataset_token: int):
+        self.rates_table = rates_table
+        self.strategy_id = int(strategy_id)
+        self.dataset_token = int(dataset_token)
+        self.processed = 0
+        self.last_date: Optional[datetime] = None
+        self.first_date: Optional[datetime] = None
+        self.slot = _OnlineSlot()
+
+
+_STRATEGY_TRAJECTORIES: dict[tuple[str, int, int], _StrategyTrajectory] = {}
+_STRATEGY_BATCH_CACHE: "OrderedDict[tuple, dict[datetime, dict[str, float]]]" = OrderedDict()
+_STRATEGY_BATCH_CACHE_MAX = 32
+
+
+def _is_daily_runtime(dataset_index: Optional[dict]) -> bool:
+    return bool((dataset_index or {}).get("is_daily"))
+
+
+def _strategy_timeframe_allowed(strategy_id: int, dataset_index: Optional[dict]) -> bool:
+    expected = STRATEGY_TIMEFRAME.get(int(strategy_id))
+    if expected == "day":
+        return _is_daily_runtime(dataset_index)
+    if expected == "hour":
+        return not _is_daily_runtime(dataset_index)
+    return False
+
+
+def _close_return_at(rates: Sequence[Mapping[str, object]], idx: int) -> float:
+    if idx <= 0 or idx >= len(rates):
+        return 0.0
+    try:
+        previous = float(rates[idx - 1].get("close") or rates[idx - 1].get("open") or 0.0)
+        current = float(rates[idx].get("close") or rates[idx].get("open") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(previous) or not math.isfinite(current) or abs(previous) < 1e-12:
+        return 0.0
+    return (current - previous) / abs(previous)
+
+
+def _sample_std(values: Sequence[float]) -> float:
+    if len(values) < 2:
+        return 0.0
+    arr = np.asarray(values, dtype=np.float64)
+    return float(np.std(arr))
+
+
+def _realized_volatility_regime(
+    rates: Sequence[Mapping[str, object]],
+    rate_idx: int,
+    vol_window: int = 21,
+    baseline_window: int = 55,
+) -> float:
+    """Causal volatility regime used by selected strategy 2.
+
+    The current candle is excluded.  We first compute 21-bar close-return
+    volatility for historical endpoints and compare the latest completed value
+    with its previous 55-value mean, matching the expanded-search definition.
+    """
+    end = int(rate_idx) - 1
+    if end < vol_window:
+        return 0.0
+
+    latest_returns = [
+        _close_return_at(rates, j)
+        for j in range(max(1, end - vol_window + 1), end + 1)
+    ]
+    latest_vol = _sample_std(latest_returns)
+    if latest_vol <= 1e-12:
+        return 0.0
+
+    history: list[float] = []
+    first_endpoint = max(vol_window, end - baseline_window + 1)
+    for endpoint in range(first_endpoint, end + 1):
+        returns = [
+            _close_return_at(rates, j)
+            for j in range(max(1, endpoint - vol_window + 1), endpoint + 1)
+        ]
+        history.append(_sample_std(returns))
+    baseline = float(np.mean(history)) if history else latest_vol
+    if baseline <= 1e-12:
+        return 0.0
+    return math.tanh(latest_vol / baseline - 1.0)
+
+
+def _strategy_raw_scalar(
+    strategy_id: int,
+    *,
+    rates: Sequence[Mapping[str, object]],
+    rate_idx: int,
+    rows: Sequence[Mapping[str, object]],
+    dates: Sequence[datetime],
+    astro_idx: int,
+    step_hours: int,
+    token: int,
+) -> Optional[tuple[str, float]]:
+    strategy_id = int(strategy_id)
+
+    if strategy_id == 2:
+        state = _row_state(rows, astro_idx)
+        if state is None:
+            return None
+        bucket = 1.0 if int(state.phase_angle // 45.0) == 4 else 0.0
+        current = bucket * _realized_volatility_regime(rates, rate_idx)
+        old_rate_idx = rate_idx - 6
+        if old_rate_idx < 0:
+            return None
+        old_date = rates[old_rate_idx].get("date")
+        if not isinstance(old_date, datetime):
+            return None
+        old_astro_idx = _find_idx(dates, old_date)
+        old_state = _row_state(rows, old_astro_idx)
+        if old_state is None:
+            return None
+        old_bucket = 1.0 if int(old_state.phase_angle // 45.0) == 4 else 0.0
+        old = old_bucket * _realized_volatility_regime(rates, old_rate_idx)
+        value = 1.0 if current > old else (-1.0 if current < old else 0.0)
+        return CUSTOM_FEATURE_KEYS[2], value
+
+    if strategy_id == 3:
+        state = _row_state(rows, astro_idx)
+        old_rate_idx = rate_idx - 13
+        if state is None or old_rate_idx < 0:
+            return None
+        old_date = rates[old_rate_idx].get("date")
+        if not isinstance(old_date, datetime):
+            return None
+        old_astro_idx = _find_idx(dates, old_date)
+        old_state = _row_state(rows, old_astro_idx)
+        if old_state is None:
+            return None
+        current = math.sin(math.radians(state.phase_angle * 623))
+        old = math.sin(math.radians(old_state.phase_angle * 623))
+        return CUSTOM_FEATURE_KEYS[3], abs(current - old)
+
+    return None
+
+
+def _strategy_features(
+    strategy_id: int,
+    *,
+    rates: Sequence[Mapping[str, object]],
+    rate_idx: int,
+    rows: Sequence[Mapping[str, object]],
+    dates: Sequence[datetime],
+    astro_idx: int,
+    step_hours: int,
+    token: int,
+) -> dict[str, float]:
+    strategy_id = int(strategy_id)
+    if strategy_id == 0:
+        return _transform_features(7, 8, rows, dates, astro_idx, step_hours, token)
+    if strategy_id == 1:
+        return _transform_features(9, 9, rows, dates, astro_idx, step_hours, token)
+    custom = _strategy_raw_scalar(
+        strategy_id,
+        rates=rates,
+        rate_idx=rate_idx,
+        rows=rows,
+        dates=dates,
+        astro_idx=astro_idx,
+        step_hours=step_hours,
+        token=token,
+    )
+    if custom is None:
+        return {}
+    key, value = custom
+    return {key: _clip(value)} if math.isfinite(value) and abs(value) > 1e-9 else {}
+
+
+def _strategy_min_occurrences(strategy_id: int) -> int:
+    # Original T7/T9 families retain their established minimums.  The custom
+    # sparse candidates use five prior observations, matching derivative-family
+    # behavior while still applying online shrinkage.
+    return {0: _minimum_occurrences(7, 8), 1: _minimum_occurrences(9, 9), 2: 5, 3: 5}[int(strategy_id)]
+
+
+def _predict_strategy(
+    features: Mapping[str, float],
+    slot: _OnlineSlot,
+    strategy_id: int,
+    ctx_by_feature: Mapping[str, int],
+) -> dict[str, float]:
+    if not features:
+        return {}
+    min_occ = _strategy_min_occurrences(strategy_id)
+    shrink = float(max(8, min_occ * 2))
+    active = max(1.0, math.sqrt(len(features)))
+    calibrated: dict[str, float] = {}
+    for key, x in features.items():
+        stat = slot.stats.get(key)
+        if stat is None:
+            continue
+        n, sx2, sxy = stat
+        if n < min_occ or sx2 <= 1e-9:
+            continue
+        beta = sxy / (sx2 + 2.0)
+        reliability = n / (n + shrink)
+        contribution = _clip(float(x) * beta * reliability / active)
+        if abs(contribution) > 1e-7:
+            calibrated[key] = contribution
+    return _encode_result(calibrated, ctx_by_feature)
+
+
+def _reset_strategy_trajectory_if_needed(
+    trajectory: _StrategyTrajectory,
+    rates: Sequence[Mapping[str, object]],
+) -> _StrategyTrajectory:
+    first_date = rates[0].get("date") if rates else None
+    invalid = (
+        trajectory.processed > len(rates)
+        or (trajectory.first_date is not None and first_date != trajectory.first_date)
+        or (
+            trajectory.processed > 0
+            and trajectory.last_date is not None
+            and trajectory.processed <= len(rates)
+            and rates[trajectory.processed - 1].get("date") != trajectory.last_date
+        )
+    )
+    if invalid:
+        return _StrategyTrajectory(
+            trajectory.rates_table, trajectory.strategy_id, trajectory.dataset_token
+        )
+    return trajectory
+
+
+def _process_strategy_until(
+    *,
+    rates: Sequence[Mapping[str, object]],
+    rows: Sequence[Mapping[str, object]],
+    dates: Sequence[datetime],
+    dataset_token: int,
+    rates_table: str,
+    strategy_id: int,
+    target_dates: set[datetime],
+    max_target: datetime,
+    step_hours: int,
+    ctx_by_feature: Mapping[str, int],
+) -> dict[datetime, dict[str, float]]:
+    key = (rates_table, int(strategy_id), int(dataset_token))
+    trajectory = _STRATEGY_TRAJECTORIES.get(key)
+    if trajectory is None:
+        trajectory = _StrategyTrajectory(rates_table, strategy_id, dataset_token)
+    trajectory = _reset_strategy_trajectory_if_needed(trajectory, rates)
+    _STRATEGY_TRAJECTORIES[key] = trajectory
+
+    captured: dict[datetime, dict[str, float]] = {}
+    if trajectory.processed == 0 and rates:
+        trajectory.first_date = rates[0].get("date")
+
+    while trajectory.processed < len(rates):
+        rate_idx = trajectory.processed
+        row = rates[rate_idx]
+        rate_date = row.get("date")
+        if not isinstance(rate_date, datetime):
+            trajectory.processed += 1
+            continue
+        if rate_date > max_target:
+            break
+        astro_idx = _find_idx(dates, rate_date)
+        if astro_idx >= 0:
+            features = _strategy_features(
+                strategy_id,
+                rates=rates,
+                rate_idx=rate_idx,
+                rows=rows,
+                dates=dates,
+                astro_idx=astro_idx,
+                step_hours=step_hours,
+                token=dataset_token,
+            )
+            if rate_date in target_dates:
+                captured[rate_date] = _predict_strategy(
+                    features, trajectory.slot, strategy_id, ctx_by_feature
+                )
+            y = _outcome(row)
+            if y is not None:
+                _update_slot(features, y, trajectory.slot)
+        trajectory.processed += 1
+        trajectory.last_date = rate_date
+
+    for dt in target_dates:
+        captured.setdefault(dt, {})
+    return captured
+
+
+def _single_strategy_from_scratch(
+    *,
+    rates: Sequence[Mapping[str, object]],
+    dataset,
+    date: datetime,
+    strategy_id: int,
+    dataset_index,
+) -> dict[str, float]:
+    rows, dates, token = _prepare_runtime(dataset, dataset_index)
+    ctx = _ctx_map(dataset_index)
+    step_hours = 24 if _is_daily_runtime(dataset_index) else 1
+    slot = _OnlineSlot()
+    for rate_idx, row in enumerate(rates):
+        rate_date = row.get("date")
+        if not isinstance(rate_date, datetime) or rate_date > date:
+            break
+        astro_idx = _find_idx(dates, rate_date)
+        if astro_idx < 0:
+            continue
+        features = _strategy_features(
+            strategy_id,
+            rates=rates,
+            rate_idx=rate_idx,
+            rows=rows,
+            dates=dates,
+            astro_idx=astro_idx,
+            step_hours=step_hours,
+            token=token,
+        )
+        if rate_date == date:
+            return _predict_strategy(features, slot, strategy_id, ctx)
+        y = _outcome(row)
+        if y is not None:
+            _update_slot(features, y, slot)
+    return {}
+
 def _single_from_scratch(
     *,
     rates: Sequence[Mapping[str, object]],
@@ -1523,6 +1882,7 @@ def _single_from_scratch(
     return prediction
 
 
+
 def model(
     rates: list[dict],
     dataset: list[dict],
@@ -1532,20 +1892,17 @@ def model(
     param: str = "",
     dataset_index: Optional[dict] = None,
 ) -> dict[str, float]:
-    type_id, var_id = int(type), int(var)
-    if type_id not in TYPE_DESCRIPTIONS or var_id not in VAR_DESCRIPTIONS:
+    strategy_id, slot_var = int(type), int(var)
+    if strategy_id not in STRATEGY_DESCRIPTIONS or slot_var != 0:
         return {}
-    rows, _dates, token = _prepare_runtime(dataset, dataset_index)
-    table = _rates_identity(rates, dataset_index)
-    cached = _PREDICTION_LRU.get((table, token, type_id, var_id, date))
-    if cached is not None:
-        return cached
-    # Direct /values cache misses can arrive out of chronological order.  A
-    # scratch causal pass is slower but prevents a trajectory trained on later
-    # dates from leaking information into an older request.
-    return _single_from_scratch(
-        rates=rates, dataset=dataset, date=date,
-        type_id=type_id, var_id=var_id, dataset_index=dataset_index,
+    if not _strategy_timeframe_allowed(strategy_id, dataset_index):
+        return {}
+    return _single_strategy_from_scratch(
+        rates=rates,
+        dataset=dataset,
+        date=date,
+        strategy_id=strategy_id,
+        dataset_index=dataset_index,
     )
 
 
@@ -1558,33 +1915,39 @@ def batch_model(
     param: str = "",
     dataset_index: Optional[dict] = None,
 ) -> dict[datetime, dict[str, float]]:
-    type_id, var_id = int(type), int(var)
-    if not dates or type_id not in TYPE_DESCRIPTIONS or var_id not in VAR_DESCRIPTIONS:
+    strategy_id, slot_var = int(type), int(var)
+    if (
+        not dates
+        or strategy_id not in STRATEGY_DESCRIPTIONS
+        or slot_var != 0
+        or not _strategy_timeframe_allowed(strategy_id, dataset_index)
+    ):
         return {dt: {} for dt in dates}
+
     rows, astro_dates, token = _prepare_runtime(dataset, dataset_index)
     ctx = _ctx_map(dataset_index)
     table = _rates_identity(rates, dataset_index)
-    step_hours = 24 if bool((dataset_index or {}).get("is_daily")) else 1
-    batch_key = (table, token, type_id, tuple(dates))
-    cached_batch = _TYPE_BATCH_CACHE.get(batch_key)
-    if cached_batch is None:
-        cached_batch = _process_type_until(
+    step_hours = 24 if _is_daily_runtime(dataset_index) else 1
+    batch_key = (table, token, strategy_id, tuple(dates))
+    cached = _STRATEGY_BATCH_CACHE.get(batch_key)
+    if cached is None:
+        cached = _process_strategy_until(
             rates=rates,
             rows=rows,
             dates=astro_dates,
             dataset_token=token,
             rates_table=table,
-            type_id=type_id,
+            strategy_id=strategy_id,
             target_dates=set(dates),
             max_target=max(dates),
             step_hours=step_hours,
             ctx_by_feature=ctx,
         )
-        _TYPE_BATCH_CACHE[batch_key] = cached_batch
-        _TYPE_BATCH_CACHE.move_to_end(batch_key)
-        while len(_TYPE_BATCH_CACHE) > _TYPE_BATCH_CACHE_MAX:
-            _TYPE_BATCH_CACHE.popitem(last=False)
-    return {dt: cached_batch.get(var_id, {}).get(dt, {}) for dt in dates}
+        _STRATEGY_BATCH_CACHE[batch_key] = cached
+        _STRATEGY_BATCH_CACHE.move_to_end(batch_key)
+        while len(_STRATEGY_BATCH_CACHE) > _STRATEGY_BATCH_CACHE_MAX:
+            _STRATEGY_BATCH_CACHE.popitem(last=False)
+    return {dt: cached.get(dt, {}) for dt in dates}
 
 
 # -----------------------------------------------------------------------------
@@ -1598,6 +1961,17 @@ def iter_feature_definitions() -> Iterator[tuple[str, str, str]]:
             seen.add(key)
             return (key, family, description)
         return None
+
+    # Selected custom strategy outputs.  T7×V8 and T9×V9 reuse the
+    # existing T7/T9 semantic universes below.
+    for strategy_id, key in CUSTOM_FEATURE_KEYS.items():
+        x = emit(
+            key,
+            "S71_selected",
+            STRATEGY_DESCRIPTIONS[strategy_id],
+        )
+        if x:
+            yield x
 
     # Type 0
     for body in BODY_ORDER:
