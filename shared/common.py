@@ -17,7 +17,18 @@ IS_DEV = MODE == "dev"
 #  Трассировка ошибок 
 _HANDLER  = os.getenv("HANDLER", "https://server.brain-project.online").rstrip("/")
 TRACE_URL = f"{_HANDLER}/trace.php"
-EMAIL     = os.getenv("ALERT_EMAIL", "vladyurjevitch@yandex.ru")
+DEFAULT_DEVELOPER_EMAIL = "vladyurjevitch@yandex.ru"
+EMAIL = os.getenv("ALERT_EMAIL", DEFAULT_DEVELOPER_EMAIL).strip() or DEFAULT_DEVELOPER_EMAIL
+
+
+def set_alert_email(email: str | None) -> str:
+    """Set the per-service trace recipient. One process hosts one model service."""
+    global EMAIL
+    value = str(email or "").strip()
+    if not value or "@" not in value:
+        value = os.getenv("ALERT_EMAIL", DEFAULT_DEVELOPER_EMAIL).strip() or DEFAULT_DEVELOPER_EMAIL
+    EMAIL = value
+    return EMAIL
 
 
 def send_error_trace(exc: Exception, node: str, script: str = "server.py") -> None:
