@@ -119,17 +119,25 @@ def _list_view(rows, start: int = 0, end: int | None = None):
 # ──────────────────────────────────────────────────────────────────────────────
 _TRACE_HANDLER = os.getenv("HANDLER", "https://server.brain-project.online").rstrip("/")
 _TRACE_URL     = f"{_TRACE_HANDLER}/trace.php"
-_ALERT_EMAIL   = os.getenv("ALERT_EMAIL", "vladyurjevitch@yandex.ru")
+_DEFAULT_DEVELOPER_EMAIL = "vladyurjevitch@yandex.ru"
+_ALERT_EMAIL = os.getenv("ALERT_EMAIL", _DEFAULT_DEVELOPER_EMAIL).strip() or _DEFAULT_DEVELOPER_EMAIL
 
 
-def _send_trace(subject: str, body: str, node: str, is_error: bool = False) -> None:
+def _send_trace(
+    subject: str,
+    body: str,
+    node: str,
+    is_error: bool = False,
+    email: str | None = None,
+) -> None:
     if _requests is None:
         return
     level = "ERROR" if is_error else "INFO"
     try:
         _requests.post(
             _TRACE_URL,
-            data={"url": "fill_cache", "node": node, "email": _ALERT_EMAIL,
+            data={"url": "fill_cache", "node": node,
+                  "email": (str(email or "").strip() or _ALERT_EMAIL),
                   "logs": f"[{level}] {subject}\n\nNode: {node}\n\n{body}"},
             timeout=10,
         )
@@ -143,7 +151,7 @@ if _here not in sys.path:
 
 from common import (
     MODE, IS_DEV,
-    log, send_error_trace,
+    log, send_error_trace, set_alert_email,
     ok_response, err_response,
     resolve_workers, build_engines, build_cache_engine,
 )
@@ -262,6 +270,49 @@ def get_service_config() -> dict:
     Безопасно вызывать из enrich_dataset() и model().
     """
     return _SERVICE_CONFIG
+
+
+def _valid_developer_email(value) -> str | None:
+    """Return a normalized email or None for an empty/invalid value."""
+    email = str(value or "").strip()
+    if not email or "@" not in email:
+        return None
+    local, domain = email.rsplit("@", 1)
+    if not local or not domain or "." not in domain:
+        return None
+    return email
+
+
+def _resolve_developer_email(config: dict, model_module) -> str:
+    """Resolve per-model trace email with backward-compatible fallbacks.
+
+    Priority:
+      1. config.toml/config.json: [developer].email
+      2. config alias: [service].developer_email
+      3. model.py: DEVELOPER_EMAIL
+      4. .env: ALERT_EMAIL
+      5. historical framework default
+    Invalid/empty candidates are skipped rather than breaking trace delivery.
+    """
+    developer_cfg = config.get("developer", {})
+    service_cfg = config.get("service", {})
+    if not isinstance(developer_cfg, dict):
+        developer_cfg = {}
+    if not isinstance(service_cfg, dict):
+        service_cfg = {}
+
+    candidates = (
+        developer_cfg.get("email"),
+        service_cfg.get("developer_email"),
+        getattr(model_module, "DEVELOPER_EMAIL", None),
+        os.getenv("ALERT_EMAIL"),
+        _DEFAULT_DEVELOPER_EMAIL,
+    )
+    for candidate in candidates:
+        email = _valid_developer_email(candidate)
+        if email:
+            return email
+    return _DEFAULT_DEVELOPER_EMAIL
 
 
 def _load_service_config(model_dir: str) -> dict:
@@ -805,6 +856,7 @@ class _State:
     PORT:         int = 9000
     NODE_NAME:    str = "brain-svc"
     SERVICE_TEXT: str = "Brain microservice"
+    DEVELOPER_EMAIL: str = _DEFAULT_DEVELOPER_EMAIL
 
     WEIGHTS_TABLE:       str | None = None
     WEIGHTS_CODE_COLUMN: str        = "weight_code"
@@ -1654,6 +1706,15 @@ def build_app(model_module) -> FastAPI:
     s.PORT         = int(_get("service", "port", "PORT",         "PORT",         9000))
     s.NODE_NAME    =     _get("service", "name", "NODE_NAME",    "NODE_NAME",    "brain-svc")
     s.SERVICE_TEXT =     _get("service", "text", "SERVICE_TEXT", "SERVICE_TEXT", "Brain microservice")
+
+    # Почта разработчика конкретной модели. Стандартный ключ:
+    #   [developer]
+    #   email = "developer@example.com"
+    # Старые модели без параметра продолжают использовать ALERT_EMAIL/.env
+    # либо исторический адрес vladyurjevitch@yandex.ru.
+    s.DEVELOPER_EMAIL = set_alert_email(
+        _resolve_developer_email(_c, model_module)
+    )
 
     # ── Котировки ─────────────────────────────────────────────────────────────
     s.RATES_TABLE = _get("rates", "table", "RATES_TABLE", "RATES_TABLE", "brain_rates_eur_usd")
@@ -3158,6 +3219,7 @@ def build_app(model_module) -> FastAPI:
                         f"Прошло : {_h}h {_m}m {_sc}s"),
             node     = s.NODE_NAME,
             is_error = (state != "done"),
+            email    = s.DEVELOPER_EMAIL,
         )
 
     # ── _backtest ─────────────────────────────────────────────────────────────
