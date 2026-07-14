@@ -32,3 +32,6 @@ target_precision = 0.95
 max_iter = 20
 step = 0.10
 extremum_limit = 50
+
+[developer]
+email = "samuray15035@gmail.com"
