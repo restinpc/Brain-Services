@@ -155,6 +155,35 @@ def build_engines():
     return engine_vlad, engine_brain, engine_super
 
 
+def build_cache_engine():
+    """
+    Отдельный AsyncEngine для общего values-cache.
+
+    Он использует ТЕ ЖЕ SUPER_* настройки, что и engine_super, поэтому кеш
+    физически хранится в БД первой (super) ноды. Отдельный пул нужен, чтобы
+    массовый fill_cache не занимал маленький служебный пул engine_super.
+    """
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    def _url(host, port, user, password, name):
+        return f"mysql+aiomysql://{user}:{password}@{host}:{port}/{name}"
+
+    return create_async_engine(
+        _url(
+            os.getenv("SUPER_HOST",     ""),
+            os.getenv("SUPER_PORT",     "3306"),
+            os.getenv("SUPER_USER",     ""),
+            os.getenv("SUPER_PASSWORD", ""),
+            os.getenv("SUPER_NAME",     "brain"),
+        ),
+        pool_size=max(1, int(os.getenv("CACHE_POOL_SIZE", "10"))),
+        max_overflow=max(0, int(os.getenv("CACHE_MAX_OVERFLOW", "10"))),
+        pool_pre_ping=False,
+        pool_recycle=900,
+        echo=False,
+    )
+
+
 #  Workers 
 async def resolve_workers(engine_super, service_id: int, default: int = 1) -> int:
     """
