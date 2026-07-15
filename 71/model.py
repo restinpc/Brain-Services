@@ -8,12 +8,18 @@ is reconstructed from those positions without loading the enormous pair/aspect
 part of the parser table into RAM.
 
 Selected strategy matrix:
-    4 fixed EUR/USD strategies × 1 slot each.
+    6 fixed strategies × 1 slot each.
 
-Strategy 0: T7 × V8 — lunar features, change over 24 market bars (Day).
-Strategy 1: T9 × V9 — geometric patterns, second derivative (Day).
-Strategy 2: lunar phase octant 5 × realized volatility × sign delta 6 bars (Day).
-Strategy 3: sin(lunar phase × 623) × absolute delta 13 bars (Hour).
+Strategy 0: EUR/USD Day — T7 × V8.
+Strategy 1: EUR/USD Day — T9 × V9.
+Strategy 2: EUR/USD Day — lunar octant 5 × realized volatility × sign delta 6.
+Strategy 3: EUR/USD Hour — sin(lunar phase × 623) × absolute delta 13.
+Strategy 4: BTC/USD Hour — T-square × realized volatility signed gate,
+            gaussian magnitude decay 1.5.
+Strategy 5: ETH/USD Hour — Moon/Uranus square strength with exponential
+            orb decay 2 × rolling z-score 120 / 3.
+
+Only these six slots are active. All other type/var combinations return {}.
 
 No future market data is used.  Type 11 projects astronomical positions from
 current positions and current Swiss-Ephemeris speeds; that information is known
@@ -39,7 +45,7 @@ from sqlalchemy import text
 SERVICE_ID = 71
 PORT = 8933
 NODE_NAME = "brain-vlad_astro_hypothesis_lab-s71"
-SERVICE_TEXT = "Astrology strategy model: 4 selected EUR/USD hypotheses"
+SERVICE_TEXT = "Astrology strategy model: 6 selected EUR/BTC/ETH hypotheses"
 DEVELOPER_EMAIL = "vladyurjevitch@yandex.ru"
 
 PARSER_TABLE = "vlad_astro_hour_features"
@@ -169,16 +175,30 @@ STRATEGY_DESCRIPTIONS = {
     1: "EUR/USD Day: T9 × V9 — multi-body geometry, second derivative",
     2: "EUR/USD Day: lunar phase octant 5 × realized volatility × sign delta 6 bars",
     3: "EUR/USD Hour: sin(lunar phase harmonic 623) × absolute delta 13 bars",
+    4: "BTC/USD Hour: T-square × realized volatility signed gate × gaussian decay 1.5",
+    5: "ETH/USD Hour: Moon/Uranus square strength decay 2 × rolling z-score 120 / 3",
 }
 STRATEGY_TIMEFRAME = {
     0: "day",
     1: "day",
     2: "day",
     3: "hour",
+    4: "hour",
+    5: "hour",
+}
+STRATEGY_PAIR = {
+    0: 1,
+    1: 1,
+    2: 1,
+    3: 1,
+    4: 3,
+    5: 4,
 }
 CUSTOM_FEATURE_KEYS = {
     2: "S71.selected.lunar_octant5_volatility_sign_delta6",
     3: "S71.selected.lunar_harmonic623_abs_delta13",
+    4: "S71.selected.btc_t_square_volatility_gate_gaussian15",
+    5: "S71.selected.eth_moon_uranus_square_strength_decay2_z120_s3",
 }
 
 # -----------------------------------------------------------------------------
@@ -1545,13 +1565,54 @@ def _is_daily_runtime(dataset_index: Optional[dict]) -> bool:
     return bool((dataset_index or {}).get("is_daily"))
 
 
-def _strategy_timeframe_allowed(strategy_id: int, dataset_index: Optional[dict]) -> bool:
-    expected = STRATEGY_TIMEFRAME.get(int(strategy_id))
-    if expected == "day":
-        return _is_daily_runtime(dataset_index)
-    if expected == "hour":
-        return not _is_daily_runtime(dataset_index)
-    return False
+def _runtime_pair(
+    rates: Sequence[Mapping[str, object]],
+    dataset_index: Optional[dict],
+) -> int:
+    info = dataset_index or {}
+    for key in ("pair", "pair_id", "instrument_id"):
+        value = info.get(key)
+        if value is not None:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                pass
+    table = str(info.get("rates_table") or "").lower()
+    if "btc" in table:
+        return 3
+    if "eth" in table:
+        return 4
+    if "eur" in table:
+        return 1
+    for row in rates:
+        try:
+            price = float(row.get("open") or row.get("close") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if price > 10000.0:
+            return 3
+        if price > 100.0:
+            return 4
+        if price > 0.0:
+            return 1
+    return 0
+
+
+def _strategy_runtime_allowed(
+    strategy_id: int,
+    rates: Sequence[Mapping[str, object]],
+    dataset_index: Optional[dict],
+) -> bool:
+    strategy_id = int(strategy_id)
+    expected_frame = STRATEGY_TIMEFRAME.get(strategy_id)
+    frame_ok = (
+        _is_daily_runtime(dataset_index)
+        if expected_frame == "day"
+        else not _is_daily_runtime(dataset_index)
+        if expected_frame == "hour"
+        else False
+    )
+    return frame_ok and _runtime_pair(rates, dataset_index) == STRATEGY_PAIR.get(strategy_id)
 
 
 def _close_return_at(rates: Sequence[Mapping[str, object]], idx: int) -> float:
@@ -1612,6 +1673,32 @@ def _realized_volatility_regime(
     return math.tanh(latest_vol / baseline - 1.0)
 
 
+def _t_square_anchor(state: Optional[_State]) -> float:
+    if state is None:
+        return 0.0
+    return float(_type9_patterns(state).get("T9.metric.t_squares", 0.0))
+
+
+def _moon_uranus_square_strength(state: Optional[_State], decay: float = 2.0) -> float:
+    if state is None:
+        return 0.0
+    for row in state.aspects:
+        a, b, aspect, _exact, orb, max_orb = row[:6]
+        if {a, b} == {"Moon", "Uranus"} and aspect == "square":
+            return math.exp(-float(decay) * float(orb) / max(float(max_orb), 1e-9))
+    return 0.0
+
+
+def _causal_zscore(values: Sequence[float], scale: float) -> float:
+    if len(values) < 5:
+        return 0.0
+    arr = np.asarray(values, dtype=np.float64)
+    std = float(np.std(arr))
+    if std <= 1e-9:
+        return 0.0
+    return (float(arr[-1]) - float(np.mean(arr))) / std / max(float(scale), 1e-9)
+
+
 def _strategy_raw_scalar(
     strategy_id: int,
     *,
@@ -1662,6 +1749,38 @@ def _strategy_raw_scalar(
         old = math.sin(math.radians(old_state.phase_angle * 623))
         return CUSTOM_FEATURE_KEYS[3], abs(current - old)
 
+    if strategy_id == 4:
+        # Exact local-refine candidate:
+        # t_square × realized_volatility (signed_gate, 13 bars)
+        # × gaussian magnitude decay 1.5.
+        state = _row_state(rows, astro_idx)
+        anchor = _t_square_anchor(state)
+        regime = _realized_volatility_regime(
+            rates, rate_idx, vol_window=13, baseline_window=55
+        )
+        gated = anchor * (1.0 if regime >= 0.0 else -1.0)
+        value = math.copysign(
+            math.exp(-1.5 * gated * gated),
+            gated,
+        ) if abs(gated) > 1e-12 else 0.0
+        return CUSTOM_FEATURE_KEYS[4], value
+
+    if strategy_id == 5:
+        # Exact selected ETH research candidate:
+        # Moon/Uranus square strength, exponential orb decay 2
+        # × rolling z-score 120 bars / 3.
+        start = max(0, rate_idx - 119)
+        values: list[float] = []
+        for old_rate_idx in range(start, rate_idx + 1):
+            old_date = rates[old_rate_idx].get("date")
+            if not isinstance(old_date, datetime):
+                values.append(0.0)
+                continue
+            old_astro_idx = _find_idx(dates, old_date)
+            old_state = _row_state(rows, old_astro_idx)
+            values.append(_moon_uranus_square_strength(old_state, decay=2.0))
+        return CUSTOM_FEATURE_KEYS[5], _causal_zscore(values, scale=3.0)
+
     return None
 
 
@@ -1701,7 +1820,14 @@ def _strategy_min_occurrences(strategy_id: int) -> int:
     # Original T7/T9 families retain their established minimums.  The custom
     # sparse candidates use five prior observations, matching derivative-family
     # behavior while still applying online shrinkage.
-    return {0: _minimum_occurrences(7, 8), 1: _minimum_occurrences(9, 9), 2: 5, 3: 5}[int(strategy_id)]
+    return {
+        0: _minimum_occurrences(7, 8),
+        1: _minimum_occurrences(9, 9),
+        2: 5,
+        3: 5,
+        4: 5,
+        5: 5,
+    }[int(strategy_id)]
 
 
 def _predict_strategy(
@@ -1895,7 +2021,7 @@ def model(
     strategy_id, slot_var = int(type), int(var)
     if strategy_id not in STRATEGY_DESCRIPTIONS or slot_var != 0:
         return {}
-    if not _strategy_timeframe_allowed(strategy_id, dataset_index):
+    if not _strategy_runtime_allowed(strategy_id, rates, dataset_index):
         return {}
     return _single_strategy_from_scratch(
         rates=rates,
@@ -1920,7 +2046,7 @@ def batch_model(
         not dates
         or strategy_id not in STRATEGY_DESCRIPTIONS
         or slot_var != 0
-        or not _strategy_timeframe_allowed(strategy_id, dataset_index)
+        or not _strategy_runtime_allowed(strategy_id, rates, dataset_index)
     ):
         return {dt: {} for dt in dates}
 
@@ -1962,8 +2088,8 @@ def iter_feature_definitions() -> Iterator[tuple[str, str, str]]:
             return (key, family, description)
         return None
 
-    # Selected custom strategy outputs.  T7×V8 and T9×V9 reuse the
-    # existing T7/T9 semantic universes below.
+    # Selected custom strategy outputs. T7×V8 and T9×V9 reuse the
+    # existing T7/T9 semantic universes below. No unused strategy keys are emitted.
     for strategy_id, key in CUSTOM_FEATURE_KEYS.items():
         x = emit(
             key,
