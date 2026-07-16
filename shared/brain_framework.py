@@ -872,6 +872,7 @@ class _State:
     REBUILD_INTERVAL:    int        = 0
     VAR_RANGE:           list       = None
     TYPES_RANGE:         list       = None
+    PARAM_RANGE:         list       = None
     CACHE_DATE_FROM:     str        = "2025-01-15"
     LABEL_FN:            object     = None
 
@@ -900,6 +901,7 @@ class _State:
         self.CTX_KEY_COLUMNS   = ["id"]
         self.VAR_RANGE         = []
         self.TYPES_RANGE       = [0, 1, 2, 3, 4]
+        self.PARAM_RANGE       = [""]
 
         self.model_fn          = None
         self.batch_model_fn    = None
@@ -1723,6 +1725,10 @@ def build_app(model_module) -> FastAPI:
     s.CACHE_DATE_FROM  =      _get("cache", "date_from",        "CACHE_DATE_FROM",  "", "2025-01-15")
     s.VAR_RANGE        =      _get("cache", "var_range",        "VAR_RANGE",        "", [0])
     s.TYPES_RANGE      =      _get("cache", "types_range",      "TYPES_RANGE",      "", [0, 1, 2, 3, 4])
+    s.PARAM_RANGE      =      _get("cache", "param_range",      "PARAM_RANGE",      "", [""])
+    if not isinstance(s.PARAM_RANGE, list):
+        s.PARAM_RANGE = [str(s.PARAM_RANGE)]
+    s.PARAM_RANGE = [str(v) for v in s.PARAM_RANGE] or [""]
     s.SHIFT_WINDOW     = int( _get("cache", "shift_window",     "SHIFT_WINDOW",     "", 12))
     s.REBUILD_INTERVAL = int(_get("cache", "rebuild_interval", "REBUILD_INTERVAL", "", 0))
     s.RELOAD_INTERVAL = int(_get("cache", "reload_interval", "RELOAD_INTERVAL", "", 3600))
@@ -2230,7 +2236,7 @@ def build_app(model_module) -> FastAPI:
         return ordered, reset_fn if callable(reset_fn) else None
 
     # ── _sync_compute для поточной обработки ─────────────────────────────────
-    def _sync_compute(candle, calc_type, calc_var, all_rows, all_dates, np_rates_pd, s_state, rates_tbl=""):
+    def _sync_compute(candle, calc_type, calc_var, calc_param, all_rows, all_dates, np_rates_pd, s_state, rates_tbl=""):
         td = candle["date"]
 
         # Обычный fill_cache обязан соблюдать те же capability-флаги, что /values.
@@ -2272,7 +2278,7 @@ def build_app(model_module) -> FastAPI:
         try:
             res = s_state.model_fn(
                 rates=rates_f, dataset=ds_f, date=td,
-                type=calc_type, var=calc_var, param="",
+                type=calc_type, var=calc_var, param=calc_param,
                 dataset_index=dataset_index_dict,
             )
             res, _ = _extract_detail(res)
@@ -2283,11 +2289,11 @@ def build_app(model_module) -> FastAPI:
                 s_state.NODE_NAME, level="error", force=True)
             return None
 
-    def _sync_compute_chunk(candles_chunk, calc_type, calc_var,
+    def _sync_compute_chunk(candles_chunk, calc_type, calc_var, calc_param,
                             all_rows, all_dates, np_rates_pd, s_state, rates_tbl=""):
         """Один executor-job обрабатывает пачку свечей вместо job на каждую свечу."""
         return [
-            _sync_compute(c, calc_type, calc_var,
+            _sync_compute(c, calc_type, calc_var, calc_param,
                           all_rows, all_dates, np_rates_pd, s_state, rates_tbl)
             for c in candles_chunk
         ]
@@ -2430,6 +2436,8 @@ def build_app(model_module) -> FastAPI:
         batch_size,
     ):
         """Automatic fused fill for standard services; returns handled + counters."""
+        if not type_var_slots:
+            return False, 0, 0, 0
         _ordered_model, _ = _ordered_fill_control(s)
         if _ordered_model:
             return False, 0, 0, 0
@@ -2653,12 +2661,13 @@ def build_app(model_module) -> FastAPI:
         # (train_mode не влияет на набор дат экстремумов, только на обучение).
         from itertools import groupby as _groupby
         slots_by_var: dict[int, list[int]] = {}
-        for calc_type, calc_var in type_var_slots:
-            slots_by_var.setdefault(calc_var, []).append(calc_type)
+        slots_by_var: dict[tuple[int, str], list[int]] = {}
+        for calc_type, calc_var, calc_param in type_var_slots:
+            slots_by_var.setdefault((calc_var, calc_param), []).append(calc_type)
 
         warmed = 0
 
-        for calc_var, calc_types in slots_by_var.items():
+        for (calc_var, calc_param), calc_types in slots_by_var.items():
             if s.fill_cancel.is_set():
                 break
 
@@ -2707,7 +2716,7 @@ def build_app(model_module) -> FastAPI:
 
                 missing = [
                     d for d in ext_dates
-                    if (pair_id, day_flag, int(d.timestamp()), calc_type, calc_var, "")
+                    if (pair_id, day_flag, int(d.timestamp()), calc_type, calc_var, calc_param)
                        not in s._ml_active_cache
                 ]
                 if not missing:
@@ -2721,12 +2730,12 @@ def build_app(model_module) -> FastAPI:
                         rates=rates_for_prewarm,
                         dataset=dataset_for_prewarm,
                         dates=missing,
-                        type=calc_type, var=calc_var, param="",
+                        type=calc_type, var=calc_var, param=calc_param,
                         dataset_index=dataset_index_dict,
                     )
                     for ext_dt, result in batch_results.items():
                         key = (pair_id, day_flag, int(ext_dt.timestamp()),
-                               calc_type, calc_var, "")
+                               calc_type, calc_var, calc_param)
                         s._ml_active_cache[key] = list(result.keys())
                         warmed += 1
                     # FIX: страховочный лимит на _ml_active_cache (без него нет eviction)
@@ -2743,7 +2752,7 @@ def build_app(model_module) -> FastAPI:
 
     # ── _fill_worker ──────────────────────────────────────────────────────────
 
-    async def _fill_worker(pairs, days, date_from_str, date_to_str, types, batch_size):
+    async def _fill_worker(pairs, days, date_from_str, date_to_str, types, params, batch_size):
         if not s.cache_writer:
             s.fill_status = {
                 "state": "error",
@@ -2764,7 +2773,7 @@ def build_app(model_module) -> FastAPI:
         await _refresh_simple_rates(s)
 
         pd_slots       = [(p, d) for p in pairs for d in days]
-        type_var_slots = [(tp, var) for tp in types for var in s.VAR_RANGE]
+        type_var_slots = [(tp, var, param) for tp in types for var in s.VAR_RANGE for param in params]
         total_slots    = len(pd_slots) * len(type_var_slots)
 
         total_candles = sum(
@@ -2783,7 +2792,7 @@ def build_app(model_module) -> FastAPI:
             "started_at": datetime.now().isoformat(),
         }
         log(f" fill_cache: {len(pd_slots)} инструментов × "
-            f"{len(type_var_slots)} type/var слотов", s.NODE_NAME, force=True)
+            f"{len(type_var_slots)} type/var/param слотов", s.NODE_NAME, force=True)
 
         try:
             for slot_idx, (pair_id, day_flag) in enumerate(pd_slots):
@@ -2806,7 +2815,7 @@ def build_app(model_module) -> FastAPI:
                 all_dates_pd = [r["date"] for r in all_rows]
                 instr_label  = f"pair{pair_id}/{'d' if day_flag else 'h'}"
                 log(f"  [{instr_label}] {len(candles)} свечей × "
-                    f"{len(type_var_slots)} type/var слотов", s.NODE_NAME, force=True)
+                    f"{len(type_var_slots)} type/var/param слотов", s.NODE_NAME, force=True)
 
                 # OPT-1: один prefetch всех cached_dates для данного инструмента
                 # вместо N отдельных SELECT на каждый (calc_type, var) слот.
@@ -2859,9 +2868,10 @@ def build_app(model_module) -> FastAPI:
                 # AUTO-3/4/5: exact fused path for the standard wrappers used by
                 # services 53, 56 and 62-70. Detection and result validation are automatic;
                 # custom models continue through the generic implementation below.
+                _fast_slots = [(t, v) for t, v, prm in type_var_slots] if all(prm == "" for _, _, prm in type_var_slots) else []
                 _fast_handled, _fast_done, _fast_skipped, _fast_errors = (
                     await _try_fill_standard_fast(
-                        pair_id, day_flag, candles, type_var_slots, cached_by_hash,
+                        pair_id, day_flag, candles, _fast_slots, cached_by_hash,
                         all_rows, all_dates_pd, np_rates_pd, tbl, batch_size,
                     )
                 )
@@ -2895,10 +2905,10 @@ def build_app(model_module) -> FastAPI:
                 _slot_lock = asyncio.Lock()
                 _ml_compute_sem = asyncio.Semaphore(max(1, s.FILL_ML_WORKERS))
 
-                async def _fill_one_slot(calc_type: int, var: int) -> None:
+                async def _fill_one_slot(calc_type: int, var: int, calc_param: str) -> None:
                     nonlocal done, skipped, errors
 
-                    extra       = {"type": calc_type, "var": var, "param": ""}
+                    extra       = {"type": calc_type, "var": var, "param": calc_param}
                     p_hash      = _params_hash(extra)
                     params_json = _json.dumps(extra, ensure_ascii=False)
 
@@ -2979,7 +2989,7 @@ def build_app(model_module) -> FastAPI:
                                             _result = await _call_model(
                                                 pair_id, day_flag,
                                                 _rep["date"].strftime("%Y-%m-%d %H:%M:%S"),
-                                                calc_type=calc_type, calc_var=var, param="",
+                                                calc_type=calc_type, calc_var=var, param=calc_param,
                                                 _skip_refresh=True,
                                             )
                                         except Exception as _e:
@@ -3015,7 +3025,7 @@ def build_app(model_module) -> FastAPI:
                                         result = await _call_model(
                                             pair_id, day_flag,
                                             candle["date"].strftime("%Y-%m-%d %H:%M:%S"),
-                                            calc_type=calc_type, calc_var=var, param="",
+                                            calc_type=calc_type, calc_var=var, param=calc_param,
                                             _skip_refresh=True,
                                         )
                                     except Exception as _e2:
@@ -3059,7 +3069,7 @@ def build_app(model_module) -> FastAPI:
                                     rates=rates_for_batch,
                                     dataset=dataset_f_b,
                                     dates=batch_dates,
-                                    type=calc_type, var=var, param="",
+                                    type=calc_type, var=var, param=calc_param,
                                     dataset_index=dataset_index_dict_b,
                                 )
                                 results = [batch_map.get(c["date"]) for c in batch]
@@ -3076,7 +3086,7 @@ def build_app(model_module) -> FastAPI:
                             results = await loop.run_in_executor(
                                 _FILL_EXECUTOR,
                                 _sync_compute_chunk,
-                                batch, calc_type, var,
+                                batch, calc_type, var, calc_param,
                                 all_rows, all_dates_pd, np_rates_pd, s, tbl,
                             )
                         else:
@@ -3095,7 +3105,7 @@ def build_app(model_module) -> FastAPI:
                                 loop.run_in_executor(
                                     _FILL_EXECUTOR,
                                     _sync_compute_chunk,
-                                    chunk, calc_type, var,
+                                    chunk, calc_type, var, calc_param,
                                     all_rows, all_dates_pd, np_rates_pd, s, tbl,
                                 )
                                 for chunk in chunks
@@ -3137,23 +3147,23 @@ def build_app(model_module) -> FastAPI:
                         async with _slot_lock:
                             done += batch_done
                             s.fill_status.update({"done": done, "skipped": skipped, "errors": errors})
-                        log(f"  [{instr_label} t={calc_type}/v={var}] "
+                        log(f"  [{instr_label} t={calc_type}/v={var}/p={calc_param!r}] "
                             f"{done}/{total} err={errors}", s.NODE_NAME, force=True)
 
                 # ── Запуск слотов ─────────────────────────────────────────────────
                 # ML-путь: последовательно (обучение зависит от предыдущего состояния).
                 # Остальные: параллельно через gather.
                 if s.USE_ML_VALUES or _ordered_model:
-                    for calc_type, var in type_var_slots:
+                    for calc_type, var, calc_param in type_var_slots:
                         if s.fill_cancel.is_set():
                             break
-                        await _fill_one_slot(calc_type, var)
+                        await _fill_one_slot(calc_type, var, calc_param)
                 else:
                     # asyncio.gather запускает все слоты параллельно.
                     # DB-записи в разные params_hash — конфликтов нет.
                     await asyncio.gather(*[
-                        _fill_one_slot(ct, v)
-                        for ct, v in type_var_slots
+                        _fill_one_slot(ct, v, prm)
+                        for ct, v, prm in type_var_slots
                         if not s.fill_cancel.is_set()
                     ])
 
@@ -3407,6 +3417,7 @@ def build_app(model_module) -> FastAPI:
                 "dataset":            len(s.dataset),
                 "var_range":          s.VAR_RANGE,
                 "types_range":        s.TYPES_RANGE,
+                "param_range":        s.PARAM_RANGE,
                 "np_built":           s.np_built,
                 "simple_rates":       len(s.simple_rates),
                 "cache_role":         s.cache_role,
@@ -3600,7 +3611,8 @@ def build_app(model_module) -> FastAPI:
     # ── fill_cache ────────────────────────────────────────────────────────────
 
     async def _start_fill(pairs_str: str, days_str: str,
-                          date_from: str, date_to: str, batch_size: int):
+                          date_from: str, date_to: str, batch_size: int,
+                          param: str | None = None):
         if not s.cache_writer:
             return err_response(
                 "fill_cache запрещён на дочерней ноде. Запустите его на Brain 1; "
@@ -3618,16 +3630,18 @@ def build_app(model_module) -> FastAPI:
         if not all(d in {0, 1} for d in dl):
             return err_response("Допустимые day: 0 (hourly), 1 (daily)")
         all_types  = list(s.TYPES_RANGE or [0, 1, 2, 3, 4])
+        all_params = [param] if param is not None else list(s.PARAM_RANGE or [""])
         eff_from   = date_from if date_from.strip() else s.CACHE_DATE_FROM
         s.fill_cancel.clear()
         s.fill_task = asyncio.create_task(
-            _fill_worker(pl, dl, eff_from, date_to, all_types, batch_size))
+            _fill_worker(pl, dl, eff_from, date_to, all_types, all_params, batch_size))
         return ok_response({
             "started":     True, "pairs": pl, "days": dl,
             "types":       all_types, "var_range": s.VAR_RANGE,
+            "param_range": all_params,
             "batch_size":  batch_size, "date_from": eff_from,
             "date_to":     date_to or "now",
-            "slots_total": len(pl) * len(dl) * len(all_types) * len(s.VAR_RANGE),
+            "slots_total": len(pl) * len(dl) * len(all_types) * len(s.VAR_RANGE) * len(all_params),
         })
 
     @app.get("/fill_cache")
@@ -3635,24 +3649,27 @@ def build_app(model_module) -> FastAPI:
         pairs: str = Query("1,3,4"), days: str = Query("0,1"),
         date_from: str = Query(""), date_to: str = Query(""),
         batch_size: int = Query(300),
+        param: str | None = Query(None, description="Один param; если не указан, используется PARAM_RANGE"),
     ):
-        return await _start_fill(pairs, days, date_from, date_to, batch_size)
+        return await _start_fill(pairs, days, date_from, date_to, batch_size, param)
 
     @app.get("/fill_cache_day")
     async def ep_fill_cache_day(
         pairs: str = Query("1,3,4"),
         date_from: str = Query(""), date_to: str = Query(""),
         batch_size: int = Query(300),
+        param: str | None = Query(None, description="Один param; если не указан, используется PARAM_RANGE"),
     ):
-        return await _start_fill(pairs, "1", date_from, date_to, batch_size)
+        return await _start_fill(pairs, "1", date_from, date_to, batch_size, param)
 
     @app.get("/fill_cache_hour")
     async def ep_fill_cache_hour(
         pairs: str = Query("1,3,4"),
         date_from: str = Query(""), date_to: str = Query(""),
         batch_size: int = Query(300),
+        param: str | None = Query(None, description="Один param; если не указан, используется PARAM_RANGE"),
     ):
-        return await _start_fill(pairs, "0", date_from, date_to, batch_size)
+        return await _start_fill(pairs, "0", date_from, date_to, batch_size, param)
 
     @app.get("/fill_status")
     async def ep_fill_status():
