@@ -176,7 +176,8 @@ def _vectorized_levels(prices: np.ndarray, sig: int = SIG_DIGITS) -> np.ndarray:
     с live-детектором в model.py — именно такой класс рассинхронизации мы
     уже чинили ранее для сервиса 59.
     """
-    safe = np.where(prices > 0, prices, 1e-10)
+    valid = np.isfinite(prices) & (prices > 0)
+    safe = np.where(valid, prices, 1.0)
     lo, hi = 10 ** (sig - 1), 10 ** sig
     exp = np.floor(np.log10(safe)).astype(np.int64)
     magnitude = 10.0 ** (exp - sig + 1)
@@ -196,8 +197,8 @@ def _vectorized_levels(prices: np.ndarray, sig: int = SIG_DIGITS) -> np.ndarray:
 
     bucket_size = hi - lo
     levels = exp * bucket_size + (mantissa - lo)
-    # Цены <=0 -> level 0 (как в скалярной версии)
-    return np.where(prices > 0, levels, 0).astype(np.int64)
+    # Некорректные, бесконечные и неположительные цены не попадают в граф.
+    return np.where(valid, levels, 0).astype(np.int64)
 
 
 def _build_candle_graph(closes: np.ndarray, sig: int = SIG_DIGITS) -> tuple[dict, dict]:
@@ -496,6 +497,47 @@ async def _write_index(engine, pair_id: int, total_candles: int) -> None:
         """), {"pair": pair_id, "cnt": total_candles})
 
 
+async def _clear_pair(engine, pair_id: int) -> None:
+    """Атомарно удаляет все данные пары, не оставляя устаревшую статистику."""
+    async with engine.begin() as conn:
+        await conn.execute(text(f"DELETE FROM `{GRAPH_TABLE}` WHERE pair=:pair"), {"pair": pair_id})
+        await conn.execute(text(f"DELETE FROM `{STATS_TABLE}` WHERE pair=:pair"), {"pair": pair_id})
+        await conn.execute(text(f"DELETE FROM `{INDEX_TABLE}` WHERE pair=:pair"), {"pair": pair_id})
+    _m.invalidate_pair_cache(pair_id)
+
+
+async def _publish_pair(engine, pair_id: int, graph: dict, stats: dict,
+                        n_nodes: int, sig_digits: int, total_candles: int) -> int:
+    """Публикует граф, статистику и индекс одной транзакцией."""
+    rows=[]
+    for from_lvl,nexts in graph.items():
+        for to_lvl,cnt,direction,prob in nexts:
+            rows.append({"pair":pair_id,"from":from_lvl,"to":to_lvl,
+                         "dir":direction,"cnt":cnt,"prob":prob})
+    sql=f"""INSERT INTO `{GRAPH_TABLE}`
+        (pair,from_level,to_level,direction,transition_count,probability,date_updated)
+        VALUES (:pair,:from,:to,:dir,:cnt,:prob,NOW())"""
+    async with engine.begin() as conn:
+        await conn.execute(text(f"DELETE FROM `{GRAPH_TABLE}` WHERE pair=:pair"), {"pair":pair_id})
+        for i in range(0,len(rows),BATCH_SIZE):
+            await conn.execute(text(sql),rows[i:i+BATCH_SIZE])
+        await conn.execute(text(f"""INSERT INTO `{STATS_TABLE}`
+            (pair,total_candles,graph_nodes,graph_edges,sig_digits,date_updated)
+            VALUES (:pair,:tc,:gn,:ge,:sig,NOW())
+            ON DUPLICATE KEY UPDATE total_candles=VALUES(total_candles),
+            graph_nodes=VALUES(graph_nodes),graph_edges=VALUES(graph_edges),
+            sig_digits=VALUES(sig_digits),date_updated=NOW()"""),
+            {"pair":pair_id,"tc":stats["total_candles"],"gn":n_nodes,
+             "ge":len(rows),"sig":sig_digits})
+        await conn.execute(text(f"""INSERT INTO `{INDEX_TABLE}`
+            (weight_code,pair,bull_ratio,occurrence_count,date_updated)
+            VALUES ('output',:pair,0.5,:cnt,NOW())
+            ON DUPLICATE KEY UPDATE occurrence_count=VALUES(occurrence_count),date_updated=NOW()"""),
+            {"pair":pair_id,"cnt":total_candles})
+    _m.invalidate_pair_cache(pair_id)
+    return len(rows)
+
+
 # ── Точка входа ───────────────────────────────────────────────────────────────
 
 async def build_index(engine_vlad, engine_brain) -> dict:
@@ -514,7 +556,8 @@ async def build_index(engine_vlad, engine_brain) -> dict:
             continue
 
         if n < 100:
-            log.warning(f"[{INDEX_TABLE}] pair={pair_id}: only {n} bars, skip")
+            log.warning(f"[{INDEX_TABLE}] pair={pair_id}: only {n} bars — очищаем stale данные")
+            await _clear_pair(engine_vlad, pair_id)
             continue
 
         # ── Подбираем sig_digits на ПОЛНОЙ истории (см. docstring _choose_sig_digits) ──
@@ -533,15 +576,11 @@ async def build_index(engine_vlad, engine_brain) -> dict:
         transitions, stats = _build_candle_graph(closes, chosen_sig)
         if not transitions:
             log.warning(f"[{INDEX_TABLE}] pair={pair_id}: empty transitions — очищаем stale граф")
-            # Без этого сервис торговал бы по устаревшим данным после неудачного rebuild.
-            async with engine_vlad.begin() as conn:
-                await conn.execute(text(
-                    f"DELETE FROM `{GRAPH_TABLE}` WHERE pair = :pair"
-                ), {"pair": pair_id})
+            await _clear_pair(engine_vlad, pair_id)
             continue
 
         graph = _normalize_graph(transitions)
-        n_nodes = len(graph)
+        n_nodes = len({lvl for f, nexts in graph.items() for lvl in ([f] + [item[0] for item in nexts])})
 
         log.info(
             f"[{INDEX_TABLE}] pair={pair_id}: "
@@ -551,9 +590,9 @@ async def build_index(engine_vlad, engine_brain) -> dict:
             f"{n_nodes} nodes | sig_digits={chosen_sig}"
         )
 
-        n_edges = await _write_graph(engine_vlad, pair_id, graph)
-        await _write_stats(engine_vlad, pair_id, stats, n_nodes, n_edges, chosen_sig)
-        await _write_index(engine_vlad, pair_id, n)
+        n_edges = await _publish_pair(
+            engine_vlad, pair_id, graph, stats, n_nodes, chosen_sig, n
+        )
 
         result["pairs"][pair_id] = {
             "total_candles":    n,
