@@ -517,6 +517,47 @@ async def _write_index(engine, pair_id: int, n_extremums: int) -> None:
         """), {"pair": pair_id, "cnt": n_extremums})
 
 
+async def _clear_pair(engine, pair_id: int) -> None:
+    """Атомарно удаляет все данные пары, не оставляя устаревшую статистику."""
+    async with engine.begin() as conn:
+        await conn.execute(text(f"DELETE FROM `{GRAPH_TABLE}` WHERE pair=:pair"), {"pair": pair_id})
+        await conn.execute(text(f"DELETE FROM `{STATS_TABLE}` WHERE pair=:pair"), {"pair": pair_id})
+        await conn.execute(text(f"DELETE FROM `{INDEX_TABLE}` WHERE pair=:pair"), {"pair": pair_id})
+    _m.invalidate_pair_cache(pair_id)
+
+
+async def _publish_pair(engine, pair_id: int, graph: dict, stats: dict,
+                        sig_digits: int, n_extremums: int) -> int:
+    """Публикует граф, статистику и индекс одной транзакцией."""
+    rows = []
+    for from_lvl, nexts in graph.items():
+        for to_lvl, cnt, direction, prob in nexts:
+            rows.append({"pair": pair_id, "from": from_lvl, "to": to_lvl,
+                         "dir": direction, "cnt": cnt, "prob": prob})
+    sql = f"""INSERT INTO `{GRAPH_TABLE}`
+        (pair, from_level, to_level, direction, transition_count, probability, date_updated)
+        VALUES (:pair,:from,:to,:dir,:cnt,:prob,NOW())"""
+    async with engine.begin() as conn:
+        await conn.execute(text(f"DELETE FROM `{GRAPH_TABLE}` WHERE pair=:pair"), {"pair": pair_id})
+        for i in range(0, len(rows), BATCH_SIZE):
+            await conn.execute(text(sql), rows[i:i+BATCH_SIZE])
+        await conn.execute(text(f"""INSERT INTO `{STATS_TABLE}`
+            (pair, avg_candles, min_candles, total_extremums, sig_digits, date_updated)
+            VALUES (:pair,:avg,:mn,:tot,:sig,NOW())
+            ON DUPLICATE KEY UPDATE avg_candles=VALUES(avg_candles),
+            min_candles=VALUES(min_candles), total_extremums=VALUES(total_extremums),
+            sig_digits=VALUES(sig_digits), date_updated=NOW()"""),
+            {"pair":pair_id,"avg":stats["avg_candles"],"mn":stats["min_candles"],
+             "tot":stats["total"],"sig":sig_digits})
+        await conn.execute(text(f"""INSERT INTO `{INDEX_TABLE}`
+            (weight_code,pair,bull_ratio,occurrence_count,date_updated)
+            VALUES ('output',:pair,0.5,:cnt,NOW())
+            ON DUPLICATE KEY UPDATE occurrence_count=VALUES(occurrence_count),date_updated=NOW()"""),
+            {"pair":pair_id,"cnt":n_extremums})
+    _m.invalidate_pair_cache(pair_id)
+    return len(rows)
+
+
 # ── Точка входа ───────────────────────────────────────────────────────────────
 
 async def build_index(engine_vlad, engine_brain) -> dict:
@@ -535,7 +576,8 @@ async def build_index(engine_vlad, engine_brain) -> dict:
             continue
 
         if n < 500:
-            log.warning(f"[{INDEX_TABLE}] pair={pair_id}: only {n} bars, skip")
+            log.warning(f"[{INDEX_TABLE}] pair={pair_id}: only {n} bars — очищаем stale данные")
+            await _clear_pair(engine_vlad, pair_id)
             continue
 
         log.info(f"[{INDEX_TABLE}] pair={pair_id}: {n:,} bars → building graph...")
@@ -547,11 +589,7 @@ async def build_index(engine_vlad, engine_brain) -> dict:
         extremums, graph, stats = _build_graph_and_stats(closes, highs, lows, chosen_sig)
         if not graph:
             log.warning(f"[{INDEX_TABLE}] pair={pair_id}: empty graph — очищаем старые данные")
-            # Удаляем stale-граф: без этого сервис торговал бы по устаревшим данным.
-            async with engine_vlad.begin() as conn:
-                await conn.execute(text(
-                    f"DELETE FROM `{GRAPH_TABLE}` WHERE pair = :pair"
-                ), {"pair": pair_id})
+            await _clear_pair(engine_vlad, pair_id)
             continue
 
         log.info(
@@ -561,9 +599,9 @@ async def build_index(engine_vlad, engine_brain) -> dict:
             f"avg_candles={stats['avg_candles']} | sig_digits={chosen_sig}"
         )
 
-        n_edges = await _write_graph(engine_vlad, pair_id, graph)
-        await _write_stats(engine_vlad, pair_id, stats, chosen_sig)
-        await _write_index(engine_vlad, pair_id, len(extremums))
+        n_edges = await _publish_pair(
+            engine_vlad, pair_id, graph, stats, chosen_sig, len(extremums)
+        )
 
         result["pairs"][pair_id] = {
             "extremums":   len(extremums),
