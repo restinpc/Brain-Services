@@ -11,7 +11,7 @@ model.py — brain-extremum-graph (сервис 59)  v2
   3. Находим узел для текущего экстремума (или ближайший)
   4. Обходим граф одним из 2 методов (type)
   5. Сравниваем предсказанное значение с close + тип экстремума
-  6. → {"output": bull_ratio}   bull_ratio>0.5=рост, <0.5=падение
+  6. → {"output": score}   score>0=рост, score<0=падение
 
 ────────────────────────────────────────────────────────────────────
 type=0  Жадный путь (1 нитка):
@@ -424,7 +424,7 @@ def round_to_level(price: float, sig: int = SIG_DIGITS) -> int:
     методологически применимой, адаптивный подбор просто пересчитает
     оптимальные sig под свежие данные при следующем /rebuild_index.
     """
-    if price <= 0:
+    if not math.isfinite(price) or price <= 0:
         return 0
     exp = math.floor(math.log10(price))
     lo, hi = 10 ** (sig - 1), 10 ** sig
@@ -488,11 +488,13 @@ def compute_bull_ratio(
     не участвует в расчёте — сигнал полностью определяется направлением
     walk по графу.
     """
-    if current_close <= 0:
+    if not math.isfinite(current_close) or current_close <= 0:
+        return None
+    if not math.isfinite(predicted_value):
         return None
 
     predicted_price = level_to_price(predicted_value, sig_digits)
-    if predicted_price <= 0:
+    if not math.isfinite(predicted_price) or predicted_price <= 0:
         return None
 
     diff = predicted_price - current_close
@@ -526,7 +528,13 @@ def _detect_pair_id(rates: list, dataset_index: dict | None = None) -> int:
     # Фолбэк по цене
     if not rates:
         return 1
-    c = float(rates[-1].get("close") or rates[-1].get("t1") or 0)
+    try:
+        last = rates[-1] if isinstance(rates[-1], dict) else {}
+        c = float(last.get("close") or last.get("t1") or 0)
+    except (TypeError, ValueError, AttributeError):
+        return 1
+    if not math.isfinite(c) or c <= 0:
+        return 1
     if c > 10_000: return 3
     if c > 100:    return 4
     return 1
@@ -586,6 +594,20 @@ def _get_graph(pair_id: int) -> ExtremGraph:
 # граф мог строиться с одним sig, а live-детекция всегда использовала
 # хардкод SIG_DIGITS=3, независимо от того что выбрал context_idx. Теперь
 # модель читает то же значение, что и было использовано при построении графа.
+def invalidate_pair_cache(pair_id: int | None = None) -> None:
+    """Сбрасывает кеш графа и точности после публикации нового индекса."""
+    if pair_id is None:
+        _GRAPH_CACHE.clear()
+        _GRAPH_TTL.clear()
+        _SIG_CACHE.clear()
+        _SIG_TTL.clear()
+        return
+    _GRAPH_CACHE.pop(pair_id, None)
+    _GRAPH_TTL.pop(pair_id, None)
+    _SIG_CACHE.pop(pair_id, None)
+    _SIG_TTL.pop(pair_id, None)
+
+
 _SIG_CACHE: dict[int, int] = {}
 _SIG_TTL:   dict[int, float] = {}
 SIG_CACHE_TTL = 3600.0   # тот же TTL что у графа — синхронно обновляются
@@ -647,7 +669,7 @@ def _detect_new_extremum(
     cand_l = float(lows[abs_cand])
 
     # Валидация OHLC: нулевые или отрицательные значения → битые данные.
-    if cand_h <= 0 or cand_l <= 0:
+    if not math.isfinite(cand_h) or not math.isfinite(cand_l) or cand_h <= 0 or cand_l <= 0:
         return None
 
     left_h = highs[abs_cand - order : abs_cand]
@@ -662,6 +684,9 @@ def _detect_new_extremum(
     left_l_min = float(min(left_l)); right_l_min = float(min(right_l))
 
     # Защита от нулей в окне (битые бары в середине ряда).
+    window_values = list(left_h) + list(right_h) + list(left_l) + list(right_l)
+    if not all(math.isfinite(float(v)) and float(v) > 0 for v in window_values):
+        return None
     if left_h_min <= 0 or right_h_min <= 0 or left_l_min <= 0 or right_l_min <= 0:
         return None
 
@@ -709,9 +734,15 @@ def model(
 
     var → ограничение глубины дерева для type=1 (10/20/30/40/50)
 
-    Возвращает {"output": bull_ratio} или {} (нет сигнала).
+    Возвращает {"output": score} или {}, где score > 0 — LONG, score < 0 — SHORT.
     """
     if not rates:
+        return {}
+    if type not in (0, 1):
+        log.warning(f"[graph] unsupported type={type}; expected 0 or 1")
+        return {}
+    if type == 1 and var not in VAR_DEPTH:
+        log.warning(f"[graph] unsupported var={var}; expected one of {sorted(VAR_DEPTH)}")
         return {}
 
     pair_id = _detect_pair_id(rates, dataset_index)
@@ -724,8 +755,13 @@ def model(
     # три NumPy-массива по 100 элементов на каждый вызов model().
     needed = 2 * EXTREMUM_ORDER + 2
     tail = rates[-needed:]
-    highs = [float(x.get("max") or 0) for x in tail]
-    lows = [float(x.get("min") or 0) for x in tail]
+    try:
+        highs = [float(x.get("max") or 0) for x in tail]
+        lows = [float(x.get("min") or 0) for x in tail]
+    except (TypeError, ValueError, AttributeError):
+        return {}
+    if not all(math.isfinite(v) and v > 0 for v in highs + lows):
+        return {}
 
     # ── Детектируем новый экстремум ────────────────────────────────────────
     ext = _detect_new_extremum((), highs, lows, sig_digits)
@@ -747,12 +783,16 @@ def model(
     # ── Обходим граф ──────────────────────────────────────────────────────
     if type == 0:
         predicted = walk_type0(graph, start_node.id)
-    else:
-        max_depth = VAR_DEPTH.get(var, 20)
-        predicted = walk_type1(graph, start_node.id, max_depth=max_depth)
+    else:  # type == 1 validated above
+        predicted = walk_type1(graph, start_node.id, max_depth=VAR_DEPTH[var])
 
     # ── Вычисляем bull_ratio ───────────────────────────────────────────────
-    current_close = float(tail[-1].get("close") or 0)
+    try:
+        current_close = float(tail[-1].get("close") or 0)
+    except (TypeError, ValueError, AttributeError):
+        return {}
+    if not math.isfinite(current_close) or current_close <= 0:
+        return {}
     bull_ratio    = compute_bull_ratio(predicted, current_close, ext["direction"], sig_digits)
 
     if bull_ratio is None:
@@ -762,7 +802,7 @@ def model(
     #   output > 0 → LONG, output < 0 → SHORT, output = 0/{} → нет сигнала.
     # Поэтому внутренний bull_ratio переводим в signed score относительно 0.5.
     score = bull_ratio - 0.5
-    if abs(score) < 1e-9:
+    if not math.isfinite(score) or abs(score) < 1e-9:
         return {}
 
     direction_str = "↑ LONG" if score > 0 else "↓ SHORT"
