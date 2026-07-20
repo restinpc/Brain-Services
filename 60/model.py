@@ -21,7 +21,7 @@ model.py — brain-candle-graph (сервис 60)
   4. Сравниваем predicted_level с current_level:
        predicted > current → LONG  (bull_ratio > 0.5)
        predicted < current → SHORT (bull_ratio < 0.5)
-  5. Возвращаем {"output": bull_ratio}
+  5. Возвращаем {"output": score}, где знак задаёт направление
 
 ────────────────────────────────────────────────────────────────────
 var → ограничение глубины для type=1:
@@ -36,6 +36,7 @@ import logging
 import math
 import os
 import time
+from bisect import bisect_left
 from datetime import datetime
 from typing import Optional
 
@@ -82,130 +83,310 @@ GRAPH_CACHE_TTL = 3600.0
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ExtremNode:
+    """
+    Узел графа экстремумов.
+
+    Оптимизация:
+      * вероятности переходов кешируются после первого расчёта;
+      * лучший переход для type=0 кешируется отдельно;
+      * __slots__ уменьшает расход памяти при большом числе узлов.
+    """
+
+    __slots__ = ("id", "value", "relations", "_relations_prob", "_best_next")
+
     def __init__(self, node_id: int, value: int) -> None:
-        self.id:        int = node_id
-        self.value:     int = value
-        self.relations: dict[int, int] = {}
+        self.id: int = node_id
+        self.value: int = value
+        self.relations: dict[int, int] = {}   # {node_id: count}
+        self._relations_prob: Optional[dict[int, float]] = None
+        self._best_next: Optional[int] = None
 
     def add_relation(self, node_id: int, count: int = 1) -> None:
+        """Добавляет (или увеличивает) счётчик перехода к node_id."""
         self.relations[node_id] = self.relations.get(node_id, 0) + count
+        # После изменения сырых transition_count кеши должны быть сброшены.
+        self._relations_prob = None
+        self._best_next = None
 
     def get_relation(self, node_id: int) -> int:
+        """Возвращает сырое кол-во переходов к node_id (0 если нет)."""
         return self.relations.get(node_id, 0)
 
     def get_relations(self) -> dict[int, float]:
-        total = sum(self.relations.values())
+        """
+        Возвращает нормализованные вероятности переходов.
+        {node_id: probability}  sum = 1.0
+
+        В старой версии этот словарь пересоздавался при каждом шаге обхода.
+        При массовом fill_cache это лишняя работа, поэтому теперь результат
+        кешируется внутри узла до следующего add_relation().
+        """
+        cached = self._relations_prob
+        if cached is not None:
+            return cached
+
+        relations = self.relations
+        total = sum(relations.values())
         if total == 0:
-            return {}
-        return {nid: cnt / total for nid, cnt in self.relations.items()}
+            self._relations_prob = {}
+        else:
+            inv_total = 1.0 / total
+            self._relations_prob = {nid: cnt * inv_total for nid, cnt in relations.items()}
+        return self._relations_prob
+
+    def get_best_next(self) -> Optional[int]:
+        """
+        Лучший следующий узел для type=0.
+
+        Для выбора максимальной вероятности не нужно нормализовать relations:
+        max(count / total) даёт тот же node_id, что и max(count).
+        """
+        if self._best_next is not None:
+            return self._best_next
+        if not self.relations:
+            return None
+        self._best_next = max(self.relations.items(), key=lambda item: item[1])[0]
+        return self._best_next
+
+    def __repr__(self) -> str:
+        return f"ExtremNode(id={self.id}, value={self.value}, rels={len(self.relations)})"
 
 
 class ExtremGraph:
+    """
+    Граф переходов между уровнями экстремумов.
+
+    Оптимизация:
+      * find_nearest теперь O(log N), а не O(N), за счёт отсортированного индекса;
+      * ближайшие уровни кешируются, что помогает при повторяющихся live/cache вызовах.
+    """
+
+    __slots__ = ("nodes", "_by_value", "_sorted_values", "_nearest_cache")
+
     def __init__(self) -> None:
-        self.nodes:     list[ExtremNode] = []
-        self._by_value: dict[int, int]   = {}
+        self.nodes: list[ExtremNode] = []
+        self._by_value: dict[int, int] = {}   # value → node_id
+        self._sorted_values: Optional[list[int]] = None
+        self._nearest_cache: dict[int, int] = {}
 
     def add_node(self, value: int) -> int:
-        if value in self._by_value:
-            return self._by_value[value]
+        """
+        Добавляет узел с данным value. Если уже существует — возвращает id.
+        Возвращает node_id.
+        """
+        existing = self._by_value.get(value)
+        if existing is not None:
+            return existing
+
         node_id = len(self.nodes)
-        self.nodes.append(ExtremNode(node_id, value))
+        node = ExtremNode(node_id, value)
+        self.nodes.append(node)
         self._by_value[value] = node_id
+        self._sorted_values = None
+        self._nearest_cache.clear()
         return node_id
 
+    def finalize(self) -> None:
+        """
+        Подготавливает быстрые индексы после массовой загрузки из БД.
+        Вызывать не обязательно: find_nearest построит индекс лениво.
+        """
+        self._sorted_values = sorted(self._by_value)
+        self._nearest_cache.clear()
+
     def get_node(self, node_id: int) -> Optional[ExtremNode]:
-        return self.nodes[node_id] if 0 <= node_id < len(self.nodes) else None
+        """Возвращает узел по его id или None."""
+        nodes = self.nodes
+        if 0 <= node_id < len(nodes):
+            return nodes[node_id]
+        return None
 
     def get_node_by_value(self, value: int) -> Optional[ExtremNode]:
+        """Возвращает узел по значению уровня или None."""
         nid = self._by_value.get(value)
         return self.nodes[nid] if nid is not None else None
 
     def find_nearest(self, value: int) -> Optional[ExtremNode]:
-        if not self.nodes:
+        """Возвращает узел с ближайшим value (для уровней не в графе)."""
+        nodes = self.nodes
+        if not nodes:
             return None
-        return min(self.nodes, key=lambda n: abs(n.value - value))
+
+        exact = self._by_value.get(value)
+        if exact is not None:
+            return nodes[exact]
+
+        cached_id = self._nearest_cache.get(value)
+        if cached_id is not None:
+            return nodes[cached_id]
+
+        values = self._sorted_values
+        if values is None:
+            values = sorted(self._by_value)
+            self._sorted_values = values
+
+        pos = bisect_left(values, value)
+        if pos <= 0:
+            nearest_value = values[0]
+        elif pos >= len(values):
+            nearest_value = values[-1]
+        else:
+            left_value = values[pos - 1]
+            right_value = values[pos]
+            left_dist = abs(value - left_value)
+            right_dist = abs(right_value - value)
+            if left_dist < right_dist:
+                nearest_value = left_value
+            elif right_dist < left_dist:
+                nearest_value = right_value
+            else:
+                # При равной дистанции сохраняем поведение min(self.nodes, ...):
+                # выбираем тот узел, который был добавлен раньше.
+                left_id = self._by_value[left_value]
+                right_id = self._by_value[right_value]
+                nearest_value = left_value if left_id <= right_id else right_value
+
+        nearest_id = self._by_value[nearest_value]
+        self._nearest_cache[value] = nearest_id
+        return nodes[nearest_id]
 
     def __len__(self) -> int:
         return len(self.nodes)
 
+    def __repr__(self) -> str:
+        return f"ExtremGraph({len(self.nodes)} nodes)"
+
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Алгоритмы обхода (идентичны сервису 59, без изменений)
+# Алгоритм type=0: Жадный путь (1 нитка)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def walk_type0(graph: ExtremGraph, start_id: int) -> float:
-    """Жадный путь: следуем наибольшей вероятности до тупика или петли."""
-    path:    list[int]     = [start_id]
-    visited: dict[int, int] = {start_id: 0}
+    """
+    Жадный путь: идём по самому частому переходу.
+
+    Оптимизация относительно старой версии:
+      * не строим normalized probabilities на каждом шаге;
+      * не вызываем graph.get_node() по 2 раза на один и тот же id;
+      * значения узлов берём напрямую из graph.nodes.
+    """
+    nodes = graph.nodes
+    nodes_len = len(nodes)
+    if not (0 <= start_id < nodes_len):
+        return 0.0
+
+    path: list[int] = [start_id]
+    visited: dict[int, int] = {start_id: 0}   # node_id → позиция в path
     current_id = start_id
 
     while True:
-        node = graph.get_node(current_id)
-        if node is None:
-            break
+        if not (0 <= current_id < nodes_len):
+            return float(nodes[start_id].value)
 
-        rels = node.get_relations()
-        if not rels:
-            last_n = path[-2:] if len(path) >= 2 else path
-            vals   = [graph.get_node(n).value for n in last_n if graph.get_node(n)]
-            return sum(vals) / len(vals) if vals else float(graph.get_node(start_id).value)
+        node = nodes[current_id]
+        next_id = node.get_best_next()
 
-        next_id = max(rels, key=rels.get)
+        if next_id is None:
+            # Тупик: mean последних 2 узлов.
+            if len(path) >= 2:
+                return (nodes[path[-1]].value + nodes[path[-2]].value) * 0.5
+            return float(nodes[start_id].value)
 
-        if next_id in visited:
-            loop_nodes = path[visited[next_id]:]
-            vals = [graph.get_node(n).value for n in loop_nodes if graph.get_node(n)]
-            return sum(vals) / len(vals) if vals else float(graph.get_node(start_id).value)
+        loop_start = visited.get(next_id)
+        if loop_start is not None:
+            # Петля: mean всех узлов в цикле.
+            loop_nodes = path[loop_start:]
+            return sum(nodes[nid].value for nid in loop_nodes) / len(loop_nodes)
 
         visited[next_id] = len(path)
         path.append(next_id)
         current_id = next_id
 
-    last_n = path[-2:] if len(path) >= 2 else path
-    vals   = [graph.get_node(n).value for n in last_n if graph.get_node(n)]
-    return sum(vals) / len(vals) if vals else float(graph.get_node(start_id).value)
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Алгоритм type=1: Квантовый обход (дерево)
+# ══════════════════════════════════════════════════════════════════════════════
 
 def walk_type1(graph: ExtremGraph, start_id: int, max_depth: int = 20) -> float:
-    """Квантовый обход: sum(mean_ветки × P_нитки) по всем конечным ветвям."""
-    total = [0.0]
+    """
+    Квантовый обход дерева: взвешенная сумма всех конечных ветвей.
 
-    def _terminal(path: list[int], prob: float) -> None:
-        last_n = path[-2:] if len(path) >= 2 else path
-        vals   = [graph.get_node(n).value for n in last_n if graph.get_node(n)]
-        if vals:
-            total[0] += (sum(vals) / len(vals)) * prob
+    Оптимизация относительно старой версии:
+      * path и visited/positions ведутся in-place через append/pop;
+      * нет копирования path + [next_id] и frozenset | {next_id} на каждой ветке;
+      * loop_start берётся из dict за O(1), без path.index();
+      * вероятности relations кешируются внутри ExtremNode.
+    """
+    nodes = graph.nodes
+    nodes_len = len(nodes)
+    if not (0 <= start_id < nodes_len):
+        return 0.0
 
-    def _recurse(node_id: int, path: list[int],
-                 path_set: frozenset, prob: float, depth: int) -> None:
+    total_signal = 0.0
+    path: list[int] = [start_id]
+    pos_by_node: dict[int, int] = {start_id: 0}
+
+    def terminal(prob: float) -> None:
+        """Добавляет сигнал конечной ветви к общей сумме."""
+        nonlocal total_signal
+        if not path:
+            return
+        if len(path) >= 2:
+            mean_val = (nodes[path[-1]].value + nodes[path[-2]].value) * 0.5
+        else:
+            mean_val = float(nodes[path[-1]].value)
+        total_signal += mean_val * prob
+
+    def recurse(node_id: int, prob: float, depth: int) -> None:
+        nonlocal total_signal
+
         if depth > max_depth or prob < 1e-9:
-            _terminal(path, prob)
+            terminal(prob)
             return
-        node = graph.get_node(node_id)
-        if node is None:
-            _terminal(path, prob)
+
+        if not (0 <= node_id < nodes_len):
+            terminal(prob)
             return
-        rels = node.get_relations()
+
+        rels = nodes[node_id].get_relations()
         if not rels:
-            _terminal(path, prob)
+            terminal(prob)
             return
 
         for next_id, next_prob in rels.items():
-            bp = prob * next_prob
-            if next_id in path_set:
-                loop_nodes = path[path.index(next_id):]  # без дубля начала цикла
-                vals = [graph.get_node(n).value for n in loop_nodes if graph.get_node(n)]
-                if vals:
-                    total[0] += (sum(vals) / len(vals)) * bp
-            else:
-                _recurse(next_id, path + [next_id], path_set | {next_id}, bp, depth + 1)
+            branch_prob = prob * next_prob
+            loop_start = pos_by_node.get(next_id)
 
-    _recurse(start_id, [start_id], frozenset([start_id]), 1.0, 0)
-    return total[0]
+            if loop_start is not None:
+                # Петля: mean всех узлов цикла, без повторного включения next_id.
+                loop_nodes = path[loop_start:]
+                if loop_nodes:
+                    total_signal += (
+                        sum(nodes[nid].value for nid in loop_nodes) / len(loop_nodes)
+                    ) * branch_prob
+                continue
+
+            # В нормальном графе next_id всегда валиден: он создан через add_node().
+            # Проверку всё равно оставляем, чтобы битая relation не роняла сервис.
+            if not (0 <= next_id < nodes_len):
+                # Поведение максимально близко к старой версии: она добавляла
+                # invalid id в path, затем terminal() отбрасывал invalid-узел и
+                # фактически усреднял только текущий валидный узел.
+                total_signal += float(nodes[path[-1]].value) * branch_prob
+                continue
+
+            pos_by_node[next_id] = len(path)
+            path.append(next_id)
+            recurse(next_id, branch_prob, depth + 1)
+            path.pop()
+            del pos_by_node[next_id]
+
+    recurse(start_id, 1.0, 0)
+    return total_signal
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Сигнал: без проверки типа экстремума (всё аналогично, но проще)
+# Преобразование предсказанного значения → bull_ratio
 # ══════════════════════════════════════════════════════════════════════════════
 
 def round_to_level(price: float, sig: int = SIG_DIGITS) -> int:
@@ -232,7 +413,7 @@ def round_to_level(price: float, sig: int = SIG_DIGITS) -> int:
     что и раньше — вся ранее проведённая калибровка sig_digits через
     backtest остаётся методологически применимой.
     """
-    if price <= 0:
+    if not math.isfinite(price) or price <= 0:
         return 0
     exp = math.floor(math.log10(price))
     lo, hi = 10 ** (sig - 1), 10 ** sig
@@ -293,11 +474,13 @@ def compute_bull_ratio(
 
     modification = min(|predicted_price - current_close| / current_close × SIGNAL_SCALE, 0.45)
     """
-    if current_close <= 0:
+    if not math.isfinite(current_close) or current_close <= 0:
+        return None
+    if not math.isfinite(predicted_value):
         return None
 
     predicted_price = level_to_price(predicted_value, sig_digits)
-    if predicted_price <= 0:
+    if not math.isfinite(predicted_price) or predicted_price <= 0:
         return None
 
     deviation    = abs(predicted_price - current_close) / current_close
@@ -329,7 +512,13 @@ def _detect_pair_id(rates: list, dataset_index: dict | None = None) -> int:
         if "eur" in table: return 1
     if not rates:
         return 1
-    c = float(rates[-1].get("close") or rates[-1].get("t1") or 0)
+    try:
+        last = rates[-1] if isinstance(rates[-1], dict) else {}
+        c = float(last.get("close") or last.get("t1") or 0)
+    except (TypeError, ValueError, AttributeError):
+        return 1
+    if not math.isfinite(c) or c <= 0:
+        return 1
     if c > 10_000: return 3
     if c > 100:    return 4
     return 1
@@ -381,6 +570,20 @@ def _get_graph(pair_id: int) -> ExtremGraph:
 # там) и сохраняет в STATS_TABLE. Раньше model.py никогда не читал это значение —
 # round_to_level всегда использовал хардкод SIG_DIGITS=3 независимо от того,
 # с каким sig был построен граф. Теперь модель читает то же значение.
+def invalidate_pair_cache(pair_id: int | None = None) -> None:
+    """Сбрасывает кеш графа и точности после публикации нового индекса."""
+    if pair_id is None:
+        _GRAPH_CACHE.clear()
+        _GRAPH_TTL.clear()
+        _SIG_CACHE.clear()
+        _SIG_TTL.clear()
+        return
+    _GRAPH_CACHE.pop(pair_id, None)
+    _GRAPH_TTL.pop(pair_id, None)
+    _SIG_CACHE.pop(pair_id, None)
+    _SIG_TTL.pop(pair_id, None)
+
+
 _SIG_CACHE: dict[int, int]   = {}
 _SIG_TTL:   dict[int, float] = {}
 SIG_CACHE_TTL = 3600.0   # тот же TTL что у графа — синхронно обновляются
@@ -437,9 +640,15 @@ def model(
     - Нет проверки типа экстремума (MAX/MIN): сигнал из сравнения predicted vs current
     - Фильтр шума: |modification| < MIN_MODIFICATION → {}
 
-    Возвращает {"output": bull_ratio} или {} (шум / нет данных в графе).
+    Возвращает {"output": score} или {}, где score > 0 — LONG, score < 0 — SHORT.
     """
     if not rates:
+        return {}
+    if type not in (0, 1):
+        log.warning(f"[candle-graph] unsupported type={type}; expected 0 or 1")
+        return {}
+    if type == 1 and var not in VAR_DEPTH:
+        log.warning(f"[candle-graph] unsupported var={var}; expected one of {sorted(VAR_DEPTH)}")
         return {}
     # При единственном баре level-change filter (rates[-2]) недоступен,
     # а сигнал без сравнения уровней не имеет смысла.
@@ -455,10 +664,12 @@ def model(
     except Exception:
         return {}
 
-    if current_close <= 0:
+    if not math.isfinite(current_close) or current_close <= 0:
         return {}
 
     entry_level = round_to_level(current_close, sig_digits)
+    if entry_level <= 0:
+        return {}
 
     # ── Level-change filter (stateless через rates[-2]) ──────────────────────
     # Сигнал только когда rounded level ИЗМЕНИЛСЯ с предыдущего бара.
@@ -468,8 +679,13 @@ def model(
     # построил граф) — иначе "уровень не изменился" мог бы определяться иначе,
     # чем в графе, и фильтр давал бы несогласованный с графом результат.
     if len(rates) >= 2:
-        prev_close = float(rates[-2].get("close") or 0)
-        if prev_close > 0 and round_to_level(prev_close, sig_digits) == entry_level:
+        try:
+            prev_close = float(rates[-2].get("close") or 0)
+        except (TypeError, ValueError, AttributeError):
+            return {}
+        if not math.isfinite(prev_close) or prev_close <= 0:
+            return {}
+        if round_to_level(prev_close, sig_digits) == entry_level:
             return {}   # уровень не изменился — пропускаем
 
 
@@ -486,11 +702,10 @@ def model(
         return {}
 
     # ── Обходим граф ──────────────────────────────────────────────────────
-    max_depth = VAR_DEPTH.get(var, 20)
     if type == 0:
         predicted = walk_type0(graph, start_node.id)
-    else:
-        predicted = walk_type1(graph, start_node.id, max_depth=max_depth)
+    else:  # type == 1 validated above
+        predicted = walk_type1(graph, start_node.id, max_depth=VAR_DEPTH[var])
 
     # ── Вычисляем сигнал ───────────────────────────────────────────────────
     bull_ratio = compute_bull_ratio(predicted, current_close, sig_digits)
@@ -501,7 +716,7 @@ def model(
     #   output > 0 → LONG, output < 0 → SHORT, output = 0/{} → нет сигнала.
     # Поэтому внутренний bull_ratio переводим в signed score относительно 0.5.
     score = bull_ratio - 0.5
-    if abs(score) < 1e-9:
+    if not math.isfinite(score) or abs(score) < 1e-9:
         return {}
 
     direction = "↑ LONG" if score > 0 else "↓ SHORT"
