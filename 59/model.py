@@ -20,11 +20,11 @@ type=0  Жадный путь (1 нитка):
          цикл → mean всех узлов петли
   Сравниваем с close + тип экстремума → output
 
-type=1  Квантовый обход (дерево):
-  Разворачиваем граф в дерево, рекурсивно обходим все ветви.
+type=1  Вероятностный обход:
+  На каждом уровне объединяем ветви, пришедшие в один узел.
   Тупик:  branch_signal = mean(последние 2 узла)   × P(нитки)
-  Петля:  branch_signal = mean(все узлы петли)       × P(нитки)
-  output = сумма branch_signal по всем конечным ветвям
+  Циклы: вероятность проходит до ограничения max_depth
+  output = нормализованная взвешенная сумма конечных состояний
   Сравниваем с close + тип экстремума → bull_ratio
 
 ────────────────────────────────────────────────────────────────────
@@ -315,80 +315,103 @@ def walk_type0(graph: ExtremGraph, start_id: int) -> float:
 
 def walk_type1(graph: ExtremGraph, start_id: int, max_depth: int = 20) -> float:
     """
-    Квантовый обход дерева: взвешенная сумма всех конечных ветвей.
+    Быстрый вероятностный обход графа с объединением состояний.
 
-    Оптимизация относительно старой версии:
-      * path и visited/positions ведутся in-place через append/pop;
-      * нет копирования path + [next_id] и frozenset | {next_id} на каждой ветке;
-      * loop_start берётся из dict за O(1), без path.index();
-      * вероятности relations кешируются внутри ExtremNode.
+    Вместо рекурсивного разворачивания всех возможных путей храним для каждой
+    глубины суммарную вероятность нахождения в каждом узле. Все ветви, которые
+    пришли в один и тот же узел на одной глубине, объединяются в одно состояние.
+
+    Для каждого состояния дополнительно сохраняется взвешенная сумма значений
+    предыдущих узлов. Это позволяет сохранить прежнюю формулу тупика/ограничения
+    глубины: mean(предыдущий узел, текущий узел) * probability.
+
+    Важно: циклы больше не завершаются при первом повторном посещении узла.
+    Вероятность проходит через цикл до max_depth. Это намеренное приближение,
+    необходимое для перехода от экспоненциального перебора путей к сложности
+    примерно O(max_depth * E), где E — число переходов графа.
     """
     nodes = graph.nodes
     nodes_len = len(nodes)
     if not (0 <= start_id < nodes_len):
         return 0.0
 
+    # node_id -> суммарная вероятность состояния на текущей глубине.
+    current_prob: dict[int, float] = {start_id: 1.0}
+
+    # node_id -> сумма previous_value * probability.
+    # Для стартового узла предыдущим считаем его же значение.
+    current_prev_weighted: dict[int, float] = {
+        start_id: float(nodes[start_id].value)
+    }
+
     total_signal = 0.0
-    path: list[int] = [start_id]
-    pos_by_node: dict[int, int] = {start_id: 0}
+    total_terminal_prob = 0.0
+    min_probability = 1e-12
 
-    def terminal(prob: float) -> None:
-        """Добавляет сигнал конечной ветви к общей сумме."""
-        nonlocal total_signal
-        if not path:
-            return
-        if len(path) >= 2:
-            mean_val = (nodes[path[-1]].value + nodes[path[-2]].value) * 0.5
-        else:
-            mean_val = float(nodes[path[-1]].value)
-        total_signal += mean_val * prob
+    for depth in range(max_depth + 1):
+        if not current_prob:
+            break
 
-    def recurse(node_id: int, prob: float, depth: int) -> None:
-        nonlocal total_signal
+        next_prob: dict[int, float] = {}
+        next_prev_weighted: dict[int, float] = {}
 
-        if depth > max_depth or prob < 1e-9:
-            terminal(prob)
-            return
-
-        if not (0 <= node_id < nodes_len):
-            terminal(prob)
-            return
-
-        rels = nodes[node_id].get_relations()
-        if not rels:
-            terminal(prob)
-            return
-
-        for next_id, next_prob in rels.items():
-            branch_prob = prob * next_prob
-            loop_start = pos_by_node.get(next_id)
-
-            if loop_start is not None:
-                # Петля: mean всех узлов цикла, без повторного включения next_id.
-                loop_nodes = path[loop_start:]
-                if loop_nodes:
-                    total_signal += (
-                        sum(nodes[nid].value for nid in loop_nodes) / len(loop_nodes)
-                    ) * branch_prob
+        for node_id, probability in current_prob.items():
+            if probability <= 0.0 or not math.isfinite(probability):
+                continue
+            if not (0 <= node_id < nodes_len):
                 continue
 
-            # В нормальном графе next_id всегда валиден: он создан через add_node().
-            # Проверку всё равно оставляем, чтобы битая relation не роняла сервис.
-            if not (0 <= next_id < nodes_len):
-                # Поведение максимально близко к старой версии: она добавляла
-                # invalid id в path, затем terminal() отбрасывал invalid-узел и
-                # фактически усреднял только текущий валидный узел.
-                total_signal += float(nodes[path[-1]].value) * branch_prob
+            node = nodes[node_id]
+            node_value = float(node.value)
+            prev_weighted = current_prev_weighted.get(
+                node_id,
+                node_value * probability,
+            )
+            previous_value = prev_weighted / probability
+
+            relations = node.get_relations()
+
+            # Тупик или достигнута заданная глубина: прежняя формула terminal().
+            if depth >= max_depth or not relations:
+                mean_value = (previous_value + node_value) * 0.5
+                total_signal += mean_value * probability
+                total_terminal_prob += probability
                 continue
 
-            pos_by_node[next_id] = len(path)
-            path.append(next_id)
-            recurse(next_id, branch_prob, depth + 1)
-            path.pop()
-            del pos_by_node[next_id]
+            for next_id, transition_probability in relations.items():
+                branch_probability = probability * float(transition_probability)
+                if branch_probability <= 0.0 or not math.isfinite(branch_probability):
+                    continue
 
-    recurse(start_id, 1.0, 0)
-    return total_signal
+                # Микроскопические ветви не разворачиваем дальше, но не теряем
+                # их массу: закрываем на текущем узле по terminal-формуле.
+                if branch_probability < min_probability:
+                    mean_value = (previous_value + node_value) * 0.5
+                    total_signal += mean_value * branch_probability
+                    total_terminal_prob += branch_probability
+                    continue
+
+                if not (0 <= next_id < nodes_len):
+                    total_signal += node_value * branch_probability
+                    total_terminal_prob += branch_probability
+                    continue
+
+                next_prob[next_id] = next_prob.get(next_id, 0.0) + branch_probability
+
+                # Для следующего состояния previous_value — значение текущего узла.
+                next_prev_weighted[next_id] = (
+                    next_prev_weighted.get(next_id, 0.0)
+                    + node_value * branch_probability
+                )
+
+        current_prob = next_prob
+        current_prev_weighted = next_prev_weighted
+
+    if total_terminal_prob <= 0.0:
+        return float(nodes[start_id].value)
+
+    # Нормализация защищает от небольшой потери массы из-за погрешностей float.
+    return total_signal / total_terminal_prob
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -730,7 +753,7 @@ def model(
     Применяет граф вероятностей для генерации торгового сигнала.
 
     type=0  Жадный путь (1 нитка, следуем наибольшей вероятности)
-    type=1  Квантовый обход (дерево, взвешенная сумма всех ветвей)
+    type=1  Быстрый вероятностный обход с объединением состояний
 
     var → ограничение глубины дерева для type=1 (10/20/30/40/50)
 
