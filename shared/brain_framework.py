@@ -2496,7 +2496,7 @@ def build_app(model_module) -> FastAPI:
                 return False, 0, 0, 0
             for calc_type, var in type_var_slots:
                 expected = _sync_compute(
-                    candle, calc_type, var,
+                    candle, calc_type, var, "",
                     all_rows, all_dates, np_rates_pd, s, rates_tbl,
                 )
                 actual = slot_results.get((calc_type, var))
@@ -2762,37 +2762,44 @@ def build_app(model_module) -> FastAPI:
             return
         s.fill_cancel.clear()
         s._fill_cache_active = True   # skip vlad_reverse_universe writes for speed
-        # Clear ML universe cache so fill_cache starts fresh
-        if s.reverse_store:
-            s.reverse_store.clear_universe_cache()
-        dt_from = _parse_date(date_from_str) if date_from_str else None
-        dt_to   = _parse_date(date_to_str)   if date_to_str   else None
+        # Preparation also needs cleanup protection.  Failures here happen
+        # before the main processing loop (for example while refreshing rates),
+        # so the loop's finally block cannot reset _fill_cache_active for us.
+        try:
+            # Clear ML universe cache so fill_cache starts fresh
+            if s.reverse_store:
+                s.reverse_store.clear_universe_cache()
+            dt_from = _parse_date(date_from_str) if date_from_str else None
+            dt_to   = _parse_date(date_to_str)   if date_to_str   else None
 
-        # Build one consistent data snapshot for the whole fill.  The previous
-        # ML path refreshed rates before every batch and repeatedly hit MySQL.
-        await _refresh_simple_rates(s)
+            # Build one consistent data snapshot for the whole fill.  The previous
+            # ML path refreshed rates before every batch and repeatedly hit MySQL.
+            await _refresh_simple_rates(s)
 
-        pd_slots       = [(p, d) for p in pairs for d in days]
-        type_var_slots = [(tp, var, param) for tp in types for var in s.VAR_RANGE for param in params]
-        total_slots    = len(pd_slots) * len(type_var_slots)
+            pd_slots       = [(p, d) for p in pairs for d in days]
+            type_var_slots = [(tp, var, param) for tp in types for var in s.VAR_RANGE for param in params]
+            total_slots    = len(pd_slots) * len(type_var_slots)
 
-        total_candles = sum(
-            sum(1 for r in s.global_rates.get(_rates_table(p, d), [])
-                if (dt_from is None or r["date"] >= dt_from)
-                and (dt_to   is None or r["date"] <= dt_to))
-            for p, d in pd_slots
-        )
-        total  = total_candles * len(type_var_slots)
-        done   = skipped = errors = 0
-        s.fill_status = {
-            "state": "running", "total": total, "done": 0,
-            "skipped": 0, "errors": 0,
-            "pairs": pairs, "days": days,
-            "slots_total": total_slots, "slots_done": 0,
-            "started_at": datetime.now().isoformat(),
-        }
-        log(f" fill_cache: {len(pd_slots)} инструментов × "
-            f"{len(type_var_slots)} type/var/param слотов", s.NODE_NAME, force=True)
+            total_candles = sum(
+                sum(1 for r in s.global_rates.get(_rates_table(p, d), [])
+                    if (dt_from is None or r["date"] >= dt_from)
+                    and (dt_to   is None or r["date"] <= dt_to))
+                for p, d in pd_slots
+            )
+            total  = total_candles * len(type_var_slots)
+            done   = skipped = errors = 0
+            s.fill_status = {
+                "state": "running", "total": total, "done": 0,
+                "skipped": 0, "errors": 0,
+                "pairs": pairs, "days": days,
+                "slots_total": total_slots, "slots_done": 0,
+                "started_at": datetime.now().isoformat(),
+            }
+            log(f" fill_cache: {len(pd_slots)} инструментов × "
+                f"{len(type_var_slots)} type/var/param слотов", s.NODE_NAME, force=True)
+        except Exception:
+            s._fill_cache_active = False
+            raise
 
         try:
             for slot_idx, (pair_id, day_flag) in enumerate(pd_slots):
@@ -2823,8 +2830,8 @@ def build_app(model_module) -> FastAPI:
                 cached_by_hash: dict[str, set] = {}
                 try:
                     _wanted_hashes = [
-                        _params_hash({"type": ct, "var": vv, "param": ""})
-                        for ct, vv in type_var_slots
+                        _params_hash({"type": ct, "var": vv, "param": prm})
+                        for ct, vv, prm in type_var_slots
                     ]
                     _where_ch = ["service_url=:url", "pair=:pair", "day_flag=:day"]
                     _params_ch = {"url": s.service_url, "pair": pair_id, "day": day_flag}
@@ -3186,14 +3193,19 @@ def build_app(model_module) -> FastAPI:
             bt_df = _parse_date(date_from_str) if date_from_str else datetime(2025, 1, 1)
             bt_dt = _parse_date(date_to_str)   if date_to_str   else datetime.now()
             for bt_pair, bt_day in pd_slots:
-                for bt_type, bt_var in type_var_slots:
+                for bt_type, bt_var, bt_param in type_var_slots:
                     try:
                         bt = await _backtest(
                             bt_pair, bt_day, tier=0,
-                            extra_params={"type": bt_type, "var": bt_var},
+                            extra_params={
+                                "type": bt_type, "var": bt_var, "param": bt_param,
+                            },
                             df=bt_df, dt=bt_dt,
                         )
-                        label = f"pair{bt_pair}/{'d' if bt_day else 'h'} t={bt_type} v={bt_var}"
+                        label = (
+                            f"pair{bt_pair}/{'d' if bt_day else 'h'} "
+                            f"t={bt_type} v={bt_var} p={bt_param!r}"
+                        )
                         if "error" in bt:
                             log(f"   backtest [{label}]: {bt['error']}",
                                 s.NODE_NAME, force=True)
@@ -3633,8 +3645,26 @@ def build_app(model_module) -> FastAPI:
         all_params = [param] if param is not None else list(s.PARAM_RANGE or [""])
         eff_from   = date_from if date_from.strip() else s.CACHE_DATE_FROM
         s.fill_cancel.clear()
+
+        async def _run_fill():
+            try:
+                await _fill_worker(
+                    pl, dl, eff_from, date_to, all_types, all_params, batch_size
+                )
+            except Exception as exc:
+                import traceback as _tb
+                s.fill_status.update({
+                    "state": "error",
+                    "error": repr(exc),
+                    "finished_at": datetime.now().isoformat(),
+                })
+                log(
+                    f" fill_cache crashed: {exc}\n{_tb.format_exc()}",
+                    s.NODE_NAME, level="error", force=True,
+                )
+
         s.fill_task = asyncio.create_task(
-            _fill_worker(pl, dl, eff_from, date_to, all_types, all_params, batch_size))
+            _run_fill())
         return ok_response({
             "started":     True, "pairs": pl, "days": dl,
             "types":       all_types, "var_range": s.VAR_RANGE,
