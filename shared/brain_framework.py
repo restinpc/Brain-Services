@@ -2293,8 +2293,17 @@ def build_app(model_module) -> FastAPI:
                             all_rows, all_dates, np_rates_pd, s_state, rates_tbl=""):
         """Один executor-job обрабатывает пачку свечей вместо job на каждую свечу."""
         return [
-            _sync_compute(c, calc_type, calc_var, calc_param,
-                          all_rows, all_dates, np_rates_pd, s_state, rates_tbl)
+            _sync_compute(
+                candle=c,
+                calc_type=calc_type,
+                calc_var=calc_var,
+                calc_param=calc_param,
+                all_rows=all_rows,
+                all_dates=all_dates,
+                np_rates_pd=np_rates_pd,
+                s_state=s_state,
+                rates_tbl=rates_tbl,
+            )
             for c in candles_chunk
         ]
 
@@ -2496,8 +2505,15 @@ def build_app(model_module) -> FastAPI:
                 return False, 0, 0, 0
             for calc_type, var in type_var_slots:
                 expected = _sync_compute(
-                    candle, calc_type, var, "",
-                    all_rows, all_dates, np_rates_pd, s, rates_tbl,
+                    candle=candle,
+                    calc_type=calc_type,
+                    calc_var=var,
+                    calc_param="",
+                    all_rows=all_rows,
+                    all_dates=all_dates,
+                    np_rates_pd=np_rates_pd,
+                    s_state=s,
+                    rates_tbl=rates_tbl,
                 )
                 actual = slot_results.get((calc_type, var))
                 if expected != actual:
