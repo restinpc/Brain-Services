@@ -12,6 +12,7 @@ model.py — FRED DFF (Effective Federal Funds Rate)
 
 from __future__ import annotations
 
+from bisect import bisect_left, bisect_right
 from datetime import date as date_class
 from datetime import datetime, time, timedelta
 
@@ -32,14 +33,13 @@ DATASET_QUERY = """
         DATE_FORMAT(date_iso, '%Y-%m-%d') AS date_iso,
         value,
         loaded_at,
-        STR_TO_DATE(DATE_FORMAT(date_iso, '%Y-%m-%d'), '%Y-%m-%d') AS event_time,
+        CAST(date_iso AS DATETIME) AS event_time,
         CAST('2000-01-01 00:00:00' AS DATETIME) AS date
     FROM sasha_fred_dff
     WHERE date_iso IS NOT NULL
       AND value IS NOT NULL
-      AND STR_TO_DATE(DATE_FORMAT(date_iso, '%Y-%m-%d'), '%Y-%m-%d') IS NOT NULL
-      AND STR_TO_DATE(DATE_FORMAT(date_iso, '%Y-%m-%d'), '%Y-%m-%d') >= '1970-01-01'
-      AND STR_TO_DATE(DATE_FORMAT(date_iso, '%Y-%m-%d'), '%Y-%m-%d') <= '2099-12-31'
+      AND date_iso >= '1970-01-01'
+      AND date_iso < '2100-01-01'
     ORDER BY date_iso
 """
 DATASET_ENGINE = "brain"
@@ -50,6 +50,7 @@ VAR_RANGE = [0, 1, 2, 3]
 REBUILD_INTERVAL = 7200
 
 _MIN_OCCURRENCE = 2
+_PREPARED_INDEX_KEY = "_model46_prepared_v2"
 
 
 def _as_datetime(value) -> datetime | None:
@@ -95,18 +96,21 @@ def _event_type(delta: float) -> str:
     return "rate_unchanged"
 
 
-def _prepare_events(dataset: list[dict]) -> list[tuple[datetime, float, str]]:
-    """
-    Превращаем сырой ряд value в список событий изменения:
-    (event_time, delta_value), где delta_value != 0.
-    """
+def _prepare_events(
+    dataset: list[dict],
+) -> tuple[list[datetime], list[tuple[datetime, float, str]]]:
     events: list[tuple[datetime, float, str]] = []
-    prev_value = None
+    prev_value: float | None = None
 
     for row in dataset:
-        dt = _as_datetime(row.get("event_time") or row.get("date_iso") or row.get("date"))
+        dt = _as_datetime(
+            row.get("event_time")
+            or row.get("date_iso")
+            or row.get("date")
+        )
         if dt is None:
             continue
+
         try:
             value = float(row.get("value"))
         except (TypeError, ValueError):
@@ -115,9 +119,32 @@ def _prepare_events(dataset: list[dict]) -> list[tuple[datetime, float, str]]:
         if prev_value is not None:
             delta = value - prev_value
             events.append((dt, delta, _event_type(delta)))
+
         prev_value = value
 
-    return events
+    events.sort(key=lambda item: item[0])
+    event_dates = [item[0] for item in events]
+    return event_dates, events
+
+
+def _get_prepared_index(
+    dataset: list[dict],
+    dataset_index: dict,
+) -> tuple[
+    dict[str, tuple[int, dict]],
+    list[datetime],
+    list[tuple[datetime, float, str]],
+]:
+    prepared = dataset_index.get(_PREPARED_INDEX_KEY)
+    if prepared is not None:
+        return prepared
+
+    ctx_index = dataset_index.get("ctx_index") or {}
+    reverse = _build_reverse(ctx_index)
+    event_dates, events = _prepare_events(dataset)
+    candidate = (reverse, event_dates, events)
+
+    return dataset_index.setdefault(_PREPARED_INDEX_KEY, candidate)
 
 
 def _apply_var(signed_t1: float, delta: float, var: int, ctx_info: dict) -> float:
@@ -152,21 +179,22 @@ def model(
 ) -> dict[str, float]:
     del param
 
-    if not rates or not dataset:
+    if not rates or not dataset or dataset_index is None:
         return {}
 
-    ctx_index = (dataset_index or {}).get("ctx_index") or {}
+    ctx_index = dataset_index.get("ctx_index") or {}
     if not ctx_index:
         return {}
-    reverse = _build_reverse(ctx_index)
-    if not reverse:
+
+    reverse, event_dates, events = _get_prepared_index(dataset, dataset_index)
+    if not reverse or not events:
         return {}
 
     last_candle = rates[-1]
     is_daily = last_candle["date"].hour == 0 and last_candle["date"].minute == 0
     is_bull = float(last_candle.get("close") or 0) > float(last_candle.get("open") or 0)
 
-    np_rates = (dataset_index or {}).get("np_rates")
+    np_rates = dataset_index.get("np_rates")
     np_view = None
     if np_rates is not None:
         dates_ns = np_rates.get("dates_ns")
@@ -204,21 +232,20 @@ def model(
                 ext_min.add(rates[i]["date"])
         ext_set = ext_max if is_bull else ext_min
         if is_daily:
-            # Daily tables can keep non-midnight timestamps; align lookups by date.
             rates_t1_by_day = {
                 r["date"].date(): float((r.get("close") or 0) - (r.get("open") or 0))
                 for r in rates
             }
             ext_by_day = {d.date(): True for d in ext_set}
 
-    events = _prepare_events(dataset)
-    if not events:
-        return {}
+    window_start = date - timedelta(days=SHIFT_WINDOW)
+    left = bisect_left(event_dates, window_start)
+    right = bisect_right(event_dates, date)
 
     result: dict[str, float] = {}
     window_sec = SHIFT_WINDOW * 86400
 
-    for event_time, delta, event_type in events:
+    for event_time, delta, event_type in events[left:right]:
         lookup = reverse.get(event_type)
         if lookup is None:
             continue
@@ -235,8 +262,8 @@ def model(
 
         t_date = event_time + timedelta(days=shift)
         t_date = t_date.replace(hour=0, minute=0, second=0, microsecond=0)
-        if is_daily:
-            t_date = t_date.replace(hour=0, minute=0, second=0, microsecond=0)
+
+        # Не используем текущую дату и будущее.
         if t_date >= date:
             continue
 
@@ -250,11 +277,11 @@ def model(
                     continue
                 day_start_ts = _dt_to_ts(t_date.replace(hour=0, minute=0, second=0, microsecond=0))
                 day_end_ts = day_start_ts + 86400
-                left = int(_np_i.searchsorted(np_view["dates_ns"], day_start_ts, side="left"))
-                right = int(_np_i.searchsorted(np_view["dates_ns"], day_end_ts, side="left"))
-                if right <= left:
+                left_day = int(_np_i.searchsorted(np_view["dates_ns"], day_start_ts, side="left"))
+                right_day = int(_np_i.searchsorted(np_view["dates_ns"], day_end_ts, side="left"))
+                if right_day <= left_day:
                     continue
-                idx = right - 1
+                idx = right_day - 1
             t1 = float(np_view["t1"][idx])
             ext_hit = bool(np_view["ext"][idx])
         else:
