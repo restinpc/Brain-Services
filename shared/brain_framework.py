@@ -26,6 +26,7 @@ brain_framework.py v20.1 — безопасное развёртывание fus
 
 from __future__ import annotations
 
+import traceback
 import asyncio
 import bisect
 import concurrent.futures as _cf
@@ -38,7 +39,7 @@ import os
 import random
 import sys
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 try:
     import requests as _requests
@@ -485,6 +486,187 @@ def _standard_dataset_is_midnight(dataset) -> bool:
         ):
             return False
     return seen
+
+
+
+def trace_standard_model(
+    rates: list[dict],
+    dataset: list[dict],
+    date: datetime,
+    *,
+    type: int,
+    var: int,
+    dataset_index: dict | None,
+    shift_window: int,
+    apply_var_fn: Callable[[float, float, int, dict], float],
+    min_occurrence: int = 2,
+    get_event_fn: Optional[Callable[[dict], Optional[tuple]]] = None,
+    signal_fn: Optional[Callable] = None,
+    max_events: int = 500,
+) -> dict:
+    """Подробная трассировка стандартной логики модели без изменения результата."""
+    trace: dict = {
+        "engine": "run_standard_model",
+        "target_date": date,
+        "type": type,
+        "var": var,
+        "shift_window_days": shift_window,
+        "rates_count": len(rates or []),
+        "dataset_count": len(dataset or []),
+        "stages": [],
+        "events": [],
+        "counters": {},
+        "result": {},
+    }
+    counters = trace["counters"]
+    for key in (
+        "rows_seen", "parse_failed", "context_missing", "outside_window",
+        "low_occurrence", "target_after_control", "candle_missing",
+        "weighted_zero", "contribution_empty", "accepted",
+    ):
+        counters[key] = 0
+
+    if not rates or not dataset:
+        trace["stop_reason"] = "rates_or_dataset_empty"
+        return trace
+
+    ctx_index = (dataset_index or {}).get("ctx_index") or {}
+    trace["context_count"] = len(ctx_index)
+    if not ctx_index:
+        trace["stop_reason"] = "ctx_index_empty"
+        return trace
+
+    reverse = {
+        str(info.get("event_type") or "").strip().lower(): (int(info["id"]), info)
+        for _, info in ctx_index.items()
+        if info.get("id") and info.get("event_type")
+    }
+    trace["reverse_event_types"] = sorted(reverse)
+    if not reverse:
+        trace["stop_reason"] = "reverse_context_empty"
+        return trace
+
+    np_rates = (dataset_index or {}).get("np_rates")
+    np_view, is_bull = _std_slice_np(np_rates, date, rates)
+    is_daily = rates[-1]["date"].hour == 0 and rates[-1]["date"].minute == 0
+    r_t1, r_t1d, ext_set, ext_day = _std_rate_dicts(rates, is_bull, is_daily, np_view)
+    trace["market_state"] = {
+        "is_daily": is_daily,
+        "is_bull": is_bull,
+        "np_view_used": np_view is not None,
+        "np_cut": None if np_view is None else int(np_view["cut"]),
+        "last_rate": rates[-1],
+    }
+
+    _get_event = get_event_fn or _std_get_event
+    result: dict[str, float] = {}
+    window_sec = shift_window * 86400
+    effective_dataset = dataset
+    slice_info = {"used": False}
+    if get_event_fn is None and dataset_index:
+        full_dataset = dataset_index.get("full_dataset")
+        dataset_ts = dataset_index.get("dataset_timestamps")
+        if full_dataset is not None and dataset_ts is not None and len(dataset_ts) == len(full_dataset):
+            date_ts = int(date.timestamp())
+            left = int(np.searchsorted(dataset_ts, date_ts - window_sec, side="left"))
+            right = int(np.searchsorted(dataset_ts, date_ts, side="right"))
+            effective_dataset = _list_view(full_dataset, left, right)
+            slice_info = {"used": True, "left": left, "right": right, "count": right-left}
+    trace["dataset_slice"] = slice_info
+
+    for row in effective_dataset:
+        counters["rows_seen"] += 1
+        event_trace = {"row_index": counters["rows_seen"] - 1}
+        parsed = _get_event(row)
+        if parsed is None:
+            counters["parse_failed"] += 1
+            event_trace["decision"] = "skip_parse_failed"
+            if len(trace["events"]) < max_events:
+                event_trace["row"] = row
+                trace["events"].append(event_trace)
+            continue
+        event_time, pct, event_type = parsed
+        event_trace.update({"event_time": event_time, "pct_change": pct, "event_type": event_type})
+
+        lookup = reverse.get(str(event_type).strip().lower())
+        if lookup is None:
+            counters["context_missing"] += 1
+            event_trace["decision"] = "skip_context_missing"
+            if len(trace["events"]) < max_events:
+                trace["events"].append(event_trace)
+            continue
+        ctx_id, ctx_info = lookup
+        occ = int(ctx_info.get("occurrence_count") or 0)
+        event_trace.update({"ctx_id": ctx_id, "occurrence_count": occ})
+
+        diff_sec = (date - event_time).total_seconds()
+        event_trace["diff_seconds"] = diff_sec
+        if diff_sec < 0 or diff_sec > window_sec:
+            counters["outside_window"] += 1
+            event_trace["decision"] = "skip_outside_window"
+            if len(trace["events"]) < max_events:
+                trace["events"].append(event_trace)
+            continue
+
+        shift = int(diff_sec // 86400)
+        event_trace["shift"] = shift
+        if occ < min_occurrence and shift != 0:
+            counters["low_occurrence"] += 1
+            event_trace["decision"] = "skip_low_occurrence"
+            if len(trace["events"]) < max_events:
+                trace["events"].append(event_trace)
+            continue
+
+        t_date = (event_time + timedelta(days=shift)).replace(hour=0, minute=0, second=0, microsecond=0)
+        event_trace["target_candle_date"] = t_date
+        if t_date > date:
+            counters["target_after_control"] += 1
+            event_trace["decision"] = "skip_target_after_control"
+            if len(trace["events"]) < max_events:
+                trace["events"].append(event_trace)
+            continue
+
+        t1, ext_hit = _std_candle(t_date, np_view, is_daily, r_t1, r_t1d, ext_set, ext_day)
+        event_trace.update({"t1": t1, "extremum_hit": ext_hit})
+        if t1 == 0.0 and not ext_hit:
+            counters["candle_missing"] += 1
+
+        direction = 1.0 if pct > 0 else -1.0
+        signed_t1 = t1 * direction
+        weighted_t1 = apply_var_fn(signed_t1, pct, var, ctx_info)
+        event_trace.update({
+            "direction": direction,
+            "signed_t1": signed_t1,
+            "weighted_t1": weighted_t1,
+            "ctx_info": ctx_info,
+        })
+        if weighted_t1 == 0.0:
+            counters["weighted_zero"] += 1
+
+        if signal_fn is not None:
+            contribution = signal_fn(type, ctx_id, shift, weighted_t1, ext_hit, pct, occ, direction, ctx_info)
+            if contribution is None:
+                contribution = _std_signal(type, ctx_id, shift, weighted_t1, ext_hit, pct, occ, direction)
+        else:
+            contribution = _std_signal(type, ctx_id, shift, weighted_t1, ext_hit, pct, occ, direction)
+        event_trace["contribution"] = contribution
+        if not contribution:
+            counters["contribution_empty"] += 1
+            event_trace["decision"] = "no_contribution"
+        else:
+            counters["accepted"] += 1
+            event_trace["decision"] = "accepted"
+            for wc, val in contribution.items():
+                if val != 0.0:
+                    result[wc] = result.get(wc, 0.0) + val
+        if len(trace["events"]) < max_events:
+            trace["events"].append(event_trace)
+
+    trace["events_truncated"] = max(0, counters["rows_seen"] - len(trace["events"]))
+    trace["result"] = {k: v for k, v in result.items() if v != 0.0}
+    trace["result_count"] = len(trace["result"])
+    trace["result_sum"] = float(sum(trace["result"].values())) if trace["result"] else 0.0
+    return trace
 
 
 def run_standard_model(
@@ -3575,6 +3757,379 @@ def build_app(model_module) -> FastAPI:
                          ", ".join(f"{k}: {v}" for k, v in list(unmatched.items())[:10]) +
                          ("..." if len(unmatched) > 10 else "") + ".")
         return lines
+
+    # ── /debug/trace ──────────────────────────────────────────────────────────
+
+    def _debug_jsonable(value, depth: int = 0):
+        """Безопасно преобразует datetime/numpy/list_view в JSON-совместимый вид."""
+        if depth > 12:
+            return "<max-depth>"
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, datetime):
+            return value.strftime("%Y-%m-%d %H:%M:%S.%f")
+        if isinstance(value, dict):
+            return {str(k): _debug_jsonable(v, depth + 1) for k, v in value.items()}
+        if isinstance(value, (list, tuple, set)):
+            return [_debug_jsonable(v, depth + 1) for v in value]
+        try:
+            if hasattr(value, "item"):
+                return _debug_jsonable(value.item(), depth + 1)
+        except Exception:
+            pass
+        try:
+            if hasattr(value, "tolist"):
+                return _debug_jsonable(value.tolist(), depth + 1)
+        except Exception:
+            pass
+        try:
+            return [_debug_jsonable(v, depth + 1) for v in value]
+        except Exception:
+            return repr(value)
+
+    def _debug_rate_row(np_r, idx: int):
+        if np_r is None or idx < 0:
+            return None
+        dates = np_r.get("dates_ns")
+        if dates is None or idx >= len(dates):
+            return None
+        row = {"index": idx, "timestamp": int(dates[idx])}
+        try:
+            row["datetime_local"] = datetime.fromtimestamp(int(dates[idx]))
+            row["datetime_utc"] = datetime.utcfromtimestamp(int(dates[idx]))
+        except Exception:
+            pass
+        for key in ("open", "close", "t1", "min", "max", "ranges", "ext_min", "ext_max"):
+            arr = np_r.get(key)
+            if arr is not None and idx < len(arr):
+                row[key] = arr[idx]
+        return row
+
+    def _debug_snapshot_local(value, depth: int = 0):
+        """Компактный снимок локальной переменной без изменения объекта."""
+        if depth > 4:
+            return "<max-depth>"
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, datetime):
+            return value.strftime("%Y-%m-%d %H:%M:%S.%f")
+        if isinstance(value, dict):
+            items = list(value.items())
+            return {
+                "type": "dict",
+                "len": len(value),
+                "sample": {str(k): _debug_snapshot_local(v, depth + 1) for k, v in items[:20]},
+                "truncated": len(items) > 20,
+            }
+        if isinstance(value, (list, tuple, set)):
+            seq = list(value)
+            return {
+                "type": type(value).__name__,
+                "len": len(seq),
+                "sample": [_debug_snapshot_local(v, depth + 1) for v in seq[:20]],
+                "truncated": len(seq) > 20,
+            }
+        if isinstance(value, np.ndarray):
+            flat = value.reshape(-1) if value.size else value
+            return {
+                "type": "ndarray",
+                "shape": list(value.shape),
+                "dtype": str(value.dtype),
+                "size": int(value.size),
+                "sample": _debug_jsonable(flat[:20].tolist() if value.size else []),
+            }
+        try:
+            if hasattr(value, "__len__") and not isinstance(value, (str, bytes)):
+                return {"type": type(value).__name__, "len": len(value), "repr": repr(value)[:500]}
+        except Exception:
+            pass
+        return {"type": type(value).__name__, "repr": repr(value)[:1000]}
+
+    def _debug_trace_callable(fn, kwargs: dict, max_steps: int = 5000):
+        """Универсально трассирует любой model() построчно через sys.settrace()."""
+        target_code = getattr(fn, "__code__", None)
+        target_file = os.path.abspath(getattr(target_code, "co_filename", "")) if target_code else ""
+        steps = []
+        previous = {}
+        truncated = False
+
+        def tracer(frame, event, arg):
+            nonlocal truncated, previous
+            frame_file = os.path.abspath(frame.f_code.co_filename)
+            if target_file and frame_file != target_file:
+                return tracer
+            if len(steps) >= max_steps:
+                truncated = True
+                return None
+            if event not in ("call", "line", "return", "exception"):
+                return tracer
+
+            current = {k: _debug_snapshot_local(v) for k, v in frame.f_locals.items() if not k.startswith("__")}
+            changed = {k: v for k, v in current.items() if previous.get(k) != v}
+            removed = [k for k in previous if k not in current]
+            previous = current
+
+            source = ""
+            try:
+                import linecache
+                source = linecache.getline(frame.f_code.co_filename, frame.f_lineno).strip()
+            except Exception:
+                pass
+
+            item = {
+                "step": len(steps) + 1,
+                "event": event,
+                "function": frame.f_code.co_name,
+                "file": frame.f_code.co_filename,
+                "line": frame.f_lineno,
+                "source": source,
+                "locals_changed": changed,
+                "locals_removed": removed,
+            }
+            if event == "return":
+                item["return_value"] = _debug_snapshot_local(arg)
+            elif event == "exception":
+                try:
+                    exc_type, exc_value, _ = arg
+                    item["exception"] = f"{exc_type.__name__}: {exc_value}"
+                except Exception:
+                    item["exception"] = repr(arg)
+            steps.append(item)
+            return tracer
+
+        old_trace = sys.gettrace()
+        started_at = datetime.now()
+        try:
+            sys.settrace(tracer)
+            result = fn(**kwargs)
+            return {
+                "status": "ok",
+                "target_file": target_file,
+                "target_function": getattr(fn, "__name__", repr(fn)),
+                "steps": steps,
+                "steps_count": len(steps),
+                "truncated": truncated,
+                "max_steps": max_steps,
+                "duration_ms": round((datetime.now() - started_at).total_seconds() * 1000, 3),
+                "return_value": _debug_snapshot_local(result),
+                "raw_result": result,
+            }
+        except Exception as exc:
+            return {
+                "status": "error",
+                "target_file": target_file,
+                "target_function": getattr(fn, "__name__", repr(fn)),
+                "steps": steps,
+                "steps_count": len(steps),
+                "truncated": truncated,
+                "max_steps": max_steps,
+                "duration_ms": round((datetime.now() - started_at).total_seconds() * 1000, 3),
+                "error": f"{exc.__class__.__name__}: {exc}",
+                "traceback": traceback.format_exc(),
+            }
+        finally:
+            sys.settrace(old_trace)
+
+    @app.get("/debug/trace")
+    async def ep_debug_trace(
+        pair: int = Query(1),
+        day: int = Query(1),
+        date: str = Query(...),
+        type: int = Query(0),
+        var: int = Query(0),
+        param: str = Query(""),
+        refresh: int = Query(1, ge=0, le=1),
+        max_events: int = Query(1000, ge=1, le=20000),
+    ):
+        """Полный путь одного расчёта без values-cache и без записи результата."""
+        started = datetime.now()
+        target_date = _parse_date(date)
+        if target_date is None:
+            return err_response(f"Не удалось разобрать дату: {date}")
+
+        table = _rates_table(pair, day)
+        report = {
+            "status": "ok",
+            "warning": "Отладочный маршрут выполняет model() напрямую, обходит values-cache и ничего не записывает.",
+            "request": {
+                "pair": pair, "day": day, "date_raw": date,
+                "target_date": target_date, "type": type, "var": var,
+                "param": param, "refresh": bool(refresh),
+                "max_trace_steps": max_events,
+            },
+            "routing": {
+                "selected_rates_table": table,
+                "service_port": s.PORT,
+                "service_name": s.NODE_NAME,
+                "cache_writer": s.cache_writer,
+                "use_ml_values": s.USE_ML_VALUES,
+                "model_uses_rate_history": s.model_uses_rate_history,
+                "model_can_filter_dataset_by_date": s.model_can_filter_dataset_by_date,
+                "filter_dataset_by_date": s.FILTER_DATASET_BY_DATE,
+            },
+            "stages": [],
+        }
+
+        try:
+            ram_before = s.rates.get(table) or {}
+            global_before = s.global_rates.get(table) or []
+            np_before = s.np_rates.get(table)
+            before_last = max(ram_before.keys()) if ram_before else None
+            report["stages"].append({
+                "stage": "rates_before_refresh",
+                "ram_t1_count": len(ram_before),
+                "global_rates_count": len(global_before),
+                "ram_first": min(ram_before.keys()) if ram_before else None,
+                "ram_last": before_last,
+                "global_first": global_before[0] if global_before else None,
+                "global_last": global_before[-1] if global_before else None,
+                "np_count": 0 if np_before is None or np_before.get("dates_ns") is None else len(np_before["dates_ns"]),
+                "np_first": _debug_rate_row(np_before, 0),
+                "np_last": _debug_rate_row(np_before, (len(np_before["dates_ns"]) - 1) if np_before is not None and np_before.get("dates_ns") is not None else -1),
+                "last_refresh_at": s.last_rates_refresh.get(table),
+            })
+
+            if refresh:
+                await _refresh_rates(table, s)
+
+            ram = s.rates.get(table) or {}
+            global_rows = s.global_rates.get(table) or []
+            np_r = s.np_rates.get(table)
+            dates_ns = None if np_r is None else np_r.get("dates_ns")
+            target_ts_local = int(target_date.timestamp())
+            target_ts_utc = int(target_date.replace(tzinfo=timezone.utc).timestamp())
+            idx_left_local = None
+            idx_right_local = None
+            nearby = []
+            if dates_ns is not None:
+                idx_left_local = int(np.searchsorted(dates_ns, target_ts_local, side="left"))
+                idx_right_local = int(np.searchsorted(dates_ns, target_ts_local, side="right"))
+                for idx in range(max(0, idx_left_local - 3), min(len(dates_ns), idx_left_local + 4)):
+                    nearby.append(_debug_rate_row(np_r, idx))
+
+            report["stages"].append({
+                "stage": "rates_after_refresh_and_target_lookup",
+                "ram_t1_count": len(ram),
+                "global_rates_count": len(global_rows),
+                "ram_first": min(ram.keys()) if ram else None,
+                "ram_last": max(ram.keys()) if ram else None,
+                "global_first": global_rows[0] if global_rows else None,
+                "global_last": global_rows[-1] if global_rows else None,
+                "np_count": 0 if dates_ns is None else len(dates_ns),
+                "target_timestamp_local": target_ts_local,
+                "target_timestamp_utc": target_ts_utc,
+                "local_minus_utc_seconds": target_ts_local - target_ts_utc,
+                "search_left_local": idx_left_local,
+                "search_right_local": idx_right_local,
+                "exact_local_match": bool(
+                    dates_ns is not None and idx_left_local is not None and
+                    idx_left_local < len(dates_ns) and int(dates_ns[idx_left_local]) == target_ts_local
+                ),
+                "exact_utc_match": bool(
+                    dates_ns is not None and
+                    (lambda i: i < len(dates_ns) and int(dates_ns[i]) == target_ts_utc)(
+                        int(np.searchsorted(dates_ns, target_ts_utc, side="left"))
+                    )
+                ),
+                "nearby_np_rows": nearby,
+                "direct_ram_t1_for_target": ram.get(target_date),
+                "direct_global_rows_for_target": [r for r in global_rows if r.get("date") == target_date][:10],
+            })
+
+            if s.model_uses_rate_history:
+                rates_x = _filter_rates_lte(table, target_date, s)
+            else:
+                marker_dt = target_date.replace(hour=0, minute=0, second=0, microsecond=0) if day else target_date
+                rates_x = [{"date": marker_dt}]
+            dataset_x = s.dataset if s.model_can_filter_dataset_by_date else _filter_dataset_lte(target_date, s)
+            dataset_index_dict = None
+            if s.model_needs_index:
+                dataset_index_dict = {
+                    "dates": s.dataset_dates,
+                    "by_key": s.dataset_by_key,
+                    "key_dates": s.dataset_key_dates,
+                    "key_field": s.dataset_key_field,
+                    "np_rates": np_r,
+                    "ctx_index": s.ctx_index,
+                    "url_map": s.url_map,
+                    "dataset_timestamps": getattr(s, "_dataset_ts_arr", None),
+                    "filter_dataset_by_date": bool(s.FILTER_DATASET_BY_DATE),
+                    "dataset_cutoff_ts": float(target_date.timestamp()),
+                    "is_daily": bool(day),
+                    "rates_table": table,
+                    "execution_scope": "debug_trace",
+                    "full_dataset": s.dataset,
+                }
+
+            report["stages"].append({
+                "stage": "model_inputs",
+                "rates_count": len(rates_x),
+                "rates_first": rates_x[0] if rates_x else None,
+                "rates_last": rates_x[-1] if rates_x else None,
+                "dataset_count": len(dataset_x),
+                "dataset_first": dataset_x[0] if dataset_x else None,
+                "dataset_last": dataset_x[-1] if dataset_x else None,
+                "dataset_dates_count": len(s.dataset_dates),
+                "dataset_index_key_field": s.dataset_key_field,
+                "dataset_index_keys_count": len(s.dataset_by_key),
+                "dataset_timestamp_count": 0 if getattr(s, "_dataset_ts_arr", None) is None else len(s._dataset_ts_arr),
+                "context_count": len(s.ctx_index),
+                "contexts": list(s.ctx_index.values()),
+                "url_map_count": len(s.url_map),
+            })
+
+            model_kwargs = {
+                "rates": rates_x,
+                "dataset": dataset_x,
+                "date": target_date,
+                "type": type,
+                "var": var,
+                "param": param,
+                "dataset_index": dataset_index_dict,
+            }
+            generic_trace = _debug_trace_callable(
+                s.model_fn,
+                model_kwargs,
+                max_steps=max_events,
+            )
+            report["model_logic_trace"] = {
+                k: v for k, v in generic_trace.items() if k not in ("raw_result",)
+            }
+            if generic_trace.get("status") != "ok":
+                raise RuntimeError(generic_trace.get("error") or "model trace failed")
+            raw_result = generic_trace.get("raw_result")
+            raw_payload, raw_details = _extract_detail(raw_result)
+            report["raw_model_result"] = {
+                "payload": raw_payload or {},
+                "payload_count": len(raw_payload or {}),
+                "payload_sum": float(sum((raw_payload or {}).values())) if raw_payload else 0.0,
+                "details": raw_details,
+            }
+
+            if s.USE_ML_VALUES:
+                report["ml_note"] = (
+                    "USE_ML_VALUES включён: /values после сырого model() запускает reverse learning. "
+                    "raw_model_result выше показывает результат до ML."
+                )
+                try:
+                    final_result = await _call_model(pair, day, date, calc_type=type, calc_var=var, param=param, _skip_refresh=True)
+                    report["final_call_model_result"] = {
+                        "payload": final_result or {},
+                        "payload_count": len(final_result or {}),
+                        "payload_sum": float(sum((final_result or {}).values())) if final_result else 0.0,
+                    }
+                except Exception as exc:
+                    report["final_call_model_error"] = f"{exc.__class__.__name__}: {exc}"
+            else:
+                report["final_call_model_result"] = report["raw_model_result"]
+
+        except Exception as exc:
+            report["status"] = "error"
+            report["error"] = f"{exc.__class__.__name__}: {exc}"
+            report["traceback"] = traceback.format_exc()
+
+        report["duration_ms"] = round((datetime.now() - started).total_seconds() * 1000, 3)
+        return _debug_jsonable(report)
 
     # ── /values ───────────────────────────────────────────────────────────────
 
