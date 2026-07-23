@@ -238,7 +238,7 @@ def model(
         t_date = t_date.replace(hour=0, minute=0, second=0, microsecond=0)
         if is_daily:
             t_date = t_date.replace(hour=0, minute=0, second=0, microsecond=0)
-        if t_date > date:
+        if t_date >= date:
             continue
 
         if np_view is not None:
