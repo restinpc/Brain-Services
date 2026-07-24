@@ -45,7 +45,7 @@ from sqlalchemy import text
 SERVICE_ID = 71
 PORT = 8933
 NODE_NAME = "brain-vlad_astro_hypothesis_lab-s71"
-SERVICE_TEXT = "Astrology strategy model: 6 selected EUR/BTC/ETH hypotheses"
+SERVICE_TEXT = "Astrology hypothesis laboratory: 144 causal type/var strategies"
 DEVELOPER_EMAIL = "vladyurjevitch@yandex.ru"
 
 PARSER_TABLE = "vlad_astro_hour_features"
@@ -166,10 +166,9 @@ VAR_DESCRIPTIONS = {
     11: "competitive L1 normalization of strongest features",
 }
 
-# Fixed deployment/research slots.  The public model interface keeps the
-# framework's ``type``/``var`` arguments, but only type 0..3 with var=0 are
-# valid.  This prevents accidental duplication of the same strategy across
-# multiple matrix cells.
+# Selected research strategies retained for compatibility with historical
+# experiments. The public model interface below supports the full 12 × 12
+# type/var matrix and does not restrict framework slots.
 STRATEGY_DESCRIPTIONS = {
     0: "EUR/USD Day: T7 × V8 — lunar cycle features, change over 24 market bars",
     1: "EUR/USD Day: T9 × V9 — multi-body geometry, second derivative",
@@ -2018,18 +2017,59 @@ def model(
     param: str = "",
     dataset_index: Optional[dict] = None,
 ) -> dict[str, float]:
-    strategy_id, slot_var = int(type), int(var)
-    if strategy_id not in STRATEGY_DESCRIPTIONS or slot_var != 0:
+    """Return one causal prediction for any valid type/var slot.
+
+    The fast path reuses the same incremental trajectory as ``batch_model``.
+    A bounded prediction cache makes the eleven subsequent var calls for the
+    same type/date effectively free. If an old date was requested after the
+    trajectory had already advanced past it and that exact prediction was not
+    cached, we safely fall back to a one-off causal replay.
+    """
+    type_id, var_id = int(type), int(var)
+    if type_id not in TYPE_DESCRIPTIONS or var_id not in VAR_DESCRIPTIONS:
         return {}
-    if not _strategy_runtime_allowed(strategy_id, rates, dataset_index):
-        return {}
-    return _single_strategy_from_scratch(
+
+    rows, astro_dates, token = _prepare_runtime(dataset, dataset_index)
+    table = _rates_identity(rates, dataset_index)
+    cache_key = (table, token, type_id, var_id, date)
+    cached = _PREDICTION_LRU.get(cache_key)
+    if cached is not None:
+        _PREDICTION_LRU.move_to_end(cache_key)
+        return cached
+
+    ctx = _ctx_map(dataset_index)
+    step_hours = 24 if bool((dataset_index or {}).get("is_daily")) else 1
+    trajectory_key = (table, type_id, token)
+    trajectory = _TRAJECTORIES.get(trajectory_key)
+
+    # If the trajectory has not passed the requested date, process this type
+    # once and calculate all twelve vars together.
+    if trajectory is None or trajectory.last_date is None or date >= trajectory.last_date:
+        captured = _process_type_until(
+            rates=rates,
+            rows=rows,
+            dates=astro_dates,
+            dataset_token=token,
+            rates_table=table,
+            type_id=type_id,
+            target_dates={date},
+            max_target=date,
+            step_hours=step_hours,
+            ctx_by_feature=ctx,
+        )
+        return captured.get(var_id, {}).get(date, {})
+
+    # Rare out-of-order request that was not retained by the bounded cache.
+    result = _single_from_scratch(
         rates=rates,
         dataset=dataset,
         date=date,
-        strategy_id=strategy_id,
+        type_id=type_id,
+        var_id=var_id,
         dataset_index=dataset_index,
     )
+    _remember_prediction(cache_key, result)
+    return result
 
 
 def batch_model(
@@ -2041,39 +2081,52 @@ def batch_model(
     param: str = "",
     dataset_index: Optional[dict] = None,
 ) -> dict[datetime, dict[str, float]]:
-    strategy_id, slot_var = int(type), int(var)
+    """Calculate a batch using one incremental pass per type.
+
+    During that pass all 12 variants are evaluated and cached. Consequently,
+    framework calls for var=1..11 reuse results produced by the first call
+    instead of replaying the full market history twelve times.
+    """
+    type_id, var_id = int(type), int(var)
     if (
         not dates
-        or strategy_id not in STRATEGY_DESCRIPTIONS
-        or slot_var != 0
-        or not _strategy_runtime_allowed(strategy_id, rates, dataset_index)
+        or type_id not in TYPE_DESCRIPTIONS
+        or var_id not in VAR_DESCRIPTIONS
     ):
         return {dt: {} for dt in dates}
 
     rows, astro_dates, token = _prepare_runtime(dataset, dataset_index)
     ctx = _ctx_map(dataset_index)
     table = _rates_identity(rates, dataset_index)
-    step_hours = 24 if _is_daily_runtime(dataset_index) else 1
-    batch_key = (table, token, strategy_id, tuple(dates))
-    cached = _STRATEGY_BATCH_CACHE.get(batch_key)
+    step_hours = 24 if bool((dataset_index or {}).get("is_daily")) else 1
+
+    # Keep the batch key independent of var: one calculation of a type fills
+    # predictions for every var slot.
+    normalized_dates = tuple(sorted(set(dates)))
+    batch_key = (table, token, type_id, normalized_dates)
+    cached = _TYPE_BATCH_CACHE.get(batch_key)
     if cached is None:
-        cached = _process_strategy_until(
+        cached = _process_type_until(
             rates=rates,
             rows=rows,
             dates=astro_dates,
             dataset_token=token,
             rates_table=table,
-            strategy_id=strategy_id,
-            target_dates=set(dates),
-            max_target=max(dates),
+            type_id=type_id,
+            target_dates=set(normalized_dates),
+            max_target=max(normalized_dates),
             step_hours=step_hours,
             ctx_by_feature=ctx,
         )
-        _STRATEGY_BATCH_CACHE[batch_key] = cached
-        _STRATEGY_BATCH_CACHE.move_to_end(batch_key)
-        while len(_STRATEGY_BATCH_CACHE) > _STRATEGY_BATCH_CACHE_MAX:
-            _STRATEGY_BATCH_CACHE.popitem(last=False)
-    return {dt: cached.get(dt, {}) for dt in dates}
+        _TYPE_BATCH_CACHE[batch_key] = cached
+        _TYPE_BATCH_CACHE.move_to_end(batch_key)
+        while len(_TYPE_BATCH_CACHE) > _TYPE_BATCH_CACHE_MAX:
+            _TYPE_BATCH_CACHE.popitem(last=False)
+    else:
+        _TYPE_BATCH_CACHE.move_to_end(batch_key)
+
+    var_results = cached.get(var_id, {})
+    return {dt: var_results.get(dt, {}) for dt in dates}
 
 
 # -----------------------------------------------------------------------------
