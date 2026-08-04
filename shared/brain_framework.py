@@ -7,6 +7,11 @@ brain_framework.py v20.1 — безопасное развёртывание fus
           состояния дня (midnight / bull / bear), с автоматической проверкой.
   AUTO-5: объединённые bulk INSERT и однократная сериализация одинаковых результатов.
 
+Исправление v20.3:
+  DAILY-CAUSAL: отдельная функция сохраняет строгую причинность H1,
+                а для D1 при точном совпадении использует последнюю
+                завершённую дневную свечу D-1 вместо пустого результата.
+
 Критическое исправление v20.1:
   SAFE-STATE: модели с глобальным хронологическим состоянием автоматически
               считаются строго последовательно; fill/pretest/live разделены по scope.
@@ -440,7 +445,8 @@ def _run_standard_model_multi_slots(
         t_date = (event_time + timedelta(days=shift)).replace(
             hour=0, minute=0, second=0, microsecond=0
         )
-        if t_date >= date:
+        t_date = _resolve_causal_t_date(t_date, date, is_daily)
+        if t_date is None:
             continue
 
         t1, ext_hit = _std_candle(
@@ -464,6 +470,29 @@ def _run_standard_model_multi_slots(
         slot: {k: v for k, v in out.items() if v != 0.0}
         for slot, out in outputs.items()
     }
+
+
+def _resolve_causal_t_date(
+    t_date: datetime,
+    target_date: datetime,
+    is_daily: bool,
+) -> datetime | None:
+    """Resolve the candle date without using target/future T1.
+
+    Hourly calculations keep the strict rule: only candles earlier than the
+    target are allowed. Daily standard models historically align an event to
+    midnight of the target day; after the strict ``>=`` fix that made every
+    daily result empty. For that exact daily equality only, use the last fully
+    completed daily candle (D-1). A genuinely future date is always rejected.
+    """
+    if t_date < target_date:
+        return t_date
+    if is_daily and t_date == target_date:
+        previous_day = (target_date - timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        return previous_day if previous_day < target_date else None
+    return None
 
 
 def _standard_dataset_is_midnight(dataset) -> bool:
@@ -582,7 +611,8 @@ def run_standard_model(
         t_date = (event_time + timedelta(days=shift)).replace(
             hour=0, minute=0, second=0, microsecond=0
         )
-        if t_date >= date:
+        t_date = _resolve_causal_t_date(t_date, date, is_daily)
+        if t_date is None:
             continue
 
         t1, ext_hit = _std_candle(t_date, np_view, is_daily, r_t1, r_t1d, ext_set, ext_day)
