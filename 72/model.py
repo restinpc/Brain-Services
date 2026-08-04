@@ -188,11 +188,11 @@ def _rates_view(rates: list[dict], target: datetime, dataset_index: dict | None)
     np_rates = (dataset_index or {}).get("np_rates")
     if np_rates is not None and len(np_rates.get("dates_ns", [])):
         dates_ns = np_rates["dates_ns"]
-        cut = int(np.searchsorted(dates_ns, int(target.timestamp()), side="right"))
+        cut = int(np.searchsorted(dates_ns, int(target.timestamp()), side="left"))
         if cut <= 0:
             return None
         ranges = np_rates["ranges"][:cut]
-        all_ranges = np_rates["ranges"]
+        all_ranges = np_rates["ranges"][:cut]
         return {
             "dates_ns": dates_ns[:cut],
             "t1": np_rates["t1"][:cut],
