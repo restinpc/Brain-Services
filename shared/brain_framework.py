@@ -400,7 +400,7 @@ def _run_standard_model_multi_slots(
 
     np_rates = (dataset_index or {}).get("np_rates")
     np_view, is_bull = _std_slice_np(np_rates, date, rates)
-    is_daily = rates[-1]["date"].hour == 0 and rates[-1]["date"].minute == 0
+    is_daily = _execution_is_daily(rates, dataset_index)
     r_t1, r_t1d, ext_set, ext_day = _std_rate_dicts(
         rates, is_bull, is_daily, np_view
     )
@@ -445,7 +445,9 @@ def _run_standard_model_multi_slots(
         t_date = (event_time + timedelta(days=shift)).replace(
             hour=0, minute=0, second=0, microsecond=0
         )
-        t_date = _resolve_causal_t_date(t_date, date, is_daily)
+        t_date = _resolve_causal_t_date(
+            t_date, date, is_daily, np_view=np_view, rates=rates
+        )
         if t_date is None:
             continue
 
@@ -472,48 +474,72 @@ def _run_standard_model_multi_slots(
     }
 
 
+def _execution_is_daily(rates, dataset_index: dict | None = None) -> bool:
+    """Resolve timeframe from the explicit execution contract first.
+
+    Timestamp heuristics are only a backward-compatible fallback because some
+    daily tables may store candles at a non-midnight hour.
+    """
+    di = dataset_index or {}
+    if "is_daily" in di:
+        return bool(di.get("is_daily"))
+    rates_table = str(di.get("rates_table") or "")
+    if rates_table:
+        return rates_table.endswith("_day")
+    if not rates:
+        return False
+    last_dt = rates[-1].get("date")
+    return bool(
+        isinstance(last_dt, datetime)
+        and last_dt.hour == 0
+        and last_dt.minute == 0
+    )
+
+
+def _latest_completed_rate_date(
+    target_date: datetime,
+    *,
+    np_view=None,
+    rates=None,
+) -> datetime | None:
+    """Return the latest actually available candle strictly before target."""
+    if np_view is not None:
+        dn = np_view.get("dates_ns")
+        cut = int(np_view.get("cut") or 0)
+        if dn is not None and cut > 0:
+            ts = int(dn[cut - 1])
+            dt = datetime.fromtimestamp(ts)
+            if dt < target_date:
+                return dt
+    if rates:
+        for row in reversed(rates):
+            dt = row.get("date")
+            if isinstance(dt, datetime) and dt < target_date:
+                return dt
+    return None
+
+
 def _resolve_causal_t_date(
     t_date: datetime,
     target_date: datetime,
     is_daily: bool,
+    *,
+    np_view=None,
+    rates=None,
 ) -> datetime | None:
-    """Resolve the candle date without using target/future T1.
+    """Resolve the candle that is causally available at ``target_date``.
 
-    Hourly calculations keep the strict rule: only candles earlier than the
-    target are allowed. Daily standard models historically align an event to
-    midnight of the target day; after the strict ``>=`` fix that made every
-    daily result empty. For that exact daily equality only, use the last fully
-    completed daily candle (D-1). A genuinely future date is always rejected.
+    H1 keeps the historical behavior and rejects target/future candles.
+    D1 maps a target-day candidate to the latest real completed daily candle,
+    which also handles weekends and gaps instead of assuming calendar D-1.
     """
     if t_date < target_date:
         return t_date
-    if is_daily and t_date == target_date:
-        previous_day = (target_date - timedelta(days=1)).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
-        return previous_day if previous_day < target_date else None
-    return None
-
-
-def _standard_dataset_is_midnight(dataset) -> bool:
-    """True when every parseable standard enriched event is at midnight."""
-    if not dataset:
-        return False
-    seen = False
-    for row in dataset:
-        parsed = _std_get_event(row)
-        if parsed is None:
-            continue
-        seen = True
-        event_time = parsed[0]
-        if (
-            event_time.hour != 0
-            or event_time.minute != 0
-            or event_time.second != 0
-            or event_time.microsecond != 0
-        ):
-            return False
-    return seen
+    if not is_daily:
+        return None
+    return _latest_completed_rate_date(
+        target_date, np_view=np_view, rates=rates
+    )
 
 
 def run_standard_model(
@@ -567,7 +593,7 @@ def run_standard_model(
 
     np_rates = (dataset_index or {}).get("np_rates")
     np_view, is_bull = _std_slice_np(np_rates, date, rates)
-    is_daily = rates[-1]["date"].hour == 0 and rates[-1]["date"].minute == 0
+    is_daily = _execution_is_daily(rates, dataset_index)
     r_t1, r_t1d, ext_set, ext_day = _std_rate_dicts(rates, is_bull, is_daily, np_view)
 
     _get_event = get_event_fn or _std_get_event
@@ -611,7 +637,9 @@ def run_standard_model(
         t_date = (event_time + timedelta(days=shift)).replace(
             hour=0, minute=0, second=0, microsecond=0
         )
-        t_date = _resolve_causal_t_date(t_date, date, is_daily)
+        t_date = _resolve_causal_t_date(
+            t_date, date, is_daily, np_view=np_view, rates=rates
+        )
         if t_date is None:
             continue
 
@@ -679,13 +707,22 @@ def _std_get_event(row: dict) -> Optional[tuple]:
 
 
 def _std_slice_np(np_rates, date, rates):
-    is_bull = float(rates[-1].get("close") or 0) > float(rates[-1].get("open") or 0)
+    # The target candle is not completed at prediction time.  Both its T1 and
+    # its OHLC direction are therefore excluded with side="left".
+    completed_rate = None
+    for row in reversed(rates or []):
+        row_dt = row.get("date")
+        if isinstance(row_dt, datetime) and row_dt < date:
+            completed_rate = row
+            break
+    source = completed_rate or (rates[-1] if rates else {})
+    is_bull = float(source.get("close") or 0) > float(source.get("open") or 0)
     if np_rates is None:
         return None, is_bull
     dn = np_rates.get("dates_ns")
     if dn is None:
         return None, is_bull
-    cut = int(np.searchsorted(dn, int(date.timestamp()), side="right"))
+    cut = int(np.searchsorted(dn, int(date.timestamp()), side="left"))
     if cut > 0:
         is_bull = float(np_rates["close"][cut - 1]) > float(np_rates["open"][cut - 1])
     return {
@@ -1881,6 +1918,53 @@ def build_app(model_module) -> FastAPI:
     s.reverse_store = rl.ReverseStore(s.engine_vlad, port=s.PORT)
 
     # ── _call_model ───────────────────────────────────────────────────────────
+
+    async def _call_raw_model(pair, day, date_str, calc_type=0, calc_var=0, param="",
+                              _skip_refresh: bool = False):
+        """Execute model.py directly, bypassing values cache and ML universe."""
+        if s.cache_writer is False:
+            raise RuntimeError("Direct model() is disabled on child node")
+        target_date = _parse_date(date_str)
+        if not target_date:
+            return None
+        table = _rates_table(pair, day)
+        if not _skip_refresh:
+            await _refresh_rates(table, s)
+        np_r = s.np_rates.get(table)
+        rates_x = (
+            _filter_rates_lte(table, target_date, s)
+            if s.model_uses_rate_history
+            else [{"date": target_date.replace(hour=0, minute=0, second=0, microsecond=0) if day else target_date}]
+        )
+        dataset_x = (
+            s.dataset if s.model_can_filter_dataset_by_date
+            else _filter_dataset_lte(target_date, s)
+        )
+        dataset_index_dict = None
+        if s.model_needs_index:
+            dataset_index_dict = {
+                "dates": s.dataset_dates,
+                "by_key": s.dataset_by_key,
+                "key_dates": s.dataset_key_dates,
+                "key_field": s.dataset_key_field,
+                "np_rates": np_r,
+                "ctx_index": s.ctx_index,
+                "url_map": s.url_map,
+                "dataset_timestamps": getattr(s, "_dataset_ts_arr", None),
+                "filter_dataset_by_date": bool(s.FILTER_DATASET_BY_DATE),
+                "dataset_cutoff_ts": float(target_date.timestamp()),
+                "is_daily": bool(day),
+                "rates_table": table,
+                "execution_scope": "diagnostic_raw",
+                "full_dataset": s.dataset,
+            }
+        result = s.model_fn(
+            rates=rates_x, dataset=dataset_x, date=target_date,
+            type=calc_type, var=calc_var, param=param,
+            dataset_index=dataset_index_dict,
+        )
+        result, _ = _extract_detail(result)
+        return result or {}
 
     async def _call_model(pair, day, date_str, calc_type=0, calc_var=0, param="",
                           _skip_refresh: bool = False):
@@ -3783,7 +3867,7 @@ def build_app(model_module) -> FastAPI:
     ) -> dict:
         table = _rates_table(pair, day)
         date_str = target.strftime("%Y-%m-%d %H:%M:%S")
-        baseline = await _call_model(
+        baseline = await _call_raw_model(
             pair, day, date_str, calc_type=calc_type, calc_var=calc_var,
             param=param, _skip_refresh=True,
         )
@@ -3795,7 +3879,7 @@ def build_app(model_module) -> FastAPI:
         future_mutated = None
         try:
             _diag_write_slots(target_slots, 987654321.0)
-            target_mutated = await _call_model(
+            target_mutated = await _call_raw_model(
                 pair, day, date_str, calc_type=calc_type, calc_var=calc_var,
                 param=param, _skip_refresh=True,
             )
@@ -3804,7 +3888,7 @@ def build_app(model_module) -> FastAPI:
 
         try:
             _diag_write_slots(future_slots, -987654321.0)
-            future_mutated = await _call_model(
+            future_mutated = await _call_raw_model(
                 pair, day, date_str, calc_type=calc_type, calc_var=calc_var,
                 param=param, _skip_refresh=True,
             )
@@ -3847,6 +3931,7 @@ def build_app(model_module) -> FastAPI:
         dataset_first, dataset_last = _diag_dataset_date_bounds()
         payload: dict[str, object] = {
             "service_id": s.SERVICE_ID,
+            "framework_diagnostics_version": "20.4-causal-daily-raw",
             "service": s.NODE_NAME,
             "pair": pair,
             "type": type,
@@ -3875,7 +3960,7 @@ def build_app(model_module) -> FastAPI:
                 for target in targets:
                     date_str = target.strftime("%Y-%m-%d %H:%M:%S")
                     try:
-                        result = await _call_model(
+                        result = await _call_raw_model(
                             pair, day_flag, date_str,
                             calc_type=type, calc_var=var, param=param,
                             _skip_refresh=True,
@@ -3920,6 +4005,7 @@ def build_app(model_module) -> FastAPI:
 
         report = {
             "service_id": s.SERVICE_ID,
+            "framework_diagnostics_version": "20.4-causal-daily-raw",
             "service": s.NODE_NAME,
             "pair": pair,
             "type": type,
