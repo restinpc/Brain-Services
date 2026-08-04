@@ -2503,7 +2503,7 @@ def build_app(model_module) -> FastAPI:
                 #   1) midnight-vs-non-midnight (legacy is_daily semantics),
                 #   2) current candle bull/bear (selects max/min extrema),
                 # while all enriched events are fixed at midnight.
-                np_cut = int(np.searchsorted(dn, int(td.timestamp()), side="right"))
+                np_cut = int(np.searchsorted(dn, int(td.timestamp()), side="left"))
                 if np_cut <= 0:
                     key = ("empty", td)
                 else:
