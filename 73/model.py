@@ -178,9 +178,11 @@ def model(
         _dates_ns     = _np["dates_ns"]
         _t1_arr       = _np["t1"]
         _rng_arr      = _np["ranges"]
-        avg_range     = float(_np["avg_range"])
-        _cut          = int(_np_mod.searchsorted(_dates_ns, _dt_to_ts(date), side="right"))
+        avg_range     = 0.0  # recomputed from completed prefix below
+        _cut          = int(_np_mod.searchsorted(_dates_ns, _dt_to_ts(date), side="left"))
         _dates_ns_cut = _dates_ns[:_cut]
+        _ranges_cut   = _np["ranges"][:_cut]
+        avg_range     = float(_np_mod.mean(_ranges_cut)) if len(_ranges_cut) else 0.0
         _t1_cut       = _t1_arr[:_cut]
         _rng_cut      = _rng_arr[:_cut]
         _ext_max_cut  = _np["ext_max"][:_cut]
