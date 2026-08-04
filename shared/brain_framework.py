@@ -474,6 +474,28 @@ def _run_standard_model_multi_slots(
     }
 
 
+
+def _standard_dataset_is_midnight(dataset) -> bool:
+    """Return True only when every dataset row has an exact midnight date.
+
+    This is a conservative optimisation gate for the standard fused H1 fill.
+    Unknown row shapes, missing dates, or any non-midnight timestamp disable
+    grouping and force the exact generic semantics instead.
+    """
+    if not dataset:
+        return False
+
+    for row in dataset:
+        if not isinstance(row, dict):
+            return False
+        dt = row.get("date")
+        if not isinstance(dt, datetime):
+            return False
+        if (dt.hour or dt.minute or dt.second or dt.microsecond):
+            return False
+
+    return True
+
 def _execution_is_daily(rates, dataset_index: dict | None = None) -> bool:
     """Resolve timeframe from the explicit execution contract first.
 
