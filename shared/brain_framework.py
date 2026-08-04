@@ -3636,6 +3636,302 @@ def build_app(model_module) -> FastAPI:
                 result[date_str] = {}
         return result
 
+    # ── Диагностика live-расчёта и утечки будущего ────────────────────────────
+
+    _diagnostic_lock = asyncio.Lock()
+
+    def _diag_dataset_date_bounds() -> tuple[datetime | None, datetime | None]:
+        """Best-effort bounds for the loaded dataset, without model-specific SQL."""
+        values: list[datetime] = []
+        for row in s.dataset:
+            if not isinstance(row, dict):
+                continue
+            raw = (
+                row.get("event_time") or row.get("date_dt") or row.get("date")
+                or row.get("event_date") or row.get("published_at")
+            )
+            if isinstance(raw, datetime):
+                values.append(raw)
+            elif isinstance(raw, str):
+                parsed = _parse_date(raw)
+                if parsed is not None:
+                    values.append(parsed)
+        if not values:
+            return None, None
+        return min(values), max(values)
+
+    async def _diag_db_last_rate(table: str) -> datetime | None:
+        try:
+            async with s.engine_brain.connect() as conn:
+                row = (await conn.execute(text(
+                    f"SELECT MAX(`date`) FROM `{table}`"
+                ))).fetchone()
+            return row[0] if row and isinstance(row[0], datetime) else None
+        except Exception:
+            return None
+
+    def _diag_result_summary(result: dict | None) -> dict:
+        payload = result if isinstance(result, dict) else {}
+        numeric = [float(v) for v in payload.values()
+                   if isinstance(v, (int, float)) and not isinstance(v, bool)]
+        return {
+            "keys": len(payload),
+            "sum": round(sum(numeric), 10) if numeric else 0.0,
+            "min": min(numeric) if numeric else None,
+            "max": max(numeric) if numeric else None,
+            "nonzero": sum(1 for v in numeric if v != 0.0),
+        }
+
+    def _diag_compare(a: dict | None, b: dict | None, tol: float = 1e-12) -> dict:
+        left = a if isinstance(a, dict) else {}
+        right = b if isinstance(b, dict) else {}
+        keys = sorted(set(left) | set(right))
+        changed: list[dict] = []
+        max_abs_delta = 0.0
+        for key in keys:
+            av = left.get(key)
+            bv = right.get(key)
+            if isinstance(av, (int, float)) and isinstance(bv, (int, float)):
+                delta = abs(float(av) - float(bv))
+                max_abs_delta = max(max_abs_delta, delta)
+                if delta > tol:
+                    changed.append({"key": key, "before": av, "after": bv,
+                                    "abs_delta": delta})
+            elif av != bv:
+                changed.append({"key": key, "before": av, "after": bv,
+                                "abs_delta": None})
+        return {
+            "equal": not changed,
+            "changed_count": len(changed),
+            "max_abs_delta": max_abs_delta,
+            "changed_preview": changed[:20],
+        }
+
+    def _diag_t1_slot(table: str, target: datetime):
+        """Return mutable T1 locations for one exact candle and their originals."""
+        slots: list[tuple[str, object, object, object]] = []
+        rates_map = s.rates.get(table) or {}
+        if target in rates_map:
+            slots.append(("dict", rates_map, target, rates_map[target]))
+
+        np_r = s.np_rates.get(table)
+        if np_r is not None and np_r.get("dates_ns") is not None:
+            dates_ns = np_r["dates_ns"]
+            idx = int(np.searchsorted(dates_ns, int(target.timestamp()), side="left"))
+            if idx < len(dates_ns) and int(dates_ns[idx]) == int(target.timestamp()):
+                slots.append(("np", np_r["t1"], idx, float(np_r["t1"][idx])))
+        return slots
+
+    def _diag_future_t1_slots(table: str, target: datetime, limit: int = 256):
+        slots: list[tuple[str, object, object, object]] = []
+        rates_map = s.rates.get(table) or {}
+        for dt in sorted((d for d in rates_map if d > target))[:limit]:
+            slots.append(("dict", rates_map, dt, rates_map[dt]))
+
+        np_r = s.np_rates.get(table)
+        if np_r is not None and np_r.get("dates_ns") is not None:
+            dates_ns = np_r["dates_ns"]
+            start = int(np.searchsorted(dates_ns, int(target.timestamp()), side="right"))
+            end = min(len(dates_ns), start + limit)
+            for idx in range(start, end):
+                slots.append(("np", np_r["t1"], idx, float(np_r["t1"][idx])))
+        return slots
+
+    def _diag_write_slots(slots, seed: float) -> None:
+        for pos, (_, owner, key, old) in enumerate(slots):
+            # Deliberately extreme, deterministic values. They are restored in finally.
+            value = seed + pos * 17.0
+            owner[key] = value
+
+    def _diag_restore_slots(slots) -> None:
+        for _, owner, key, old in slots:
+            owner[key] = old
+
+    async def _diag_future_leak_one(
+        pair: int, day: int, target: datetime,
+        calc_type: int, calc_var: int, param: str,
+    ) -> dict:
+        table = _rates_table(pair, day)
+        date_str = target.strftime("%Y-%m-%d %H:%M:%S")
+        baseline = await _call_model(
+            pair, day, date_str, calc_type=calc_type, calc_var=calc_var,
+            param=param, _skip_refresh=True,
+        )
+
+        target_slots = _diag_t1_slot(table, target)
+        future_slots = _diag_future_t1_slots(table, target)
+
+        target_mutated = None
+        future_mutated = None
+        try:
+            _diag_write_slots(target_slots, 987654321.0)
+            target_mutated = await _call_model(
+                pair, day, date_str, calc_type=calc_type, calc_var=calc_var,
+                param=param, _skip_refresh=True,
+            )
+        finally:
+            _diag_restore_slots(target_slots)
+
+        try:
+            _diag_write_slots(future_slots, -987654321.0)
+            future_mutated = await _call_model(
+                pair, day, date_str, calc_type=calc_type, calc_var=calc_var,
+                param=param, _skip_refresh=True,
+            )
+        finally:
+            _diag_restore_slots(future_slots)
+
+        target_cmp = _diag_compare(baseline, target_mutated)
+        future_cmp = _diag_compare(baseline, future_mutated)
+        passed = target_cmp["equal"] and future_cmp["equal"]
+        return {
+            "date": date_str,
+            "table": table,
+            "baseline": _diag_result_summary(baseline),
+            "target_t1_locations": len(target_slots),
+            "future_t1_locations": len(future_slots),
+            "target_t1_mutation": target_cmp,
+            "future_t1_mutation": future_cmp,
+            "status": "PASS" if passed else "FAIL",
+            "meaning": (
+                "Результат не зависит от T1 целевой и будущих свечей."
+                if passed else
+                "Результат изменился после подмены недоступного T1: возможен просмотр в будущее."
+            ),
+        }
+
+    @app.get("/diagnostics/timeframes")
+    async def ep_diagnostics_timeframes(
+        pair: int = Query(1),
+        type: int = Query(0),
+        var: int = Query(0),
+        param: str = Query(""),
+        samples: int = Query(3, ge=1, le=24),
+    ):
+        """Direct live diagnostics for both H1 and D1, bypassing values-cache."""
+        if pair not in _INSTRUMENTS:
+            return err_response("Допустимые pair: 1, 3, 4")
+        if not s.cache_writer:
+            return err_response("Диагностика прямого model() разрешена только на Brain 1")
+
+        dataset_first, dataset_last = _diag_dataset_date_bounds()
+        payload: dict[str, object] = {
+            "service_id": s.SERVICE_ID,
+            "service": s.NODE_NAME,
+            "pair": pair,
+            "type": type,
+            "var": var,
+            "param": param,
+            "dataset": {
+                "rows": len(s.dataset),
+                "first": dataset_first.isoformat(sep=" ") if dataset_first else None,
+                "last": dataset_last.isoformat(sep=" ") if dataset_last else None,
+                "ctx_index": len(s.ctx_index),
+                "weights": len(s.weight_codes),
+                "last_reload": s.last_reload.isoformat() if s.last_reload else None,
+            },
+            "frames": {},
+        }
+
+        async with _diagnostic_lock:
+            for day_flag, frame_name in ((0, "hour"), (1, "day")):
+                table = _rates_table(pair, day_flag)
+                await _refresh_rates(table, s)
+                rows = s.global_rates.get(table, [])
+                ram_last = rows[-1]["date"] if rows else None
+                db_last = await _diag_db_last_rate(table)
+                targets = [r["date"] for r in rows[-samples:]] if rows else []
+                checks = []
+                for target in targets:
+                    date_str = target.strftime("%Y-%m-%d %H:%M:%S")
+                    try:
+                        result = await _call_model(
+                            pair, day_flag, date_str,
+                            calc_type=type, calc_var=var, param=param,
+                            _skip_refresh=True,
+                        )
+                        summary = _diag_result_summary(result)
+                        summary.update({
+                            "date": date_str,
+                            "status": "OK" if summary["keys"] else "EMPTY",
+                        })
+                    except Exception as exc:
+                        summary = {
+                            "date": date_str, "status": "ERROR",
+                            "error": f"{exc.__class__.__name__}: {exc}",
+                        }
+                    checks.append(summary)
+
+                payload["frames"][frame_name] = {
+                    "day_flag": day_flag,
+                    "table": table,
+                    "ram_rows": len(rows),
+                    "ram_last": ram_last.isoformat(sep=" ") if ram_last else None,
+                    "db_last": db_last.isoformat(sep=" ") if db_last else None,
+                    "ram_matches_db": bool(ram_last and db_last and ram_last == db_last),
+                    "checks": checks,
+                    "empty_is_not_automatically_error": True,
+                }
+        return ok_response(payload)
+
+    @app.get("/diagnostics/future_leak")
+    async def ep_diagnostics_future_leak(
+        pair: int = Query(1),
+        type: int = Query(0),
+        var: int = Query(0),
+        param: str = Query(""),
+        samples: int = Query(3, ge=1, le=12),
+    ):
+        """Mutation test for target/future T1 on both hourly and daily frames."""
+        if pair not in _INSTRUMENTS:
+            return err_response("Допустимые pair: 1, 3, 4")
+        if not s.cache_writer:
+            return err_response("Диагностика прямого model() разрешена только на Brain 1")
+
+        report = {
+            "service_id": s.SERVICE_ID,
+            "service": s.NODE_NAME,
+            "pair": pair,
+            "type": type,
+            "var": var,
+            "param": param,
+            "frames": {},
+            "warning": (
+                "Endpoint временно подменяет T1 только под внутренним lock и всегда "
+                "восстанавливает значения. Не запускайте несколько процессов uvicorn "
+                "с общим портом во время проверки."
+            ),
+        }
+        overall = True
+        async with _diagnostic_lock:
+            for day_flag, frame_name in ((0, "hour"), (1, "day")):
+                table = _rates_table(pair, day_flag)
+                await _refresh_rates(table, s)
+                rows = s.global_rates.get(table, [])
+                targets = [r["date"] for r in rows[-samples:]] if rows else []
+                tests = []
+                for target in targets:
+                    try:
+                        item = await _diag_future_leak_one(
+                            pair, day_flag, target, type, var, param,
+                        )
+                    except Exception as exc:
+                        item = {
+                            "date": target.strftime("%Y-%m-%d %H:%M:%S"),
+                            "status": "ERROR",
+                            "error": f"{exc.__class__.__name__}: {exc}",
+                        }
+                    if item.get("status") != "PASS":
+                        overall = False
+                    tests.append(item)
+                report["frames"][frame_name] = {
+                    "day_flag": day_flag,
+                    "table": table,
+                    "tests": tests,
+                }
+        report["status"] = "PASS" if overall else "FAIL"
+        return ok_response(report)
+
     # ── fill_cache ────────────────────────────────────────────────────────────
 
     async def _start_fill(pairs_str: str, days_str: str,
