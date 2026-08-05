@@ -1,5 +1,5 @@
 """
-brain_framework.py v20.1 — безопасное развёртывание fused fill_cache.
+brain_framework.py v20.4 — безопасное развёртывание fused fill_cache.
 
 Оптимизации v20 над v19:
   AUTO-3: один проход по событиям сразу для всех type/var.
@@ -7,10 +7,10 @@ brain_framework.py v20.1 — безопасное развёртывание fus
           состояния дня (midnight / bull / bear), с автоматической проверкой.
   AUTO-5: объединённые bulk INSERT и однократная сериализация одинаковых результатов.
 
-Исправление v20.3:
-  DAILY-CAUSAL: отдельная функция сохраняет строгую причинность H1,
-                а для D1 при точном совпадении использует последнюю
-                завершённую дневную свечу D-1 вместо пустого результата.
+Исправление v20.4:
+  DAILY-CAUSAL-GAPS: D1 использует последнюю реально существующую завершённую
+                     свечу строго раньше target date, включая выходные и разрывы.
+  DAILY-CAUSAL: единая логика применяется и в одиночном, и в fused расчёте.
 
 Критическое исправление v20.1:
   SAFE-STATE: модели с глобальным хронологическим состоянием автоматически
@@ -528,6 +528,8 @@ def _latest_completed_rate_date(
     if np_view is not None:
         dn = np_view.get("dates_ns")
         cut = int(np_view.get("cut") or 0)
+        if dn is not None:
+            cut = min(max(cut, 0), len(dn))
         if dn is not None and cut > 0:
             ts = int(dn[cut - 1])
             dt = datetime.fromtimestamp(ts)
