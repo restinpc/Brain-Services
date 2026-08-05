@@ -1,5 +1,18 @@
 """
-brain_framework.py v20.4 — безопасное развёртывание fused fill_cache.
+brain_framework.py v21.0 — refactor исходного event/outcome алгоритма.
+
+
+Рефакторинг v21.0:
+  EVENT-OUTCOME-CONTRACT: stored_t1 сохранён как исторический outcome следующего
+  интервала; close-open больше не подменяет T1.
+  CAUSAL-OUTCOME: исторический outcome используется только после полного закрытия
+  соответствующего часа/дня к моменту target_date.
+  CURRENT-vs-ANALOG: отдельно выбираются текущие события и их исторические аналоги.
+  SHIFT-SEMANTICS: outcome исторического аналога сдвигается так же, как событие
+  относительно целевой даты.
+  SINGLE-CORE: одиночный и fused multi-slot пути используют одну реализацию.
+  NO-SILENT-FALLBACK: при отсутствии stored_t1 framework возвращает пустой outcome,
+  а не синтезирует другое значение.
 
 Оптимизации v20 над v19:
   AUTO-3: один проход по событиям сразу для всех type/var.
@@ -7,10 +20,10 @@ brain_framework.py v20.4 — безопасное развёртывание fus
           состояния дня (midnight / bull / bear), с автоматической проверкой.
   AUTO-5: объединённые bulk INSERT и однократная сериализация одинаковых результатов.
 
-Исправление v20.4:
-  DAILY-CAUSAL-GAPS: D1 использует последнюю реально существующую завершённую
-                     свечу строго раньше target date, включая выходные и разрывы.
-  DAILY-CAUSAL: единая логика применяется и в одиночном, и в fused расчёте.
+Исправление v20.3:
+  DAILY-CAUSAL: отдельная функция сохраняет строгую причинность H1,
+                а для D1 при точном совпадении использует последнюю
+                завершённую дневную свечу D-1 вместо пустого результата.
 
 Критическое исправление v20.1:
   SAFE-STATE: модели с глобальным хронологическим состоянием автоматически
@@ -228,6 +241,7 @@ def _build_np_rates_for_table(rates, candle_ranges, extremums, global_rates_list
     sorted_dates = sorted(rates.keys())
     n            = len(sorted_dates)
     dates_ns     = np.array([_dt_to_ts(d) for d in sorted_dates], dtype=np.int64)
+    t1_arr       = np.array([rates.get(d, 0.0) for d in sorted_dates], dtype=np.float64)
     ranges_arr   = np.array([candle_ranges.get(d, 0.0) for d in sorted_dates], dtype=np.float64)
     ext_min_set  = extremums.get("min", set())
     ext_max_set  = extremums.get("max", set())
@@ -243,16 +257,7 @@ def _build_np_rates_for_table(rates, candle_ranges, extremums, global_rates_list
                               for d in sorted_dates], dtype=np.float64)
         min_arr   = np.array([float(_gr_map[d]["min"])   if d in _gr_map else 0.0
                               for d in sorted_dates], dtype=np.float64)
-
-        # IMPORTANT: rates.t1 в Brain Server — отдельная целевая величина.
-        # По реальным таблицам она может соответствовать следующей свече и
-        # поэтому не является причинно доступным признаком текущей свечи.
-        # Для стандартных моделей используем тело этой же завершённой свечи.
-        t1_arr = close_arr - open_arr
     else:
-        # Обратная совместимость для редкого режима без OHLC. В обычном
-        # build_app global_rates_list всегда передаётся.
-        t1_arr    = np.array([rates.get(d, 0.0) for d in sorted_dates], dtype=np.float64)
         close_arr = np.zeros(n, dtype=np.float64)
         open_arr  = np.zeros(n, dtype=np.float64)
         max_arr   = np.zeros(n, dtype=np.float64)
@@ -373,7 +378,495 @@ def _load_service_config(model_dir: str) -> dict:
     return {}
 
 
-# ── run_standard_model ────────────────────────────────────────────────────────
+# ── run_standard_model v21 ────────────────────────────────────────────────────
+#
+# Контракт исходного ТЗ
+# ---------------------
+# 1. ``stored_t1`` из brain_rates_* — исторический outcome следующего интервала.
+#    Он НЕ является телом текущей свечи и никогда не заменяется на close-open.
+# 2. Сначала выбираются события, актуальные для целевой даты:
+#      • нулевой интервал: все события;
+#      • смещённые интервалы: только редкие события.
+# 3. Для каждого актуального события выбираются аналогичные события того же типа,
+#    произошедшие строго раньше целевой даты.
+# 4. Для исторического аналога outcome берётся со сдвигом:
+#        outcome_time = analog_event_time + shift * timeframe
+#    где shift = target_time - current_event_time в часах либо днях.
+# 5. Outcome разрешён только если соответствующий прогнозный интервал полностью
+#    завершился к target_date. Это устраняет утечку будущего без изменения смысла T1.
+# 6. mode=0 суммирует historical stored_t1.
+# 7. mode=1 оценивает долю исторических аналогов, попавших в нужный экстремум,
+#    переводит вероятность из [0,1] в [-1,1] и задаёт торговое направление:
+#      • ожидаемый min  -> положительный вес;
+#      • ожидаемый max  -> отрицательный вес.
+#
+# Совместимость
+# -------------
+# • Публичная сигнатура run_standard_model сохранена.
+# • type=0: mode 0 + mode 1; type=1: только mode 0; type=2: только mode 1.
+# • apply_var_fn и signal_fn сохранены.
+# • Редкость события должна быть задана явно полем is_rare/rare,
+#   event_class/frequency_class либо rare_event_fn.
+# • Для старых context-таблиц допускается явный fallback:
+#       [model]
+#       rare_occurrence_max = 24
+#   Значение по умолчанию 0, чтобы framework не придумывал классификацию.
+# • Все вычислительные пути (single и fused multi-slot) используют один core.
+
+
+def _timeframe_delta(is_daily: bool) -> timedelta:
+    return timedelta(days=1) if is_daily else timedelta(hours=1)
+
+
+def _timeframe_seconds(is_daily: bool) -> int:
+    return 86400 if is_daily else 3600
+
+
+def _normalize_frame_date(dt: datetime, is_daily: bool) -> datetime:
+    if is_daily:
+        return dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    return dt.replace(minute=0, second=0, microsecond=0)
+
+
+def _signed_shift(
+    target_date: datetime,
+    current_event_time: datetime,
+    is_daily: bool,
+) -> int:
+    """Сдвиг weight-code из ТЗ.
+
+    Событие в прошлом  -> положительный shift.
+    Событие в будущем  -> отрицательный shift.
+    Событие в нулевом интервале -> 0.
+    """
+    seconds = (target_date - current_event_time).total_seconds()
+    unit = _timeframe_seconds(is_daily)
+    if seconds >= 0:
+        return int(seconds // unit)
+    return -int((-seconds) // unit)
+
+
+def _is_zero_interval_event(
+    event_time: datetime,
+    target_date: datetime,
+    is_daily: bool,
+) -> bool:
+    """Нулевой час/день: [target - timeframe, target)."""
+    delta = _timeframe_delta(is_daily)
+    return target_date - delta <= event_time < target_date
+
+
+def _ctx_is_rare(
+    ctx_info: dict,
+    occurrence_count: int,
+    *,
+    rare_occurrence_max: int,
+    rare_event_fn: Optional[Callable[[dict], bool]] = None,
+) -> bool:
+    """Явная семантика rare/frequent с контролируемым fallback."""
+    if rare_event_fn is not None:
+        return bool(rare_event_fn(ctx_info))
+
+    for key in ("is_rare", "rare"):
+        if key in ctx_info and ctx_info.get(key) is not None:
+            return bool(ctx_info.get(key))
+
+    value = str(
+        ctx_info.get("event_class")
+        or ctx_info.get("frequency_class")
+        or ctx_info.get("event_frequency")
+        or ""
+    ).strip().lower()
+    if value in ("rare", "редкое", "low", "sparse"):
+        return True
+    if value in ("frequent", "частое", "high", "dense"):
+        return False
+
+    return int(occurrence_count) <= int(rare_occurrence_max)
+
+
+def _dataset_event_index(
+    dataset,
+    dataset_index: dict | None,
+    get_event_fn: Callable[[dict], Optional[tuple]],
+) -> dict[str, list[tuple[datetime, float, dict]]]:
+    """Индекс всех исторических событий по event_type.
+
+    Кешируется в dataset_index только для стандартного parser-а. Пользовательский
+    get_event_fn может зависеть от внешнего состояния, поэтому для него кеш не
+    используется.
+    """
+    di = dataset_index or {}
+    use_cache = get_event_fn is _std_get_event
+    cached = di.get("_standard_events_by_type") if use_cache else None
+    if isinstance(cached, dict):
+        return cached
+
+    source = di.get("full_dataset") if di.get("full_dataset") is not None else dataset
+    result: dict[str, list[tuple[datetime, float, dict]]] = {}
+    for row in source or ():
+        parsed = get_event_fn(row)
+        if parsed is None:
+            continue
+        event_time, pct, event_type = parsed
+        key = str(event_type).strip().lower()
+        if not key:
+            continue
+        result.setdefault(key, []).append((event_time, float(pct), row))
+
+    for values in result.values():
+        values.sort(key=lambda item: item[0])
+
+    if use_cache:
+        di["_standard_events_by_type"] = result
+    return result
+
+
+def _select_current_events(
+    events_by_type: dict[str, list[tuple[datetime, float, dict]]],
+    target_date: datetime,
+    *,
+    is_daily: bool,
+    shift_window: int,
+    reverse: dict[str, tuple[int, dict]],
+    rare_occurrence_max: int,
+    rare_event_fn: Optional[Callable[[dict], bool]],
+) -> list[tuple[datetime, float, str, int, dict, int]]:
+    """Выбирает события, для которых надо сформировать weight-code."""
+    # Точное окно из исходного ТЗ:
+    #   H1: редкие события в пределах ±12 часов;
+    #   D1: редкие события в пределах ±1 дня.
+    # shift_window сохранён в сигнатуре для обратной совместимости, но не
+    # подменяет это бизнес-правило.
+    horizon = timedelta(days=1) if is_daily else timedelta(hours=12)
+    left = target_date - horizon
+    right = target_date + horizon
+    selected = []
+
+    for event_type, values in events_by_type.items():
+        lookup = reverse.get(event_type)
+        if lookup is None:
+            continue
+        ctx_id, ctx_info = lookup
+        occ = int(ctx_info.get("occurrence_count") or len(values))
+        rare = _ctx_is_rare(
+            ctx_info,
+            occ,
+            rare_occurrence_max=rare_occurrence_max,
+            rare_event_fn=rare_event_fn,
+        )
+
+        dates = [item[0] for item in values]
+        lo = bisect.bisect_left(dates, left)
+        hi = bisect.bisect_right(dates, right)
+
+        for event_time, pct, _row in values[lo:hi]:
+            if _is_zero_interval_event(event_time, target_date, is_daily):
+                shift = 0
+            else:
+                if not rare:
+                    continue
+                shift = _signed_shift(target_date, event_time, is_daily)
+
+            selected.append(
+                (event_time, pct, event_type, int(ctx_id), ctx_info, int(shift))
+            )
+
+    selected.sort(key=lambda item: (item[0], item[2], item[5]))
+    return selected
+
+
+def _np_rate_exact_index(np_rates, dt: datetime) -> int | None:
+    if np_rates is None:
+        return None
+    dates_ns = np_rates.get("dates_ns")
+    if dates_ns is None:
+        return None
+    ts = int(_normalize_frame_date(dt, False).timestamp())
+    idx = int(np.searchsorted(dates_ns, ts, side="left"))
+    if idx >= len(dates_ns) or int(dates_ns[idx]) != ts:
+        return None
+    return idx
+
+
+def _lookup_historical_outcome(
+    np_rates,
+    outcome_time: datetime,
+    target_date: datetime,
+    *,
+    is_daily: bool,
+) -> tuple[float | None, bool]:
+    """Возвращает stored_t1 и попадание в экстремум без future leak."""
+    frame_start = _normalize_frame_date(outcome_time, is_daily)
+    frame_end = frame_start + _timeframe_delta(is_daily)
+
+    # В момент target_date outcome уже обязан быть полностью известен.
+    if frame_end > target_date:
+        return None, False
+
+    if np_rates is None:
+        return None, False
+
+    dates_ns = np_rates.get("dates_ns")
+    if dates_ns is None:
+        return None, False
+
+    ts = int(frame_start.timestamp())
+    idx = int(np.searchsorted(dates_ns, ts, side="left"))
+    if idx >= len(dates_ns) or int(dates_ns[idx]) != ts:
+        return None, False
+
+    stored_t1 = float(np_rates["t1"][idx])
+    return stored_t1, bool(
+        np_rates.get("ext_max", np.zeros(0, dtype=bool))[idx]
+        or np_rates.get("ext_min", np.zeros(0, dtype=bool))[idx]
+    )
+
+
+def _previous_completed_candle_direction(
+    np_rates,
+    target_date: datetime,
+) -> tuple[bool, int | None]:
+    """True = предыдущая свеча бычья, значит прогнозируется max."""
+    if np_rates is None:
+        return False, None
+    dates_ns = np_rates.get("dates_ns")
+    if dates_ns is None or len(dates_ns) == 0:
+        return False, None
+
+    cut = int(np.searchsorted(
+        dates_ns, int(target_date.timestamp()), side="left"
+    ))
+    if cut <= 0:
+        return False, None
+    idx = cut - 1
+    is_bull = (
+        float(np_rates["close"][idx])
+        > float(np_rates["open"][idx])
+    )
+    return is_bull, idx
+
+
+def _historical_analogs(
+    values: list[tuple[datetime, float, dict]],
+    target_date: datetime,
+    current_event_time: datetime,
+) -> list[tuple[datetime, float, dict]]:
+    """Все аналоги строго раньше target_date, кроме самого текущего события."""
+    dates = [item[0] for item in values]
+    end = bisect.bisect_left(dates, target_date)
+    return [
+        item for item in values[:end]
+        if item[0] != current_event_time
+    ]
+
+
+def _aggregate_event_history(
+    *,
+    current_event_time: datetime,
+    current_pct: float,
+    event_type: str,
+    shift: int,
+    ctx_info: dict,
+    events_by_type: dict[str, list[tuple[datetime, float, dict]]],
+    np_rates,
+    target_date: datetime,
+    is_daily: bool,
+    var: int,
+    apply_var_fn: Callable[[float, float, int, dict], float],
+    min_occurrence: int,
+) -> tuple[float, float, int, int]:
+    """Считает mode=0 и mode=1 для одного актуального события."""
+    analogs = _historical_analogs(
+        events_by_type.get(event_type, []),
+        target_date,
+        current_event_time,
+    )
+
+    if len(analogs) < int(min_occurrence):
+        return 0.0, 0.0, 0, 0
+
+    # Направление extremum из предыдущей завершённой свечи target_date.
+    predict_max, _prev_idx = _previous_completed_candle_direction(
+        np_rates, target_date
+    )
+
+    t1_sum = 0.0
+    outcomes = 0
+    extremum_hits = 0
+
+    unit = _timeframe_delta(is_daily)
+    ext_array_name = "ext_max" if predict_max else "ext_min"
+
+    for analog_time, analog_pct, _row in analogs:
+        outcome_time = analog_time + (unit * int(shift))
+        frame_start = _normalize_frame_date(outcome_time, is_daily)
+        frame_end = frame_start + unit
+        if frame_end > target_date:
+            continue
+
+        dates_ns = np_rates.get("dates_ns") if np_rates is not None else None
+        if dates_ns is None:
+            continue
+        ts = int(frame_start.timestamp())
+        idx = int(np.searchsorted(dates_ns, ts, side="left"))
+        if idx >= len(dates_ns) or int(dates_ns[idx]) != ts:
+            continue
+
+        stored_t1 = float(np_rates["t1"][idx])
+        weighted = float(
+            apply_var_fn(stored_t1, analog_pct, var, ctx_info)
+        )
+        t1_sum += weighted
+        outcomes += 1
+
+        ext_arr = np_rates.get(ext_array_name)
+        if ext_arr is not None and bool(ext_arr[idx]):
+            extremum_hits += 1
+
+    if outcomes < int(min_occurrence):
+        return 0.0, 0.0, outcomes, extremum_hits
+
+    probability = extremum_hits / outcomes
+    extremum_score = (probability * 2.0) - 1.0
+    if predict_max:
+        extremum_score = -extremum_score
+
+    return t1_sum, extremum_score, outcomes, extremum_hits
+
+
+def _standard_contribution(
+    *,
+    calc_type: int,
+    ctx_id: int,
+    shift: int,
+    mode0_value: float,
+    mode1_value: float,
+) -> dict[str, float]:
+    result: dict[str, float] = {}
+    if calc_type in (0, 1) and mode0_value != 0.0:
+        result[f"{ctx_id}_0_{shift}"] = round(mode0_value, 6)
+    if calc_type in (0, 2) and mode1_value != 0.0:
+        result[f"{ctx_id}_1_{shift}"] = round(mode1_value, 6)
+    return result
+
+
+def _run_standard_model_core(
+    rates,
+    dataset,
+    date: datetime,
+    *,
+    slots: list[tuple[int, int]],
+    dataset_index: dict | None,
+    shift_window: int,
+    apply_var_fn: Callable[[float, float, int, dict], float],
+    min_occurrence: int,
+    get_event_fn: Optional[Callable[[dict], Optional[tuple]]],
+    signal_fn: Optional[Callable],
+    rare_event_fn: Optional[Callable[[dict], bool]],
+    rare_occurrence_max: int,
+) -> dict[tuple[int, int], dict[str, float]]:
+    slot_list = list(dict.fromkeys((int(t), int(v)) for t, v in slots))
+    outputs = {slot: {} for slot in slot_list}
+    if not dataset or not slot_list:
+        return outputs
+
+    di = dataset_index or {}
+    ctx_index = di.get("ctx_index") or {}
+    np_rates = di.get("np_rates")
+    if not ctx_index or np_rates is None:
+        return outputs
+
+    reverse: dict[str, tuple[int, dict]] = {
+        str(info.get("event_type") or "").strip().lower(): (
+            int(info["id"]), info
+        )
+        for info in ctx_index.values()
+        if info.get("id") and info.get("event_type")
+    }
+    if not reverse:
+        return outputs
+
+    is_daily = _execution_is_daily(rates, di)
+    parser = get_event_fn or _std_get_event
+    events_by_type = _dataset_event_index(dataset, di, parser)
+    current_events = _select_current_events(
+        events_by_type,
+        date,
+        is_daily=is_daily,
+        shift_window=shift_window,
+        reverse=reverse,
+        rare_occurrence_max=rare_occurrence_max,
+        rare_event_fn=rare_event_fn,
+    )
+
+    for (
+        current_event_time,
+        current_pct,
+        event_type,
+        ctx_id,
+        ctx_info,
+        shift,
+    ) in current_events:
+        for calc_type, var in slot_list:
+            mode0, mode1, outcomes, hits = _aggregate_event_history(
+                current_event_time=current_event_time,
+                current_pct=current_pct,
+                event_type=event_type,
+                shift=shift,
+                ctx_info=ctx_info,
+                events_by_type=events_by_type,
+                np_rates=np_rates,
+                target_date=date,
+                is_daily=is_daily,
+                var=var,
+                apply_var_fn=apply_var_fn,
+                min_occurrence=min_occurrence,
+            )
+
+            if signal_fn is not None:
+                direction = 1.0 if current_pct > 0 else -1.0
+                custom = signal_fn(
+                    calc_type,
+                    ctx_id,
+                    shift,
+                    mode0,
+                    bool(hits),
+                    current_pct,
+                    outcomes,
+                    direction,
+                    ctx_info,
+                )
+                contribution = (
+                    _standard_contribution(
+                        calc_type=calc_type,
+                        ctx_id=ctx_id,
+                        shift=shift,
+                        mode0_value=mode0,
+                        mode1_value=mode1,
+                    )
+                    if custom is None
+                    else custom
+                )
+            else:
+                contribution = _standard_contribution(
+                    calc_type=calc_type,
+                    ctx_id=ctx_id,
+                    shift=shift,
+                    mode0_value=mode0,
+                    mode1_value=mode1,
+                )
+
+            out = outputs[(calc_type, var)]
+            for code, value in contribution.items():
+                value = float(value)
+                if value != 0.0:
+                    out[code] = out.get(code, 0.0) + value
+
+    return {
+        slot: {k: v for k, v in result.items() if v != 0.0}
+        for slot, result in outputs.items()
+    }
 
 
 def _run_standard_model_multi_slots(
@@ -386,130 +879,43 @@ def _run_standard_model_multi_slots(
     shift_window: int,
     apply_var_fn: Callable[[float, float, int, dict], float],
     min_occurrence: int = 2,
+    rare_event_fn: Optional[Callable[[dict], bool]] = None,
+    rare_occurrence_max: int = 0,
 ) -> dict[tuple[int, int], dict[str, float]]:
-    """Compute many ``type/var`` combinations in one exact event pass."""
-    slot_list = list(dict.fromkeys((int(t), int(v)) for t, v in slots))
-    outputs: dict[tuple[int, int], dict[str, float]] = {
-        slot: {} for slot in slot_list
-    }
-    if not rates or not dataset or not slot_list:
-        return outputs
-
-    ctx_index = (dataset_index or {}).get("ctx_index") or {}
-    if not ctx_index:
-        return outputs
-    reverse: dict[str, tuple[int, dict]] = {
-        str(info.get("event_type") or "").strip().lower(): (int(info["id"]), info)
-        for _, info in ctx_index.items()
-        if info.get("id") and info.get("event_type")
-    }
-    if not reverse:
-        return outputs
-
-    np_rates = (dataset_index or {}).get("np_rates")
-    np_view, is_bull = _std_slice_np(np_rates, date, rates)
-    is_daily = _execution_is_daily(rates, dataset_index)
-    r_t1, r_t1d, ext_set, ext_day = _std_rate_dicts(
-        rates, is_bull, is_daily, np_view
+    """Fused-расчёт, использующий тот же core, что и одиночный вызов."""
+    return _run_standard_model_core(
+        rates,
+        dataset,
+        date,
+        slots=slots,
+        dataset_index=dataset_index,
+        shift_window=shift_window,
+        apply_var_fn=apply_var_fn,
+        min_occurrence=min_occurrence,
+        get_event_fn=None,
+        signal_fn=None,
+        rare_event_fn=rare_event_fn,
+        rare_occurrence_max=rare_occurrence_max,
     )
-
-    window_sec = int(shift_window) * 86400
-    effective_dataset = dataset
-    if dataset_index:
-        full_dataset = dataset_index.get("full_dataset")
-        dataset_ts = dataset_index.get("dataset_timestamps")
-        if (
-            full_dataset is not None
-            and dataset_ts is not None
-            and len(dataset_ts) == len(full_dataset)
-        ):
-            date_ts = int(date.timestamp())
-            left = int(np.searchsorted(dataset_ts, date_ts - window_sec, side="left"))
-            right = int(np.searchsorted(dataset_ts, date_ts, side="right"))
-            effective_dataset = _list_view(full_dataset, left, right)
-
-    vars_needed = sorted({v for _, v in slot_list})
-    types_by_var: dict[int, list[int]] = {}
-    for tp, vr in slot_list:
-        types_by_var.setdefault(vr, []).append(tp)
-
-    for row in effective_dataset:
-        parsed = _std_get_event(row)
-        if parsed is None:
-            continue
-        event_time, pct, event_type = parsed
-        lookup = reverse.get(event_type)
-        if lookup is None:
-            continue
-        ctx_id, ctx_info = lookup
-        occ = int(ctx_info.get("occurrence_count") or 0)
-
-        diff_sec = (date - event_time).total_seconds()
-        if diff_sec < 0 or diff_sec > window_sec:
-            continue
-        shift = int(diff_sec // 86400)
-        if occ < min_occurrence and shift != 0:
-            continue
-        t_date = (event_time + timedelta(days=shift)).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
-        t_date = _resolve_causal_t_date(
-            t_date, date, is_daily, np_view=np_view, rates=rates
-        )
-        if t_date is None:
-            continue
-
-        t1, ext_hit = _std_candle(
-            t_date, np_view, is_daily, r_t1, r_t1d, ext_set, ext_day
-        )
-        direction = 1.0 if pct > 0 else -1.0
-        signed_t1 = t1 * direction
-        for vr in vars_needed:
-            weighted_t1 = apply_var_fn(signed_t1, pct, vr, ctx_info)
-            for tp in types_by_var.get(vr, ()):
-                contribution = _std_signal(
-                    tp, ctx_id, shift, weighted_t1,
-                    ext_hit, pct, occ, direction,
-                )
-                out = outputs[(tp, vr)]
-                for wc, val in contribution.items():
-                    if val != 0.0:
-                        out[wc] = out.get(wc, 0.0) + val
-
-    return {
-        slot: {k: v for k, v in out.items() if v != 0.0}
-        for slot, out in outputs.items()
-    }
-
 
 
 def _standard_dataset_is_midnight(dataset) -> bool:
-    """Return True only when every dataset row has an exact midnight date.
-
-    This is a conservative optimisation gate for the standard fused H1 fill.
-    Unknown row shapes, missing dates, or any non-midnight timestamp disable
-    grouping and force the exact generic semantics instead.
-    """
+    """True, если все события датасета привязаны ровно к полуночи."""
     if not dataset:
         return False
-
     for row in dataset:
         if not isinstance(row, dict):
             return False
         dt = row.get("date")
         if not isinstance(dt, datetime):
             return False
-        if (dt.hour or dt.minute or dt.second or dt.microsecond):
+        if dt.hour or dt.minute or dt.second or dt.microsecond:
             return False
-
     return True
 
-def _execution_is_daily(rates, dataset_index: dict | None = None) -> bool:
-    """Resolve timeframe from the explicit execution contract first.
 
-    Timestamp heuristics are only a backward-compatible fallback because some
-    daily tables may store candles at a non-midnight hour.
-    """
+def _execution_is_daily(rates, dataset_index: dict | None = None) -> bool:
+    """Таймфрейм берётся из явного execution-контракта."""
     di = dataset_index or {}
     if "is_daily" in di:
         return bool(di.get("is_daily"))
@@ -526,54 +932,6 @@ def _execution_is_daily(rates, dataset_index: dict | None = None) -> bool:
     )
 
 
-def _latest_completed_rate_date(
-    target_date: datetime,
-    *,
-    np_view=None,
-    rates=None,
-) -> datetime | None:
-    """Return the latest actually available candle strictly before target."""
-    if np_view is not None:
-        dn = np_view.get("dates_ns")
-        cut = int(np_view.get("cut") or 0)
-        if dn is not None:
-            cut = min(max(cut, 0), len(dn))
-        if dn is not None and cut > 0:
-            ts = int(dn[cut - 1])
-            dt = datetime.fromtimestamp(ts)
-            if dt < target_date:
-                return dt
-    if rates:
-        for row in reversed(rates):
-            dt = row.get("date")
-            if isinstance(dt, datetime) and dt < target_date:
-                return dt
-    return None
-
-
-def _resolve_causal_t_date(
-    t_date: datetime,
-    target_date: datetime,
-    is_daily: bool,
-    *,
-    np_view=None,
-    rates=None,
-) -> datetime | None:
-    """Resolve the candle that is causally available at ``target_date``.
-
-    H1 keeps the historical behavior and rejects target/future candles.
-    D1 maps a target-day candidate to the latest real completed daily candle,
-    which also handles weekends and gaps instead of assuming calendar D-1.
-    """
-    if t_date < target_date:
-        return t_date
-    if not is_daily:
-        return None
-    return _latest_completed_rate_date(
-        target_date, np_view=np_view, rates=rates
-    )
-
-
 def run_standard_model(
     rates: list[dict],
     dataset: list[dict],
@@ -587,217 +945,107 @@ def run_standard_model(
     min_occurrence: int = 2,
     get_event_fn: Optional[Callable[[dict], Optional[tuple]]] = None,
     signal_fn: Optional[Callable] = None,
+    rare_event_fn: Optional[Callable[[dict], bool]] = None,
+    rare_occurrence_max: int | None = None,
 ) -> dict[str, float]:
+    """Реализация исходного алгоритма событий и исторических outcomes.
+
+    ``stored_t1`` читается только из ``dataset_index["np_rates"]["t1"]``.
+    Тело свечи ``close-open`` используется исключительно для определения
+    направления предыдущей завершённой свечи в mode=1.
     """
-    Универсальный движок модели. Вызывается из model() сервиса.
-
-    Параметры
-    ─────────
-    apply_var_fn(signed_t1, pct, var, ctx_info) → float
-        Специфична для сервиса. Как взвешивать T1.
-
-    signal_fn(type, ctx_id, shift, weighted_t1, ext_hit, pct, occ, direction, ctx_info)
-        → dict[str, float]  — свои weight_code для этого event
-        → {}                — пропустить событие
-        → None              — использовать встроенную логику (type 0/1/2)
-        Передавать только если нужны кастомные type (3, 4, 5...).
-        Для type 0/1/2 возвращать None — дублировать логику не нужно.
-
-    get_event_fn(row) → (event_time, pct, event_type) | None
-        Как парсить строку датасета.
-        Дефолт: читает готовые поля из enriched-таблицы (date_dt / event_time,
-        pct_change, event_type). Передавать только для нестандартных датасетов.
-    """
-    if not rates or not dataset:
-        return {}
-
-    ctx_index = (dataset_index or {}).get("ctx_index") or {}
-    if not ctx_index:
-        return {}
-
-    reverse: dict[str, tuple[int, dict]] = {
-        str(info.get("event_type") or "").strip().lower(): (int(info["id"]), info)
-        for _, info in ctx_index.items()
-        if info.get("id") and info.get("event_type")
-    }
-    if not reverse:
-        return {}
-
-    np_rates = (dataset_index or {}).get("np_rates")
-    np_view, is_bull = _std_slice_np(np_rates, date, rates)
-    is_daily = _execution_is_daily(rates, dataset_index)
-    r_t1, r_t1d, ext_set, ext_day = _std_rate_dicts(rates, is_bull, is_daily, np_view)
-
-    _get_event = get_event_fn or _std_get_event
-    result: dict[str, float] = {}
-    window_sec = shift_window * 86400
-
-    # All current services 62-70 use the default enriched-event format.  Their
-    # original loop discarded events outside [date-shift_window, date] anyway.
-    # When the framework index is available, select that exact equivalent window
-    # with two searchsorted calls instead of scanning the whole historical set.
-    effective_dataset = dataset
-    if get_event_fn is None and dataset_index:
-        full_dataset = dataset_index.get("full_dataset")
-        dataset_ts = dataset_index.get("dataset_timestamps")
-        if full_dataset is not None and dataset_ts is not None and len(dataset_ts) == len(full_dataset):
-            date_ts = int(date.timestamp())
-            left = int(np.searchsorted(dataset_ts, date_ts - window_sec, side="left"))
-            right = int(np.searchsorted(dataset_ts, date_ts, side="right"))
-            effective_dataset = _list_view(full_dataset, left, right)
-
-    for row in effective_dataset:
-        parsed = _get_event(row)
-        if parsed is None:
-            continue
-        event_time, pct, event_type = parsed
-
-        lookup = reverse.get(event_type)
-        if lookup is None:
-            continue
-        ctx_id, ctx_info = lookup
-        occ = int(ctx_info.get("occurrence_count") or 0)
-
-        diff_sec = (date - event_time).total_seconds()
-        if diff_sec < 0 or diff_sec > window_sec:
-            continue
-
-        shift = int(diff_sec // 86400)
-        if occ < min_occurrence and shift != 0:
-            continue
-
-        t_date = (event_time + timedelta(days=shift)).replace(
-            hour=0, minute=0, second=0, microsecond=0
+    if rare_occurrence_max is None:
+        model_cfg = get_service_config().get("model", {})
+        if not isinstance(model_cfg, dict):
+            model_cfg = {}
+        rare_occurrence_max = int(
+            model_cfg.get("rare_occurrence_max", 0)
         )
-        t_date = _resolve_causal_t_date(
-            t_date, date, is_daily, np_view=np_view, rates=rates
-        )
-        if t_date is None:
-            continue
 
-        t1, ext_hit = _std_candle(t_date, np_view, is_daily, r_t1, r_t1d, ext_set, ext_day)
-        direction   = 1.0 if pct > 0 else -1.0
-        weighted_t1 = apply_var_fn(t1 * direction, pct, var, ctx_info)
-
-        if signal_fn is not None:
-            contribution = signal_fn(
-                type, ctx_id, shift, weighted_t1,
-                ext_hit, pct, occ, direction, ctx_info,
-            )
-            if contribution is None:
-                contribution = _std_signal(
-                    type, ctx_id, shift, weighted_t1,
-                    ext_hit, pct, occ, direction,
-                )
-        else:
-            contribution = _std_signal(
-                type, ctx_id, shift, weighted_t1,
-                ext_hit, pct, occ, direction,
-            )
-
-        for wc, val in contribution.items():
-            if val != 0.0:
-                result[wc] = result.get(wc, 0.0) + val
-
-    return {k: v for k, v in result.items() if v != 0.0}
-
-
-def _std_signal(
-    type: int, ctx_id: int, shift: int,
-    weighted_t1: float, ext_hit: bool,
-    pct: float, occ: int, direction: float,
-) -> dict[str, float]:
-    """Встроенная логика типов 0 / 1 / 2."""
-    result: dict[str, float] = {}
-    if weighted_t1 != 0.0 and type in (0, 1):
-        result[f"{ctx_id}_0_{shift}"] = round(weighted_t1, 6)
-    if type in (0, 2) and occ > 0 and ext_hit:
-        ext = ((1.0 / occ) * 2 - 1) * direction
-        if ext != 0.0:
-            result[f"{ctx_id}_1_{shift}"] = round(ext, 6)
-    return result
+    result = _run_standard_model_core(
+        rates,
+        dataset,
+        date,
+        slots=[(int(type), int(var))],
+        dataset_index=dataset_index,
+        shift_window=int(shift_window),
+        apply_var_fn=apply_var_fn,
+        min_occurrence=int(min_occurrence),
+        get_event_fn=get_event_fn,
+        signal_fn=signal_fn,
+        rare_event_fn=rare_event_fn,
+        rare_occurrence_max=int(rare_occurrence_max),
+    )
+    return result.get((int(type), int(var)), {})
 
 
 def _std_get_event(row: dict) -> Optional[tuple]:
     """Парсит строку enriched-датасета."""
-    v = row.get("event_time") or row.get("date_dt")
-    if v is None:
+    value = row.get("event_time") or row.get("date_dt") or row.get("date")
+    if value is None:
         return None
-    if isinstance(v, str):
+    if isinstance(value, str):
+        parsed = None
         for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
             try:
-                v = datetime.strptime(v[:19], fmt)
+                parsed = datetime.strptime(value[:19], fmt)
                 break
             except ValueError:
-                pass
-        else:
+                continue
+        if parsed is None:
             return None
+        value = parsed
     try:
-        return v, float(row["pct_change"]), str(row["event_type"])
+        return (
+            value,
+            float(row.get("pct_change") or 0.0),
+            str(row["event_type"]).strip().lower(),
+        )
     except (KeyError, TypeError, ValueError):
         return None
 
 
+# Deprecated compatibility helpers. Они оставлены, чтобы внешние model.py,
+# которые импортировали приватные функции, не падали. Новый core их не использует.
+
 def _std_slice_np(np_rates, date, rates):
-    # The target candle is not completed at prediction time.  Both its T1 and
-    # its OHLC direction are therefore excluded with side="left".
-    completed_rate = None
-    for row in reversed(rates or []):
-        row_dt = row.get("date")
-        if isinstance(row_dt, datetime) and row_dt < date:
-            completed_rate = row
-            break
-    source = completed_rate or (rates[-1] if rates else {})
-    is_bull = float(source.get("close") or 0) > float(source.get("open") or 0)
-    if np_rates is None:
+    is_bull, cut_idx = _previous_completed_candle_direction(np_rates, date)
+    if np_rates is None or cut_idx is None:
         return None, is_bull
-    dn = np_rates.get("dates_ns")
-    if dn is None:
-        return None, is_bull
-    cut = int(np.searchsorted(dn, int(date.timestamp()), side="left"))
-    if cut > 0:
-        is_bull = float(np_rates["close"][cut - 1]) > float(np_rates["open"][cut - 1])
+    cut = cut_idx + 1
     return {
-        "dates_ns": dn[:cut],
-        "t1":       np_rates["t1"][:cut],
-        "ext":      (np_rates["ext_max"] if is_bull else np_rates["ext_min"])[:cut],
-        "cut":      cut,
+        "dates_ns": np_rates["dates_ns"][:cut],
+        "t1": np_rates["t1"][:cut],
+        "ext": (
+            np_rates["ext_max"] if is_bull else np_rates["ext_min"]
+        )[:cut],
+        "cut": cut,
     }, is_bull
 
 
 def _std_rate_dicts(rates, is_bull, is_daily, np_view):
+    """Запрещено синтезировать T1 через close-open.
+
+    Без np_rates stored_t1 недоступен, поэтому fallback возвращает пустые
+    outcome-структуры. Это лучше, чем молча менять экономический смысл модели.
+    """
     if np_view is not None:
         return {}, {}, set(), {}
-    t1   = {r["date"]: float((r.get("close") or 0) - (r.get("open") or 0)) for r in rates}
-    emax, emin = set(), set()
-    for i in range(1, len(rates) - 1):
-        h  = float(rates[i].get("max") or 0)
-        lo = float(rates[i].get("min") or 0)
-        if h  > float(rates[i-1].get("max") or 0) and h  > float(rates[i+1].get("max") or 0): emax.add(rates[i]["date"])
-        if lo < float(rates[i-1].get("min") or 0) and lo < float(rates[i+1].get("min") or 0): emin.add(rates[i]["date"])
-    ext  = emax if is_bull else emin
-    t1d  = {r["date"].date(): float((r.get("close") or 0) - (r.get("open") or 0)) for r in rates} if is_daily else {}
-    extd = {d.date(): True for d in ext} if is_daily else {}
-    return t1, t1d, ext, extd
+    return {}, {}, set(), {}
 
 
 def _std_candle(t_date, np_view, is_daily, r_t1, r_t1d, ext_set, ext_day):
-    if np_view is not None:
-        ts  = int(t_date.timestamp())
-        idx = int(np.searchsorted(np_view["dates_ns"], ts, side="left"))
-        if idx >= np_view["cut"] or int(np_view["dates_ns"][idx]) != ts:
-            if not is_daily:
-                return 0.0, False
-            l = int(np.searchsorted(np_view["dates_ns"], ts, side="left"))
-            r = int(np.searchsorted(np_view["dates_ns"], ts + 86400, side="left"))
-            if r <= l:
-                return 0.0, False
-            idx = r - 1
-        return float(np_view["t1"][idx]), bool(np_view["ext"][idx])
-    if is_daily:
-        dk = t_date.date()
-        return r_t1d.get(dk, 0.0), bool(ext_day.get(dk, False))
-    return r_t1.get(t_date, 0.0), t_date in ext_set
+    """Совместимый exact lookup. Не подменяет отсутствующий outcome."""
+    if np_view is None:
+        return 0.0, False
+    frame = _normalize_frame_date(t_date, is_daily)
+    ts = int(frame.timestamp())
+    idx = int(np.searchsorted(np_view["dates_ns"], ts, side="left"))
+    if idx >= len(np_view["dates_ns"]):
+        return 0.0, False
+    if int(np_view["dates_ns"][idx]) != ts:
+        return 0.0, False
+    return float(np_view["t1"][idx]), bool(np_view["ext"][idx])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1397,12 +1645,7 @@ async def _refresh_rates(table: str, s: _State):
                 })
                 s.global_rates_dates.setdefault(table, []).append(dt)
                 if s.np_built:
-                    # Не используем DB rates.t1 как входной признак: это
-                    # целевая величина и она может относиться к следующей свече.
-                    causal_candle_t1 = (
-                        float(r["close"] or 0.0) - float(r["open"] or 0.0)
-                    )
-                    _append_np_rates_row(table, dt, causal_candle_t1, rng, s,
+                    _append_np_rates_row(table, dt, t1, rng, s,
                                          close=float(r["close"] or 0),
                                          open_=float(r["open"]  or 0),
                                          max_=float(r["max"] or 0),
