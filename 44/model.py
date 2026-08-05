@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import bisect
 import os
+from collections import OrderedDict
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -137,6 +138,70 @@ WINDOW_MIN_HOUR = 2
 WINDOW_MAX_HOUR = 12
 WINDOW_MIN_DAY  = 2
 WINDOW_MAX_DAY  = 7
+
+# Bounded caches for fill_cache: framework repeatedly evaluates the same
+# target date with different type/var slots. The original implementation rebuilt
+# rate maps, extrema sets and scanned every URL for every shift on every call.
+_RATE_PREP_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
+_EVENT_INDEX_CACHE: "OrderedDict[tuple, dict]" = OrderedDict()
+_CACHE_LIMIT = 12
+
+def _cache_get(cache, key):
+    value = cache.get(key)
+    if value is not None:
+        cache.move_to_end(key)
+    return value
+
+def _cache_put(cache, key, value):
+    cache[key] = value
+    cache.move_to_end(key)
+    while len(cache) > _CACHE_LIMIT:
+        cache.popitem(last=False)
+
+def _rates_cache_key(rates):
+    first, last = rates[0], rates[-1]
+    return (len(rates), first.get("date"), last.get("date"),
+            float(first.get("close") or 0.0), float(last.get("close") or 0.0))
+
+def _prepare_rate_state(rates, np_r):
+    key = _rates_cache_key(rates)
+    cached = _cache_get(_RATE_PREP_CACHE, key)
+    if cached is not None:
+        return cached
+    t1_map, rng_map = build_rates_lookup(rates)
+    avg_range = extract_avg_range(np_r, rng_map)
+    ext_max_set, ext_min_set = build_ext_sets(np_r, t1_map)
+    value = (t1_map, rng_map, avg_range, ext_max_set, ext_min_set)
+    _cache_put(_RATE_PREP_CACHE, key, value)
+    return value
+
+def _prepare_event_index(dataset_index):
+    key_dates = dataset_index.get("key_dates", {})
+    by_key = dataset_index.get("by_key", {})
+    url_map = dataset_index.get("url_map", {})
+    total = sum(len(v) for v in key_dates.values())
+    cache_key = (id(key_dates), id(by_key), len(key_dates), total)
+    cached = _cache_get(_EVENT_INDEX_CACHE, cache_key)
+    if cached is not None:
+        return cached
+
+    timeline = sorted((dt, url) for url, dates in key_dates.items() for dt in dates)
+    timeline_dates = [x[0] for x in timeline]
+    metadata = {}
+    for url, rows in by_key.items():
+        if not rows:
+            continue
+        row0 = rows[0]
+        um = url_map.get(url)
+        event_id = um.get("event_id") if isinstance(um, dict) else um
+        currency = row0.get("currency_code")
+        importance = row0.get("importance") or "none"
+        fcd, scd, rcd = _compute_dirs(row0)
+        metadata[url] = (event_id, currency, importance, fcd, scd, rcd)
+
+    value = {"timeline": timeline, "dates": timeline_dates, "meta": metadata}
+    _cache_put(_EVENT_INDEX_CACHE, cache_key, value)
+    return value
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -499,10 +564,8 @@ def model(
     window  = get_adaptive_window(np_r, day_flag)
     weights = get_linear_weights(window)    # [N, N-1, ..., 1]
 
-    # ── Словари ставок / диапазонов / экстремумов ─────────────────────────────
-    t1_map, rng_map = build_rates_lookup(rates)
-    avg_range       = extract_avg_range(np_r, rng_map)
-    ext_max_set, ext_min_set = build_ext_sets(np_r, t1_map)
+    # ── Словари ставок / диапазонов / экстремумов (cached per target) ────────
+    t1_map, rng_map, avg_range, ext_max_set, ext_min_set = _prepare_rate_state(rates, np_r)
 
     # ── Тренд предыдущей свечи ────────────────────────────────────────────────
     is_bull = prev_candle_is_bull(rates, date)
@@ -514,34 +577,30 @@ def model(
     result: dict[str, float] = {}
 
     # ── Основной цикл: shift = 0 … SHIFT_WINDOW ──────────────────────────────
+    # Вместо полного сканирования каждого URL на каждом shift берём только URL,
+    # у которых реально есть событие в текущем временном интервале.
+    event_index = _prepare_event_index(dataset_index)
+    timeline = event_index["timeline"]
+    timeline_dates = event_index["dates"]
+    metadata = event_index["meta"]
+
     for shift in range(0, SHIFT_WINDOW + 1):
-        check_dt      = date - bar_delta * shift   # = dt из оригинала
-        check_dt_next = check_dt + bar_delta        # = dt_end из оригинала
+        check_dt = date - bar_delta * shift
+        check_dt_next = check_dt + bar_delta
+        lo_global = bisect.bisect_left(timeline_dates, check_dt)
+        hi_global = bisect.bisect_left(timeline_dates, check_dt_next)
+        if lo_global >= hi_global:
+            continue
 
-        for url, dates_sorted in key_dates.items():
-            # bisect_LEFT для обеих границ — событие ровно на check_dt_next
-            # не попадёт в этот слот и не дублируется в следующем (БАГ 4).
-            lo = bisect.bisect_left(dates_sorted, check_dt)
-            hi = bisect.bisect_left(dates_sorted, check_dt_next)
-            if lo >= hi:
+        # Original code processes each URL once per interval even if it has
+        # multiple rows inside the interval. dict preserves deterministic order.
+        candidate_urls = dict.fromkeys(url for _, url in timeline[lo_global:hi_global])
+        for url in candidate_urls:
+            dates_sorted = key_dates.get(url, [])
+            meta = metadata.get(url)
+            if not meta:
                 continue
-
-            rows = by_key.get(url)
-            if not rows:
-                continue
-
-            # ── Вычисляем направления из первой строки датасета ──────────────
-            # brain_calendar не хранит event_id и готовые _dir.
-            # event_id берём из url_map (фреймворк строит из URL_MAP_QUERY).
-            # Направления вычисляем на лету из числовых колонок.
-            row0       = rows[0]
-            url_map    = dataset_index.get("url_map", {})
-            _um_entry  = url_map.get(url)
-            event_id   = (_um_entry.get("event_id") if isinstance(_um_entry, dict)
-                          else _um_entry)
-            currency   = row0.get("currency_code")
-            importance = row0.get("importance") or "none"
-            fcd, scd, rcd = _compute_dirs(row0)
+            event_id, currency, importance, fcd, scd, rcd = meta
 
             ctx_key  = (event_id, currency, importance, fcd, scd, rcd)
             ctx_info = ctx_index.get(ctx_key, {})
