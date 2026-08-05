@@ -16,8 +16,8 @@ brain_framework.py v21.0 — refactor исходного event/outcome алго�
 
 Оптимизации v20 над v19:
   AUTO-3: один проход по событиям сразу для всех type/var.
-  AUTO-4: на H1 повторное использование точного результата для одинакового
-          состояния дня (midnight / bull / bear), с автоматической проверкой.
+  AUTO-4: H1 рассчитывается для каждого точного target timestamp.
+          Группировка по состоянию дня отключена как семантически небезопасная.
   AUTO-5: объединённые bulk INSERT и однократная сериализация одинаковых результатов.
 
 Исправление v20.3:
@@ -2747,7 +2747,7 @@ def build_app(model_module) -> FastAPI:
         dataset_midnight,
         s_state,
     ):
-        """Compute all requested slots, reusing exact equivalent H1 day states."""
+        """Compute all requested slots; H1 targets are always exact timestamps."""
         dataset_index_dict = {
             "dates": s_state.dataset_dates,
             "by_key": s_state.dataset_by_key,
@@ -2765,7 +2765,14 @@ def build_app(model_module) -> FastAPI:
         }
 
         is_hourly_table = not bool(str(rates_tbl or "").endswith("_day"))
-        can_group_day = bool(dataset_midnight and is_hourly_table and np_rates_pd is not None)
+
+        # H1 must always be calculated for the exact target timestamp.
+        # Even with a midnight-only dataset, the causal event window, available
+        # historical outcomes and previous completed candle can change each hour.
+        # Grouping H1 timestamps by (day, legacy_daily, bull/bear) copied a
+        # representative result into non-equivalent hours.
+        can_group_day = False
+
         group_for_date: dict[datetime, tuple] = {}
         representatives: dict[tuple, dict] = {}
 
