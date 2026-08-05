@@ -228,7 +228,6 @@ def _build_np_rates_for_table(rates, candle_ranges, extremums, global_rates_list
     sorted_dates = sorted(rates.keys())
     n            = len(sorted_dates)
     dates_ns     = np.array([_dt_to_ts(d) for d in sorted_dates], dtype=np.int64)
-    t1_arr       = np.array([rates.get(d, 0.0) for d in sorted_dates], dtype=np.float64)
     ranges_arr   = np.array([candle_ranges.get(d, 0.0) for d in sorted_dates], dtype=np.float64)
     ext_min_set  = extremums.get("min", set())
     ext_max_set  = extremums.get("max", set())
@@ -244,7 +243,16 @@ def _build_np_rates_for_table(rates, candle_ranges, extremums, global_rates_list
                               for d in sorted_dates], dtype=np.float64)
         min_arr   = np.array([float(_gr_map[d]["min"])   if d in _gr_map else 0.0
                               for d in sorted_dates], dtype=np.float64)
+
+        # IMPORTANT: rates.t1 в Brain Server — отдельная целевая величина.
+        # По реальным таблицам она может соответствовать следующей свече и
+        # поэтому не является причинно доступным признаком текущей свечи.
+        # Для стандартных моделей используем тело этой же завершённой свечи.
+        t1_arr = close_arr - open_arr
     else:
+        # Обратная совместимость для редкого режима без OHLC. В обычном
+        # build_app global_rates_list всегда передаётся.
+        t1_arr    = np.array([rates.get(d, 0.0) for d in sorted_dates], dtype=np.float64)
         close_arr = np.zeros(n, dtype=np.float64)
         open_arr  = np.zeros(n, dtype=np.float64)
         max_arr   = np.zeros(n, dtype=np.float64)
@@ -1389,7 +1397,12 @@ async def _refresh_rates(table: str, s: _State):
                 })
                 s.global_rates_dates.setdefault(table, []).append(dt)
                 if s.np_built:
-                    _append_np_rates_row(table, dt, t1, rng, s,
+                    # Не используем DB rates.t1 как входной признак: это
+                    # целевая величина и она может относиться к следующей свече.
+                    causal_candle_t1 = (
+                        float(r["close"] or 0.0) - float(r["open"] or 0.0)
+                    )
+                    _append_np_rates_row(table, dt, causal_candle_t1, rng, s,
                                          close=float(r["close"] or 0),
                                          open_=float(r["open"]  or 0),
                                          max_=float(r["max"] or 0),
