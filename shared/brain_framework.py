@@ -1221,6 +1221,7 @@ class _State:
     TYPES_RANGE:         list       = None
     PARAM_RANGE:         list       = None
     CACHE_DATE_FROM:     str        = "2025-01-15"
+    CACHE_FRESH_LAG_DAYS: int        = 14  # последние N календарных дней не кешируем
     LABEL_FN:            object     = None
 
     URL_MAP_QUERY:  str | None = None
@@ -2070,6 +2071,7 @@ def build_app(model_module) -> FastAPI:
 
     # ── Кеш ───────────────────────────────────────────────────────────────────
     s.CACHE_DATE_FROM  =      _get("cache", "date_from",        "CACHE_DATE_FROM",  "", "2025-01-15")
+    s.CACHE_FRESH_LAG_DAYS = max(0, int(_get("cache", "fresh_lag_days", "CACHE_FRESH_LAG_DAYS", "", 14)))
     s.VAR_RANGE        =      _get("cache", "var_range",        "VAR_RANGE",        "", [0])
     s.TYPES_RANGE      =      _get("cache", "types_range",      "TYPES_RANGE",      "", [0, 1, 2, 3, 4])
     s.PARAM_RANGE      =      _get("cache", "param_range",      "PARAM_RANGE",      "", [""])
@@ -3977,6 +3979,18 @@ def build_app(model_module) -> FastAPI:
                          ("..." if len(unmatched) > 10 else "") + ".")
         return lines
 
+    # ── Cache freshness guard ────────────────────────────────────────────────
+
+    def _cache_cutoff_dt() -> datetime:
+        """Последний календарный момент, который разрешено хранить в values-cache.
+
+        При CACHE_FRESH_LAG_DAYS=14 сегодня и предыдущие 13 календарных дней
+        всегда считаются live и не читаются/не записываются в SUPER_* cache.
+        Кеш разрешён до конца дня (today - 14 days) включительно.
+        """
+        cutoff_day = (datetime.now() - timedelta(days=s.CACHE_FRESH_LAG_DAYS)).date()
+        return datetime.combine(cutoff_day, datetime.max.time())
+
     # ── /values ───────────────────────────────────────────────────────────────
 
     @app.get("/values")
@@ -3997,6 +4011,30 @@ def build_app(model_module) -> FastAPI:
                 return err_response(
                     "Central cache proxy loop detected: upstream service is not Brain 1"
                 )
+
+            # Последние CACHE_FRESH_LAG_DAYS календарных дней намеренно живут
+            # вне persistent values-cache. Это исключает залипание старого {}
+            # после того, как parser/enriched догоняет свежие даты.
+            request_dt = _parse_date(date)
+            if request_dt is None:
+                return err_response(f"Invalid date format: {date!r}")
+            if request_dt > _cache_cutoff_dt():
+                if s.cache_writer:
+                    payload = await _call_model(
+                        pair, day, date, calc_type=type, calc_var=var, param=param
+                    )
+                else:
+                    payload = await _proxy_values_to_brain1(
+                        s, pair=pair, day=day, date=date, calc_type=type,
+                        calc_var=var, param=param,
+                    )
+                payload = payload or {}
+                resp = ok_response(payload)
+                resp["details"] = _build_narrative(
+                    payload, date, 1 if day == 1 else 0, type
+                )
+                return resp
+
             resp = await cached_values(
                 engine_vlad=s.engine_cache, service_url=s.service_url,
                 pair=pair, day=day, date=date,
@@ -4359,12 +4397,30 @@ def build_app(model_module) -> FastAPI:
         all_types  = list(s.TYPES_RANGE or [0, 1, 2, 3, 4])
         all_params = [param] if param is not None else list(s.PARAM_RANGE or [""])
         eff_from   = date_from if date_from.strip() else s.CACHE_DATE_FROM
+
+        # Persistent cache никогда не строим внутри свежего окна. Даже если
+        # caller передал date_to позднее, жёстко ограничиваем его D-N.
+        cutoff_dt = _cache_cutoff_dt()
+        requested_to = _parse_date(date_to) if date_to.strip() else None
+        if date_to.strip() and requested_to is None:
+            return err_response("Invalid date_to format")
+        eff_to_dt = min(requested_to, cutoff_dt) if requested_to else cutoff_dt
+        eff_to = eff_to_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+        eff_from_dt = _parse_date(eff_from)
+        if eff_from_dt is None:
+            return err_response("Invalid date_from format")
+        if eff_from_dt > eff_to_dt:
+            return err_response(
+                f"date_from={eff_from} позже cache cutoff={eff_to}; "
+                f"fresh_lag_days={s.CACHE_FRESH_LAG_DAYS}"
+            )
         s.fill_cancel.clear()
 
         async def _run_fill():
             try:
                 await _fill_worker(
-                    pl, dl, eff_from, date_to, all_types, all_params, batch_size
+                    pl, dl, eff_from, eff_to, all_types, all_params, batch_size
                 )
             except Exception as exc:
                 import traceback as _tb
@@ -4385,7 +4441,8 @@ def build_app(model_module) -> FastAPI:
             "types":       all_types, "var_range": s.VAR_RANGE,
             "param_range": all_params,
             "batch_size":  batch_size, "date_from": eff_from,
-            "date_to":     date_to or "now",
+            "date_to":     eff_to,
+            "fresh_lag_days": s.CACHE_FRESH_LAG_DAYS,
             "slots_total": len(pl) * len(dl) * len(all_types) * len(s.VAR_RANGE) * len(all_params),
         })
 
