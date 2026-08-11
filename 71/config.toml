@@ -2,7 +2,7 @@
 id = 71
 port = 8933
 name = "brain-vlad_astro_hypothesis_lab-s71"
-text = "Astrology hypothesis laboratory: 144 causal type/var strategies"
+text = "Astrology selected strategies: 6 validated hypotheses"
 
 [developer]
 email = "vladyurjevitch@yandex.ru"
@@ -12,8 +12,8 @@ table = "brain_rates_eur_usd"
 
 [cache]
 date_from = "2025-01-01"
-var_range = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
-types_range = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+var_range = [0]
+types_range = [0, 1, 2, 3, 4, 5]
 shift_window = 0
 rebuild_interval = 0
 reload_interval = 3600
@@ -36,7 +36,7 @@ table = "vlad_astro_hypothesis_ctx_s71"
 weights_table = "vlad_astro_hypothesis_weights_s71"
 weights_code_column = "weight_code"
 key_columns = ["id"]
-query = "SELECT id, feature_key, feature_family, name, occurrence_count, date_added FROM vlad_astro_hypothesis_ctx_s71 ORDER BY id"
+query = "SELECT id, feature_key, feature_family, name, occurrence_count, date_added FROM vlad_astro_hypothesis_ctx_s71 WHERE feature_family IN ('T7_lunar', 'T9_patterns', 'S71_selected') ORDER BY id"
 
 [ml]
 enabled = false
