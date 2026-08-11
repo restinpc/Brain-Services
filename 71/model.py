@@ -7,8 +7,12 @@ Every pair angle, aspect, lunar phase, sign, ingress and retrograde transition
 is reconstructed from those positions without loading the enormous pair/aspect
 part of the parser table into RAM.
 
-Strategy matrix:
-    12 hypothesis families × 12 transformations = 144 causal combinations.
+Production strategy set:
+    Only the six strategies selected by the completed hypothesis search are
+    exposed to Brain Framework.  The public interface is compact:
+
+        type=0..5  -> selected strategy id
+        var=0      -> the strategy's fixed, already-selected transformation
 
 Strategy 0: EUR/USD Day — T7 × V8.
 Strategy 1: EUR/USD Day — T9 × V9.
@@ -19,7 +23,9 @@ Strategy 4: BTC/USD Hour — T-square × realized volatility signed gate,
 Strategy 5: ETH/USD Hour — Moon/Uranus square strength with exponential
             orb decay 2 × rolling z-score 120 / 3.
 
-All type=0..11 and var=0..11 combinations remain active.
+The original 12×12 research matrix remains implemented below only as reusable
+feature-generation code for strategies 0 and 1; it is no longer enumerated or
+computed by the runtime API.
 
 No future market data is used.  Type 11 projects astronomical positions from
 current positions and current Swiss-Ephemeris speeds; that information is known
@@ -46,7 +52,7 @@ from sqlalchemy import text
 SERVICE_ID = 71
 PORT = 8933
 NODE_NAME = "brain-vlad_astro_hypothesis_lab-s71"
-SERVICE_TEXT = "Astrology hypothesis laboratory: 144 causal type/var strategies"
+SERVICE_TEXT = "Astrology selected strategies: 6 validated hypotheses"
 DEVELOPER_EMAIL = "vladyurjevitch@yandex.ru"
 
 PARSER_TABLE = "vlad_astro_hour_features"
@@ -200,6 +206,14 @@ CUSTOM_FEATURE_KEYS = {
     5: "S71.selected.eth_moon_uranus_square_strength_decay2_z120_s3",
 }
 
+# Brain Framework must enumerate only these public type/var values.  Each type
+# is one complete selected strategy, so there is no Cartesian type×var search
+# left in production.
+PUBLIC_TYPE_DESCRIPTIONS = dict(STRATEGY_DESCRIPTIONS)
+PUBLIC_VAR_DESCRIPTIONS = {0: "fixed transformation of the selected strategy"}
+PUBLIC_STRATEGY_IDS = frozenset(PUBLIC_TYPE_DESCRIPTIONS)
+PUBLIC_VAR_IDS = frozenset(PUBLIC_VAR_DESCRIPTIONS)
+
 # -----------------------------------------------------------------------------
 # Small math helpers
 # -----------------------------------------------------------------------------
@@ -330,9 +344,13 @@ async def _ensure_contexts_and_weights(
     async with engine_vlad.connect() as conn:
         row = (await conn.execute(text(f"""
             SELECT
-              (SELECT COUNT(*) FROM `{ctx_table}`) AS ctx_count,
-              (SELECT COUNT(*) FROM `{weights_table}`) AS weight_count,
-              (SELECT COUNT(DISTINCT feature_family) FROM `{ctx_table}`) AS families
+              (SELECT COUNT(*) FROM `{ctx_table}`
+                 WHERE feature_family IN ('T7_lunar','T9_patterns','S71_selected')) AS ctx_count,
+              (SELECT COUNT(*) FROM `{weights_table}` w
+                 JOIN `{ctx_table}` c ON c.id=w.ctx_id
+                 WHERE c.feature_family IN ('T7_lunar','T9_patterns','S71_selected')) AS weight_count,
+              (SELECT COUNT(DISTINCT feature_family) FROM `{ctx_table}`
+                 WHERE feature_family IN ('T7_lunar','T9_patterns','S71_selected')) AS families
         """))).fetchone()
     ctx_count = int(row[0] if row else 0)
     weight_count = int(row[1] if row else 0)
@@ -365,14 +383,19 @@ async def _ensure_contexts_and_weights(
                 (weight_code, ctx_id, mode, shift)
             SELECT CONCAT(id, '_0_0'), id, 0, 0
             FROM `{ctx_table}`
+            WHERE feature_family IN ('T7_lunar','T9_patterns','S71_selected')
         """))
 
     async with engine_vlad.connect() as conn:
         row = (await conn.execute(text(f"""
             SELECT
-              (SELECT COUNT(*) FROM `{ctx_table}`),
-              (SELECT COUNT(*) FROM `{weights_table}`),
-              (SELECT COUNT(DISTINCT feature_family) FROM `{ctx_table}`)
+              (SELECT COUNT(*) FROM `{ctx_table}`
+                 WHERE feature_family IN ('T7_lunar','T9_patterns','S71_selected')),
+              (SELECT COUNT(*) FROM `{weights_table}` w
+                 JOIN `{ctx_table}` c ON c.id=w.ctx_id
+                 WHERE c.feature_family IN ('T7_lunar','T9_patterns','S71_selected')),
+              (SELECT COUNT(DISTINCT feature_family) FROM `{ctx_table}`
+                 WHERE feature_family IN ('T7_lunar','T9_patterns','S71_selected'))
         """))).fetchone()
     ctx_count = int(row[0] if row else 0)
     weight_count = int(row[1] if row else 0)
@@ -1916,6 +1939,19 @@ def _process_strategy_until(
     if trajectory.processed == 0 and rates:
         trajectory.first_date = rates[0].get("date")
 
+    # Repeated framework calls for the same strategy/date must not replay the
+    # trajectory and must not return an empty value after it has advanced.
+    all_cached = True
+    for dt in target_dates:
+        cache_key = ("S71_SELECTED", rates_table, dataset_token, strategy_id, dt)
+        value = _PREDICTION_LRU.get(cache_key)
+        if value is None:
+            all_cached = False
+            break
+        captured[dt] = value
+    if all_cached:
+        return captured
+
     while trajectory.processed < len(rates):
         rate_idx = trajectory.processed
         row = rates[rate_idx]
@@ -1938,8 +1974,13 @@ def _process_strategy_until(
                 token=dataset_token,
             )
             if rate_date in target_dates:
-                captured[rate_date] = _predict_strategy(
+                result = _predict_strategy(
                     features, trajectory.slot, strategy_id, ctx_by_feature
+                )
+                captured[rate_date] = result
+                _remember_prediction(
+                    ("S71_SELECTED", rates_table, dataset_token, strategy_id, rate_date),
+                    result,
                 )
             y = _outcome(row)
             if y is not None:
@@ -1948,7 +1989,11 @@ def _process_strategy_until(
         trajectory.last_date = rate_date
 
     for dt in target_dates:
-        captured.setdefault(dt, {})
+        if dt not in captured:
+            captured[dt] = {}
+            _remember_prediction(
+                ("S71_SELECTED", rates_table, dataset_token, strategy_id, dt), {}
+            )
     return captured
 
 
@@ -2031,41 +2076,49 @@ def model(
     param: str = "",
     dataset_index: Optional[dict] = None,
 ) -> dict[str, float]:
-    type_id, var_id = int(type), int(var)
-    if type_id not in TYPE_DESCRIPTIONS or var_id not in VAR_DESCRIPTIONS:
+    """Return one of the six selected production/research strategies.
+
+    Public mapping is intentionally sparse and cheap: ``type`` is the selected
+    strategy id (0..5) and ``var`` must be 0.  Unsupported pair/timeframe
+    combinations return immediately before any dataset preparation.
+    """
+    strategy_id, var_id = int(type), int(var)
+    if strategy_id not in PUBLIC_STRATEGY_IDS or var_id not in PUBLIC_VAR_IDS:
+        return {}
+    if not rates or not _strategy_runtime_allowed(strategy_id, rates, dataset_index):
         return {}
 
     rows, astro_dates, token = _prepare_runtime(dataset, dataset_index)
-    if not rows or not rates:
+    if not rows:
         return {}
     ctx = _ctx_map(dataset_index)
     table = _rates_identity(rates, dataset_index)
     step_hours = 24 if _is_daily_runtime(dataset_index) else 1
-    pred_key = (table, token, type_id, var_id, date)
-    cached = _PREDICTION_LRU.get(pred_key)
+    cache_key = ("S71_SELECTED", table, token, strategy_id, date)
+    cached = _PREDICTION_LRU.get(cache_key)
     if cached is not None:
-        _PREDICTION_LRU.move_to_end(pred_key)
+        _PREDICTION_LRU.move_to_end(cache_key)
         return cached
 
-    trajectory_key = (table, type_id, token)
-    with _type_lock(trajectory_key):
-        cached = _PREDICTION_LRU.get(pred_key)
+    lock_key = (f"S71_SELECTED:{table}", strategy_id, token)
+    with _type_lock(lock_key):
+        cached = _PREDICTION_LRU.get(cache_key)
         if cached is not None:
-            _PREDICTION_LRU.move_to_end(pred_key)
+            _PREDICTION_LRU.move_to_end(cache_key)
             return cached
-        prepared = _process_type_until(
+        prepared = _process_strategy_until(
             rates=rates,
             rows=rows,
             dates=astro_dates,
             dataset_token=token,
             rates_table=table,
-            type_id=type_id,
+            strategy_id=strategy_id,
             target_dates={date},
             max_target=date,
             step_hours=step_hours,
             ctx_by_feature=ctx,
         )
-        return prepared.get(var_id, {}).get(date, {})
+        return prepared.get(date, {})
 
 
 def batch_model(
@@ -2077,53 +2130,54 @@ def batch_model(
     param: str = "",
     dataset_index: Optional[dict] = None,
 ) -> dict[datetime, dict[str, float]]:
-    type_id, var_id = int(type), int(var)
-    if (
-        not dates
-        or type_id not in TYPE_DESCRIPTIONS
-        or var_id not in VAR_DESCRIPTIONS
-    ):
-        return {dt: {} for dt in dates}
+    strategy_id, var_id = int(type), int(var)
+    if not dates:
+        return {}
+    empty = {dt: {} for dt in dates}
+    if strategy_id not in PUBLIC_STRATEGY_IDS or var_id not in PUBLIC_VAR_IDS:
+        return empty
+    if not rates or not _strategy_runtime_allowed(strategy_id, rates, dataset_index):
+        return empty
 
     rows, astro_dates, token = _prepare_runtime(dataset, dataset_index)
-    if not rows or not rates:
-        return {dt: {} for dt in dates}
+    if not rows:
+        return empty
     ctx = _ctx_map(dataset_index)
     table = _rates_identity(rates, dataset_index)
     step_hours = 24 if _is_daily_runtime(dataset_index) else 1
     requested = tuple(sorted(set(dates)))
-    batch_key = (table, token, type_id, requested)
+    batch_key = (table, token, strategy_id, requested)
 
-    cached_all = _TYPE_BATCH_CACHE.get(batch_key)
-    if cached_all is None:
-        trajectory_key = (table, type_id, token)
-        with _type_lock(trajectory_key):
-            cached_all = _TYPE_BATCH_CACHE.get(batch_key)
-            if cached_all is None:
-                cached_all = _process_type_until(
+    cached = _STRATEGY_BATCH_CACHE.get(batch_key)
+    if cached is None:
+        lock_key = (f"S71_SELECTED:{table}", strategy_id, token)
+        with _type_lock(lock_key):
+            cached = _STRATEGY_BATCH_CACHE.get(batch_key)
+            if cached is None:
+                cached = _process_strategy_until(
                     rates=rates,
                     rows=rows,
                     dates=astro_dates,
                     dataset_token=token,
                     rates_table=table,
-                    type_id=type_id,
+                    strategy_id=strategy_id,
                     target_dates=set(requested),
                     max_target=max(requested),
                     step_hours=step_hours,
                     ctx_by_feature=ctx,
                 )
-                _TYPE_BATCH_CACHE[batch_key] = cached_all
-                _TYPE_BATCH_CACHE.move_to_end(batch_key)
-                while len(_TYPE_BATCH_CACHE) > _TYPE_BATCH_CACHE_MAX:
-                    _TYPE_BATCH_CACHE.popitem(last=False)
-    selected = cached_all.get(var_id, {})
-    return {dt: selected.get(dt, {}) for dt in dates}
+                _STRATEGY_BATCH_CACHE[batch_key] = cached
+                _STRATEGY_BATCH_CACHE.move_to_end(batch_key)
+                while len(_STRATEGY_BATCH_CACHE) > _STRATEGY_BATCH_CACHE_MAX:
+                    _STRATEGY_BATCH_CACHE.popitem(last=False)
+    return {dt: cached.get(dt, {}) for dt in dates}
 
 
 # -----------------------------------------------------------------------------
 # Static semantic feature universe created by enrich_dataset()
 # -----------------------------------------------------------------------------
 def iter_feature_definitions() -> Iterator[tuple[str, str, str]]:
+    """Yield only semantic contexts reachable by the six selected strategies."""
     seen: set[str] = set()
 
     def emit(key: str, family: str, description: str):
@@ -2132,134 +2186,13 @@ def iter_feature_definitions() -> Iterator[tuple[str, str, str]]:
             return (key, family, description)
         return None
 
-    # Selected custom strategy outputs. T7×V8 and T9×V9 reuse the
-    # existing T7/T9 semantic universes below. No unused strategy keys are emitted.
+    # Four custom scalar strategies each use exactly one semantic key.
     for strategy_id, key in CUSTOM_FEATURE_KEYS.items():
-        x = emit(
-            key,
-            "S71_selected",
-            STRATEGY_DESCRIPTIONS[strategy_id],
-        )
+        x = emit(key, "S71_selected", STRATEGY_DESCRIPTIONS[strategy_id])
         if x:
             yield x
 
-    # Type 0
-    for body in BODY_ORDER:
-        for sign in SIGNS:
-            x = emit(f"T0.sign.{body}.{sign}", "T0_absolute", f"{body} in {sign}")
-            if x: yield x
-        for decan in (1, 2, 3):
-            x = emit(f"T0.decan.{body}.{decan}", "T0_absolute", f"{body} decan {decan}")
-            if x: yield x
-        for motion in ("direct", "retro"):
-            x = emit(f"T0.motion.{body}.{motion}", "T0_absolute", f"{body} {motion}")
-            if x: yield x
-    for phase in PHASE_NAMES:
-        x = emit(f"T0.phase.{phase}", "T0_absolute", f"Moon phase {phase}")
-        if x: yield x
-    for a, b in itertools.combinations(CORE_BODIES, 2):
-        for asp in ASPECT_NAMES:
-            x = emit(f"T0.aspect.{_pair_name(a, b)}.{asp}", "T0_absolute", f"{a}-{b} {asp}")
-            if x: yield x
-
-    # Type 1
-    for body in BODY_ORDER:
-        for harmonic in HARMONICS:
-            for component in ("sin", "cos"):
-                key = f"T1.h{harmonic}.{body}.{component}"
-                x = emit(key, "T1_harmonics", f"{body} harmonic {harmonic} {component}")
-                if x: yield x
-
-    # Type 2
-    for name in ELEMENTS:
-        x = emit(f"T2.element.{name}", "T2_composition", f"Element share: {name}")
-        if x: yield x
-        x = emit(f"T2.element_dominant.{name}", "T2_composition", f"Dominant element: {name}")
-        if x: yield x
-        x = emit(f"T2.retro_by_element.{name}", "T2_composition", f"Retrograde share in {name}")
-        if x: yield x
-    for name in MODALITIES:
-        x = emit(f"T2.modality.{name}", "T2_composition", f"Modality share: {name}")
-        if x: yield x
-        x = emit(f"T2.modality_dominant.{name}", "T2_composition", f"Dominant modality: {name}")
-        if x: yield x
-    for name in ("positive", "negative"):
-        x = emit(f"T2.polarity.{name}", "T2_composition", f"Polarity share: {name}")
-        if x: yield x
-        x = emit(f"T2.polarity_dominant.{name}", "T2_composition", f"Dominant polarity: {name}")
-        if x: yield x
-    for sign in SIGNS:
-        x = emit(f"T2.sign_occupancy.{sign}", "T2_composition", f"Bodies occupying {sign}")
-        if x: yield x
-    for name in ("fire_minus_water", "earth_minus_air", "cardinal_minus_fixed", "mutable_minus_fixed"):
-        x = emit(f"T2.contrast.{name}", "T2_composition", f"Composition contrast {name}")
-        if x: yield x
-    for name in ("element", "modality", "sign"):
-        x = emit(f"T2.concentration.{name}", "T2_composition", f"{name} concentration")
-        if x: yield x
-
-    # Type 3
-    for body in BODY_ORDER:
-        for metric in ("signed", "absolute", "station_score", "retro"):
-            x = emit(f"T3.speed.{body}.{metric}", "T3_speed", f"{body} speed {metric}")
-            if x: yield x
-        for regime in ("retro", "station", "slow", "normal", "fast"):
-            x = emit(f"T3.regime.{body}.{regime}", "T3_speed", f"{body} regime {regime}")
-            if x: yield x
-    for metric in ("retro_count", "station_count"):
-        x = emit(f"T3.total.{metric}", "T3_speed", metric)
-        if x: yield x
-
-    # Type 4
-    for a, b in itertools.combinations(CORE_BODIES, 2):
-        for asp in ASPECT_NAMES:
-            x = emit(f"T4.aspect.{_pair_name(a, b)}.{asp}", "T4_network", f"Aspect network {a}-{b} {asp}")
-            if x: yield x
-    for body in CORE_BODIES:
-        x = emit(f"T4.centrality.{body}", "T4_network", f"Aspect centrality {body}")
-        if x: yield x
-    for metric in ("density", "harmony", "tension", "balance"):
-        x = emit(f"T4.metric.{metric}", "T4_network", f"Aspect network {metric}")
-        if x: yield x
-    for asp in ASPECT_NAMES:
-        x = emit(f"T4.dominant.{asp}", "T4_network", f"Dominant aspect {asp}")
-        if x: yield x
-
-    # Type 5
-    for a, b in itertools.combinations(CORE_BODIES, 2):
-        for asp in ASPECT_NAMES:
-            for status in ("applying", "separating", "forming", "breaking", "exact"):
-                x = emit(f"T5.aspect.{_pair_name(a, b)}.{asp}.{status}", "T5_dynamics", f"{a}-{b} {asp} {status}")
-                if x: yield x
-    for status in ("applying", "separating", "forming", "breaking", "exact"):
-        x = emit(f"T5.metric.{status}", "T5_dynamics", f"Aspect dynamics {status}")
-        if x: yield x
-
-    # Type 6
-    for body in BODY_ORDER:
-        for sign in SIGNS:
-            base = f"T6.ingress.{body}.{sign}"
-            x = emit(base, "T6_events", f"{body} ingress into {sign}")
-            if x: yield x
-            for recency in ("r1", "r6", "r24"):
-                x = emit(base.replace("T6.", "T6.recent.", 1) + f".{recency}", "T6_events", f"Recent {body} ingress {sign} {recency}")
-                if x: yield x
-        for direction in ("direct", "retro"):
-            base = f"T6.retro_turn.{body}.{direction}"
-            x = emit(base, "T6_events", f"{body} turns {direction}")
-            if x: yield x
-            for recency in ("r1", "r6", "r24"):
-                x = emit(base.replace("T6.", "T6.recent.", 1) + f".{recency}", "T6_events", f"Recent {body} turn {direction} {recency}")
-                if x: yield x
-        for direction in ("enter", "exit"):
-            base = f"T6.station.{body}.{direction}"
-            x = emit(base, "T6_events", f"{body} station {direction}")
-            if x: yield x
-            for recency in ("r1", "r6", "r24"):
-                x = emit(base.replace("T6.", "T6.recent.", 1) + f".{recency}", "T6_events", f"Recent {body} station {direction} {recency}")
-                if x: yield x
-
-    # Type 7
+    # Strategy 0 = legacy T7 × V8.  V8 transforms this complete T7 family.
     for phase in PHASE_NAMES:
         x = emit(f"T7.phase.{phase}", "T7_lunar", f"Lunar phase {phase}")
         if x: yield x
@@ -2283,23 +2216,7 @@ def iter_feature_definitions() -> Iterator[tuple[str, str, str]]:
             x = emit(f"T7.moon_aspect.{other}.{asp}", "T7_lunar", f"Moon-{other} {asp}")
             if x: yield x
 
-    # Type 8
-    for a, b in itertools.combinations(CORE_BODIES, 2):
-        pair = _pair_name(a, b)
-        for sector in range(12):
-            x = emit(f"T8.sector.{pair}.{sector}", "T8_synodic", f"{a}-{b} synodic sector {sector}")
-            if x: yield x
-        for quarter in range(4):
-            x = emit(f"T8.quarter.{pair}.{quarter}", "T8_synodic", f"{a}-{b} synodic quarter {quarter}")
-            if x: yield x
-        for comp in ("sin", "cos"):
-            x = emit(f"T8.wave.{pair}.{comp}", "T8_synodic", f"{a}-{b} synodic {comp}")
-            if x: yield x
-        for direction in ("increasing", "decreasing"):
-            x = emit(f"T8.direction.{pair}.{direction}", "T8_synodic", f"{a}-{b} angle {direction}")
-            if x: yield x
-
-    # Type 9
+    # Strategy 1 = legacy T9 × V9.  V9 transforms this complete T9 family.
     for sign in SIGNS:
         x = emit(f"T9.stellium_sign.{sign}", "T9_patterns", f"Stellium in {sign}")
         if x: yield x
@@ -2324,36 +2241,12 @@ def iter_feature_definitions() -> Iterator[tuple[str, str, str]]:
         x = emit(f"T9.metric.{metric}", "T9_patterns", metric)
         if x: yield x
 
-    # Type 10
-    for body in PHYSICAL_BODIES:
-        for label in ("short", "medium", "long"):
-            for metric in ("lon", "speed"):
-                x = emit(f"T10.{metric}.{body}.{label}", "T10_momentum", f"{body} {metric} momentum {label}")
-                if x: yield x
-    for metric in ("aspect_density", "harmony", "tension", "retro"):
-        for label in ("short", "medium", "long"):
-            x = emit(f"T10.aggregate.{metric}.{label}", "T10_momentum", f"Aggregate {metric} momentum {label}")
-            if x: yield x
-
-    # Type 11
-    for horizon in PROJECTION_HOURS:
-        for body in PHYSICAL_BODIES:
-            for sign in SIGNS:
-                x = emit(f"T11.ingress.{body}.{sign}.h{horizon}", "T11_projection", f"Projected {body} ingress {sign} +{horizon}h")
-                if x: yield x
-        for phase in PHASE_NAMES:
-            x = emit(f"T11.moon_phase.{phase}.h{horizon}", "T11_projection", f"Projected Moon phase {phase} +{horizon}h")
-            if x: yield x
-        for a, b in itertools.combinations(CORE_BODIES, 2):
-            for asp in ASPECT_NAMES:
-                x = emit(f"T11.aspect.{_pair_name(a, b)}.{asp}.h{horizon}", "T11_projection", f"Projected {a}-{b} {asp} +{horizon}h")
-                if x: yield x
-
 
 def hypothesis_catalog() -> dict:
     return {
-        "types": TYPE_DESCRIPTIONS,
-        "vars": VAR_DESCRIPTIONS,
-        "combinations": len(TYPE_DESCRIPTIONS) * len(VAR_DESCRIPTIONS),
+        "types": PUBLIC_TYPE_DESCRIPTIONS,
+        "vars": PUBLIC_VAR_DESCRIPTIONS,
+        "combinations": len(PUBLIC_TYPE_DESCRIPTIONS),
+        "selected_only": True,
         "feature_contexts": sum(1 for _ in iter_feature_definitions()),
     }
