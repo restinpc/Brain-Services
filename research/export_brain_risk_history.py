@@ -138,6 +138,21 @@ def safe_ident(name: str) -> str:
     return f"`{name}`"
 
 
+def row_get_ci(row: Dict[str, Any], key: str, default: Any = None) -> Any:
+    """Get a dictionary-row column name case-insensitively.
+
+    MySQL Connector can expose INFORMATION_SCHEMA column labels as TABLE_NAME
+    on some server/connector combinations even when the SELECT used table_name.
+    """
+    if key in row:
+        return row[key]
+    target = key.casefold()
+    for k, value in row.items():
+        if str(k).casefold() == target:
+            return value
+    return default
+
+
 def write_json(path: Path, obj: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -266,7 +281,7 @@ class BrainDB:
         if not self.table_exists(table):
             return []
         rows = self.query(f"SHOW COLUMNS FROM {safe_ident(table)}")
-        return [str(r["Field"]) for r in rows]
+        return [str(row_get_ci(r, "Field", "")) for r in rows if row_get_ci(r, "Field", "")]
 
 
 def load_env_files(explicit: Optional[str]) -> List[str]:
@@ -353,15 +368,15 @@ def discover_model_ids(db: BrainDB) -> List[int]:
 
     tables = db.query(
         """
-        SELECT table_name
+        SELECT TABLE_NAME AS table_name
         FROM information_schema.tables
-        WHERE table_schema = DATABASE()
-          AND table_name REGEXP '^brain_signal[0-9]+$'
-        ORDER BY table_name
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME REGEXP '^brain_signal[0-9]+$'
+        ORDER BY TABLE_NAME
         """
     )
     for row in tables:
-        name = str(row["table_name"])
+        name = str(row_get_ci(row, "table_name", ""))
         m = MODEL_SIGNAL_TABLE_RE.fullmatch(name)
         if m:
             ids.add(int(m.group(1)))
@@ -836,7 +851,7 @@ def main() -> int:
     db: Optional[BrainDB] = None
     try:
         log("=" * 80)
-        log("Brain Server historical Risk Manager exporter — READ ONLY")
+        log("Brain Server historical Risk Manager exporter v3 — READ ONLY")
         log("=" * 80)
         log(
             f"DB: {cfg['user']}@{cfg['host']}:{cfg['port']}/{cfg['database']} "
