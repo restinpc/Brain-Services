@@ -1,0 +1,46 @@
+# brain_llm ensemble / disagreement model.
+# Service 77 intentionally does not reproduce the legacy PHP neuronet11 algorithm.
+
+[service]
+id = 77
+port = 8939
+name = "brain-llm-ensemble-baseline-s77"
+text = "brain_llm ensemble consensus/disagreement baseline (no ML)"
+
+[rates]
+table = "brain_rates_eur_usd"
+
+[cache]
+date_from = "2025-01-15"
+fresh_lag_days = 14
+var_range = [0, 1, 2, 3, 4, 5]
+types_range = [0, 1, 2, 3, 4]
+shift_window = 12
+reload_interval = 3600
+rebuild_interval = 7200
+ml_workers = 1
+ml_batch_size = 2000
+
+[dataset]
+parser_table = "brain_llm"
+enriched_table = "vlad_brain_llm_ensemble"
+index_fields = ["event_type"]
+date_field = "date_dt"
+engine = "vlad"
+filter_by_date = true
+
+[ctx]
+key_columns = ["id"]
+
+[model]
+rare_occurrence_max = 0
+
+[ml]
+enabled = false
+init_mode = "constant"
+target_precision = 0.95
+max_iter = 20
+step = 0.10
+extremum_limit = 50
+active_tail = 0
+precision_metric = "mean"
