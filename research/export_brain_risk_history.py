@@ -305,15 +305,18 @@ def choose_db_config(args: argparse.Namespace) -> Dict[str, Any]:
     def env_first(primary: str, secondary: str, default=None):
         return os.getenv(primary) or os.getenv(secondary) or default
 
-    host = args.host or env_first("DB_HOST", "MASTER_HOST", "127.0.0.1")
-    port = args.port or env_first("DB_PORT", "MASTER_PORT", "3306")
-    user = args.user or env_first("DB_USER", "MASTER_USER")
+    # Brain risk history lives in the Brain/master DB. Prefer MASTER_*.
+    # DB_* in Brain-Services commonly points to the writable "vlad" database,
+    # which does not contain brain_rates_* / brain_signal* tables.
+    host = args.host or env_first("MASTER_HOST", "DB_HOST", "127.0.0.1")
+    port = args.port or env_first("MASTER_PORT", "DB_PORT", "3306")
+    user = args.user or env_first("MASTER_USER", "DB_USER")
     password = (
         args.password
         if args.password is not None
-        else env_first("DB_PASSWORD", "MASTER_PASSWORD")
+        else env_first("MASTER_PASSWORD", "DB_PASSWORD")
     )
-    database = args.database or env_first("DB_NAME", "MASTER_NAME", "brain")
+    database = args.database or env_first("MASTER_NAME", "DB_NAME", "brain")
 
     if not user:
         raise RuntimeError(
@@ -856,6 +859,16 @@ def main() -> int:
             """
         )
         summary["server_info"] = info[0] if info else {}
+
+        actual_db = str(summary["server_info"].get("db_name") or "")
+        if actual_db.lower() != "brain":
+            log(
+                f"WARNING: connected database is {actual_db!r}, expected 'brain'. "
+                "Use --database brain or verify MASTER_NAME."
+            )
+            summary["warnings"].append(
+                f"Connected database is {actual_db!r}; expected 'brain'."
+            )
 
         discovered = discover_model_ids(db)
         requested = parse_model_filter(args.models)
