@@ -2495,6 +2495,25 @@ def build_app(model_module) -> FastAPI:
                 send_error_trace(e, s.NODE_NAME, "build_weights")
                 return {"error": str(e)}
 
+        # NEWS_79_80_FIX: refresh enriched dataset after rebuild.
+        # _preload() runs before enrich_dataset() on first service start, so the
+        # in-memory dataset can still be empty/stale even though enrichment has
+        # just materialized rows in MySQL. Reload only when enrichment actually
+        # changed the shared dataset; noop/locked means the current snapshot is
+        # already suitable (or another service owns the refresh).
+        _enrich_result = stats.get("enrich")
+        _enrich_mode = (
+            str(_enrich_result.get("mode") or "").lower()
+            if isinstance(_enrich_result, dict) else ""
+        )
+        if s.enrich_fn is not None and _enrich_mode not in ("noop", "locked"):
+            await _load_dataset(s)
+            stats["dataset_reload"] = {"rows": len(s.dataset), "mode": _enrich_mode or "changed"}
+            log(
+                f"   dataset reload after enrich: {len(s.dataset)} rows",
+                s.NODE_NAME, force=True,
+            )
+
         await _load_weight_codes(s)
         await _load_ctx_index(s)
         await _load_label_cache(s)
