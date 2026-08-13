@@ -741,3 +741,431 @@ def model(
         rare_event_fn=lambda _ctx: True,
         rare_occurrence_max=0,
     )
+
+
+# ============================================================================
+# FAST BATCH CACHE v1 — services 77/78
+#
+# Behavior-preserving acceleration for Brain Framework fill_cache.
+#
+# Important:
+#   - model() above is NOT changed;
+#   - live calculation continues to use the original run_standard_model();
+#   - batch calculation uses the SAME brain_framework helpers;
+#   - mode0/mode1, T1, extrema, shifts, causality and _apply_var are unchanged;
+#   - type=3 and type=4 keep the original _ml_signal_fn behaviour.
+#
+# Main optimization:
+#   1. Build parsed event index once for a whole candle chunk, not once/candle.
+#   2. Calculate historical analogs once per current event.
+#   3. Produce all type 0..4 results from that single aggregation.
+#   4. Cache the batch across framework calls for different type values.
+# ============================================================================
+
+import threading as _fast_threading
+from collections import OrderedDict as _FastOrderedDict
+
+from brain_framework import (
+    _dataset_event_index as _fast_dataset_event_index,
+    _select_current_events as _fast_select_current_events,
+    _aggregate_event_history as _fast_aggregate_event_history,
+    _execution_is_daily as _fast_execution_is_daily,
+    _standard_contribution as _fast_standard_contribution,
+)
+
+
+_FAST_BATCH_LOCK = _fast_threading.RLock()
+
+# One H1 timeframe normally consists of ~6-7 chunks × 6 vars.
+# 64 entries are enough to retain all var/chunk results until framework starts
+# requesting the next calc_type, without allowing unlimited RAM growth.
+_FAST_BATCH_CACHE_MAX = 64
+_FAST_BATCH_CACHE: _FastOrderedDict = _FastOrderedDict()
+
+
+def _fast_mode_from_code(code: str) -> int | None:
+    """
+    Brain weight code:
+        <ctx_id>_<mode>_<shift>
+
+    ctx_id and shift may vary; mode is always the middle component from the end.
+    """
+    try:
+        return int(str(code).rsplit("_", 2)[1])
+    except (ValueError, IndexError):
+        return None
+
+
+def _fast_batch_cache_key(
+    dataset: list[dict],
+    dates: list[datetime],
+    var: int,
+    dataset_index: dict | None,
+) -> tuple:
+    di = dataset_index or {}
+
+    pair_id = _pair_id(di)
+    is_daily = bool(di.get("is_daily"))
+
+    np_rates = di.get("np_rates") or {}
+    dates_ns = np_rates.get("dates_ns")
+
+    if dates:
+        first_ts = int(dates[0].timestamp())
+        last_ts = int(dates[-1].timestamp())
+    else:
+        first_ts = 0
+        last_ts = 0
+
+    return (
+        int(pair_id),
+        int(is_daily),
+        int(var),
+
+        # New dataset / reload => another cache generation automatically.
+        id(dataset),
+        len(dataset),
+
+        # New rates arrays / reload => another cache generation.
+        id(dates_ns),
+
+        len(dates),
+        first_ts,
+        last_ts,
+    )
+
+
+def _fast_cache_get(key):
+    with _FAST_BATCH_LOCK:
+        item = _FAST_BATCH_CACHE.get(key)
+        if item is None:
+            return None
+
+        # LRU
+        _FAST_BATCH_CACHE.move_to_end(key)
+        return item
+
+
+def _fast_cache_put(key, value):
+    with _FAST_BATCH_LOCK:
+        _FAST_BATCH_CACHE[key] = value
+        _FAST_BATCH_CACHE.move_to_end(key)
+
+        while len(_FAST_BATCH_CACHE) > _FAST_BATCH_CACHE_MAX:
+            _FAST_BATCH_CACHE.popitem(last=False)
+
+
+def _fast_build_batch_base(
+    rates: list[dict],
+    dataset: list[dict],
+    dates: list[datetime],
+    *,
+    var: int,
+    dataset_index: dict | None,
+) -> dict[datetime, tuple[dict[str, float], dict[str, float]]]:
+    """
+    Calculate one var for all dates.
+
+    Returned value per date:
+        (
+            type0_result,   # contains mode0 + mode1
+            type3_result,   # active-code representation for ML types 3/4
+        )
+
+    From those two dictionaries we can reproduce all five calc_type values
+    exactly:
+
+        type 0 = type0_result
+        type 1 = only mode0 codes from type0_result
+        type 2 = only mode1 codes from type0_result
+        type 3 = type3_result
+        type 4 = type3_result
+
+    This follows the original framework contract.
+    """
+
+    empty = {d: ({}, {}) for d in dates}
+
+    if not dataset or not dates:
+        return empty
+
+    di = dict(dataset_index or {})
+
+    ctx_index = di.get("ctx_index") or {}
+    np_rates = di.get("np_rates")
+
+    if not ctx_index or np_rates is None:
+        return empty
+
+    pair_id = _pair_id(di)
+    calc_var = int(var)
+
+    # Same parser as original model().
+    parser = _event_parser(pair_id, calc_var)
+
+    # ------------------------------------------------------------------
+    # Critical optimization #1
+    #
+    # Original model() -> run_standard_model() builds this index again
+    # for every target candle.
+    #
+    # Here it is built ONCE for the whole batch.
+    # ------------------------------------------------------------------
+
+    local_index = dict(di)
+
+    # We deliberately allow the index to contain the complete loaded dataset.
+    # Causality is enforced below by:
+    #
+    #   event_time <= target_date
+    #
+    # and _aggregate_event_history itself only accepts analogs strictly before
+    # target_date and only outcomes whose candle is already closed.
+    local_index["full_dataset"] = dataset
+
+    events_by_type = _fast_dataset_event_index(
+        dataset,
+        local_index,
+        parser,
+    )
+
+    if not events_by_type:
+        return empty
+
+    reverse: dict[str, tuple[int, dict]] = {
+        str(info.get("event_type") or "").strip().lower(): (
+            int(info["id"]),
+            info,
+        )
+        for info in ctx_index.values()
+        if info.get("id") and info.get("event_type")
+    }
+
+    if not reverse:
+        return empty
+
+    is_daily = _fast_execution_is_daily(rates, di)
+
+    result: dict[
+        datetime,
+        tuple[dict[str, float], dict[str, float]]
+    ] = {}
+
+    for target_date in dates:
+
+        # Same event selection as _run_standard_model_core().
+        current_events = _fast_select_current_events(
+            events_by_type,
+            target_date,
+            is_daily=is_daily,
+            shift_window=SHIFT_WINDOW,
+            reverse=reverse,
+
+            # Same values as the original model().
+            rare_occurrence_max=0,
+            rare_event_fn=lambda _ctx: True,
+        )
+
+        out_type0: dict[str, float] = {}
+        out_type3: dict[str, float] = {}
+
+        for (
+            current_event_time,
+            current_pct,
+            event_type,
+            ctx_id,
+            ctx_info,
+            shift,
+        ) in current_events:
+
+            # ----------------------------------------------------------
+            # CRITICAL CAUSAL GUARD
+            #
+            # Original model() gives run_standard_model() a causal dataset
+            # prefix. A batch receives a larger dataset, therefore future
+            # news selected by the ±12h selector must explicitly be rejected.
+            # ----------------------------------------------------------
+            if current_event_time > target_date:
+                continue
+
+            # ----------------------------------------------------------
+            # Critical optimization #2
+            #
+            # Calculate historical outcomes ONCE.
+            #
+            # Previously type 0,1,2,3,4 caused the same aggregation to be
+            # repeated five times.
+            # ----------------------------------------------------------
+            mode0, mode1, outcomes, hits = _fast_aggregate_event_history(
+                current_event_time=current_event_time,
+                current_pct=current_pct,
+                event_type=event_type,
+                shift=shift,
+                ctx_info=ctx_info,
+                events_by_type=events_by_type,
+                np_rates=np_rates,
+                target_date=target_date,
+                is_daily=is_daily,
+                var=calc_var,
+                apply_var_fn=_apply_var,
+                min_occurrence=2,
+            )
+
+            # ----------------------------------------------------------
+            # TYPE 0
+            #
+            # Framework definition:
+            # type=0 -> mode0 + mode1
+            # ----------------------------------------------------------
+            contribution0 = _fast_standard_contribution(
+                calc_type=0,
+                ctx_id=ctx_id,
+                shift=shift,
+                mode0_value=mode0,
+                mode1_value=mode1,
+            )
+
+            for code, value in contribution0.items():
+                value = float(value)
+                if value != 0.0:
+                    out_type0[code] = out_type0.get(code, 0.0) + value
+
+            # ----------------------------------------------------------
+            # TYPE 3 / TYPE 4
+            #
+            # Use EXACTLY the original model's _ml_signal_fn().
+            #
+            # In services 77/78 _ml_signal_fn returns the same active-code
+            # representation for calc_type 3 and 4.
+            # ----------------------------------------------------------
+            direction = 1.0 if current_pct > 0 else -1.0
+
+            contribution3 = _ml_signal_fn(
+                3,
+                ctx_id,
+                shift,
+                mode0,
+                bool(hits),
+                current_pct,
+                outcomes,
+                direction,
+                ctx_info,
+            )
+
+            if contribution3:
+                for code, value in contribution3.items():
+                    value = float(value)
+                    if value != 0.0:
+                        out_type3[code] = out_type3.get(code, 0.0) + value
+
+        # Same final zero filtering as brain_framework core.
+        out_type0 = {
+            k: v
+            for k, v in out_type0.items()
+            if v != 0.0
+        }
+
+        out_type3 = {
+            k: v
+            for k, v in out_type3.items()
+            if v != 0.0
+        }
+
+        result[target_date] = (
+            out_type0,
+            out_type3,
+        )
+
+    return result
+
+
+def _fast_extract_type(
+    base: dict[datetime, tuple[dict[str, float], dict[str, float]]],
+    calc_type: int,
+) -> dict[datetime, dict[str, float]]:
+
+    result: dict[datetime, dict[str, float]] = {}
+
+    for dt, (type0, type3) in base.items():
+
+        if calc_type == 0:
+            result[dt] = dict(type0)
+
+        elif calc_type == 1:
+            # mode0 only
+            result[dt] = {
+                code: value
+                for code, value in type0.items()
+                if _fast_mode_from_code(code) == 0
+            }
+
+        elif calc_type == 2:
+            # mode1 only
+            result[dt] = {
+                code: value
+                for code, value in type0.items()
+                if _fast_mode_from_code(code) == 1
+            }
+
+        elif calc_type in (3, 4):
+            # Existing _ml_signal_fn has identical output for 3 and 4.
+            result[dt] = dict(type3)
+
+        else:
+            result[dt] = {}
+
+    return result
+
+
+def batch_model(
+    rates: list[dict],
+    dataset: list[dict],
+    dates: list[datetime],
+    *,
+    type: int = 0,
+    var: int = 0,
+    param: str = "",
+    dataset_index: dict | None = None,
+) -> dict[datetime, dict[str, float]]:
+    """
+    Optimized batch implementation for fill_cache / ML prewarm.
+
+    It is intentionally separate from model(), so real-time calculation keeps
+    using the original implementation.
+    """
+
+    if not dates:
+        return {}
+
+    if not dataset:
+        return {d: {} for d in dates}
+
+    calc_type = int(type)
+    calc_var = int(var)
+
+    if calc_type not in TYPES_RANGE:
+        return {d: {} for d in dates}
+
+    if calc_var not in VAR_RANGE:
+        return {d: {} for d in dates}
+
+    key = _fast_batch_cache_key(
+        dataset,
+        dates,
+        calc_var,
+        dataset_index,
+    )
+
+    base = _fast_cache_get(key)
+
+    if base is None:
+        base = _fast_build_batch_base(
+            rates,
+            dataset,
+            dates,
+            var=calc_var,
+            dataset_index=dataset_index,
+        )
+        _fast_cache_put(key, base)
+
+    return _fast_extract_type(base, calc_type)
