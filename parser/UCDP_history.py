@@ -15,6 +15,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 TRACE_URL = "https://server.brain-project.online/trace.php"
 NODE_NAME = os.getenv("NODE_NAME", "ucdp_history")
 EMAIL = os.getenv("ALERT_EMAIL", "vladyurjevitch@yandex.ru")
