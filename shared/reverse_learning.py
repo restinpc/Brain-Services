@@ -1,5 +1,11 @@
 """
-reverse_learning.py v8 — OPT-A: _build_csr кеш, OPT-B: numpy noise rng, OPT-C: universe_json zlib.
+reverse_learning.py v9 — faster prefix training, extremum-window caches, vectorized diff amps.
+
+v9 keeps the v8 training semantics/seed sequence and adds:
+  • fused directed/noise Numba cycles with shared scratch buffers;
+  • cached recency arrays and extremum timestamp/window materialization;
+  • vectorized diff-amplitude lookup;
+  • lower-overhead code-universe construction.
 
 reverse_learning.py — ML-режим для /values: обратное обучение по экстремумам.
 
@@ -447,16 +453,87 @@ if _NUMBA_ENABLED:
             w = weights_arr[i]
             amp = abs(w) if abs(w) > 1e-9 else 0.01
             weights_arr[i] = w + noise_arr[i] * amp
+
+    @_njit(cache=True)
+    def _directed_cycle_jit(
+        weights_arr, offsets, rec_indices, signs, base_amps,
+        start_rec, rec_count, step, target, bad_flags,
+        recency_weights, metric_id,
+    ):
+        """One even rebalance cycle with one Python->Numba transition."""
+        any_bad = False
+        for j in range(rec_count):
+            r = start_rec + j
+            pr = _precision_one_jit(
+                weights_arr, rec_indices, offsets[r], offsets[r + 1], signs[r]
+            )
+            bad = pr < target
+            bad_flags[j] = bad
+            if bad:
+                any_bad = True
+
+        if not any_bad:
+            return False, 0.0
+
+        for j in range(rec_count):
+            if not bad_flags[j]:
+                continue
+            r = start_rec + j
+            tgt_sign = signs[r]
+            base_amp = base_amps[r]
+            for p in range(offsets[r], offsets[r + 1]):
+                idx = rec_indices[p]
+                if idx < 0:
+                    continue
+                w = weights_arr[idx]
+                if w == 0.0:
+                    weights_arr[idx] = tgt_sign * 0.01 * base_amp
+                    continue
+                same = (w > 0.0 and tgt_sign > 0) or (w < 0.0 and tgt_sign < 0)
+                if same:
+                    nw = w * (1.0 + step)
+                else:
+                    nw = w * (1.0 - step)
+                if abs(nw) < 1e-9:
+                    nw = tgt_sign * 0.01 * base_amp
+                weights_arr[idx] = nw
+
+        pr = _total_precision_jit(
+            weights_arr, offsets, rec_indices, signs, recency_weights,
+            start_rec, rec_count, metric_id,
+        )
+        return True, pr
+
+    @_njit(cache=True)
+    def _noise_cycle_jit(
+        weights_arr, active_count, noise_arr,
+        offsets, rec_indices, signs, recency_weights,
+        start_rec, rec_count, metric_id,
+    ):
+        """One odd rebalance cycle + precision in one JIT call."""
+        for i in range(active_count):
+            w = weights_arr[i]
+            amp = abs(w) if abs(w) > 1e-9 else 0.01
+            weights_arr[i] = w + noise_arr[i] * amp
+        return _total_precision_jit(
+            weights_arr, offsets, rec_indices, signs, recency_weights,
+            start_rec, rec_count, metric_id,
+        )
 else:
     _precision_one_jit = None
     _total_precision_jit = None
     _mark_bad_jit = None
     _directed_update_jit = None
     _noise_update_prefix_jit = None
+    _directed_cycle_jit = None
+    _noise_cycle_jit = None
 
 
+@functools.lru_cache(maxsize=128)
 def _recency_weights(count: int, recency_decay: float = 0.92) -> np.ndarray:
-    return np.asarray([recency_decay ** i for i in range(count)], dtype=np.float64)
+    arr = np.asarray([recency_decay ** i for i in range(count)], dtype=np.float64)
+    arr.flags.writeable = False
+    return arr
 
 
 def total_precision_fast(
@@ -502,6 +579,7 @@ def _rebalance_prefix_fast(
     active_tail: int,
     metric: PrecisionMetric,
     rng,
+    bad_scratch: np.ndarray | None = None,
 ) -> tuple[np.ndarray, float, int]:
     """JIT-перевешивание prefix-universe.
 
@@ -515,7 +593,10 @@ def _rebalance_prefix_fast(
     start_rec = rec_count - work_len
     metric_id = _metric_id(metric)
     recency_weights = _recency_weights(work_len)
-    bad_flags = np.zeros(work_len, dtype=np.bool_)
+    if bad_scratch is not None and len(bad_scratch) >= work_len:
+        bad_flags = bad_scratch[:work_len]
+    else:
+        bad_flags = np.empty(work_len, dtype=np.bool_)
 
     best_pr = float(_total_precision_jit(
         cur_arr, offsets, rec_indices, signs, recency_weights,
@@ -529,21 +610,16 @@ def _rebalance_prefix_fast(
     for cycle in range(max_iter):
         iters = cycle + 1
         if cycle % 2 == 0:
-            any_bad = bool(_mark_bad_jit(
-                cur_arr, offsets, rec_indices, signs,
-                start_rec, work_len, target, bad_flags,
-            ))
-            if not any_bad:
-                break
-            _directed_update_jit(
+            any_bad, pr_raw = _directed_cycle_jit(
                 cur_arr, offsets, rec_indices, signs, base_amps,
-                start_rec, work_len, step, bad_flags,
+                start_rec, work_len, step, target, bad_flags,
+                recency_weights, metric_id,
             )
+            if not bool(any_bad):
+                break
+            pr = float(pr_raw)
         else:
-            # OPT-B: numpy rng вместо list comprehension (×18 быстрее).
-            # Используем отдельный np.random.Generator с тем же seed что и rng,
-            # чтобы не ломать детерминированность Python-rng для других вызовов.
-            # Шум стохастический — точное воспроизведение между версиями не нужно.
+            # Keep exactly the same deterministic NumPy RNG stream as v8.
             if isinstance(rng, random.Random):
                 _np_rng = getattr(rng, "_np_rng", None)
                 if _np_rng is None:
@@ -551,17 +627,16 @@ def _rebalance_prefix_fast(
                     rng._np_rng = _np_rng
                 noise = _np_rng.uniform(-step / 2, step / 2, active_count)
             else:
-                # Fallback: module-level random (rng_seed=None path)
                 noise = np.asarray(
                     [rng.uniform(-step / 2, step / 2) for _ in range(active_count)],
                     dtype=np.float64,
                 )
-            _noise_update_prefix_jit(cur_arr, active_count, noise)
+            pr = float(_noise_cycle_jit(
+                cur_arr, active_count, noise,
+                offsets, rec_indices, signs, recency_weights,
+                start_rec, work_len, metric_id,
+            ))
 
-        pr = float(_total_precision_jit(
-            cur_arr, offsets, rec_indices, signs, recency_weights,
-            start_rec, work_len, metric_id,
-        ))
         if pr > best_pr:
             best_pr = pr
             best_arr = cur_arr[:active_count].copy()
@@ -668,23 +743,30 @@ def _train_records_numba_exact(
     code_order: list[str] = []
     new_indices_by_rec: list[list[int]] = []
     overlap_by_rec: list[bool] = []
-    seen: set[str] = set()
 
+    # One pass is enough.  `existing_count` distinguishes a code that existed
+    # before this record from a duplicate introduced inside the same record, so
+    # overlap semantics stay identical even if a caller supplies duplicate codes.
     for rec in records:
-        rec_set = set(rec.codes)
-        overlap_by_rec.append(bool(rec_set & seen))
+        existing_count = len(code_order)
+        overlap = False
         new_idxs: list[int] = []
         for c in rec.codes:
-            if c not in code_to_idx:
-                code_to_idx[c] = len(code_order)
+            idx = code_to_idx.get(c)
+            if idx is None:
+                idx = len(code_order)
+                code_to_idx[c] = idx
                 code_order.append(c)
-                new_idxs.append(code_to_idx[c])
+                new_idxs.append(idx)
+            elif idx < existing_count:
+                overlap = True
+        overlap_by_rec.append(overlap)
         new_indices_by_rec.append(new_idxs)
-        seen |= rec_set
 
     offsets, rec_indices, signs, base_amps = _build_csr(records, code_to_idx)
     rng = random.Random(rng_seed) if rng_seed is not None else random
     cur_arr = np.zeros(len(code_order), dtype=np.float64)
+    bad_scratch = np.empty(len(records), dtype=np.bool_)
     active_count = 0
     iterations_total = 0
 
@@ -700,6 +782,7 @@ def _train_records_numba_exact(
             cur_arr, active_count, offsets, rec_indices, signs, base_amps, rec_idx + 1,
             max_iter=max_iter, step=step, target=target_precision,
             active_tail=active_tail, metric=metric, rng=rng,
+            bad_scratch=bad_scratch,
         )
         cur_arr[:active_count] = best_arr
         iterations_total += iters
@@ -714,6 +797,7 @@ def _train_records_numba_exact(
             cur_arr, active_count, offsets, rec_indices, signs, base_amps, len(records),
             max_iter=max_iter, step=step, target=target_precision,
             active_tail=active_tail, metric=metric, rng=rng,
+            bad_scratch=bad_scratch,
         )
         cur_arr[:active_count] = best_arr
         iterations_total += iters
@@ -744,6 +828,15 @@ _extremum_flags_cache: dict = {}
 # Computed once per dataset, then collect_extremums_back/forward use bisect O(1)
 # instead of scanning the full candle array on each call (up to 119k iterations).
 _all_extremums_cache: dict = {}
+
+# NumPy timestamp view for group_control_dates_by_extremum_state().  Building
+# np.asarray(all_ext_ts) for every ML batch is pure allocation/copy overhead.
+_all_extremums_np_cache: dict = {}
+
+# Same 50-extremum windows are reused by train modes 0/2 (backward) and
+# 1/3/4 (forward). Cache datetime materialization across those calls.
+_extremum_window_cache: dict = {}
+_EXTREMUM_WINDOW_CACHE_MAX = 8192
 
 
 def _extremum_flags(
@@ -871,6 +964,62 @@ def _get_all_extremums(
     return result
 
 
+def _all_extremum_ts_array(
+    np_simple_rates: dict,
+    *,
+    interval: int = 3,
+) -> np.ndarray:
+    dates_ns = np_simple_rates.get("dates_ns")
+    n = len(dates_ns) if dates_ns is not None else 0
+    try:
+        interval_i = max(3, int(interval or 3))
+    except Exception:
+        interval_i = 3
+    radius = max(1, interval_i // 2)
+    key = (id(np_simple_rates), n, radius)
+    arr = _all_extremums_np_cache.get(key)
+    if arr is not None:
+        return arr
+    _all_ext, all_ext_ts = _get_all_extremums(np_simple_rates, interval=interval_i)
+    arr = np.asarray(all_ext_ts, dtype=np.int64)
+    arr.flags.writeable = False
+    _all_extremums_np_cache[key] = arr
+    # Bound generations in long-lived workers/reloads.
+    if len(_all_extremums_np_cache) > 64:
+        del _all_extremums_np_cache[next(iter(_all_extremums_np_cache))]
+    return arr
+
+
+def _materialize_extremum_window(
+    np_simple_rates: dict,
+    all_ext: list[tuple[int, int]],
+    start: int,
+    cutoff: int,
+    *,
+    interval: int,
+    forward: bool,
+) -> list[tuple[datetime, int]]:
+    dates_ns = np_simple_rates.get("dates_ns")
+    n = len(dates_ns) if dates_ns is not None else 0
+    try:
+        interval_i = max(3, int(interval or 3))
+    except Exception:
+        interval_i = 3
+    radius = max(1, interval_i // 2)
+    key = (id(np_simple_rates), n, radius, int(start), int(cutoff), bool(forward))
+    cached = _extremum_window_cache.get(key)
+    if cached is not None:
+        return list(cached)
+
+    chunk = all_ext[start:cutoff]
+    source = chunk if forward else reversed(chunk)
+    value = tuple((datetime.fromtimestamp(t), int(sign)) for t, sign in source)
+    _extremum_window_cache[key] = value
+    if len(_extremum_window_cache) > _EXTREMUM_WINDOW_CACHE_MAX:
+        del _extremum_window_cache[next(iter(_extremum_window_cache))]
+    return list(value)
+
+
 def collect_extremums_back(
     np_simple_rates: dict | None,
     control_date:    datetime,
@@ -894,10 +1043,10 @@ def collect_extremums_back(
     ts         = int(control_date.timestamp())
     cutoff_idx = bisect.bisect_right(all_ext_ts, ts)   # первый индекс > ts
     start      = max(0, cutoff_idx - limit)
-    chunk      = all_ext[start:cutoff_idx]
-
-    # chunk в хронологическом порядке → разворачиваем (ближайший к control_date первый)
-    return [(datetime.fromtimestamp(t), s) for t, s in reversed(chunk)]
+    return _materialize_extremum_window(
+        np_simple_rates, all_ext, start, cutoff_idx,
+        interval=extremum_interval, forward=False,
+    )
 
 
 def collect_extremums_forward(
@@ -923,10 +1072,10 @@ def collect_extremums_forward(
     ts         = int(control_date.timestamp())
     cutoff_idx = bisect.bisect_right(all_ext_ts, ts)
     start      = max(0, cutoff_idx - limit)
-    chunk      = all_ext[start:cutoff_idx]
-
-    # Хронологический порядок — разворот не нужен
-    return [(datetime.fromtimestamp(t), s) for t, s in chunk]
+    return _materialize_extremum_window(
+        np_simple_rates, all_ext, start, cutoff_idx,
+        interval=extremum_interval, forward=True,
+    )
 
 
 def group_control_dates_by_extremum_state(
@@ -967,7 +1116,9 @@ def group_control_dates_by_extremum_state(
         (int(dt.timestamp()) for dt in control_dates),
         dtype=np.int64, count=len(control_dates),
     )
-    ext_ts_arr = np.asarray(all_ext_ts, dtype=np.int64)
+    ext_ts_arr = _all_extremum_ts_array(
+        np_simple_rates, interval=extremum_interval
+    )
     cutoffs = np.searchsorted(ext_ts_arr, control_ts, side="right")
 
     windows: dict[tuple[int, int], list[int]] = {}
@@ -980,14 +1131,16 @@ def group_control_dates_by_extremum_state(
     forward = train_mode in (1, 3, 4)
     for (start, cutoff), indexes in windows.items():
         chunk = all_ext[start:cutoff]
-        if forward:
-            seq = [(datetime.fromtimestamp(t), sign) for t, sign in chunk]
-        else:
-            seq = [(datetime.fromtimestamp(t), sign) for t, sign in reversed(chunk)]
-        key = tuple((int(d.timestamp()), int(sign)) for d, sign in seq)
+        ordered = chunk if forward else list(reversed(chunk))
+        # Key already exists as integer timestamps; avoid datetime -> timestamp
+        # round-trip for every state.
+        key = tuple((int(t), int(sign)) for t, sign in ordered)
         groups.setdefault(key, []).extend(indexes)
         if key not in seq_by_key:
-            seq_by_key[key] = seq
+            seq_by_key[key] = _materialize_extremum_window(
+                np_simple_rates, all_ext, start, cutoff,
+                interval=extremum_interval, forward=forward,
+            )
 
     return groups, seq_by_key
 
@@ -1044,6 +1197,51 @@ _seq_codes_cache: dict = {}
 _SEQ_CODES_CACHE_MAX = 1024
 
 
+def _diff_amps_for_seq(
+    np_simple_rates: dict | None,
+    seq: list[tuple[datetime, int]],
+    *,
+    strict_last: bool,
+) -> list[float | None]:
+    """Vectorized equivalent of repeated _diff_amp() calls."""
+    if not seq:
+        return []
+    if not np_simple_rates:
+        values = [1.0] * len(seq)
+        if strict_last and values:
+            values[-1] = None
+        return values
+
+    dates_ns = np_simple_rates.get("dates_ns")
+    close = np_simple_rates.get("close")
+    n = len(close) if close is not None else 0
+    if dates_ns is None or n == 0:
+        values = [1.0] * len(seq)
+        if strict_last and values:
+            values[-1] = None
+        return values
+
+    ts = np.fromiter(
+        (int(d.timestamp()) for d, _ in seq),
+        dtype=np.int64, count=len(seq),
+    )
+    idx = np.searchsorted(dates_ns, ts, side="left").astype(np.int64, copy=False)
+    idx = np.minimum(idx, n - 1)
+    c = np.asarray(close, dtype=np.float64)[idx]
+
+    values: list[float | None] = [1.0] * len(seq)
+    for i in range(len(seq) - 1):
+        amp = abs(float(c[i] - c[i + 1]))
+        values[i] = amp or 1.0
+    if values:
+        if strict_last:
+            values[-1] = None
+        else:
+            amp = abs(float(c[-1]))
+            values[-1] = amp or 1.0
+    return values
+
+
 def _build_records_from_seq_codes(
     *,
     seq: list[tuple[datetime, int]],
@@ -1057,22 +1255,17 @@ def _build_records_from_seq_codes(
     codes, then asking train_at_date() to do it all again.
     """
     use_diff = train_mode in (2, 3, 4)
-    strict_amp = train_mode == 4
+    amps = (
+        _diff_amps_for_seq(
+            np_simple_rates, seq, strict_last=(train_mode == 4)
+        )
+        if use_diff else [1.0] * len(seq)
+    )
     records: list[ExtremumRecord] = []
 
-    for idx, ((ext_date, sign), codes) in enumerate(zip(seq, pre_codes)):
-        if not codes:
+    for (ext_date, sign), codes, amp in zip(seq, pre_codes, amps):
+        if not codes or amp is None:
             continue
-
-        if use_diff:
-            has_next = idx + 1 < len(seq)
-            next_date = seq[idx + 1][0] if has_next else None
-            if strict_amp and not has_next:
-                continue
-            amp = _diff_amp(np_simple_rates, ext_date, next_date)
-        else:
-            amp = 1.0
-
         records.append(ExtremumRecord(
             date=ext_date,
             sign=sign,
@@ -1242,36 +1435,12 @@ async def train_at_date(
     if cached is not None:
         return (*cached, True)   # True = from cache, skip DB writes
 
-    use_diff   = train_mode in (2, 3, 4)
-    strict_amp = train_mode == 4
-
-    records: list[ExtremumRecord] = []
-
-    for idx, ((ext_date, sign), codes) in enumerate(zip(seq, pre_codes)):
-        if not codes:
-            continue
-
-        if use_diff:
-            has_next = idx + 1 < len(seq)
-            next_date = seq[idx + 1][0] if has_next else None
-
-            if strict_amp and not has_next:
-                continue
-
-            amp = _diff_amp(np_simple_rates, ext_date, next_date)
-        else:
-            amp = 1.0
-
-        # Дедупликация кодов на одном экстремуме, чтобы один код не усиливался
-        # дважды из-за повторного события в одной свече.
-        records.append(
-            ExtremumRecord(
-                date=ext_date,
-                sign=sign,
-                codes=sorted(set(codes)),
-                base_amp=float(amp),
-            )
-        )
+    records = _build_records_from_seq_codes(
+        seq=seq,
+        pre_codes=pre_codes,
+        np_simple_rates=np_simple_rates,
+        train_mode=train_mode,
+    )
 
     if not records:
         return {}, 1.0, 0, 0

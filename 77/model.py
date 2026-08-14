@@ -744,115 +744,378 @@ def model(
 
 
 # ============================================================================
-# FAST BATCH CACHE v1 — services 77/78
+# FAST BATCH CACHE v2 — services 77/78
 #
-# Behavior-preserving acceleration for Brain Framework fill_cache.
+# Behavior-preserving acceleration for fill_cache / ML prewarm.
 #
-# Important:
-#   - model() above is NOT changed;
-#   - live calculation continues to use the original run_standard_model();
-#   - batch calculation uses the SAME brain_framework helpers;
-#   - mode0/mode1, T1, extrema, shifts, causality and _apply_var are unchanged;
-#   - type=3 and type=4 keep the original _ml_signal_fn behaviour.
+# v2 removes the two dominant costs left in v1:
+#   1. dataset parsing/filtering is done once for all six var values;
+#   2. historical outcomes are pre-aggregated by event_type + shift and are
+#      queried through prefix sums instead of rescanning every historical analog.
 #
-# Main optimization:
-#   1. Build parsed event index once for a whole candle chunk, not once/candle.
-#   2. Calculate historical analogs once per current event.
-#   3. Produce all type 0..4 results from that single aggregation.
-#   4. Cache the batch across framework calls for different type values.
+# The public model() above remains untouched.  Only batch_model() uses this path.
 # ============================================================================
 
+import bisect as _fast_bisect
+import numpy as np
 import threading as _fast_threading
 from collections import OrderedDict as _FastOrderedDict
-
-from brain_framework import (
-    _dataset_event_index as _fast_dataset_event_index,
-    _select_current_events as _fast_select_current_events,
-    _aggregate_event_history as _fast_aggregate_event_history,
-    _execution_is_daily as _fast_execution_is_daily,
-    _standard_contribution as _fast_standard_contribution,
-)
+from datetime import timedelta as _fast_timedelta
 
 
 _FAST_BATCH_LOCK = _fast_threading.RLock()
-
-# One H1 timeframe normally consists of ~6-7 chunks × 6 vars.
-# 64 entries are enough to retain all var/chunk results until framework starts
-# requesting the next calc_type, without allowing unlimited RAM growth.
-_FAST_BATCH_CACHE_MAX = 64
+_FAST_BATCH_CACHE_MAX = 32
 _FAST_BATCH_CACHE: _FastOrderedDict = _FastOrderedDict()
+
+# Parsed dataset generations are shared by all var values.  A generation is
+# naturally invalidated when framework reloads dataset/context/rates objects.
+_FAST_PREP_CACHE_MAX = 6
+_FAST_PREP_CACHE: _FastOrderedDict = _FastOrderedDict()
+
+
+class _FastShiftStats:
+    __slots__ = (
+        "completion_dates", "valid_prefix", "t1_prefix",
+        "ext_max_prefix", "ext_min_prefix",
+    )
+
+    def __init__(self, completion_dates, valid_prefix, t1_prefix,
+                 ext_max_prefix, ext_min_prefix):
+        self.completion_dates = completion_dates
+        self.valid_prefix = valid_prefix
+        self.t1_prefix = t1_prefix
+        self.ext_max_prefix = ext_max_prefix
+        self.ext_min_prefix = ext_min_prefix
+
+
+class _FastEventSeries:
+    __slots__ = (
+        "event_type", "times", "pcts", "ctx_id", "ctx_info",
+        "same_lo", "same_hi", "shift_stats",
+    )
+
+    def __init__(self, event_type, values, ctx_id, ctx_info):
+        self.event_type = event_type
+        self.times = [v[0] for v in values]
+        self.pcts = [float(v[1]) for v in values]
+        self.ctx_id = int(ctx_id)
+        self.ctx_info = ctx_info
+        self.shift_stats: dict[int, _FastShiftStats] = {}
+
+        # _historical_analogs excludes every row with exactly the same datetime
+        # as the current event.  Store equal-time group bounds once so the hot
+        # path does not bisect twice per event.
+        n = len(self.times)
+        self.same_lo = [0] * n
+        self.same_hi = [0] * n
+        i = 0
+        while i < n:
+            j = i + 1
+            t = self.times[i]
+            while j < n and self.times[j] == t:
+                j += 1
+            for k in range(i, j):
+                self.same_lo[k] = i
+                self.same_hi[k] = j
+            i = j
 
 
 def _fast_mode_from_code(code: str) -> int | None:
-    """
-    Brain weight code:
-        <ctx_id>_<mode>_<shift>
-
-    ctx_id and shift may vary; mode is always the middle component from the end.
-    """
     try:
         return int(str(code).rsplit("_", 2)[1])
     except (ValueError, IndexError):
         return None
 
 
+def _fast_cache_get(cache, key):
+    with _FAST_BATCH_LOCK:
+        item = cache.get(key)
+        if item is None:
+            return None
+        cache.move_to_end(key)
+        return item
+
+
+def _fast_cache_put(cache, key, value, max_size: int):
+    with _FAST_BATCH_LOCK:
+        cache[key] = value
+        cache.move_to_end(key)
+        while len(cache) > max_size:
+            cache.popitem(last=False)
+
+
+def _fast_is_daily(rates: list[dict] | None, dataset_index: dict | None) -> bool:
+    di = dataset_index or {}
+    if "is_daily" in di:
+        return bool(di.get("is_daily"))
+    rates_table = str(di.get("rates_table") or "")
+    if rates_table:
+        return rates_table.endswith("_day")
+    if not rates:
+        return False
+    last_dt = rates[-1].get("date")
+    return bool(
+        isinstance(last_dt, datetime)
+        and last_dt.hour == 0
+        and last_dt.minute == 0
+    )
+
+
 def _fast_batch_cache_key(
+    rates: list[dict],
     dataset: list[dict],
     dates: list[datetime],
     var: int,
     dataset_index: dict | None,
 ) -> tuple:
     di = dataset_index or {}
-
-    pair_id = _pair_id(di)
-    is_daily = bool(di.get("is_daily"))
-
     np_rates = di.get("np_rates") or {}
     dates_ns = np_rates.get("dates_ns")
-
-    if dates:
-        first_ts = int(dates[0].timestamp())
-        last_ts = int(dates[-1].timestamp())
-    else:
-        first_ts = 0
-        last_ts = 0
-
+    ctx_index = di.get("ctx_index") or {}
     return (
-        int(pair_id),
-        int(is_daily),
-        int(var),
-
-        # New dataset / reload => another cache generation automatically.
-        id(dataset),
-        len(dataset),
-
-        # New rates arrays / reload => another cache generation.
-        id(dates_ns),
-
+        _pair_id(di), _fast_is_daily(rates, di), int(var),
+        id(dataset), len(dataset), id(ctx_index), len(ctx_index), id(dates_ns),
         len(dates),
-        first_ts,
-        last_ts,
+        int(dates[0].timestamp()) if dates else 0,
+        int(dates[-1].timestamp()) if dates else 0,
     )
 
 
-def _fast_cache_get(key):
-    with _FAST_BATCH_LOCK:
-        item = _FAST_BATCH_CACHE.get(key)
-        if item is None:
-            return None
+def _fast_prep_key(dataset, dataset_index):
+    di = dataset_index or {}
+    np_rates = di.get("np_rates") or {}
+    ctx_index = di.get("ctx_index") or {}
+    return (
+        _pair_id(di), bool(di.get("is_daily")) if "is_daily" in di else str(di.get("rates_table") or "").endswith("_day"),
+        id(dataset), len(dataset),
+        id(ctx_index), len(ctx_index),
+        id(np_rates.get("dates_ns")),
+        id(np_rates.get("t1")),
+        id(np_rates.get("ext_max")),
+        id(np_rates.get("ext_min")),
+    )
 
-        # LRU
-        _FAST_BATCH_CACHE.move_to_end(key)
-        return item
+
+def _fast_var_mask(row: dict) -> int:
+    """Return six-bit mask equivalent to _row_allowed_for_var()."""
+    agreement = str(row.get("agreement_class") or "mixed")
+    try:
+        coherence = float(row.get("coherence") or 0.0)
+    except (TypeError, ValueError):
+        coherence = 0.0
+    try:
+        dispersion = float(row.get("dispersion") or 0.0)
+    except (TypeError, ValueError):
+        dispersion = 0.0
+
+    mask = (1 << 0) | (1 << 3)
+    if agreement in ("majority", "unanimous"):
+        mask |= 1 << 1
+    if agreement == "unanimous":
+        mask |= 1 << 2
+    if coherence >= COHERENCE_FILTER_MIN:
+        mask |= 1 << 4
+    if dispersion >= CONFLICT_DISPERSION_MIN and agreement != "unanimous":
+        mask |= 1 << 5
+    return mask
 
 
-def _fast_cache_put(key, value):
-    with _FAST_BATCH_LOCK:
-        _FAST_BATCH_CACHE[key] = value
-        _FAST_BATCH_CACHE.move_to_end(key)
+def _fast_prepare_generation(dataset: list[dict], dataset_index: dict | None):
+    """Parse dataset once and build event series for all six vars."""
+    key = _fast_prep_key(dataset, dataset_index)
+    cached = _fast_cache_get(_FAST_PREP_CACHE, key)
+    if cached is not None:
+        return cached
 
-        while len(_FAST_BATCH_CACHE) > _FAST_BATCH_CACHE_MAX:
-            _FAST_BATCH_CACHE.popitem(last=False)
+    di = dataset_index or {}
+    pair_id = _pair_id(di)
+    ctx_index = di.get("ctx_index") or {}
+    reverse = {
+        str(info.get("event_type") or "").strip().lower(): (int(info["id"]), info)
+        for info in ctx_index.values()
+        if info.get("id") and info.get("event_type")
+    }
+
+    grouped = [dict() for _ in range(6)]
+    for row in dataset or ():
+        try:
+            if int(row.get("pair_id") or 0) != pair_id:
+                continue
+        except (TypeError, ValueError):
+            continue
+
+        event_time = row.get("date_dt") or row.get("date")
+        if event_time is None:
+            continue
+        if isinstance(event_time, str):
+            try:
+                event_time = datetime.fromisoformat(event_time[:19])
+            except ValueError:
+                continue
+
+        try:
+            event_type = str(row["event_type"]).strip().lower()
+            pct = float(row.get("median_edge") or 0.0)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not event_type or event_type not in reverse:
+            continue
+
+        mask = _fast_var_mask(row)
+        value = (event_time, pct)
+        for var in range(6):
+            if mask & (1 << var):
+                grouped[var].setdefault(event_type, []).append(value)
+
+    prepared_by_var = []
+    for var in range(6):
+        series_by_type: dict[str, _FastEventSeries] = {}
+        flat = []
+        for event_type, values in grouped[var].items():
+            values.sort(key=lambda item: item[0])
+            ctx_id, ctx_info = reverse[event_type]
+            series = _FastEventSeries(event_type, values, ctx_id, ctx_info)
+            series_by_type[event_type] = series
+            for pos, (event_time, pct) in enumerate(values):
+                flat.append((event_time, event_type, pos, pct, series))
+        flat.sort(key=lambda item: (item[0], item[1]))
+        prepared_by_var.append((series_by_type, flat, [x[0] for x in flat]))
+
+    result = (prepared_by_var, di.get("np_rates"))
+    _fast_cache_put(_FAST_PREP_CACHE, key, result, _FAST_PREP_CACHE_MAX)
+    return result
+
+
+def _fast_get_shift_stats(
+    series: _FastEventSeries,
+    *,
+    shift: int,
+    np_rates: dict,
+    is_daily: bool,
+    var: int,
+) -> _FastShiftStats:
+    cached = series.shift_stats.get(int(shift))
+    if cached is not None:
+        return cached
+
+    n = len(series.times)
+    unit = _fast_timedelta(days=1) if is_daily else _fast_timedelta(hours=1)
+    shift_delta = unit * int(shift)
+
+    dates_ns = np_rates.get("dates_ns")
+    t1_arr = np_rates.get("t1")
+    ext_max = np_rates.get("ext_max")
+    ext_min = np_rates.get("ext_min")
+    rates_n = len(dates_ns) if dates_ns is not None else 0
+
+    completion_dates = [None] * n
+    valid_prefix = [0] * (n + 1)
+    t1_prefix = [0.0] * (n + 1)
+    ext_max_prefix = [0] * (n + 1)
+    ext_min_prefix = [0] * (n + 1)
+
+    for i, event_time in enumerate(series.times):
+        outcome_time = event_time + shift_delta
+        if is_daily:
+            frame_start = outcome_time.replace(hour=0, minute=0, second=0, microsecond=0)
+        else:
+            frame_start = outcome_time.replace(minute=0, second=0, microsecond=0)
+        frame_end = frame_start + unit
+        completion_dates[i] = frame_end
+
+        valid = False
+        weighted = 0.0
+        hit_max = 0
+        hit_min = 0
+        if rates_n:
+            ts = int(frame_start.timestamp())
+            idx = int(np.searchsorted(dates_ns, ts, side="left"))
+            if idx < rates_n and int(dates_ns[idx]) == ts:
+                valid = True
+                stored_t1 = float(t1_arr[idx])
+                if int(var) == 3:
+                    scale = min(max(abs(float(series.pcts[i])) / 3.0, 0.25), 3.0)
+                    weighted = stored_t1 * scale
+                else:
+                    weighted = stored_t1
+                if ext_max is not None and bool(ext_max[idx]):
+                    hit_max = 1
+                if ext_min is not None and bool(ext_min[idx]):
+                    hit_min = 1
+
+        valid_prefix[i + 1] = valid_prefix[i] + (1 if valid else 0)
+        # Python cumulative addition deliberately matches the old loop order.
+        t1_prefix[i + 1] = t1_prefix[i] + (weighted if valid else 0.0)
+        ext_max_prefix[i + 1] = ext_max_prefix[i] + hit_max
+        ext_min_prefix[i + 1] = ext_min_prefix[i] + hit_min
+
+    stats = _FastShiftStats(
+        completion_dates, valid_prefix, t1_prefix,
+        ext_max_prefix, ext_min_prefix,
+    )
+    series.shift_stats[int(shift)] = stats
+    return stats
+
+
+def _fast_range_delta(prefix, lo: int, hi: int):
+    if hi <= lo:
+        return 0
+    return prefix[hi] - prefix[lo]
+
+
+def _fast_aggregate_from_prefix(
+    series: _FastEventSeries,
+    pos: int,
+    target_date: datetime,
+    *,
+    shift: int,
+    np_rates: dict,
+    is_daily: bool,
+    var: int,
+    predict_max: bool,
+    min_occurrence: int = 2,
+):
+    # Same strict analog cutoff as _historical_analogs: event_time < target.
+    analog_end = _fast_bisect.bisect_left(series.times, target_date)
+    lo_same = series.same_lo[pos]
+    hi_same = series.same_hi[pos]
+
+    excluded_analogs = 0
+    if series.times[pos] < target_date:
+        excluded_analogs = max(0, min(hi_same, analog_end) - lo_same)
+    analog_count = analog_end - excluded_analogs
+    if analog_count < int(min_occurrence):
+        return 0.0, 0.0, 0, 0
+
+    stats = _fast_get_shift_stats(
+        series, shift=shift, np_rates=np_rates,
+        is_daily=is_daily, var=var,
+    )
+
+    # frame_end <= target_date. completion_dates are monotonic because the
+    # source event series is sorted and shift is constant.
+    completed_end = _fast_bisect.bisect_right(stats.completion_dates, target_date)
+    end = min(analog_end, completed_end)
+
+    ex_lo = lo_same if series.times[pos] < target_date else end
+    ex_hi = min(hi_same, end) if series.times[pos] < target_date else end
+    if ex_lo >= end:
+        ex_lo = ex_hi = end
+
+    outcomes = stats.valid_prefix[end] - _fast_range_delta(stats.valid_prefix, ex_lo, ex_hi)
+    t1_sum = stats.t1_prefix[end] - _fast_range_delta(stats.t1_prefix, ex_lo, ex_hi)
+
+    hit_prefix = stats.ext_max_prefix if predict_max else stats.ext_min_prefix
+    hits = hit_prefix[end] - _fast_range_delta(hit_prefix, ex_lo, ex_hi)
+
+    if outcomes < int(min_occurrence):
+        return 0.0, 0.0, int(outcomes), int(hits)
+
+    probability = hits / outcomes
+    mode1 = (probability * 2.0) - 1.0
+    if predict_max:
+        mode1 = -mode1
+    return float(t1_sum), float(mode1), int(outcomes), int(hits)
 
 
 def _fast_build_batch_base(
@@ -863,257 +1126,105 @@ def _fast_build_batch_base(
     var: int,
     dataset_index: dict | None,
 ) -> dict[datetime, tuple[dict[str, float], dict[str, float]]]:
-    """
-    Calculate one var for all dates.
-
-    Returned value per date:
-        (
-            type0_result,   # contains mode0 + mode1
-            type3_result,   # active-code representation for ML types 3/4
-        )
-
-    From those two dictionaries we can reproduce all five calc_type values
-    exactly:
-
-        type 0 = type0_result
-        type 1 = only mode0 codes from type0_result
-        type 2 = only mode1 codes from type0_result
-        type 3 = type3_result
-        type 4 = type3_result
-
-    This follows the original framework contract.
-    """
-
     empty = {d: ({}, {}) for d in dates}
-
     if not dataset or not dates:
         return empty
 
-    di = dict(dataset_index or {})
-
-    ctx_index = di.get("ctx_index") or {}
-    np_rates = di.get("np_rates")
-
-    if not ctx_index or np_rates is None:
-        return empty
-
-    pair_id = _pair_id(di)
+    prepared_by_var, np_rates_cached = _fast_prepare_generation(dataset, dataset_index)
     calc_var = int(var)
-
-    # Same parser as original model().
-    parser = _event_parser(pair_id, calc_var)
-
-    # ------------------------------------------------------------------
-    # Critical optimization #1
-    #
-    # Original model() -> run_standard_model() builds this index again
-    # for every target candle.
-    #
-    # Here it is built ONCE for the whole batch.
-    # ------------------------------------------------------------------
-
-    local_index = dict(di)
-
-    # We deliberately allow the index to contain the complete loaded dataset.
-    # Causality is enforced below by:
-    #
-    #   event_time <= target_date
-    #
-    # and _aggregate_event_history itself only accepts analogs strictly before
-    # target_date and only outcomes whose candle is already closed.
-    local_index["full_dataset"] = dataset
-
-    events_by_type = _fast_dataset_event_index(
-        dataset,
-        local_index,
-        parser,
-    )
-
-    if not events_by_type:
+    if calc_var < 0 or calc_var >= len(prepared_by_var):
         return empty
 
-    reverse: dict[str, tuple[int, dict]] = {
-        str(info.get("event_type") or "").strip().lower(): (
-            int(info["id"]),
-            info,
-        )
-        for info in ctx_index.values()
-        if info.get("id") and info.get("event_type")
-    }
-
-    if not reverse:
+    _series_by_type, flat, flat_times = prepared_by_var[calc_var]
+    np_rates = (dataset_index or {}).get("np_rates") or np_rates_cached
+    if not flat or np_rates is None:
         return empty
 
-    is_daily = _fast_execution_is_daily(rates, di)
+    is_daily = _fast_is_daily(rates, dataset_index)
+    unit = _fast_timedelta(days=1) if is_daily else _fast_timedelta(hours=1)
+    dates_ns = np_rates.get("dates_ns")
+    opens = np_rates.get("open")
+    closes = np_rates.get("close")
+    if dates_ns is None or opens is None or closes is None:
+        return empty
 
-    result: dict[
-        datetime,
-        tuple[dict[str, float], dict[str, float]]
-    ] = {}
+    result = {}
+    horizon = _fast_timedelta(days=1) if is_daily else _fast_timedelta(hours=12)
 
     for target_date in dates:
+        left = target_date - horizon
+        lo = _fast_bisect.bisect_left(flat_times, left)
+        # v1 selected up to target+horizon then explicitly rejected future rows.
+        # The resulting causal set is exactly <= target, so skip future rows now.
+        hi = _fast_bisect.bisect_right(flat_times, target_date)
 
-        # Same event selection as _run_standard_model_core().
-        current_events = _fast_select_current_events(
-            events_by_type,
-            target_date,
-            is_daily=is_daily,
-            shift_window=SHIFT_WINDOW,
-            reverse=reverse,
-
-            # Same values as the original model().
-            rare_occurrence_max=0,
-            rare_event_fn=lambda _ctx: True,
-        )
+        cut = int(np.searchsorted(dates_ns, int(target_date.timestamp()), side="left"))
+        predict_max = bool(cut > 0 and float(closes[cut - 1]) > float(opens[cut - 1]))
 
         out_type0: dict[str, float] = {}
         out_type3: dict[str, float] = {}
 
-        for (
-            current_event_time,
-            current_pct,
-            event_type,
-            ctx_id,
-            ctx_info,
-            shift,
-        ) in current_events:
+        for event_time, _event_type, pos, current_pct, series in flat[lo:hi]:
+            if target_date - unit <= event_time < target_date:
+                shift = 0
+            else:
+                seconds = (target_date - event_time).total_seconds()
+                shift = int(seconds // (86400 if is_daily else 3600)) if seconds >= 0 else 0
 
-            # ----------------------------------------------------------
-            # CRITICAL CAUSAL GUARD
-            #
-            # Original model() gives run_standard_model() a causal dataset
-            # prefix. A batch receives a larger dataset, therefore future
-            # news selected by the ±12h selector must explicitly be rejected.
-            # ----------------------------------------------------------
-            if current_event_time > target_date:
-                continue
-
-            # ----------------------------------------------------------
-            # Critical optimization #2
-            #
-            # Calculate historical outcomes ONCE.
-            #
-            # Previously type 0,1,2,3,4 caused the same aggregation to be
-            # repeated five times.
-            # ----------------------------------------------------------
-            mode0, mode1, outcomes, hits = _fast_aggregate_event_history(
-                current_event_time=current_event_time,
-                current_pct=current_pct,
-                event_type=event_type,
+            mode0, mode1, outcomes, hits = _fast_aggregate_from_prefix(
+                series,
+                pos,
+                target_date,
                 shift=shift,
-                ctx_info=ctx_info,
-                events_by_type=events_by_type,
                 np_rates=np_rates,
-                target_date=target_date,
                 is_daily=is_daily,
                 var=calc_var,
-                apply_var_fn=_apply_var,
+                predict_max=predict_max,
                 min_occurrence=2,
             )
 
-            # ----------------------------------------------------------
-            # TYPE 0
-            #
-            # Framework definition:
-            # type=0 -> mode0 + mode1
-            # ----------------------------------------------------------
-            contribution0 = _fast_standard_contribution(
-                calc_type=0,
-                ctx_id=ctx_id,
-                shift=shift,
-                mode0_value=mode0,
-                mode1_value=mode1,
-            )
+            ctx_id = series.ctx_id
+            if mode0 != 0.0:
+                code0 = f"{ctx_id}_0_{shift}"
+                value0 = round(float(mode0), 6)
+                if value0 != 0.0:
+                    out_type0[code0] = out_type0.get(code0, 0.0) + value0
+                    out_type3[code0] = out_type3.get(code0, 0.0) + value0
 
-            for code, value in contribution0.items():
-                value = float(value)
-                if value != 0.0:
-                    out_type0[code] = out_type0.get(code, 0.0) + value
+            if mode1 != 0.0:
+                code1 = f"{ctx_id}_1_{shift}"
+                value1 = round(float(mode1), 6)
+                if value1 != 0.0:
+                    out_type0[code1] = out_type0.get(code1, 0.0) + value1
 
-            # ----------------------------------------------------------
-            # TYPE 3 / TYPE 4
-            #
-            # Use EXACTLY the original model's _ml_signal_fn().
-            #
-            # In services 77/78 _ml_signal_fn returns the same active-code
-            # representation for calc_type 3 and 4.
-            # ----------------------------------------------------------
-            direction = 1.0 if current_pct > 0 else -1.0
-
-            contribution3 = _ml_signal_fn(
-                3,
-                ctx_id,
-                shift,
-                mode0,
-                bool(hits),
-                current_pct,
-                outcomes,
-                direction,
-                ctx_info,
-            )
-
-            if contribution3:
-                for code, value in contribution3.items():
-                    value = float(value)
-                    if value != 0.0:
-                        out_type3[code] = out_type3.get(code, 0.0) + value
-
-        # Same final zero filtering as brain_framework core.
-        out_type0 = {
-            k: v
-            for k, v in out_type0.items()
-            if v != 0.0
-        }
-
-        out_type3 = {
-            k: v
-            for k, v in out_type3.items()
-            if v != 0.0
-        }
+            # Exact _ml_signal_fn type=3/4 contract: mode1 active code is based
+            # on bool(hits), not on mode1_value itself.
+            if hits:
+                code1 = f"{ctx_id}_1_{shift}"
+                value3 = 1.0 if current_pct > 0 else -1.0
+                out_type3[code1] = out_type3.get(code1, 0.0) + value3
 
         result[target_date] = (
-            out_type0,
-            out_type3,
+            {k: v for k, v in out_type0.items() if v != 0.0},
+            {k: v for k, v in out_type3.items() if v != 0.0},
         )
 
     return result
 
 
-def _fast_extract_type(
-    base: dict[datetime, tuple[dict[str, float], dict[str, float]]],
-    calc_type: int,
-) -> dict[datetime, dict[str, float]]:
-
-    result: dict[datetime, dict[str, float]] = {}
-
+def _fast_extract_type(base, calc_type: int):
+    result = {}
     for dt, (type0, type3) in base.items():
-
         if calc_type == 0:
             result[dt] = dict(type0)
-
         elif calc_type == 1:
-            # mode0 only
-            result[dt] = {
-                code: value
-                for code, value in type0.items()
-                if _fast_mode_from_code(code) == 0
-            }
-
+            result[dt] = {c: v for c, v in type0.items() if _fast_mode_from_code(c) == 0}
         elif calc_type == 2:
-            # mode1 only
-            result[dt] = {
-                code: value
-                for code, value in type0.items()
-                if _fast_mode_from_code(code) == 1
-            }
-
+            result[dt] = {c: v for c, v in type0.items() if _fast_mode_from_code(c) == 1}
         elif calc_type in (3, 4):
-            # Existing _ml_signal_fn has identical output for 3 and 4.
             result[dt] = dict(type3)
-
         else:
             result[dt] = {}
-
     return result
 
 
@@ -1127,45 +1238,24 @@ def batch_model(
     param: str = "",
     dataset_index: dict | None = None,
 ) -> dict[datetime, dict[str, float]]:
-    """
-    Optimized batch implementation for fill_cache / ML prewarm.
-
-    It is intentionally separate from model(), so real-time calculation keeps
-    using the original implementation.
-    """
-
     if not dates:
         return {}
-
     if not dataset:
         return {d: {} for d in dates}
 
     calc_type = int(type)
     calc_var = int(var)
-
-    if calc_type not in TYPES_RANGE:
+    if calc_type not in TYPES_RANGE or calc_var not in VAR_RANGE:
         return {d: {} for d in dates}
 
-    if calc_var not in VAR_RANGE:
-        return {d: {} for d in dates}
-
-    key = _fast_batch_cache_key(
-        dataset,
-        dates,
-        calc_var,
-        dataset_index,
-    )
-
-    base = _fast_cache_get(key)
-
+    key = _fast_batch_cache_key(rates, dataset, dates, calc_var, dataset_index)
+    base = _fast_cache_get(_FAST_BATCH_CACHE, key)
     if base is None:
         base = _fast_build_batch_base(
-            rates,
-            dataset,
-            dates,
+            rates, dataset, dates,
             var=calc_var,
             dataset_index=dataset_index,
         )
-        _fast_cache_put(key, base)
+        _fast_cache_put(_FAST_BATCH_CACHE, key, base, _FAST_BATCH_CACHE_MAX)
 
     return _fast_extract_type(base, calc_type)

@@ -18,8 +18,11 @@ types_range = [0, 1, 2, 3, 4]
 shift_window = 12
 reload_interval = 3600
 rebuild_interval = 7200
-ml_workers = 1
+# Two deterministic ML states may train concurrently; reverse_learning uses a process pool.
+ml_workers = 2
 ml_batch_size = 2000
+# Stream batch_model in bounded chunks: fast progress without giant RAM spikes.
+batch_model_size = 1000
 
 [dataset]
 parser_table = "brain_llm"

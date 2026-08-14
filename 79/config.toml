@@ -20,6 +20,8 @@ reload_interval = 3600
 rebuild_interval = 7200
 ml_workers = 1
 ml_batch_size = 2000
+# Stream batch_model in bounded chunks: fast progress without giant RAM spikes.
+batch_model_size = 1000
 
 [dataset]
 parser_table = "brain_cnn_news"

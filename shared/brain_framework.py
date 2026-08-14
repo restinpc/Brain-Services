@@ -1237,6 +1237,10 @@ class _State:
     ML_PRECISION_METRIC:  str   = "mean"
     FILL_ML_WORKERS:      int   = 1
     FILL_ML_BATCH_SIZE:   int   = 2000
+    # Maximum chunk passed to synchronous batch_model() during fill_cache.
+    # A whole 14k+ candle history in one call creates huge temporary dicts,
+    # delays the first DB commit and can push Brain 1 into swap/GC thrash.
+    FILL_BATCH_MODEL_SIZE: int  = 1000
 
     # Новые поля для enriched-паттерна
     PARSER_TABLE:         str | None = None
@@ -2115,6 +2119,10 @@ def build_app(model_module) -> FastAPI:
     s.ML_PRECISION_METRIC =       _get("ml", "precision_metric", "ML_PRECISION_METRIC", "", "mean")
     s.FILL_ML_WORKERS     = max(1, int(_get("cache", "ml_workers", "FILL_ML_WORKERS", "FILL_ML_WORKERS", getattr(rl, "_RL_TRAIN_WORKERS", 1))))
     s.FILL_ML_BATCH_SIZE  = max(100, int(_get("cache", "ml_batch_size", "FILL_ML_BATCH_SIZE", "FILL_ML_BATCH_SIZE", 2000)))
+    s.FILL_BATCH_MODEL_SIZE = max(100, int(_get(
+        "cache", "batch_model_size", "FILL_BATCH_MODEL_SIZE",
+        "FILL_BATCH_MODEL_SIZE", 1000,
+    )))
 
     # ── Прочее ────────────────────────────────────────────────────────────────
     s.LABEL_FN  = getattr(model_module, "LABEL_FN",  None)
@@ -3161,26 +3169,54 @@ def build_app(model_module) -> FastAPI:
                     continue
 
                 try:
-                    # batch_model за один вызов — O(N) вместо O(N²).
-                    rates_for_prewarm = rows if s.model_uses_rate_history else [{"date": missing[-1]}]
-                    dataset_for_prewarm = s.dataset if s.model_can_filter_dataset_by_date else _filter_dataset_lte(missing[-1], s)
-                    batch_results = s.batch_model_fn(
-                        rates=rates_for_prewarm,
-                        dataset=dataset_for_prewarm,
-                        dates=missing,
-                        type=calc_type, var=calc_var, param=calc_param,
-                        dataset_index=dataset_index_dict,
-                    )
-                    for ext_dt, result in batch_results.items():
-                        key = (pair_id, day_flag, int(ext_dt.timestamp()),
-                               calc_type, calc_var, calc_param)
-                        s._ml_active_cache[key] = list(result.keys())
-                        warmed += 1
-                    # FIX: страховочный лимит на _ml_active_cache (без него нет eviction)
-                    if len(s._ml_active_cache) > _ML_ACTIVE_CACHE_MAX:
-                        _evict = len(s._ml_active_cache) - _ML_ACTIVE_CACHE_MAX
-                        for _k in list(s._ml_active_cache.keys())[:_evict]:
-                            del s._ml_active_cache[_k]
+                    # Stream prewarm too.  One call with thousands of extrema
+                    # creates the same giant-result-map problem as normal fill.
+                    _prewarm_bs = max(100, min(
+                        s.FILL_ML_BATCH_SIZE, s.FILL_BATCH_MODEL_SIZE
+                    ))
+                    _prewarm_total = len(missing)
+                    _prewarm_done = 0
+                    for _j in range(0, _prewarm_total, _prewarm_bs):
+                        if s.fill_cancel.is_set():
+                            break
+                        _missing_chunk = missing[_j:_j + _prewarm_bs]
+                        rates_for_prewarm = (
+                            rows if s.model_uses_rate_history
+                            else [{"date": _missing_chunk[-1]}]
+                        )
+                        dataset_for_prewarm = (
+                            s.dataset if s.model_can_filter_dataset_by_date
+                            else _filter_dataset_lte(_missing_chunk[-1], s)
+                        )
+                        batch_results = s.batch_model_fn(
+                            rates=rates_for_prewarm,
+                            dataset=dataset_for_prewarm,
+                            dates=_missing_chunk,
+                            type=calc_type, var=calc_var, param=calc_param,
+                            dataset_index=dataset_index_dict,
+                        )
+                        for ext_dt, result in batch_results.items():
+                            key = (pair_id, day_flag, int(ext_dt.timestamp()),
+                                   calc_type, calc_var, calc_param)
+                            s._ml_active_cache[key] = list(result.keys())
+                            warmed += 1
+                        _prewarm_done += len(_missing_chunk)
+                        s.fill_status.update({
+                            "phase": "ml_prewarm",
+                            "prewarm_done": _prewarm_done,
+                            "prewarm_total": _prewarm_total,
+                            "current_pair": pair_id,
+                            "current_day": day_flag,
+                            "current_type": calc_type,
+                            "current_var": calc_var,
+                            "current_param": calc_param,
+                        })
+                        # Safety cap; with per-slot prewarm the entries currently
+                        # needed for calculation are newest and survive eviction.
+                        if len(s._ml_active_cache) > _ML_ACTIVE_CACHE_MAX:
+                            _evict = len(s._ml_active_cache) - _ML_ACTIVE_CACHE_MAX
+                            for _k in list(s._ml_active_cache.keys())[:_evict]:
+                                del s._ml_active_cache[_k]
                 except Exception as _e:
                     log(f"   prewarm pair{pair_id}/{'d' if day_flag else 'h'} "
                         f"t={calc_type} v={calc_var}: {_e}",
@@ -3226,8 +3262,10 @@ def build_app(model_module) -> FastAPI:
             )
             total  = total_candles * len(type_var_slots)
             done   = skipped = errors = 0
+            completed_slots = 0
             s.fill_status = {
-                "state": "running", "total": total, "done": 0,
+                "state": "running", "phase": "preparing",
+                "total": total, "done": 0,
                 "skipped": 0, "errors": 0,
                 "pairs": pairs, "days": days,
                 "slots_total": total_slots, "slots_done": 0,
@@ -3251,7 +3289,8 @@ def build_app(model_module) -> FastAPI:
                             if (dt_from is None or r["date"] >= dt_from)
                             and (dt_to   is None or r["date"] <= dt_to)]
                 if not candles:
-                    s.fill_status["slots_done"] = slot_idx + 1
+                    completed_slots += len(type_var_slots)
+                    s.fill_status["slots_done"] = completed_slots
                     log(f"  [pair{pair_id}/{'d' if day_flag else 'h'}] нет свечей, пропуск",
                         s.NODE_NAME, force=True)
                     continue
@@ -3259,6 +3298,11 @@ def build_app(model_module) -> FastAPI:
                 np_rates_pd  = s.np_rates.get(tbl)
                 all_dates_pd = [r["date"] for r in all_rows]
                 instr_label  = f"pair{pair_id}/{'d' if day_flag else 'h'}"
+                s.fill_status.update({
+                    "phase": "cache_prefetch",
+                    "current_pair": pair_id,
+                    "current_day": day_flag,
+                })
                 log(f"  [{instr_label}] {len(candles)} свечей × "
                     f"{len(type_var_slots)} type/var/param слотов", s.NODE_NAME, force=True)
 
@@ -3324,25 +3368,12 @@ def build_app(model_module) -> FastAPI:
                     done += _fast_done
                     skipped += _fast_skipped
                     errors += _fast_errors
+                    completed_slots += len(type_var_slots)
                     s.fill_status.update({
                         "done": done, "skipped": skipped, "errors": errors,
-                        "slots_done": slot_idx + 1,
+                        "slots_done": completed_slots,
                     })
                     continue
-
-                # ── Прогрев ML-кеша через batch_model ────────────────────────────
-                # Если модель имеет batch_model и USE_ML_VALUES=True — вычисляем
-                # активные коды для всех экстремумов одним вызовом.
-                # maybe_retrain() будет получать _active_codes_at из кеша (O(1))
-                # вместо пересчёта срезов rates на каждый экстремум.
-                if s.USE_ML_VALUES and s.batch_model_fn is not None:
-                    warmed = await _prewarm_ml_active_cache(
-                        pair_id, day_flag, type_var_slots,
-                        dt_from=dt_from, dt_to=dt_to,
-                    )
-                    if warmed:
-                        log(f"  [{instr_label}] ML-кеш прогрет: {warmed} экстремумов",
-                            s.NODE_NAME, force=True)
 
                 # OPT-2: параллельный запуск type_var_slots через asyncio.gather
                 # (только для не-ML пути — ML-обучение state-dependent, нельзя параллелить).
@@ -3351,7 +3382,7 @@ def build_app(model_module) -> FastAPI:
                 _ml_compute_sem = asyncio.Semaphore(max(1, s.FILL_ML_WORKERS))
 
                 async def _fill_one_slot(calc_type: int, var: int, calc_param: str) -> None:
-                    nonlocal done, skipped, errors
+                    nonlocal done, skipped, errors, completed_slots
 
                     extra       = {"type": calc_type, "var": var, "param": calc_param}
                     p_hash      = _params_hash(extra)
@@ -3380,15 +3411,62 @@ def build_app(model_module) -> FastAPI:
                     async with _slot_lock:
                         skipped += skipped_local
 
-                    # OPT-5: для batch_model один большой батч выгоднее
-                    # (стоимость вызова константа, нет смысла дробить).
-                    _eff_bs = (len(to_fetch)
-                               if s.batch_model_fn is not None and not s.USE_ML_VALUES
-                               else (max(batch_size, s.FILL_ML_BATCH_SIZE)
-                                     if s.USE_ML_VALUES else batch_size)) or batch_size
-                    # Exact extremum-state results can safely cross batch boundaries.
+                    # Streaming batches are intentional even for batch_model().
+                    # Passing the whole 2025→now hourly range (≈14k candles) made
+                    # model-side result caches enormous and `done` stayed at zero
+                    # until one giant calculation + INSERT finished.  A bounded
+                    # chunk keeps memory flat and commits visible progress quickly.
+                    if s.batch_model_fn is not None and not s.USE_ML_VALUES:
+                        _eff_bs = min(
+                            max(1, len(to_fetch)),
+                            max(batch_size, s.FILL_BATCH_MODEL_SIZE),
+                        )
+                    elif s.USE_ML_VALUES:
+                        _eff_bs = max(batch_size, s.FILL_ML_BATCH_SIZE)
+                    else:
+                        _eff_bs = batch_size
+
+                    # ML results are slot-specific: train_mode / var / param are
+                    # part of model semantics, so never leak a state result into
+                    # another slot merely because the extremum sequence is equal.
                     _ml_state_results: dict[tuple, dict | None] = {}
+
+                    # Prewarm only the ML slot that is about to be consumed.
+                    # The previous implementation warmed ALL type/var slots for a
+                    # pair before writing the first cache row; on 78/80 this could
+                    # spend hours in a phase invisible to fill_status.done and also
+                    # evict early prewarm entries before those slots were processed.
+                    if s.USE_ML_VALUES and s.batch_model_fn is not None and to_fetch:
+                        s.fill_status.update({
+                            "phase": "ml_prewarm",
+                            "current_pair": pair_id,
+                            "current_day": day_flag,
+                            "current_type": calc_type,
+                            "current_var": var,
+                            "current_param": calc_param,
+                        })
+                        warmed = await _prewarm_ml_active_cache(
+                            pair_id, day_flag, [(calc_type, var, calc_param)],
+                            dt_from=dt_from, dt_to=dt_to,
+                        )
+                        if warmed:
+                            log(
+                                f"  [{instr_label} t={calc_type}/v={var}] "
+                                f"ML-кеш прогрет: {warmed} экстремумов",
+                                s.NODE_NAME, force=True,
+                            )
+
                     for i in range(0, len(to_fetch), _eff_bs):
+                        s.fill_status.update({
+                            "phase": "calculating",
+                            "current_pair": pair_id,
+                            "current_day": day_flag,
+                            "current_type": calc_type,
+                            "current_var": var,
+                            "current_param": calc_param,
+                            "slot_batch_from": i,
+                            "slot_total": len(to_fetch),
+                        })
                         if s.fill_cancel.is_set():
                             break
                         batch = to_fetch[i:i + _eff_bs]
@@ -3595,24 +3673,34 @@ def build_app(model_module) -> FastAPI:
                         log(f"  [{instr_label} t={calc_type}/v={var}/p={calc_param!r}] "
                             f"{done}/{total} err={errors}", s.NODE_NAME, force=True)
 
+                    if not s.fill_cancel.is_set():
+                        async with _slot_lock:
+                            completed_slots += 1
+                            s.fill_status["slots_done"] = completed_slots
+
                 # ── Запуск слотов ─────────────────────────────────────────────────
-                # ML-путь: последовательно (обучение зависит от предыдущего состояния).
-                # Остальные: параллельно через gather.
-                if s.USE_ML_VALUES or _ordered_model:
-                    for calc_type, var, calc_param in type_var_slots:
+                # ML/stateful path is sequential by definition.  Synchronous
+                # batch_model() also runs sequentially: wrapping 30-40 sync calls
+                # in asyncio.gather never made them CPU-parallel, but did allow many
+                # large DB inserts / result maps to coexist in memory.  Process
+                # var-first so model-side base-result caches are reused by all types.
+                if s.USE_ML_VALUES or _ordered_model or s.batch_model_fn is not None:
+                    _slots_to_run = type_var_slots
+                    if s.batch_model_fn is not None and not s.USE_ML_VALUES and not _ordered_model:
+                        _slots_to_run = sorted(
+                            type_var_slots, key=lambda x: (x[1], x[2], x[0])
+                        )
+                    for calc_type, var, calc_param in _slots_to_run:
                         if s.fill_cancel.is_set():
                             break
                         await _fill_one_slot(calc_type, var, calc_param)
                 else:
-                    # asyncio.gather запускает все слоты параллельно.
-                    # DB-записи в разные params_hash — конфликтов нет.
+                    # Plain model() can still use executor-backed slot parallelism.
                     await asyncio.gather(*[
                         _fill_one_slot(ct, v, prm)
                         for ct, v, prm in type_var_slots
                         if not s.fill_cancel.is_set()
                     ])
-
-                s.fill_status["slots_done"] = slot_idx + 1
 
         finally:
             # Guaranteed cleanup — runs even if an exception aborts the loop.
@@ -3621,7 +3709,10 @@ def build_app(model_module) -> FastAPI:
             s._fill_cache_active = False
 
         state = "stopped" if s.fill_cancel.is_set() else "done"
-        s.fill_status.update({"state": state, "finished_at": datetime.now().isoformat()})
+        s.fill_status.update({
+            "state": state, "phase": state,
+            "finished_at": datetime.now().isoformat(),
+        })
         log(f" fill_cache {state}: done={done} skip={skipped} err={errors}",
             s.NODE_NAME, force=True)
 
