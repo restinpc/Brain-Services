@@ -363,10 +363,11 @@ async def _fetch_aisstream_async():
     subscription = {
         "APIKey": AISSTREAM_API_KEY,
         "BoundingBoxes": bbox,
-        "FilterMessageTypes": ["PositionReport", "ShipStaticData"],
+        "FilterMessageTypes": ["PositionReport"],
     }
 
     vessels_by_mmsi = {}
+    received_count = 0
     started = time.time()
     print(f"    Источник: AISStream WebSocket, слушаем {AISSTREAM_LISTEN_SECONDS}s")
 
@@ -377,25 +378,42 @@ async def _fetch_aisstream_async():
                 try:
                     raw = await asyncio.wait_for(ws.recv(), timeout=5)
                     msg = json.loads(raw)
+                    received_count += 1
+                    if received_count == 1 and isinstance(msg, dict):
+                        print(
+                            "    AISStream первый ответ: "
+                            f"type={msg.get('MessageType')}, keys={list(msg.keys())}"
+                        )
                 except asyncio.TimeoutError:
                     continue
-                except Exception:
-                    continue
+                except Exception as e:
+                    print(f"    AISStream: соединение прервано: {e}")
+                    break
 
-                meta = msg.get("MetaData", {}) if isinstance(msg, dict) else {}
+                meta = (
+                    msg.get("Metadata")
+                    or msg.get("MetaData")
+                    or {}
+                ) if isinstance(msg, dict) else {}
                 message = msg.get("Message", {}) if isinstance(msg, dict) else {}
-                mmsi = meta.get("MMSI") or meta.get("mmsi")
+                pr = message.get("PositionReport", {}) if isinstance(message, dict) else {}
+                ssd = message.get("ShipStaticData", {}) if isinstance(message, dict) else {}
+                mmsi = (
+                    meta.get("MMSI")
+                    or meta.get("mmsi")
+                    or (pr.get("UserID") if isinstance(pr, dict) else None)
+                    or (ssd.get("UserID") if isinstance(ssd, dict) else None)
+                )
                 if not mmsi:
                     continue
 
                 vessel = vessels_by_mmsi.get(mmsi, {"MMSI": mmsi})
                 vessel["NAME"] = meta.get("ShipName") or meta.get("ship_name") or vessel.get("NAME", "")
                 vessel["CALLSIGN"] = meta.get("CallSign") or vessel.get("CALLSIGN", "")
-                vessel["LATITUDE"] = meta.get("latitude") or meta.get("Latitude") or vessel.get("LATITUDE")
-                vessel["LONGITUDE"] = meta.get("longitude") or meta.get("Longitude") or vessel.get("LONGITUDE")
+                vessel["LATITUDE"] = meta.get("Latitude") or meta.get("latitude") or vessel.get("LATITUDE")
+                vessel["LONGITUDE"] = meta.get("Longitude") or meta.get("longitude") or vessel.get("LONGITUDE")
 
                 # PositionReport может быть вложен по-разному
-                pr = message.get("PositionReport", {}) if isinstance(message, dict) else {}
                 if isinstance(pr, dict):
                     vessel["LATITUDE"] = pr.get("Latitude", vessel.get("LATITUDE"))
                     vessel["LONGITUDE"] = pr.get("Longitude", vessel.get("LONGITUDE"))
@@ -403,7 +421,6 @@ async def _fetch_aisstream_async():
                     vessel["COG"] = pr.get("Cog", vessel.get("COG"))
                     vessel["HEADING"] = pr.get("TrueHeading", vessel.get("HEADING"))
 
-                ssd = message.get("ShipStaticData", {}) if isinstance(message, dict) else {}
                 if isinstance(ssd, dict):
                     vessel["NAME"] = ssd.get("Name", vessel.get("NAME", ""))
                     vessel["CALLSIGN"] = ssd.get("CallSign", vessel.get("CALLSIGN", ""))
