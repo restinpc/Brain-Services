@@ -26,8 +26,8 @@ NODE_NAME = os.getenv("NODE_NAME", "ucdp_history")
 EMAIL = os.getenv("ALERT_EMAIL", "vladyurjevitch@yandex.ru")
 UCDP_TOKEN = os.getenv("UCDP_TOKEN", "")
 UCDP_API_BASE = "https://ucdpapi.pcr.uu.se/api"
-UCDP_GED_VERSION = "25.1"
-UCDP_CANDIDATE_VERSION = "26.0.1"
+UCDP_GED_VERSION_OVERRIDE = os.getenv("UCDP_GED_VERSION", "").strip()
+UCDP_CANDIDATE_VERSION_OVERRIDE = os.getenv("UCDP_CANDIDATE_VERSION", "").strip()
 MAX_PAGE_RETRIES = 5
 RETRY_BACKOFF_BASE = 10
 
@@ -103,7 +103,8 @@ class UCDPCollector:
         url = f"{UCDP_API_BASE}/gedevents/{version}"
         params = {"pagesize": pagesize, "page": page}
         if year_filter:
-            params["year"] = year_filter
+            params["StartDate"] = f"{year_filter}-01-01"
+            params["EndDate"] = f"{year_filter}-12-31"
         resp = self.session.get(url, params=params, timeout=90)
         if resp.status_code == 429:
             wait = 30 + random.uniform(5, 15)
@@ -154,7 +155,7 @@ class UCDPCollector:
     def ensure_table(self):
         conn = self.get_db_connection()
         c = conn.cursor()
-        
+
         # Проверяем, нет ли старой таблицы с iso3
         c.execute(f"SHOW TABLES LIKE '{self.table_name}'")
         if c.fetchone():
@@ -163,7 +164,7 @@ class UCDPCollector:
                 print(f"🗑️ Обнаружена старая таблица с полем iso3. Удаляем...")
                 c.execute(f"DROP TABLE IF EXISTS `{self.table_name}`")
                 print(f"✅ Старая таблица удалена")
-        
+
         c.execute(f"""
             CREATE TABLE IF NOT EXISTS `{self.table_name}` (
                 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -236,6 +237,58 @@ class UCDPCollector:
         except:
             return 0
 
+    def get_last_date(self):
+        try:
+            conn = self.get_db_connection()
+            c = conn.cursor()
+            c.execute(f"SELECT MAX(date_start) FROM `{self.table_name}`")
+            row = c.fetchone()
+            c.close()
+            conn.close()
+            return row[0] if row and row[0] else None
+        except Exception:
+            return None
+
+    def version_exists(self, version):
+        url = f"{UCDP_API_BASE}/gedevents/{version}"
+        resp = self.session.get(url, params={"pagesize": 1, "page": 0}, timeout=90)
+        if resp.status_code in (401, 403):
+            resp.raise_for_status()
+        return resp.status_code == 200
+
+    def discover_versions(self):
+        current_year = date.today().year
+
+        if UCDP_GED_VERSION_OVERRIDE:
+            ged_version = UCDP_GED_VERSION_OVERRIDE
+        else:
+            ged_version = None
+            for year in range(current_year, current_year - 3, -1):
+                candidate = f"{year % 100}.1"
+                if self.version_exists(candidate):
+                    ged_version = candidate
+                    break
+            if not ged_version:
+                raise RuntimeError("Не удалось определить актуальную версию UCDP GED")
+
+        if UCDP_CANDIDATE_VERSION_OVERRIDE:
+            candidate_version = UCDP_CANDIDATE_VERSION_OVERRIDE
+        else:
+            candidate_version = None
+            for year in range(current_year, current_year - 2, -1):
+                max_month = date.today().month if year == current_year else 12
+                for month in range(max_month, 0, -1):
+                    candidate = f"{year % 100}.0.{month}"
+                    if self.version_exists(candidate):
+                        candidate_version = candidate
+                        break
+                if candidate_version:
+                    break
+            if not candidate_version:
+                raise RuntimeError("Не удалось определить актуальную версию UCDP Candidate")
+
+        return ged_version, candidate_version
+
     def insert_events(self, events):
         if not events:
             return 0
@@ -253,7 +306,12 @@ class UCDPCollector:
         c = conn.cursor()
         cols_str = ", ".join(f"`{col}`" for col in columns)
         placeholders = ", ".join(["%s"] * len(columns))
-        sql = f"INSERT IGNORE INTO `{self.table_name}` ({cols_str}) VALUES ({placeholders})"
+        update_columns = [col for col in columns if col != "ucdp_id"]
+        update_clause = ", ".join(f"`{col}` = VALUES(`{col}`)" for col in update_columns)
+        sql = (
+            f"INSERT INTO `{self.table_name}` ({cols_str}) VALUES ({placeholders}) "
+            f"ON DUPLICATE KEY UPDATE {update_clause}"
+        )
 
         def si(v):
             if v is None or v == "": return None
@@ -303,7 +361,7 @@ class UCDPCollector:
                     si(e.get("high", 0)),
                     (e.get("source_article", "") or "")[:5000],
                     (e.get("source_office", "") or "")[:500],
-                    e.get("source_date"),
+                    str(e.get("source_date") or "")[:100],
                     (e.get("where_description", "") or "")[:2000],
                 ))
             if rows:
@@ -318,40 +376,48 @@ class UCDPCollector:
     def process(self):
         self.ensure_table()
         last_year = self.get_last_year()
+        last_date = self.get_last_date()
         current_count = self.get_row_count()
+        ged_version, latest_candidate_version = self.discover_versions()
+        candidate_year, _, candidate_month = map(int, latest_candidate_version.split("."))
+        candidate_year += 2000
+
+        print(f"\n🔎 Актуальная GED: {ged_version}")
+        print(f"🔎 Актуальная Candidate: {latest_candidate_version}")
 
         if last_year is None:
             # === BACKFILL: весь датасет одним проходом ===
-            print(f"\n🔄 BACKFILL MODE: UCDP GED v{UCDP_GED_VERSION} (1989–2024)")
+            print(f"\n🔄 BACKFILL MODE: UCDP GED v{ged_version}")
             print("   Скачиваем весь датасет за один проход...\n")
-            events = self.fetch_all_events(UCDP_GED_VERSION)
+            events = self.fetch_all_events(ged_version)
             n = self.insert_events(events)
             print(f"\n✅ BACKFILL завершён: вставлено {n} записей")
-
-            # Candidate
-            print(f"\n📥 Загрузка Candidate v{UCDP_CANDIDATE_VERSION}")
-            events = self.fetch_all_events(UCDP_CANDIDATE_VERSION)
-            n = self.insert_events(events)
-            print(f"    Candidate: {n} записей")
         else:
             # === INCREMENTAL ===
             print(f"\n📊 INCREMENTAL MODE")
             print(f"   Последний год в БД: {last_year}")
             print(f"   Текущих записей: {current_count}\n")
-            
+
             current_year = date.today().year
-            for year in range(max(last_year - 1, 1989), 2025):
-                print(f"    GED v{UCDP_GED_VERSION}, год {year}...")
-                events = self.fetch_all_events(UCDP_GED_VERSION, year_filter=year)
+            for year in range(max(last_year - 1, 1989), current_year):
+                print(f"    GED v{ged_version}, год {year}...")
+                events = self.fetch_all_events(ged_version, year_filter=year)
                 n = self.insert_events(events)
                 if n > 0:
-                    print(f"      +{n} новых")
+                    print(f"      {n} вставлено/обновлено")
                 time.sleep(random.uniform(0.5, 1.5))
 
-            print(f"    Candidate v{UCDP_CANDIDATE_VERSION}...")
-            events = self.fetch_all_events(UCDP_CANDIDATE_VERSION)
+        if last_date and last_date.year == candidate_year:
+            first_candidate_month = max(1, last_date.month - 1)
+        else:
+            first_candidate_month = 1
+
+        for month in range(first_candidate_month, candidate_month + 1):
+            version = f"{candidate_year % 100}.0.{month}"
+            print(f"\n📥 Candidate v{version}...")
+            events = self.fetch_all_events(version)
             n = self.insert_events(events)
-            print(f"      +{n} новых из candidate")
+            print(f"      {n} вставлено/обновлено из Candidate")
 
         final_count = self.get_row_count()
         print(f"\n📊 ИТОГО в таблице {self.table_name}: {final_count} записей")
