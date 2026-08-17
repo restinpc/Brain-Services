@@ -1,0 +1,31 @@
+# Service configuration for sasha_us_treasury_debt_to_penny model.
+
+[service]
+id = 71
+port = 8943
+name = "brain-sasha_us_treasury_debt_to_penny-s71"
+text = "U.S. Treasury debt-to-the-penny fiscal regime model"
+
+[cache]
+date_from = "2025-01-01"
+var_range = [0, 1, 2, 3]
+types_range = [0, 1, 2]
+shift_window = 30
+rebuild_interval = 7200
+
+[dataset]
+parser_table = "sasha_us_treasury_debt_to_penny"
+enriched_table = "sasha_us_treasury_debt_to_penny_enriched"
+index_fields = ["event_type"]
+date_field = "date_dt"
+engine = "vlad"
+
+[ctx]
+key_columns = ["id"]
+
+[ml]
+enabled = false
+target_precision = 0.95
+max_iter = 20
+step = 0.10
+extremum_limit = 50

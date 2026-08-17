@@ -51,6 +51,8 @@ parser.add_argument("port", nargs="?", default=os.getenv("DB_PORT", "3306"), hel
 parser.add_argument("user", nargs="?", default=os.getenv("DB_USER"), help="Пользователь БД")
 parser.add_argument("password", nargs="?", default=os.getenv("DB_PASSWORD"), help="Пароль БД")
 parser.add_argument("database", nargs="?", default=os.getenv("DB_NAME"), help="Имя базы данных")
+parser.add_argument("--start-date", type=date.fromisoformat, help="Начальная дата YYYY-MM-DD")
+parser.add_argument("--end-date", type=date.fromisoformat, help="Конечная дата YYYY-MM-DD")
 args = parser.parse_args()
 
 if not all([args.host, args.user, args.password, args.database]):
@@ -187,6 +189,48 @@ class DB:
             conn.commit()
             return affected > 0
 
+    def upsert_many(self, rows: List[Dict[str, Any]]) -> int:
+        """Записывает пакет через одно подключение и возвращает число изменённых строк."""
+        if not rows:
+            return 0
+
+        update_fields = [
+            "actual", "forecast", "previous",
+            "preliminary", "precision_value",
+            "previous_revised_from", "actual_to_forecast", "revised_to_previous"
+        ]
+        set_clause = ", ".join([f"{col} = VALUES({col})" for col in update_fields])
+        sql = f"""
+        INSERT INTO `{self.table_name}` (
+            occurrence_id, occurrence_time_utc, event_id,
+            currency, importance, event_name,
+            actual, forecast, previous,
+            country_id, category, source, page_link,
+            unit, reference_period,
+            preliminary, precision_value, previous_revised_from,
+            actual_to_forecast, revised_to_previous
+        ) VALUES (
+            %(occurrence_id)s, %(occurrence_time_utc)s, %(event_id)s,
+            %(currency)s, %(importance)s, %(event_name)s,
+            %(actual)s, %(forecast)s, %(previous)s,
+            %(country_id)s, %(category)s, %(source)s, %(page_link)s,
+            %(unit)s, %(reference_period)s,
+            %(preliminary)s, %(precision_value)s, %(previous_revised_from)s,
+            %(actual_to_forecast)s, %(revised_to_previous)s
+        )
+        ON DUPLICATE KEY UPDATE {set_clause}
+        """
+
+        changed = 0
+        with self.get_db_connection() as conn:
+            cursor = conn.cursor()
+            for row in rows:
+                cursor.execute(sql, row)
+                if cursor.rowcount > 0:
+                    changed += 1
+            conn.commit()
+        return changed
+
 
 # ---------- VALUE HELPERS ----------
 def safe_int(v: Any) -> Optional[int]:
@@ -244,19 +288,19 @@ def build_occ_url(start_d: date, end_d: date, limit: int, cursor: Optional[str])
     return f"{SETTINGS['api_occ']}?{urlencode(params)}"
 
 
-def request_json_with_retries(context, url: str, headers: Dict[str, str], tries: int = 4) -> Dict[str, Any]:
+def request_json_with_retries(session, url: str, headers: Dict[str, str], tries: int = 4) -> Dict[str, Any]:
     last_err = None
     for attempt in range(1, tries + 1):
         try:
-            resp = context.request.get(url, headers=headers, timeout=60000)
-            if resp.status == 200:
+            resp = session.get(url, headers=headers, timeout=60)
+            if resp.status_code == 200:
                 return resp.json()
-            if resp.status in {429, 500, 502, 503, 504}:
+            if resp.status_code in {429, 500, 502, 503, 504}:
                 wait = min(10, 0.7 * (2 ** (attempt - 1))) + random.uniform(0.0, 0.6)
-                log(f"HTTP {resp.status} retry {attempt}/{tries}, sleep {wait:.1f}s")
+                log(f"HTTP {resp.status_code} retry {attempt}/{tries}, sleep {wait:.1f}s")
                 time.sleep(wait)
                 continue
-            raise RuntimeError(f"HTTP {resp.status}: {resp.text()[:300]}")
+            raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:300]}")
         except Exception as e:
             last_err = e
             wait = min(10, 0.7 * (2 ** (attempt - 1))) + random.uniform(0.0, 0.6)
@@ -265,7 +309,7 @@ def request_json_with_retries(context, url: str, headers: Dict[str, str], tries:
     raise RuntimeError(f"Failed after {tries} tries: {last_err}")
 
 
-def fetch_all_pages_for_range(context, start_d: date, end_d: date, limit: int) -> Tuple[
+def fetch_all_pages_for_range(session, start_d: date, end_d: date, limit: int) -> Tuple[
     List[Dict[str, Any]], List[Dict[str, Any]]]:
     headers = {
         "domain-id": str(SETTINGS["domain_id"]),
@@ -281,7 +325,7 @@ def fetch_all_pages_for_range(context, start_d: date, end_d: date, limit: int) -
     while True:
         page_num += 1
         url = build_occ_url(start_d, end_d, limit=limit, cursor=cursor)
-        data = request_json_with_retries(context, url, headers=headers)
+        data = request_json_with_retries(session, url, headers=headers)
         occ = data.get("occurrences", []) or []
         events = data.get("events", []) or []
         cursor = data.get("next_page_cursor")
@@ -330,45 +374,38 @@ def occurrence_to_db_row(o: Dict[str, Any], event_map: Dict[int, Dict[str, Any]]
 def main() -> int:
     db = DB(args.table_name)
     db.ensure_table()
-    last_time = db.get_max_time()
-    if last_time:
-        start_d = last_time.date() - timedelta(days=LOOKBACK_DAYS)
-        if start_d < START_FALLBACK:
-            start_d = START_FALLBACK
-        log(f"Incremental start: {start_d.isoformat()} (lookback={LOOKBACK_DAYS}d)")
+    if args.start_date:
+        start_d = args.start_date
+        log(f"Explicit start: {start_d.isoformat()}")
     else:
-        start_d = START_FALLBACK
-        log(f"DB empty. Full start: {start_d.isoformat()}")
-    end_d = END_DATE_UTC
-    log(f"End date (today UTC): {end_d.isoformat()}")
+        last_time = db.get_max_time()
+        if last_time:
+            start_d = last_time.date() - timedelta(days=LOOKBACK_DAYS)
+            if start_d < START_FALLBACK:
+                start_d = START_FALLBACK
+            log(f"Incremental start: {start_d.isoformat()} (lookback={LOOKBACK_DAYS}d)")
+        else:
+            start_d = START_FALLBACK
+            log(f"DB empty. Full start: {start_d.isoformat()}")
+    end_d = args.end_date or END_DATE_UTC
+    log(f"End date: {end_d.isoformat()}")
     log(f"DB={args.database} Table={args.table_name}")
 
     try:
-        from playwright.sync_api import sync_playwright
+        from curl_cffi import requests as curl_requests
     except ImportError:
         raise SystemExit(
-            "Install: pip install playwright mysql-connector-python python-dotenv && playwright install chromium")
+            "Install: pip install curl-cffi mysql-connector-python python-dotenv")
 
     processed_total = 0
     seen_total = 0
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                       "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-            locale="ru-RU",
-            timezone_id="UTC",
-        )
-        page = context.new_page()
-        log("Opening calendar page...")
-        page.goto(SETTINGS["base_page"], timeout=60000)
-        page.wait_for_timeout(1500)
+    with curl_requests.Session(impersonate="chrome") as session:
         ranges = month_ranges(start_d, end_d)
         log(f"Month chunks: {len(ranges)}")
         event_map: Dict[int, Dict[str, Any]] = {}
         for i, (sd, ed) in enumerate(ranges, 1):
             log(f"[{i}/{len(ranges)}] Fetching {sd.isoformat()} .. {ed.isoformat()}")
-            occ, events = fetch_all_pages_for_range(context, sd, ed, limit=SETTINGS["limit"])
+            occ, events = fetch_all_pages_for_range(session, sd, ed, limit=SETTINGS["limit"])
             for e in events:
                 eid = safe_int(e.get("event_id"))
                 if eid is not None:
@@ -382,14 +419,10 @@ def main() -> int:
                     batch.append(row)
             seen_total += len(batch)
 
-            # Обрабатываем по одной строке для точного подсчёта
-            for row in batch:
-                if db.upsert_single(row):
-                    processed_total += 1
+            processed_total += db.upsert_many(batch)
 
             log(f"  rows seen={len(batch)} processed (new/updated)={processed_total}")
             time.sleep(random.uniform(0.15, 0.5))
-        browser.close()
 
     # Финальная статистика
     with db.get_db_connection() as conn:
