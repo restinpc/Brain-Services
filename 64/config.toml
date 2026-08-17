@@ -1,37 +1,43 @@
-# Service configuration for vlad_coingecko_stablecoin_history model.
-
 [service]
-id = 64
+id = 81
 port = 8926
-name = "brain-vlad_coingecko_stablecoin_history-s64"
-text = "Stablecoin depeg stress context model"
+name = "brain-news-digestion-h1-ml-s81"
+text = "H1 causal news digestion + market reaction + bounded reverse learning"
 
 [rates]
 table = "brain_rates_eur_usd"
 
 [cache]
-date_from = "2025-01-01"
-var_range = [0, 1, 2, 3]
-types_range = [0, 1, 2]
-shift_window = 30
-rebuild_interval = 7200
+date_from = "2025-01-15"
+fresh_lag_days = 14
+var_range = [0, 1, 2, 3, 4, 5, 6]
+types_range = [0, 1, 2, 3, 4]
+shift_window = 4
+reload_interval = 1800
+rebuild_interval = 1800
+ml_workers = 1
+ml_batch_size = 2000
 
 [dataset]
-parser_table = "vlad_coingecko_stablecoin_history"
-enriched_table = "vlad_coingecko_stablecoin_history_enriched"
-index_fields = ["event_type"]
-date_field = "date_dt"
 engine = "vlad"
+filter_by_date = true
+key_field = "event_type"
+model_can_filter = true
+model_uses_rates = true
 
-[ctx]
-key_columns = ["id"]
+[model]
+rare_occurrence_max = 0
 
 [ml]
-enabled = false
-target_precision = 0.95
-max_iter = 20
-step = 0.10
-extremum_limit = 50
-
-[developer]
-email = "samuray15035@gmail.com"
+enabled = true
+init_mode = "constant"
+# 0.95 forces almost every noisy market state through maximum reweight cycles.
+# 0.62 is intentionally demanding but realistic enough to avoid pathological
+# optimisation pressure; final quality is judged by Brain backtest/history, not
+# by this training metric alone.
+target_precision = 0.62
+max_iter = 8
+step = 0.04
+extremum_limit = 48
+active_tail = 0
+precision_metric = "mean"
