@@ -1,0 +1,37 @@
+# Service configuration for the Eurostat government-debt model.
+
+[service]
+id = 75
+port = 8946
+name = "brain-sasha_eurostat_debt-s75"
+text = "Euro-area government-debt context model"
+
+[rates]
+table = "brain_rates_eur_usd"
+
+[cache]
+date_from = "2025-01-01"
+var_range = [0, 1, 2, 3]
+types_range = [0, 1, 2]
+param_range = ["eu27_2020", "ea20"]
+shift_window = 30
+rebuild_interval = 7200
+
+[dataset]
+parser_table = "sasha_eurostat_debt_pc_gdp"
+parser_table_2 = "sasha_eurostat_debt_mio_eur"
+enriched_table = "sasha_eurostat_debt_enriched"
+index_fields = ["event_type"]
+date_field = "date_dt"
+engine = "vlad"
+model_can_filter = true
+
+[ctx]
+key_columns = ["id"]
+
+[ml]
+enabled = false
+target_precision = 0.95
+max_iter = 20
+step = 0.10
+extremum_limit = 50

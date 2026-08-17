@@ -1,0 +1,41 @@
+# Service configuration for the U.S. monetary-supply model.
+
+[service]
+id = 86
+port = 8948
+name = "brain-sasha_fred_us_money_supply-ml-s86"
+text = "U.S. currency-in-circulation and M2 context model with ML/reverse-learning"
+
+[rates]
+table = "brain_rates_eur_usd"
+
+[cache]
+date_from = "2025-01-01"
+# Reverse-learning axes: train mode and extremum detection interval.
+var_range = [3, 5, 7, 9]
+types_range = [0, 1, 2, 3, 4]
+param_range = ["currcir", "wm2ns"]
+shift_window = 30
+rebuild_interval = 7200
+
+[dataset]
+parser_table = "sasha_fred_currcir"
+parser_table_2 = "sasha_fred_wm2ns"
+enriched_table = "sasha_fred_us_money_supply_enriched"
+index_fields = ["event_type"]
+date_field = "date_dt"
+engine = "vlad"
+model_can_filter = true
+
+[ctx]
+key_columns = ["id"]
+
+[ml]
+enabled = true
+init_mode = "constant"
+target_precision = 0.95
+max_iter = 20
+step = 0.10
+extremum_limit = 50
+active_tail = 0
+precision_metric = "mean"
