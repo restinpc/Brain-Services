@@ -66,9 +66,9 @@ import numpy as np
 # Brain framework contract
 # -----------------------------------------------------------------------------
 
-SERVICE_ID = 81
-PORT = 8943
-NODE_NAME = "brain-news-digestion-h1-ml-s81"
+SERVICE_ID = 64
+PORT = 8926
+NODE_NAME = "brain-news-digestion-h1-ml-s64"
 SERVICE_TEXT = "H1 causal news digestion + market reaction + bounded reverse learning"
 
 RATES_TABLE = "brain_rates_eur_usd"
@@ -989,17 +989,153 @@ def _codes_for_var(snapshot: dict[str, Any], var: int) -> dict[str, float]:
 
 
 # -----------------------------------------------------------------------------
+# FAST CACHE v2
+# Calculation-preserving execution cache.
+#
+# News state does not depend on pair/rates, therefore it is shared between
+# EUR/USD, BTC/USD and ETH/USD.
+#
+# Price state depends on np_rates, therefore it has a separate per-market cache.
+#
+# IMPORTANT:
+#   _news_state() and _price_state() are NOT changed.
+#   Only their already-calculated return values are reused.
+# -----------------------------------------------------------------------------
+
+_NEWS_STATE_LOCK = threading.RLock()
+_NEWS_STATE_CACHE: "OrderedDict[tuple, dict[str, Any]]" = OrderedDict()
+
+# Enough for the complete H1 period from 2025-01-15 with margin.
+_NEWS_STATE_CACHE_MAX = 32768
+
+
+_PRICE_STATE_LOCK = threading.RLock()
+_PRICE_STATE_CACHE: "OrderedDict[tuple, dict[str, Any] | None]" = OrderedDict()
+
+# 3 markets × ~14-16k H1 dates + margin.
+_PRICE_STATE_CACHE_MAX = 65536
+
+
+def _news_cache_key(
+    dataset: list[dict[str, Any]],
+    target: datetime,
+    di: dict[str, Any],
+) -> tuple:
+    source = di.get("full_dataset") or dataset
+
+    return (
+        id(source),
+        id(di.get("dataset_timestamps")),
+        id(di.get("key_dates")),
+        len(source),
+        int(target.timestamp()),
+    )
+
+
+def _price_cache_key(
+    target: datetime,
+    di: dict[str, Any],
+) -> tuple:
+    npr = di.get("np_rates") or {}
+    dates_ns = npr.get("dates_ns")
+
+    return (
+        id(dates_ns),
+        id(npr.get("open")),
+        id(npr.get("close")),
+        id(npr.get("max")),
+        id(npr.get("min")),
+        id(npr.get("ranges")),
+        len(dates_ns) if dates_ns is not None else 0,
+        int(target.timestamp()),
+    )
+
+
+def _news_state_cached(
+    dataset: list[dict[str, Any]],
+    target: datetime,
+    di: dict[str, Any],
+) -> dict[str, Any]:
+
+    key = _news_cache_key(dataset, target, di)
+
+    with _NEWS_STATE_LOCK:
+        cached = _NEWS_STATE_CACHE.get(key)
+
+        if cached is not None:
+            _NEWS_STATE_CACHE.move_to_end(key)
+            return cached
+
+    source = di.get("full_dataset") or dataset
+
+    if source:
+        built = _news_state(source, target, di)
+    else:
+        built = {
+            "has_fast": False,
+            "codes": [],
+        }
+
+    with _NEWS_STATE_LOCK:
+        existing = _NEWS_STATE_CACHE.get(key)
+
+        if existing is not None:
+            _NEWS_STATE_CACHE.move_to_end(key)
+            return existing
+
+        _NEWS_STATE_CACHE[key] = built
+
+        while len(_NEWS_STATE_CACHE) > _NEWS_STATE_CACHE_MAX:
+            _NEWS_STATE_CACHE.popitem(last=False)
+
+    return built
+
+
+def _price_state_cached(
+    target: datetime,
+    di: dict[str, Any],
+) -> dict[str, Any] | None:
+
+    key = _price_cache_key(target, di)
+
+    # None является допустимым cached result, поэтому обычный .get()
+    # здесь использовать нельзя.
+    sentinel = object()
+
+    with _PRICE_STATE_LOCK:
+        cached = _PRICE_STATE_CACHE.get(key, sentinel)
+
+        if cached is not sentinel:
+            _PRICE_STATE_CACHE.move_to_end(key)
+            return cached
+
+    built = _price_state(target, di)
+
+    with _PRICE_STATE_LOCK:
+        if key in _PRICE_STATE_CACHE:
+            _PRICE_STATE_CACHE.move_to_end(key)
+            return _PRICE_STATE_CACHE[key]
+
+        _PRICE_STATE_CACHE[key] = built
+
+        while len(_PRICE_STATE_CACHE) > _PRICE_STATE_CACHE_MAX:
+            _PRICE_STATE_CACHE.popitem(last=False)
+
+    return built
+
+
+# -----------------------------------------------------------------------------
 # Snapshot caches — the expensive point-in-time state is independent of type/var
 # and should not be rebuilt 35 times during fill_cache.
 # -----------------------------------------------------------------------------
 
 _SNAPSHOT_LOCK = threading.RLock()
 _SNAPSHOT_CACHE: "OrderedDict[tuple, dict[str, Any]]" = OrderedDict()
-_SNAPSHOT_CACHE_MAX = 8192
+_SNAPSHOT_CACHE_MAX = 65536
 
 _BATCH_LOCK = threading.RLock()
 _BATCH_CACHE: "OrderedDict[tuple, dict[datetime, dict[str, Any]]]" = OrderedDict()
-_BATCH_CACHE_MAX = 12
+_BATCH_CACHE_MAX = 32
 
 
 def _snapshot_key(dataset: list[dict[str, Any]], target: datetime, di: dict[str, Any]) -> tuple:
@@ -1014,9 +1150,17 @@ def _snapshot_key(dataset: list[dict[str, Any]], target: datetime, di: dict[str,
 
 
 def _build_snapshot(dataset: list[dict[str, Any]], target: datetime, di: dict[str, Any]) -> dict[str, Any]:
-    source = di.get("full_dataset") or dataset
-    price = _price_state(target, di)
-    news = _news_state(source, target, di) if source else {"has_fast": False, "codes": []}
+    price = _price_state_cached(
+        target,
+        di,
+    )
+
+    news = _news_state_cached(
+        dataset,
+        target,
+        di,
+    )
+
     return {"price": price, "news": news}
 
 
@@ -1040,18 +1184,23 @@ def _snapshot_cached(dataset: list[dict[str, Any]], target: datetime, di: dict[s
     return built
 
 
-def _batch_key(dataset: list[dict[str, Any]], dates: list[datetime], di: dict[str, Any]) -> tuple | None:
+def _batch_key(
+    dataset: list[dict[str, Any]],
+    dates: list[datetime],
+    di: dict[str, Any],
+) -> tuple | None:
+
     if not dates:
         return None
+
     source = di.get("full_dataset") or dataset
     npr = di.get("np_rates") or {}
+
     return (
         id(source),
         id(di.get("dataset_timestamps")),
         id(npr.get("dates_ns")),
-        len(dates),
-        dates[0],
-        dates[-1],
+        tuple(dates),
     )
 
 
@@ -1075,6 +1224,31 @@ def _batch_snapshots(dataset: list[dict[str, Any]], dates: list[datetime], di: d
         while len(_BATCH_CACHE) > _BATCH_CACHE_MAX:
             _BATCH_CACHE.popitem(last=False)
     return built
+
+
+def clear_runtime_caches() -> None:
+    """
+    Clears only service-local execution caches.
+
+    Does NOT touch:
+      reverse universe
+      DB
+      dataset
+      weights
+      model logic
+    """
+
+    with _SNAPSHOT_LOCK:
+        _SNAPSHOT_CACHE.clear()
+
+    with _BATCH_LOCK:
+        _BATCH_CACHE.clear()
+
+    with _NEWS_STATE_LOCK:
+        _NEWS_STATE_CACHE.clear()
+
+    with _PRICE_STATE_LOCK:
+        _PRICE_STATE_CACHE.clear()
 
 
 # -----------------------------------------------------------------------------
@@ -1150,15 +1324,16 @@ def batch_model(
 
 
 async def enrich_dataset(engine_vlad, engine_brain):
-    """Service 81 consumes the shared service-80 enriched dataset as-is.
-
-    Rebuild/reload is still useful because it refreshes rows written by the
-    existing news enrichment pipeline.  Model 81 deliberately does not refit or
-    mutate the frozen NLP artifact/table.
+    """Service 64 consumes the shared service-80 enriched dataset as-is.
     """
     del engine_vlad, engine_brain
+
+    # Dataset/reload boundary:
+    # old point-in-time snapshots must not survive a refreshed dataset.
+    clear_runtime_caches()
+
     return {
         "mode": "noop",
         "source": "vlad_news_algo_events",
-        "reason": "service81 reuses frozen service80 NLP dataset",
+        "reason": "service64 reuses frozen service80 NLP dataset",
     }
