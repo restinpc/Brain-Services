@@ -16,7 +16,7 @@ No LLM is used.
 
 Each article is converted into low-cardinality financial event attributes:
 family, actor/actor class, action, object, semantic orientation, certainty,
-importance, magnitude, surprise hints and asset relevance.
+importance, magnitude, surprise hints and explicit asset/currency mentions.
 
 A second strictly chronological pass builds story lifecycle features:
 FIRST/FOLLOWUP/CONFIRMED/MULTI_SOURCE/SATURATED, 1h/4h article and source
@@ -30,10 +30,10 @@ building its _mask/_indexes/_weights tables.
 VAR semantics
 -------------
 0 PRICE_CONTROL       closed H1 market state only
-1 STRUCTURED_EVENT    family + actor + action + object + relevance
+1 STRUCTURED_EVENT    family + actor + action + object + asset mentions
 2 SURPRISE            structured event + surprise/magnitude/expectedness
 3 STORY               structured event + causal story lifecycle/narrative
-4 EVENT_REACTION      structured event + first closed H1 price reaction
+4 EVENT_REACTION      structured event + current closed H1 reaction state
 5 ALL                 structured + surprise + story + reaction
 
 TYPE semantics remain the shared reverse-learning modes 0..4.
@@ -106,8 +106,9 @@ FAST_HOURS = 4
 NARRATIVE_HOURS = 24
 STORY_MATCH_HOURS = 72
 EXPECTEDNESS_DAYS = 180
+DUPLICATE_WINDOW_MINUTES = 30
 ENRICH_BATCH = 3000
-SCHEMA_VERSION = "structured-fin-events-v2.4"
+SCHEMA_VERSION = "structured-fin-events-v2.5"
 
 SOURCE_TABLES: dict[str, str] = {
     "cnn": "brain_cnn_news",
@@ -115,15 +116,6 @@ SOURCE_TABLES: dict[str, str] = {
     "twp": "brain_twp_news",
     "wsj": "brain_wsj_news",
     "tgd": "brain_tgd_news",
-}
-
-RATES_TO_PAIR = {
-    "brain_rates_eur_usd": 1,
-    "brain_rates_eur_usd_day": 1,
-    "brain_rates_btc_usd": 3,
-    "brain_rates_btc_usd_day": 3,
-    "brain_rates_eth_usd": 4,
-    "brain_rates_eth_usd_day": 4,
 }
 
 VAR_LABELS = {
@@ -366,9 +358,8 @@ USD_MARKET_TERMS = (
 )
 
 EUR_MARKET_TERMS = (
-    "european central bank", "ecb", "lagarde", "eurozone", "euro area",
     "eur", "eur/usd", "euro rises", "euro falls", "euro gains",
-    "euro weakens", "euro strengthens",
+    "euro drops", "euro weakens", "euro strengthens",
 )
 
 CRYPTO_SECURITY_TERMS = (
@@ -376,6 +367,39 @@ CRYPTO_SECURITY_TERMS = (
     "blockchain", "defi", "binance", "coinbase", "kraken",
     "stablecoin", "usdt", "usdc",
 )
+
+FINANCIAL_SECURITY_TERMS = CRYPTO_SECURITY_TERMS + (
+    "financial", "finance", "banking", "commercial bank", "bank account",
+    "bank accounts", "payment", "payments", "broker", "brokerage",
+    "stock exchange", "customer funds", "investor funds", "trading platform",
+)
+
+GEOPOLITICAL_MARKET_TERMS = (
+    "sanction", "sanctions", "sanctioned", "oil", "crude oil", "brent", "wti",
+    "natural gas", "energy", "tariff", "tariffs", "trade", "supply chain",
+    "shipping", "financial market", "financial markets", "stock market",
+    "bond market", "currency", "currencies", "central bank", "inflation",
+    "u.s. dollar", "us dollar", "usd", "euro", "eur", "crypto",
+    "cryptocurrency", "bitcoin", "btc", "ethereum", "blockchain",
+)
+
+FINANCIAL_FAMILIES = {
+    "monetary_policy", "inflation", "labor", "growth", "fiscal", "trade",
+    "energy", "markets", "banking", "corporate", "etf", "crypto_regulation",
+    "exchange", "stablecoin", "protocol",
+}
+
+FINANCIAL_ACTOR_CLASSES = {
+    "CENTRAL_BANK_US", "CENTRAL_BANK_EU", "REGULATOR_US", "GOVERNMENT_US",
+    "STATISTICS_US", "CRYPTO_EXCHANGE", "ETF_ISSUER", "STABLECOIN_ISSUER",
+    "ENERGY_ORG",
+}
+
+FINANCIAL_OBJECTS = {
+    "BTC_ETF", "ETH_ETF", "INTEREST_RATE", "CPI", "PPI", "PCE", "JOBS",
+    "GDP", "BITCOIN", "ETHEREUM", "STABLECOIN", "EXCHANGE", "BANK", "OIL",
+    "TARIFFS", "SANCTIONS",
+}
 
 FAMILY_RULES = [
     ("etf", (
@@ -431,7 +455,8 @@ FAMILY_RULES = [
         "sanctions","troops","nuclear","conflict",
     )),
     ("energy", (
-        "oil price","crude oil","brent"," wti ","opec","natural gas",
+        "oil price", "oil prices", "oil shock", "oil supply", "crude oil",
+        "brent", "wti", "opec", "natural gas",
     )),
     ("fiscal", (
         "debt ceiling","budget deficit","treasury issuance","government spending",
@@ -486,8 +511,12 @@ OBJECT_RULES = [
     ("ETHEREUM", ("ethereum",)),
     ("STABLECOIN", ("stablecoin","tether"," usdt ","usd coin"," usdc ")),
     ("EXCHANGE", ("binance","coinbase","kraken","crypto exchange")),
-    ("BANK", (" bank ","banking sector")),
-    ("OIL", ("crude oil","brent"," wti ","oil price")),
+    ("BANK", (
+        "banking sector", "banking system", "commercial bank", "commercial banks",
+        "bank failure", "bank failures", "bank run", "bank runs", "regional banks",
+        "bank deposits", "deposit outflow",
+    )),
+    ("OIL", ("crude oil", "brent", "wti", "oil price", "oil prices", "oil shock", "oil supply")),
     ("TARIFFS", ("tariff","import duty")),
     ("SANCTIONS", ("sanctions","sanctioned")),
 ]
@@ -730,62 +759,62 @@ def _story_terms(title: str, family: str, actor_class: str, action: str, obj: st
     return " ".join(ranked[:12])
 
 
-def _relevance(text: str, family: str, actor_class: str, obj: str) -> dict[str, int]:
+def _relevance(text: str, actor_class: str, obj: str) -> dict[str, int]:
+    """Return explicit asset/currency mention flags, never pair eligibility."""
+    del actor_class
     r = {"usd": 0, "eur": 0, "btc": 0, "eth": 0}
 
-    if (
-        _contains(text, FED_CONTEXT_TERMS)
-        or _contains(text, ("u.s. economy", "us economy"))
-        or _contains(text, USD_MARKET_TERMS)
-    ):
-        r["usd"] = 3
+    if _contains(text, USD_MARKET_TERMS):
+        r["usd"] = 1
     if _contains(text, EUR_MARKET_TERMS):
-        r["eur"] = 3
+        r["eur"] = 1
 
     if _contains(text, ("bitcoin", "btc")):
-        r["btc"] = 3
+        r["btc"] = 1
     if _contains(text, ("ethereum",)):
-        r["eth"] = 3
+        r["eth"] = 1
 
     if _has_eth_alias_context(text):
-        r["eth"] = 3
+        r["eth"] = 1
 
-    if obj == "BTC_ETF":
-        r["btc"] = 3
-    elif obj == "ETH_ETF":
-        r["eth"] = 3
-
-    # These families and actors are crypto-specific by definition. They affect
-    # both crypto pairs even when the headline names an exchange, stablecoin or
-    # protocol rather than Bitcoin/Ethereum directly.
-    if (
-        family in {"crypto_regulation", "exchange", "stablecoin", "protocol"}
-        or actor_class in {"CRYPTO_EXCHANGE", "STABLECOIN_ISSUER"}
-    ):
-        r["btc"] = max(r["btc"], 2)
-        r["eth"] = max(r["eth"], 2)
-
-    # Security is broad; project it to crypto only in explicit crypto context.
-    if family == "security" and (
-        _contains(text, CRYPTO_SECURITY_TERMS) or _has_eth_alias_context(text)
-    ):
-        r["btc"] = max(r["btc"], 2)
-        r["eth"] = max(r["eth"], 2)
-
-    if family in {"monetary_policy","inflation","labor","growth","fiscal","trade"}:
-        r["usd"] = max(r["usd"], 2)
-        r["eur"] = max(r["eur"], 1)
-
-    if family in {"geopolitics","banking","energy","markets"}:
-        r["usd"] = max(r["usd"], 1)
-        r["eur"] = max(r["eur"], 1)
-
-    if actor_class == "CENTRAL_BANK_US":
-        r["usd"] = 3
-    elif actor_class == "CENTRAL_BANK_EU":
-        r["eur"] = 3
+    if obj in {"BTC_ETF", "BITCOIN"}:
+        r["btc"] = 1
+    if obj in {"ETH_ETF", "ETHEREUM"}:
+        r["eth"] = 1
 
     return r
+
+
+def _is_financial_event(
+    text: str,
+    family: str,
+    actor_class: str,
+    obj: str,
+    mentions: dict[str, int],
+) -> bool:
+    """Decide only whether an event belongs in the common financial stream."""
+    if family == "security":
+        return (
+            _contains(text, FINANCIAL_SECURITY_TERMS)
+            or _has_eth_alias_context(text)
+            or actor_class in {"CRYPTO_EXCHANGE", "STABLECOIN_ISSUER"}
+            or obj in {"BITCOIN", "ETHEREUM", "STABLECOIN", "EXCHANGE"}
+        )
+
+    if family == "geopolitics":
+        return (
+            _contains(text, GEOPOLITICAL_MARKET_TERMS)
+            or any(mentions.values())
+            or obj in {"OIL", "TARIFFS", "SANCTIONS"}
+        )
+
+    if family in FINANCIAL_FAMILIES:
+        return True
+    if actor_class in FINANCIAL_ACTOR_CLASSES:
+        return True
+    if obj in FINANCIAL_OBJECTS:
+        return True
+    return any(mentions.values())
 
 
 def _importance(family: str, action: str, actor_class: str, surprise: str, magnitude: str, title: str) -> str:
@@ -809,24 +838,32 @@ def _extract_static(press: str, raw: dict[str, Any]) -> dict[str, Any] | None:
     feed = str(raw.get("feed") or "").lower()[:64]
 
     title = _clean(title_raw)
-    lead_raw = body_raw[:1800]
-    signal_text = title + " " + _clean(lead_raw)
+    primary_text = title + " " + _clean(body_raw[:500])
+    context_text = title + " " + _clean(body_raw[:1800])
     full_text = title + " " + _clean(body_raw)
 
-    family = _find_rule(signal_text, FAMILY_RULES, "other")
-    action = _find_rule(signal_text, ACTION_RULES, "OTHER")
-    obj = _object(signal_text)
-    actor, actor_class = _actor(signal_text)
+    family = _find_rule(primary_text, FAMILY_RULES, "other")
+
+    action = _find_rule(title, ACTION_RULES, "OTHER")
+    if action == "OTHER":
+        action = _find_rule(primary_text, ACTION_RULES, "OTHER")
+
+    obj = _object(title)
+    if obj == "OTHER":
+        obj = _object(primary_text)
+
+    actor, actor_class = _actor(title)
+    if actor_class == "OTHER":
+        actor, actor_class = _actor(primary_text)
+
     orientation = _orientation(action)
-    tone = _tone(signal_text)
-    certainty = _certainty(signal_text)
+    tone = _tone(primary_text)
+    certainty = _certainty(primary_text)
     surprise_class, surprise_value = _surprise(full_text)
     magnitude = _magnitude(full_text)
-    relevance = _relevance(signal_text, family, actor_class, obj)
+    relevance = _relevance(context_text, actor_class, obj)
 
-    # Runtime ignores zero-relevance events, so keeping them would only pollute
-    # story/signature statistics and derived indexes.
-    if not any(relevance.values()):
+    if not _is_financial_event(context_text, family, actor_class, obj, relevance):
         return None
 
     importance = _importance(family, action, actor_class, surprise_class, magnitude, title)
@@ -1191,6 +1228,21 @@ def _velocity_class(
     return "L"
 
 
+def _is_duplicate_publication(
+    events: deque[tuple[datetime, str, str]],
+    dt: datetime,
+    press: str,
+    terms_key: str,
+) -> bool:
+    cutoff = dt - timedelta(minutes=DUPLICATE_WINDOW_MINUTES)
+    return any(
+        event_dt >= cutoff
+        and event_press == press
+        and event_terms == terms_key
+        for event_dt, event_press, event_terms in events
+    )
+
+
 async def _causal_rebuild(engine_vlad, recompute_from: datetime) -> int:
     """Rebuild lifecycle fields chronologically; no future row can update an older row."""
     from sqlalchemy import text
@@ -1303,9 +1355,6 @@ async def _causal_rebuild(engine_vlad, recompute_from: datetime) -> int:
             else:
                 expectedness = "NORMAL"
 
-            # Add current event only after computing its prior state.
-            hist.append(dt)
-
             terms = set(str(row.get("story_terms") or "").split())
             candidate_keys: set[str] = set()
             for term in terms:
@@ -1334,6 +1383,9 @@ async def _causal_rebuild(engine_vlad, recompute_from: datetime) -> int:
                     "object_type": row["object_type"],
                     "actor_class": row["actor_class"],
                     "events": deque(),
+                    "last_velocity_class": "L",
+                    # Each economic signature counts only once per causal story.
+                    "signature_states": {},
                 }
                 stories[story_key] = st
                 for term in terms:
@@ -1354,16 +1406,46 @@ async def _causal_rebuild(engine_vlad, recompute_from: datetime) -> int:
                     st["terms"] = new_terms
                 st["last_dt"] = dt
 
+            # Expectedness/rarity is an event-level property, not an article-count
+            # property. Multiple publishers covering the same causal story must not
+            # make that event signature artificially COMMON.
+            signature_states = st.setdefault("signature_states", {})
+            saved_state = signature_states.get(signature)
+
+            if saved_state is not None:
+                (
+                    novelty,
+                    expectedness,
+                    prior_count,
+                    gap_hours,
+                ) = saved_state
+            else:
+                signature_states[signature] = (
+                    novelty,
+                    expectedness,
+                    prior_count,
+                    gap_hours,
+                )
+
+                # Add exactly one occurrence of this signature for this causal story.
+                hist.append(dt)
+
             expiry_queue.append((dt, story_key))
 
-            events: deque[tuple[datetime, str]] = st["events"]
+            events: deque[tuple[datetime, str, str]] = st["events"]
             cutoff4 = dt - timedelta(hours=4)
             while events and events[0][0] < cutoff4:
                 events.popleft()
 
-            # Counts before current event determine FIRST/FOLLOWUP causally.
+            # Same-source republishes with identical story terms remain stored
+            # as rows, but do not inflate lifecycle counters or velocity.
+            press = str(row["press"])
+            terms_key = " ".join(sorted(terms))
+            is_duplicate = _is_duplicate_publication(events, dt, press, terms_key)
+
             prior_events4 = len(events)
-            events.append((dt, str(row["press"])))
+            if not is_duplicate:
+                events.append((dt, press, terms_key))
 
             events1 = [e for e in events if e[0] >= dt - timedelta(hours=1)]
             count1 = len(events1)
@@ -1371,7 +1453,7 @@ async def _causal_rebuild(engine_vlad, recompute_from: datetime) -> int:
             sources1 = len({e[1] for e in events1})
             sources4 = len({e[1] for e in events})
 
-            if prior_events4 == 0:
+            if count4 <= 1:
                 stage = "FIRST"
             elif count4 >= 6 or sources4 >= 4:
                 stage = "SATURATED"
@@ -1392,13 +1474,17 @@ async def _causal_rebuild(engine_vlad, recompute_from: datetime) -> int:
             prev_count1 = len(previous1)
             prev_sources1 = len({e[1] for e in previous1})
 
-            velocity_class = _velocity_class(
-                count1,
-                sources1,
-                prev_count1,
-                prev_sources1,
-                prior_events4,
-            )
+            if is_duplicate:
+                velocity_class = str(st.get("last_velocity_class") or "L")
+            else:
+                velocity_class = _velocity_class(
+                    count1,
+                    sources1,
+                    prev_count1,
+                    prev_sources1,
+                    prior_events4,
+                )
+                st["last_velocity_class"] = velocity_class
 
             if dt >= recompute_from:
                 updates.append({
@@ -1490,19 +1576,20 @@ async def _build_structured_news(engine_vlad, engine_brain, *, force_full: bool 
 
         await _ensure_tables(engine_vlad)
 
-        for press in SOURCE_TABLES:
-            await _meta_set(engine_vlad, f"last_{press}_id", 0)
-
     total = 0
     min_new_date: datetime | None = None
     max_new_date: datetime | None = None
     sources: dict[str, Any] = {}
+    pending_last_ids: dict[str, int] = {}
 
     for press, source_table in SOURCE_TABLES.items():
-        try:
-            last_id = int(await _meta_get(engine_vlad, f"last_{press}_id") or 0)
-        except Exception:
+        if full:
             last_id = 0
+        else:
+            try:
+                last_id = int(await _meta_get(engine_vlad, f"last_{press}_id") or 0)
+            except Exception:
+                last_id = 0
 
         count = 0
         while True:
@@ -1523,7 +1610,6 @@ async def _build_structured_news(engine_vlad, engine_brain, *, force_full: bool 
             await _upsert_static(engine_vlad, out)
             count += len(out)
             total += len(out)
-            await _meta_set(engine_vlad, f"last_{press}_id", last_id)
 
             if len(batch) < ENRICH_BATCH:
                 break
@@ -1533,8 +1619,8 @@ async def _build_structured_news(engine_vlad, engine_brain, *, force_full: bool 
         max_source_id = await _source_max_id(engine_brain, source_table)
         if max_source_id > last_id:
             last_id = max_source_id
-            await _meta_set(engine_vlad, f"last_{press}_id", last_id)
 
+        pending_last_ids[press] = last_id
         sources[press] = {"rows": count, "last_id": last_id}
 
     causal_updated = 0
@@ -1542,6 +1628,11 @@ async def _build_structured_news(engine_vlad, engine_brain, *, force_full: bool 
         causal_updated = await _causal_rebuild(engine_vlad, SOURCE_WARM_FROM)
     elif min_new_date is not None:
         causal_updated = await _causal_rebuild(engine_vlad, min_new_date)
+
+    # Source cursors are commit markers too: publish them only after every
+    # ingestion batch and the required causal pass have completed successfully.
+    for press, last_id in pending_last_ids.items():
+        await _meta_set(engine_vlad, f"last_{press}_id", last_id)
 
     # Schema version is the commit marker. Record it only after ingestion and
     # the full causal pass have both completed successfully, so an interrupted
@@ -1584,9 +1675,6 @@ async def enrich_dataset(engine_vlad, engine_brain):
 # Runtime news state
 # -----------------------------------------------------------------------------
 
-def _pair_id(di: dict[str, Any]) -> int:
-    return int(RATES_TO_PAIR.get(str(di.get("rates_table") or RATES_TABLE), 1))
-
 
 def _rows_window(source: list[dict[str, Any]], target: datetime, di: dict[str, Any], hours_back: int, *, end_before_hours: int = 0) -> list[dict[str, Any]]:
     start = target - timedelta(hours=hours_back)
@@ -1612,24 +1700,9 @@ def _rows_window(source: list[dict[str, Any]], target: datetime, di: dict[str, A
     return out
 
 
-def _pair_rel(row: dict[str, Any], pair_id: int) -> tuple[int, int]:
-    if pair_id == 1:
-        return _safe_int(row.get("relevance_eur")), _safe_int(row.get("relevance_usd"))
-    if pair_id == 3:
-        return _safe_int(row.get("relevance_btc")), _safe_int(row.get("relevance_usd"))
-    if pair_id == 4:
-        return _safe_int(row.get("relevance_eth")), _safe_int(row.get("relevance_usd"))
-    return 0, 0
-
-
-def _impact_score(row: dict[str, Any], pair_id: int, target: datetime) -> float:
+def _impact_score(row: dict[str, Any], target: datetime) -> float:
     dt = _as_dt(row.get("date") or row.get("date_dt"))
     if dt is None or dt >= target:
-        return -1.0
-
-    base_rel, quote_rel = _pair_rel(row, pair_id)
-    rel = max(base_rel, quote_rel)
-    if rel <= 0:
         return -1.0
 
     age_h = max(0.0, (target - dt).total_seconds() / 3600.0)
@@ -1641,18 +1714,14 @@ def _impact_score(row: dict[str, Any], pair_id: int, target: datetime) -> float:
     surpr = 1.30 if str(row.get("surprise_class") or "NONE") != "NONE" else 1.0
     rare = 1.20 if str(row.get("expectedness_class") or "") in ("RARE","UNEXPECTED") else 1.0
 
-    return recency * (0.75 + 0.55 * rel) * imp * min(1.0 + 0.10 * (src - 1), 1.4) * vel * surpr * rare
+    return recency * imp * min(1.0 + 0.10 * (src - 1), 1.4) * vel * surpr * rare
 
 
 def _count_bucket(n: int) -> str:
     return "6P" if n >= 6 else ("35" if n >= 3 else ("2" if n == 2 else "1"))
 
 
-def _rel_bucket(n: int) -> str:
-    return "H" if n >= 3 else ("M" if n >= 2 else ("L" if n >= 1 else "0"))
-
-
-def _event_codes(row: dict[str, Any], pair_id: int) -> list[str]:
+def _event_codes(row: dict[str, Any]) -> list[str]:
     family = str(row.get("family") or "other")
     actor = str(row.get("actor") or "OTHER")
     actor_class = str(row.get("actor_class") or "OTHER")
@@ -1662,7 +1731,6 @@ def _event_codes(row: dict[str, Any], pair_id: int) -> list[str]:
     cert = str(row.get("certainty") or "REPORTED")
     tone = str(row.get("tone_class") or "NEU")
     imp = str(row.get("importance_class") or "L")
-    base_rel, quote_rel = _pair_rel(row, pair_id)
 
     codes = [
         f"E.F.{family}",
@@ -1670,9 +1738,11 @@ def _event_codes(row: dict[str, Any], pair_id: int) -> list[str]:
         f"E.CERT.{cert}",
         f"E.IMP.{imp}",
         f"E.TONE.{tone}",
-        f"E.REL.B.{_rel_bucket(base_rel)}",
-        f"E.REL.Q.{_rel_bucket(quote_rel)}",
     ]
+
+    for asset in ("USD", "EUR", "BTC", "ETH"):
+        if _safe_int(row.get(f"relevance_{asset.lower()}")) > 0:
+            codes.append(f"E.MENTION.{asset}")
 
     if actor_class != "OTHER":
         codes.append(f"E.AC.{actor_class}")
@@ -1724,20 +1794,25 @@ def _price_codes(price: dict[str, Any]) -> list[str]:
     ]
 
 
+def _story_identity(row: dict[str, Any]) -> str:
+    story_key = str(row.get("story_key") or "").strip()
+    if story_key:
+        return story_key
+    return (
+        f"row:{row.get('press', '')}:"
+        f"{row.get('source_news_id', row.get('id', ''))}"
+    )
+
+
 def _top_story_rows(
     ranked_articles: list[tuple[float, dict[str, Any]]],
-    limit: int = 2,
+    limit: int = 4,
 ) -> list[dict[str, Any]]:
     """Keep the highest-scoring article from each distinct causal story."""
     best_by_story: dict[str, tuple[float, dict[str, Any]]] = {}
 
     for score, row in ranked_articles:
-        story_key = str(row.get("story_key") or "").strip()
-        if not story_key:
-            story_key = (
-                f"row:{row.get('press', '')}:"
-                f"{row.get('source_news_id', row.get('id', ''))}"
-            )
+        story_key = _story_identity(row)
 
         old = best_by_story.get(story_key)
         if old is None or score > old[0]:
@@ -1750,28 +1825,52 @@ def _top_story_rows(
     return [row for _, row in ranked_stories[:max(0, int(limit))]]
 
 
-def _build_news_state(source: list[dict[str, Any]], target: datetime, di: dict[str, Any], pair_id: int) -> dict[str, Any]:
+def _build_news_state(source: list[dict[str, Any]], target: datetime, di: dict[str, Any]) -> dict[str, Any]:
     fast = _rows_window(source, target, di, FAST_HOURS)
     slow = _rows_window(source, target, di, NARRATIVE_HOURS, end_before_hours=FAST_HOURS)
 
     ranked_articles: list[tuple[float, dict[str, Any]]] = []
     for row in fast:
-        score = _impact_score(row, pair_id, target)
+        score = _impact_score(row, target)
         if score > 0:
             ranked_articles.append((score, row))
     ranked_articles.sort(key=lambda x: (-x[0], _safe_int(x[1].get("id"), 0)))
+    distinct_fast_stories = {
+        _story_identity(row)
+        for _, row in ranked_articles
+    }
 
-    # Two distinct top stories keep multiple simultaneous narratives without
-    # letting duplicate coverage consume both slots. Codes remain factorized.
-    top_rows = _top_story_rows(ranked_articles, 2)
+    # Four distinct top stories preserve a broader common event stream without
+    # letting duplicate coverage consume multiple slots. Codes remain factorized.
+    top_rows = _top_story_rows(ranked_articles, 4)
+
+    slow_best_by_story: dict[str, dict[str, Any]] = {}
+    slow_max_sources_by_story: dict[str, int] = defaultdict(int)
+    for row in slow:
+        key = _story_identity(row)
+        slow_max_sources_by_story[key] = max(
+            slow_max_sources_by_story[key],
+            max(_safe_int(row.get("source_count_4h"), 1), 1),
+        )
+        old = slow_best_by_story.get(key)
+        if old is None:
+            slow_best_by_story[key] = row
+            continue
+
+        old_importance = {"H": 3, "M": 2, "L": 1}.get(
+            str(old.get("importance_class") or "L"),
+            1,
+        )
+        new_importance = {"H": 3, "M": 2, "L": 1}.get(
+            str(row.get("importance_class") or "L"),
+            1,
+        )
+        if new_importance > old_importance:
+            slow_best_by_story[key] = row
 
     narrative_scores: dict[str, float] = defaultdict(float)
-    narrative_sources: dict[str, set[str]] = defaultdict(set)
-    for row in slow:
-        base_rel, quote_rel = _pair_rel(row, pair_id)
-        rel = max(base_rel, quote_rel)
-        if rel <= 0:
-            continue
+    narrative_max_sources: dict[str, int] = defaultdict(int)
+    for row in slow_best_by_story.values():
         family = str(row.get("family") or "other")
         if family == "other":
             continue
@@ -1779,10 +1878,17 @@ def _build_news_state(source: list[dict[str, Any]], target: datetime, di: dict[s
         if dt is None:
             continue
         age_h = max(FAST_HOURS, (target - dt).total_seconds() / 3600.0)
-        narrative_scores[family] += rel * (2.0 ** (-age_h / 12.0))
-        press = str(row.get("press") or "")
-        if press:
-            narrative_sources[family].add(press)
+        importance = {"H": 3.0, "M": 2.0, "L": 1.0}.get(
+            str(row.get("importance_class") or "L"),
+            1.0,
+        )
+        sources4 = slow_max_sources_by_story.get(_story_identity(row), 1)
+        narrative_max_sources[family] = max(
+            narrative_max_sources[family],
+            sources4,
+        )
+        source_boost = min(1.0 + 0.10 * (sources4 - 1), 1.4)
+        narrative_scores[family] += importance * source_boost * (2.0 ** (-age_h / 12.0))
 
     narrative = None
     if narrative_scores:
@@ -1790,7 +1896,7 @@ def _build_news_state(source: list[dict[str, Any]], target: datetime, di: dict[s
         total = sum(v for _, v in ordered)
         fam, score = ordered[0]
         dominance = score / total if total > 0 else 0.0
-        if dominance >= 0.20 and len(narrative_sources.get(fam, set())) >= 2:
+        if dominance >= 0.20 and narrative_max_sources.get(fam, 0) >= 2:
             narrative = fam
 
     orientations = {str(r.get("orientation") or "NEUTRAL") for r in top_rows}
@@ -1799,7 +1905,7 @@ def _build_news_state(source: list[dict[str, Any]], target: datetime, di: dict[s
     return {
         "rows": top_rows,
         "has_news": bool(top_rows),
-        "count4": len(ranked_articles),
+        "count4": len(distinct_fast_stories),
         "narrative": narrative,
         "orientation_conflict": len(nonneutral) >= 2,
     }
@@ -1821,10 +1927,9 @@ def _codes_for_var(snapshot: dict[str, Any], var: int) -> dict[str, float]:
     if not rows:
         return {}
 
-    pair_id = int(snapshot.get("pair_id") or 1)
     event_codes: list[str] = []
     for row in rows:
-        event_codes.extend(_event_codes(row, pair_id))
+        event_codes.extend(_event_codes(row))
 
     # Deduplicate while preserving deterministic order.
     event_codes = list(dict.fromkeys(event_codes))
@@ -1914,14 +2019,13 @@ _BATCH_CACHE: "OrderedDict[tuple, dict[datetime, dict[str, Any]]]" = OrderedDict
 _BATCH_CACHE_MAX = 32
 
 
-def _news_key(dataset: list[dict[str, Any]], target: datetime, di: dict[str, Any], pair_id: int) -> tuple:
+def _news_key(dataset: list[dict[str, Any]], target: datetime, di: dict[str, Any]) -> tuple:
     source = di.get("full_dataset") or dataset
     return (
         id(source),
         id(di.get("dataset_timestamps")),
         id(di.get("dates")),
         len(source),
-        pair_id,
         int(target.timestamp()),
     )
 
@@ -1941,8 +2045,8 @@ def _price_key(target: datetime, di: dict[str, Any]) -> tuple:
     )
 
 
-def _news_cached(dataset: list[dict[str, Any]], target: datetime, di: dict[str, Any], pair_id: int) -> dict[str, Any]:
-    key = _news_key(dataset, target, di, pair_id)
+def _news_cached(dataset: list[dict[str, Any]], target: datetime, di: dict[str, Any]) -> dict[str, Any]:
+    key = _news_key(dataset, target, di)
     with _NEWS_LOCK:
         hit = _NEWS_CACHE.get(key)
         if hit is not None:
@@ -1950,7 +2054,7 @@ def _news_cached(dataset: list[dict[str, Any]], target: datetime, di: dict[str, 
             return hit
 
     source = di.get("full_dataset") or dataset
-    built = _build_news_state(source, target, di, pair_id)
+    built = _build_news_state(source, target, di)
 
     with _NEWS_LOCK:
         old = _NEWS_CACHE.get(key)
@@ -1984,16 +2088,15 @@ def _price_cached(target: datetime, di: dict[str, Any]) -> dict[str, Any] | None
     return built
 
 
-def _snapshot_key(dataset: list[dict[str, Any]], target: datetime, di: dict[str, Any], pair_id: int) -> tuple:
+def _snapshot_key(dataset: list[dict[str, Any]], target: datetime, di: dict[str, Any]) -> tuple:
     return (
-        _news_key(dataset, target, di, pair_id),
+        _news_key(dataset, target, di),
         _price_key(target, di),
     )
 
 
 def _snapshot_cached(dataset: list[dict[str, Any]], target: datetime, di: dict[str, Any]) -> dict[str, Any]:
-    pair_id = _pair_id(di)
-    key = _snapshot_key(dataset, target, di, pair_id)
+    key = _snapshot_key(dataset, target, di)
     with _SNAPSHOT_LOCK:
         hit = _SNAPSHOT_CACHE.get(key)
         if hit is not None:
@@ -2001,9 +2104,8 @@ def _snapshot_cached(dataset: list[dict[str, Any]], target: datetime, di: dict[s
             return hit
 
     built = {
-        "pair_id": pair_id,
         "price": _price_cached(target, di),
-        "news": _news_cached(dataset, target, di, pair_id),
+        "news": _news_cached(dataset, target, di),
     }
 
     with _SNAPSHOT_LOCK:
@@ -2035,7 +2137,6 @@ def _batch_key(dataset: list[dict[str, Any]], dates: list[datetime], di: dict[st
         id(npr.get("min")),
         id(npr.get("ranges")),
         len(dates_ns) if dates_ns is not None else 0,
-        _pair_id(di),
         tuple(dates),
     )
 
