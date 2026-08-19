@@ -107,7 +107,7 @@ NARRATIVE_HOURS = 24
 STORY_MATCH_HOURS = 72
 EXPECTEDNESS_DAYS = 180
 ENRICH_BATCH = 3000
-SCHEMA_VERSION = "structured-fin-events-v2.1"
+SCHEMA_VERSION = "structured-fin-events-v2.4"
 
 SOURCE_TABLES: dict[str, str] = {
     "cnn": "brain_cnn_news",
@@ -259,8 +259,10 @@ def _install_service64_reverse_policy() -> None:
                 v = float(value)
             except (TypeError, ValueError):
                 continue
-            if not math.isfinite(v):
-                v = math.copysign(REVERSE_MAX_ABS_WEIGHT, v) if v else 0.0
+            if math.isnan(v):
+                v = 0.0
+            elif math.isinf(v):
+                v = math.copysign(REVERSE_MAX_ABS_WEIGHT, v)
             clean[str(key)] = v
             mx = max(mx, abs(v))
         if mx > REVERSE_MAX_ABS_WEIGHT and mx > 0:
@@ -322,6 +324,7 @@ _install_service64_reverse_policy()
 
 _SPACE_RE = re.compile(r"\s+")
 _WORD_RE = re.compile(r"[a-z0-9][a-z0-9'\-]{2,}", re.I)
+_TERM_RE_CACHE: dict[str, re.Pattern[str]] = {}
 
 STOP = {
     "the","and","for","with","from","that","this","into","after","before","about",
@@ -331,15 +334,58 @@ STOP = {
     "were","been","being","have","has","had","not","but","out","off","you","your",
 }
 
+FED_CONTEXT_TERMS = (
+    "federal reserve", "fomc", "jerome powell", "powell",
+    "fed chair", "fed officials", "fed governor", "fed meeting",
+    "fed policy", "fed rate", "fed rates",
+)
+
+SEC_CONTEXT_TERMS = (
+    "securities", "regulator", "regulation", "etf", "crypto",
+    "bitcoin", "ethereum", "coinbase", "binance", "filing",
+    "filings", "lawsuit", "charges", "charged", "enforcement", "sues", "sued",
+    "approve", "approved", "approves", "approval", "reject", "rejected", "rejects",
+)
+
+ETHER_CONTEXT_TERMS = (
+    "crypto", "cryptocurrency", "ethereum", "etf", "token", "blockchain",
+)
+
+ETH_ALIAS_CONTEXT_TERMS = (
+    "crypto", "cryptocurrency", "ethereum", "ether", "blockchain", "token",
+    "wallet", "smart contract", "defi", "staking", "stablecoin", "binance",
+    "coinbase", "kraken", "crypto exchange", "eth/usd", "ethusd", "eth/usdt",
+)
+
+ETH_PAIR_ALIASES = ("eth/usd", "ethusd", "eth/usdt", "ethusdt")
+
+USD_MARKET_TERMS = (
+    "u.s. dollar", "us dollar", "usd", "dollar index", "dxy",
+    "dollar rises", "dollar falls", "dollar gains", "dollar drops",
+    "dollar weakens", "dollar strengthens",
+)
+
+EUR_MARKET_TERMS = (
+    "european central bank", "ecb", "lagarde", "eurozone", "euro area",
+    "eur", "eur/usd", "euro rises", "euro falls", "euro gains",
+    "euro weakens", "euro strengthens",
+)
+
+CRYPTO_SECURITY_TERMS = (
+    "crypto", "cryptocurrency", "bitcoin", "btc", "ethereum",
+    "blockchain", "defi", "binance", "coinbase", "kraken",
+    "stablecoin", "usdt", "usdc",
+)
+
 FAMILY_RULES = [
     ("etf", (
         "spot bitcoin etf","bitcoin etf","btc etf","spot ether etf",
         "spot ethereum etf","ethereum etf","ether etf","eth etf",
-        "exchange-traded fund",
+        "exchange-traded fund","etf",
     )),
     ("monetary_policy", (
-        "federal reserve"," fed ","fomc","powell","european central bank"," ecb ",
-        "lagarde","interest rate","rate cut","rate hike","central bank",
+        *FED_CONTEXT_TERMS, "european central bank", "ecb", "lagarde",
+        "interest rate","rate cut","rate hike","central bank",
         "monetary policy","quantitative easing","quantitative tightening",
     )),
     ("inflation", (
@@ -355,8 +401,9 @@ FAMILY_RULES = [
         "services pmi","economic growth","economic slowdown","recession",
     )),
     ("crypto_regulation", (
-        " sec ","securities and exchange commission"," cftc ","crypto regulation",
-        "cryptocurrency regulation","crypto regulator",
+        "crypto regulation", "cryptocurrency regulation", "crypto regulator",
+        "crypto rules", "cryptocurrency rules", "crypto enforcement",
+        "digital asset regulation", "digital asset rules",
     )),
     ("exchange", (
         "binance","coinbase","kraken","bitfinex","okx","bybit","crypto exchange",
@@ -366,7 +413,7 @@ FAMILY_RULES = [
         "stolen crypto","security breach","data breach",
     )),
     ("stablecoin", (
-        "stablecoin","tether"," usdt ","usd coin"," usdc ","circle",
+        "stablecoin","tether","usdt","usd coin","usdc",
     )),
     ("protocol", (
         "bitcoin network","ethereum","blockchain","protocol upgrade","hard fork",
@@ -376,12 +423,12 @@ FAMILY_RULES = [
         "bank failure","bank run","banking crisis","liquidity crisis","credit crunch",
         "deposit outflow","bankruptcy","insolvent",
     )),
-    ("geopolitics", (
-        "war ","invasion","missile","airstrike","military strike","ceasefire",
-        "sanctions","troops","nuclear","conflict",
-    )),
     ("trade", (
         "tariff","trade war","import duty","export ban","trade agreement","trade deal",
+    )),
+    ("geopolitics", (
+        "war","invasion","missile","airstrike","military strike","ceasefire",
+        "sanctions","troops","nuclear","conflict",
     )),
     ("energy", (
         "oil price","crude oil","brent"," wti ","opec","natural gas",
@@ -436,7 +483,7 @@ OBJECT_RULES = [
     ("JOBS", ("nonfarm payroll","payrolls","jobs report","unemployment","jobless claims")),
     ("GDP", (" gdp ","gross domestic product")),
     ("BITCOIN", ("bitcoin"," btc ")),
-    ("ETHEREUM", ("ethereum","ether "," eth ")),
+    ("ETHEREUM", ("ethereum",)),
     ("STABLECOIN", ("stablecoin","tether"," usdt ","usd coin"," usdc ")),
     ("EXCHANGE", ("binance","coinbase","kraken","crypto exchange")),
     ("BANK", (" bank ","banking sector")),
@@ -446,9 +493,7 @@ OBJECT_RULES = [
 ]
 
 ACTOR_RULES = [
-    ("FED", "CENTRAL_BANK_US", ("federal reserve"," fed ","fomc","jerome powell","powell")),
     ("ECB", "CENTRAL_BANK_EU", ("european central bank"," ecb ","christine lagarde","lagarde")),
-    ("SEC", "REGULATOR_US", (" sec ","securities and exchange commission")),
     ("CFTC", "REGULATOR_US", (" cftc ",)),
     ("US_TREASURY", "GOVERNMENT_US", ("u.s. treasury","us treasury","treasury department")),
     ("BLS", "STATISTICS_US", ("bureau of labor statistics"," bls ")),
@@ -460,7 +505,10 @@ ACTOR_RULES = [
     ("FIDELITY", "ETF_ISSUER", ("fidelity",)),
     ("GRAYSCALE", "ETF_ISSUER", ("grayscale",)),
     ("TETHER", "STABLECOIN_ISSUER", ("tether",)),
-    ("CIRCLE", "STABLECOIN_ISSUER", ("circle","usd coin")),
+    ("CIRCLE", "STABLECOIN_ISSUER", (
+        "circle internet financial", "circle stablecoin", "circle usdc",
+        "usd coin", "usdc",
+    )),
     ("OPEC", "ENERGY_ORG", ("opec",)),
 ]
 
@@ -481,8 +529,18 @@ _SURPRISE_PATTERNS: list[tuple[re.Pattern, bool]] = [
     (re.compile(rf"{_NUM}\s*%?\s+(?:vs\.?|versus)\s+(?:an?\s+)?(?:expected|forecast|estimate(?:d)?)\s+{_NUM}\s*%?", re.I), False),
     (re.compile(rf"(?:expected|forecast|estimate(?:d)?(?: at| of)?)\s+{_NUM}\s*%?.{{0,80}}?(?:actual|came in at|rose to|fell to)\s+{_NUM}\s*%?", re.I), True),
 ]
-_BPS_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:basis points|bps|bp)\b", re.I)
-_PCT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%", re.I)
+_BPS_RE = re.compile(r"(-?\d+(?:\.\d+)?)\s*(?:basis points|bps|bp)\b", re.I)
+_PCT_RE = re.compile(r"(-?\d+(?:\.\d+)?)\s*%", re.I)
+_MAGNITUDE_CONTEXT = (
+    "rate", "rates", "interest rate", "inflation", "consumer price", "producer price",
+    "price", "prices", "cpi", "ppi", "pce", "jobs", "jobless", "employment",
+    "unemployment", "payroll", "payrolls", "wage", "wages", "gdp",
+    "gross domestic product", "growth", "yield", "yields", "revenue", "profit",
+    "earnings", "sales", "tariff", "tariffs", "deficit", "debt", "budget",
+    "forecast", "expected", "estimate", "actual", "market share", "inflow",
+    "inflows", "outflow", "outflows", "bitcoin", "btc", "ethereum", "eth",
+    "ether", "crypto", "stock", "stocks", "bond", "bonds", "oil", "gas",
+)
 
 
 def _clean(v: Any) -> str:
@@ -490,8 +548,19 @@ def _clean(v: Any) -> str:
     return " " + _SPACE_RE.sub(" ", s).strip() + " "
 
 
+def _term_pattern(term: str) -> re.Pattern[str]:
+    """Compile an exact token/phrase matcher instead of using substrings."""
+    normalized = _SPACE_RE.sub(" ", str(term or "").strip().lower())
+    pattern = _TERM_RE_CACHE.get(normalized)
+    if pattern is None:
+        body = r"\s+".join(re.escape(part) for part in normalized.split(" "))
+        pattern = re.compile(rf"(?<![a-z0-9]){body}(?![a-z0-9])", re.I)
+        _TERM_RE_CACHE[normalized] = pattern
+    return pattern
+
+
 def _contains(text: str, phrases: tuple[str, ...]) -> bool:
-    return any(p in text for p in phrases)
+    return any(_term_pattern(p).search(text) is not None for p in phrases if str(p).strip())
 
 
 def _safe_float(v: Any, default: float = 0.0) -> float:
@@ -529,10 +598,37 @@ def _find_rule(text: str, rules, default: str) -> str:
 
 
 def _actor(text: str) -> tuple[str, str]:
+    if _contains(text, FED_CONTEXT_TERMS):
+        return "FED", "CENTRAL_BANK_US"
+
+    if _contains(text, ("securities and exchange commission",)):
+        return "SEC", "REGULATOR_US"
+
+    if _contains(text, ("sec",)) and _contains(text, SEC_CONTEXT_TERMS):
+        return "SEC", "REGULATOR_US"
+
+    if _contains(text, ("circle",)) and _contains(text, ("stablecoin", "usdc", "usd coin")):
+        return "CIRCLE", "STABLECOIN_ISSUER"
+
     for actor, actor_class, phrases in ACTOR_RULES:
         if _contains(text, phrases):
             return actor, actor_class
     return "OTHER", "OTHER"
+
+
+def _object(text: str) -> str:
+    obj = _find_rule(text, OBJECT_RULES, "OTHER")
+    if obj == "OTHER" and _has_eth_alias_context(text):
+        return "ETHEREUM"
+    return obj
+
+
+def _has_eth_alias_context(text: str) -> bool:
+    return (
+        _contains(text, ETH_PAIR_ALIASES)
+        or (_contains(text, ("ether",)) and _contains(text, ETHER_CONTEXT_TERMS))
+        or (_contains(text, ("eth",)) and _contains(text, ETH_ALIAS_CONTEXT_TERMS))
+    )
 
 
 def _orientation(action: str) -> str:
@@ -556,11 +652,20 @@ def _tone(text: str) -> str:
 
 
 def _certainty(text: str) -> str:
-    if _contains(text, ("rumor","rumour","reportedly","sources say","may ","might ","could ")):
+    if _contains(text, (
+        "rumor", "rumour", "reportedly", "sources say",
+        "might approve", "might reject", "might cut", "might raise", "might launch",
+        "could approve", "could reject", "could cut", "could raise", "could launch",
+        "may be", "may have", "may seek", "may consider", "may plan",
+    )):
         return "RUMOR"
-    if _contains(text, ("plans to","proposes","proposal","considering","seeks approval","files for")):
+    if _contains(text, (
+        "plans to", "proposes", "proposal", "considering", "seeks approval", "files for",
+    )):
         return "PLANNED"
-    if _contains(text, ("confirmed","official","announced","approved","completed","effective immediately")):
+    if _contains(text, (
+        "confirmed", "official", "announced", "approved", "completed", "effective immediately",
+    )):
         return "CONFIRMED"
     return "REPORTED"
 
@@ -588,14 +693,28 @@ def _surprise(text: str) -> tuple[str, float | None]:
     return "NONE", None
 
 
+def _has_magnitude_context(text: str, start: int, end: int) -> bool:
+    # A percentage is meaningful only when a nearby phrase identifies a
+    # financial/economic measure. This prevents arbitrary percentages elsewhere
+    # in an article from becoming event magnitude.
+    window = text[max(0, start - 96):min(len(text), end + 96)]
+    return _contains(window, _MAGNITUDE_CONTEXT)
+
+
 def _magnitude(text: str) -> str:
-    m = _BPS_RE.search(text)
-    if m:
-        v = float(m.group(1))
+    # Basis points are themselves an unambiguous financial unit.
+    bps_vals = [float(m.group(1)) for m in _BPS_RE.finditer(text)]
+    if bps_vals:
+        v = max(abs(x) for x in bps_vals)
         return "H" if v >= 75 else ("M" if v >= 25 else "L")
-    vals = [float(x) for x in _PCT_RE.findall(text)]
+
+    vals = [
+        float(m.group(1))
+        for m in _PCT_RE.finditer(text)
+        if _has_magnitude_context(text, m.start(), m.end())
+    ]
     if vals:
-        v = max(vals)
+        v = max(abs(x) for x in vals)
         return "H" if v >= 5.0 else ("M" if v >= 1.0 else "L")
     return "U"
 
@@ -614,13 +733,21 @@ def _story_terms(title: str, family: str, actor_class: str, action: str, obj: st
 def _relevance(text: str, family: str, actor_class: str, obj: str) -> dict[str, int]:
     r = {"usd": 0, "eur": 0, "btc": 0, "eth": 0}
 
-    if _contains(text, ("federal reserve"," fed ","fomc","powell","u.s. economy","us economy","dollar"," usd ")):
+    if (
+        _contains(text, FED_CONTEXT_TERMS)
+        or _contains(text, ("u.s. economy", "us economy"))
+        or _contains(text, USD_MARKET_TERMS)
+    ):
         r["usd"] = 3
-    if _contains(text, ("european central bank"," ecb ","lagarde","eurozone","euro "," eur ")):
+    if _contains(text, EUR_MARKET_TERMS):
         r["eur"] = 3
-    if _contains(text, ("bitcoin"," btc ","bitcoin etf")):
+
+    if _contains(text, ("bitcoin", "btc")):
         r["btc"] = 3
-    if _contains(text, ("ethereum","ether "," eth ","ethereum etf","ether etf")):
+    if _contains(text, ("ethereum",)):
+        r["eth"] = 3
+
+    if _has_eth_alias_context(text):
         r["eth"] = 3
 
     if obj == "BTC_ETF":
@@ -628,19 +755,30 @@ def _relevance(text: str, family: str, actor_class: str, obj: str) -> dict[str, 
     elif obj == "ETH_ETF":
         r["eth"] = 3
 
-    if family in {"crypto_regulation","exchange","security","stablecoin","protocol","etf"}:
+    # These families and actors are crypto-specific by definition. They affect
+    # both crypto pairs even when the headline names an exchange, stablecoin or
+    # protocol rather than Bitcoin/Ethereum directly.
+    if (
+        family in {"crypto_regulation", "exchange", "stablecoin", "protocol"}
+        or actor_class in {"CRYPTO_EXCHANGE", "STABLECOIN_ISSUER"}
+    ):
+        r["btc"] = max(r["btc"], 2)
+        r["eth"] = max(r["eth"], 2)
+
+    # Security is broad; project it to crypto only in explicit crypto context.
+    if family == "security" and (
+        _contains(text, CRYPTO_SECURITY_TERMS) or _has_eth_alias_context(text)
+    ):
         r["btc"] = max(r["btc"], 2)
         r["eth"] = max(r["eth"], 2)
 
     if family in {"monetary_policy","inflation","labor","growth","fiscal","trade"}:
         r["usd"] = max(r["usd"], 2)
         r["eur"] = max(r["eur"], 1)
-        r["btc"] = max(r["btc"], 1)
-        r["eth"] = max(r["eth"], 1)
 
     if family in {"geopolitics","banking","energy","markets"}:
-        for k in r:
-            r[k] = max(r[k], 1)
+        r["usd"] = max(r["usd"], 1)
+        r["eur"] = max(r["eur"], 1)
 
     if actor_class == "CENTRAL_BANK_US":
         r["usd"] = 3
@@ -671,25 +809,33 @@ def _extract_static(press: str, raw: dict[str, Any]) -> dict[str, Any] | None:
     feed = str(raw.get("feed") or "").lower()[:64]
 
     title = _clean(title_raw)
-    combined = title + " " + _clean(body_raw)
+    lead_raw = body_raw[:1800]
+    signal_text = title + " " + _clean(lead_raw)
+    full_text = title + " " + _clean(body_raw)
 
-    family = _find_rule(combined, FAMILY_RULES, "other")
-    action = _find_rule(combined, ACTION_RULES, "OTHER")
-    obj = _find_rule(combined, OBJECT_RULES, "OTHER")
-    actor, actor_class = _actor(combined)
+    family = _find_rule(signal_text, FAMILY_RULES, "other")
+    action = _find_rule(signal_text, ACTION_RULES, "OTHER")
+    obj = _object(signal_text)
+    actor, actor_class = _actor(signal_text)
     orientation = _orientation(action)
-    tone = _tone(combined)
-    certainty = _certainty(combined)
-    surprise_class, surprise_value = _surprise(combined)
-    magnitude = _magnitude(combined)
-    relevance = _relevance(combined, family, actor_class, obj)
+    tone = _tone(signal_text)
+    certainty = _certainty(signal_text)
+    surprise_class, surprise_value = _surprise(full_text)
+    magnitude = _magnitude(full_text)
+    relevance = _relevance(signal_text, family, actor_class, obj)
+
+    # Runtime ignores zero-relevance events, so keeping them would only pollute
+    # story/signature statistics and derived indexes.
+    if not any(relevance.values()):
+        return None
+
     importance = _importance(family, action, actor_class, surprise_class, magnitude, title)
 
     signature = f"{family}|{actor_class}|{action}|{obj}"
     terms = _story_terms(title_raw, family, actor_class, action, obj)
     unexpected_hint = int(
         surprise_class != "NONE"
-        or _contains(combined, ("unexpected","unexpectedly","surprise","shocks markets"))
+        or _contains(full_text, ("unexpected","unexpectedly","surprise","shocks markets"))
     )
 
     return {
@@ -1022,6 +1168,29 @@ def _story_score(row: dict[str, Any], story: dict[str, Any], terms: set[str]) ->
     return score
 
 
+def _velocity_class(
+    count1: int,
+    sources1: int,
+    prev_count1: int,
+    prev_sources1: int,
+    prior_events4: int,
+) -> str:
+    """Classify publication acceleration using two equal causal windows."""
+    if prior_events4 == 0:
+        return "L"
+
+    article_growth = count1 > prev_count1
+    source_growth = sources1 > prev_sources1
+    high_article_growth = count1 >= max(3, 2 * max(prev_count1, 1))
+    high_source_growth = sources1 >= max(2, 2 * max(prev_sources1, 1))
+
+    if (article_growth and high_article_growth) or (source_growth and high_source_growth):
+        return "H"
+    if article_growth or source_growth:
+        return "M"
+    return "L"
+
+
 async def _causal_rebuild(engine_vlad, recompute_from: datetime) -> int:
     """Rebuild lifecycle fields chronologically; no future row can update an older row."""
     from sqlalchemy import text
@@ -1213,10 +1382,23 @@ async def _causal_rebuild(engine_vlad, recompute_from: datetime) -> int:
             else:
                 stage = "FOLLOWUP"
 
-            prev_1_to_4h = max(count4 - count1, 0)
-            baseline_per_hour = max(prev_1_to_4h / 3.0, 0.25)
-            velocity = count1 / baseline_per_hour
-            velocity_class = "H" if velocity >= 2.0 else ("M" if velocity >= 1.2 else "L")
+            # Compare equal one-hour windows. A lone first publication is never
+            # a burst; M/H require an actual increase in article or source count
+            # over the immediately preceding hour.
+            previous1 = [
+                e for e in events
+                if dt - timedelta(hours=2) <= e[0] < dt - timedelta(hours=1)
+            ]
+            prev_count1 = len(previous1)
+            prev_sources1 = len({e[1] for e in previous1})
+
+            velocity_class = _velocity_class(
+                count1,
+                sources1,
+                prev_count1,
+                prev_sources1,
+                prior_events4,
+            )
 
             if dt >= recompute_from:
                 updates.append({
@@ -1284,8 +1466,10 @@ async def _build_structured_news(engine_vlad, engine_brain, *, force_full: bool 
         #
         # This branch executes only on a structured schema-version change/full
         # rebuild, not on ordinary incremental rebuilds.
+        # Values cache lives in engine_cache / SUPER_* and must be cleared once
+        # on the cache-writer through /clear_cache?also_backtest=true. Only the
+        # reverse-learning tables below belong to engine_vlad.
         for stale_table in (
-            "vlad_values_cache_svc8926",
             "vlad_reverse_universe_svc8926",
             "vlad_reverse_jobs_svc8926",
         ):
@@ -1308,8 +1492,6 @@ async def _build_structured_news(engine_vlad, engine_brain, *, force_full: bool 
 
         for press in SOURCE_TABLES:
             await _meta_set(engine_vlad, f"last_{press}_id", 0)
-
-        await _meta_set(engine_vlad, "schema_version", SCHEMA_VERSION)
 
     total = 0
     min_new_date: datetime | None = None
@@ -1360,6 +1542,12 @@ async def _build_structured_news(engine_vlad, engine_brain, *, force_full: bool 
         causal_updated = await _causal_rebuild(engine_vlad, SOURCE_WARM_FROM)
     elif min_new_date is not None:
         causal_updated = await _causal_rebuild(engine_vlad, min_new_date)
+
+    # Schema version is the commit marker. Record it only after ingestion and
+    # the full causal pass have both completed successfully, so an interrupted
+    # build is retried as full on the next /rebuild_index.
+    if full:
+        await _meta_set(engine_vlad, "schema_version", SCHEMA_VERSION)
 
     return {
         "mode": "full" if full else ("incremental" if total else "noop"),
@@ -1536,20 +1724,46 @@ def _price_codes(price: dict[str, Any]) -> list[str]:
     ]
 
 
+def _top_story_rows(
+    ranked_articles: list[tuple[float, dict[str, Any]]],
+    limit: int = 2,
+) -> list[dict[str, Any]]:
+    """Keep the highest-scoring article from each distinct causal story."""
+    best_by_story: dict[str, tuple[float, dict[str, Any]]] = {}
+
+    for score, row in ranked_articles:
+        story_key = str(row.get("story_key") or "").strip()
+        if not story_key:
+            story_key = (
+                f"row:{row.get('press', '')}:"
+                f"{row.get('source_news_id', row.get('id', ''))}"
+            )
+
+        old = best_by_story.get(story_key)
+        if old is None or score > old[0]:
+            best_by_story[story_key] = (score, row)
+
+    ranked_stories = sorted(
+        best_by_story.values(),
+        key=lambda x: (-x[0], _safe_int(x[1].get("id"), 0)),
+    )
+    return [row for _, row in ranked_stories[:max(0, int(limit))]]
+
+
 def _build_news_state(source: list[dict[str, Any]], target: datetime, di: dict[str, Any], pair_id: int) -> dict[str, Any]:
     fast = _rows_window(source, target, di, FAST_HOURS)
     slow = _rows_window(source, target, di, NARRATIVE_HOURS, end_before_hours=FAST_HOURS)
 
-    ranked = []
+    ranked_articles: list[tuple[float, dict[str, Any]]] = []
     for row in fast:
         score = _impact_score(row, pair_id, target)
         if score > 0:
-            ranked.append((score, row))
-    ranked.sort(key=lambda x: (-x[0], _safe_int(x[1].get("id"), 0)))
+            ranked_articles.append((score, row))
+    ranked_articles.sort(key=lambda x: (-x[0], _safe_int(x[1].get("id"), 0)))
 
-    # Two top events keep multiple simultaneous narratives without exploding the
-    # reverse code space. Codes are factorized, not rank-specific.
-    top_rows = [row for _, row in ranked[:2]]
+    # Two distinct top stories keep multiple simultaneous narratives without
+    # letting duplicate coverage consume both slots. Codes remain factorized.
+    top_rows = _top_story_rows(ranked_articles, 2)
 
     narrative_scores: dict[str, float] = defaultdict(float)
     narrative_sources: dict[str, set[str]] = defaultdict(set)
@@ -1585,7 +1799,7 @@ def _build_news_state(source: list[dict[str, Any]], target: datetime, di: dict[s
     return {
         "rows": top_rows,
         "has_news": bool(top_rows),
-        "count4": len(ranked),
+        "count4": len(ranked_articles),
         "narrative": narrative,
         "orientation_conflict": len(nonneutral) >= 2,
     }
@@ -1705,6 +1919,7 @@ def _news_key(dataset: list[dict[str, Any]], target: datetime, di: dict[str, Any
     return (
         id(source),
         id(di.get("dataset_timestamps")),
+        id(di.get("dates")),
         len(source),
         pair_id,
         int(target.timestamp()),
@@ -1770,14 +1985,9 @@ def _price_cached(target: datetime, di: dict[str, Any]) -> dict[str, Any] | None
 
 
 def _snapshot_key(dataset: list[dict[str, Any]], target: datetime, di: dict[str, Any], pair_id: int) -> tuple:
-    source = di.get("full_dataset") or dataset
-    npr = di.get("np_rates") or {}
     return (
-        id(source),
-        id(di.get("dataset_timestamps")),
-        id(npr.get("dates_ns")),
-        pair_id,
-        int(target.timestamp()),
+        _news_key(dataset, target, di, pair_id),
+        _price_key(target, di),
     )
 
 
@@ -1812,10 +2022,19 @@ def _batch_key(dataset: list[dict[str, Any]], dates: list[datetime], di: dict[st
         return None
     source = di.get("full_dataset") or dataset
     npr = di.get("np_rates") or {}
+    dates_ns = npr.get("dates_ns")
     return (
         id(source),
         id(di.get("dataset_timestamps")),
-        id(npr.get("dates_ns")),
+        id(di.get("dates")),
+        len(source),
+        id(dates_ns),
+        id(npr.get("open")),
+        id(npr.get("close")),
+        id(npr.get("max")),
+        id(npr.get("min")),
+        id(npr.get("ranges")),
+        len(dates_ns) if dates_ns is not None else 0,
         _pair_id(di),
         tuple(dates),
     )
