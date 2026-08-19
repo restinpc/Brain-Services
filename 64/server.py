@@ -1,4 +1,4 @@
-"""FastAPI entry point for service 81."""
+"""FastAPI entry point for service 64."""
 from __future__ import annotations
 
 import os
@@ -19,5 +19,5 @@ if __name__ == "__main__":
     import uvicorn
 
     cfg = get_service_config() or {}
-    port = int((cfg.get("service") or {}).get("port", 8943))
+    port = int((cfg.get("service") or {}).get("port", 8926))
     uvicorn.run("server:app", host="0.0.0.0", port=port, reload=False)

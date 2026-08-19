@@ -1,61 +1,54 @@
 """
-Service 81 — H1 News Digestion + Reverse Learning
-=================================================
+Service 64 — Structured Financial News H1 + Reverse Learning
+============================================================
 
-Purpose
--------
-A new hourly model built on the already prepared ``vlad_news_algo_events``
-dataset used by service 80.  Unlike service 80, this model does NOT ask only
-"what happened after the same semantic event in the past?".  It describes the
-point-in-time market/news state with a small hierarchy of reusable feature
-codes and lets Brain reverse-learning decide which states correspond to future
-buy/sell extrema.
+Replacement for the experimental service-81-style news digestion model.
 
-Design lessons intentionally carried over from services 58/80 and the research
-review:
-  * H1 only.  Do not compete for the first seconds/minutes after a release.
-    The model trades the market's *digestion* of information on later H1 bars.
-  * strict point-in-time news: only rows with publication ``date_dt < target``;
-  * no use of stored ``novelty``/``confirmation_count`` because those fields may
-    have been calculated with information that arrived later.  Confirmation and
-    novelty are rebuilt causally from rows that were already available;
-  * frozen NLP cutoff: pre-cutoff semantic rows are never used as active reverse
-    codes, preventing a frozen artifact trained through the cutoff from leaking
-    backwards into earlier reverse-training extrema;
-  * price-only control var so we can prove that news adds edge beyond H1
-    momentum/reversal alone;
-  * first closed H1 reaction, volatility regime and shock are explicit features;
-  * continuation / underreaction / overreaction are separate hypotheses;
-  * reverse types 2/3/4 use ATR/range-normalised extremum amplitude instead of
-    raw BTC/EUR/ETH price units;
-  * reverse extremum registration interval is fixed at 3 bars for every var so
-    ``var`` changes only the economic hypothesis, not the label definition;
-  * service-local bounded reverse policy prevents the 1e30..1e60 weight runaway
-    seen in older reverse models.  Uniform rescaling preserves reverse precision
-    and all within-universe weight ratios.
+The service builds its own deterministic structured event dataset directly from
+the existing raw news tables:
+    brain_cnn_news
+    brain_nyt_news
+    brain_twp_news
+    brain_wsj_news
+    brain_tgd_news
+
+No LLM is used.
+
+Each article is converted into low-cardinality financial event attributes:
+family, actor/actor class, action, object, semantic orientation, certainty,
+importance, magnitude, surprise hints and asset relevance.
+
+A second strictly chronological pass builds story lifecycle features:
+FIRST/FOLLOWUP/CONFIRMED/MULTI_SOURCE/SATURATED, 1h/4h article and source
+counts, velocity, novelty, and 180-day expectedness/rarity.  The pass never
+updates a historical row using later articles.
+
+The enriched table is created and maintained by enrich_dataset(), therefore
+Brain Framework /rebuild_index runs the whole raw->structured pipeline before
+building its _mask/_indexes/_weights tables.
 
 VAR semantics
 -------------
-0 PRICE_CONTROL       : closed-price state only, no news (placebo/control)
-1 NEWS_ONLY           : causal news state only
-2 NEWS_REACTION       : news + first closed H1 reaction (main general model)
-3 HIGH_IMPACT         : only high-impact news states
-4 UNDERREACTION       : strong news + weak/normal first price response
-5 CONTINUATION        : meaningful news + directional, non-extreme response
-6 OVERREACTION        : high-impact news + extreme first response; reverse learns
-                        continuation versus fade, we do not hard-code the side
+0 PRICE_CONTROL       closed H1 market state only
+1 STRUCTURED_EVENT    family + actor + action + object + relevance
+2 SURPRISE            structured event + surprise/magnitude/expectedness
+3 STORY               structured event + causal story lifecycle/narrative
+4 EVENT_REACTION      structured event + first closed H1 price reaction
+5 ALL                 structured + surprise + story + reaction
 
-TYPE semantics are intentionally left to shared reverse_learning.py:
-0 backward/sign, 1 forward/sign, 2 backward/amplitude,
-3 forward/amplitude, 4 forward-strict/amplitude.
-The active feature set itself does not change with type.
+TYPE semantics remain the shared reverse-learning modes 0..4.
+No event action is hard-coded as bullish/bearish for the traded market.
 """
+
 from __future__ import annotations
 
 import bisect
+import hashlib
+import html
 import math
+import re
 import threading
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict, defaultdict, deque
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -68,31 +61,17 @@ import numpy as np
 
 SERVICE_ID = 64
 PORT = 8926
-NODE_NAME = "brain-news-digestion-h1-ml-s64"
-SERVICE_TEXT = "H1 causal news digestion + market reaction + bounded reverse learning"
+NODE_NAME = "brain-news-structured-h1-ml-s64"
+SERVICE_TEXT = "Structured financial news events + causal story lifecycle + H1 reverse-learning"
 
 RATES_TABLE = "brain_rates_eur_usd"
 
-# Use only the columns that model 81 actually needs.  date_dt is the information
-# availability timestamp for this model; reference/economic dates are never used
-# as substitutes for publication time.
-DATASET_QUERY = """
-    SELECT
-        date_dt AS date,
-        date_dt,
-        press,
-        event_type,
-        topic_id,
-        cluster_id,
-        topic_focus,
-        cluster_similarity,
-        quality_score
-    FROM vlad_news_algo_events
-    WHERE date_dt IS NOT NULL
-    ORDER BY date_dt
-"""
+ENRICHED_TABLE = "vlad_news_structured_events_v2"
+DATASET_INDEX_FIELDS = ["event_type"]
+DATASET_DATE_FIELD = "date_dt"
 DATASET_ENGINE = "vlad"
 DATASET_KEY = "event_type"
+
 FILTER_DATASET_BY_DATE = True
 MODEL_CAN_FILTER_DATASET_BY_DATE = True
 MODEL_USES_RATE_HISTORY = True
@@ -101,15 +80,15 @@ PRETEST_ALLOW_EMPTY = True
 CACHE_DATE_FROM = "2025-01-15"
 MODEL_START = datetime(2025, 1, 15, 0, 0, 0)
 
-# Semantic horizon of the H1 model.  The reverse layer has its own extremum
-# history window; these four hours are the direct post-news digestion horizon.
+# We keep 180 days only as causal warm-up for rarity/expectedness before
+# MODEL_START. Rows earlier than this cannot affect the model.
+SOURCE_WARM_FROM = MODEL_START - timedelta(days=180)
+
 SHIFT_WINDOW = 4
-VAR_RANGE = list(range(7))
+VAR_RANGE = [0, 1, 2, 3, 4, 5]
 TYPES_RANGE = [0, 1, 2, 3, 4]
 USE_ML_VALUES = True
 
-# Fallback ML settings when config.toml does not override them.  0.95 was far too
-# aggressive for noisy market data and was one cause of excessive reweighting.
 ML_TARGET_PRECISION = 0.62
 ML_MAX_ITER = 8
 ML_STEP = 0.04
@@ -117,62 +96,56 @@ ML_EXTREMUM_LIMIT = 48
 ML_ACTIVE_TAIL = 0
 ML_PRECISION_METRIC = "mean"
 
-
-# -----------------------------------------------------------------------------
-# Frozen thresholds derived before/at the service-80 NLP cutoff, not from future
-# H1 performance.  Service-80 diagnostics had median topic_focus ~= .358 and
-# median cluster_similarity ~= .723; 0.36/0.70 were its runtime thresholds.
-# -----------------------------------------------------------------------------
-
-TOPIC_FOCUS_MID = 0.36
-TOPIC_FOCUS_HIGH = 0.58
-CLUSTER_SIM_MID = 0.70
-CLUSTER_SIM_HIGH = 0.80
-
-FAST_NEWS_HOURS = 4
-FAST_1H_HOURS = 1
-SLOW_NEWS_HOURS = 48
-NOVEL_GAP_HOURS = 24
-FRESH_GAP_HOURS = 6
-MIN_CAUSAL_CLUSTER_SUPPORT = 60
-
-# The model emits only compact categorical codes.  Reverse weights are bounded
-# separately below.
 REVERSE_MAX_ABS_WEIGHT = 32.0
 REVERSE_AMP_MIN = 0.25
 REVERSE_AMP_MAX = 8.0
 REVERSE_AMP_LOOKBACK = 24
 REVERSE_FIXED_EXTREMUM_INTERVAL = 3
 
+FAST_HOURS = 4
+NARRATIVE_HOURS = 24
+STORY_MATCH_HOURS = 72
+EXPECTEDNESS_DAYS = 180
+ENRICH_BATCH = 3000
+SCHEMA_VERSION = "structured-fin-events-v2.1"
+
+SOURCE_TABLES: dict[str, str] = {
+    "cnn": "brain_cnn_news",
+    "nyt": "brain_nyt_news",
+    "twp": "brain_twp_news",
+    "wsj": "brain_wsj_news",
+    "tgd": "brain_tgd_news",
+}
+
+RATES_TO_PAIR = {
+    "brain_rates_eur_usd": 1,
+    "brain_rates_eur_usd_day": 1,
+    "brain_rates_btc_usd": 3,
+    "brain_rates_btc_usd_day": 3,
+    "brain_rates_eth_usd": 4,
+    "brain_rates_eth_usd_day": 4,
+}
 
 VAR_LABELS = {
     0: "PRICE_CONTROL",
-    1: "NEWS_ONLY",
-    2: "NEWS_REACTION",
-    3: "HIGH_IMPACT",
-    4: "UNDERREACTION",
-    5: "CONTINUATION",
-    6: "OVERREACTION",
+    1: "STRUCTURED_EVENT",
+    2: "SURPRISE",
+    3: "STORY",
+    4: "EVENT_REACTION",
+    5: "ALL",
 }
 
-
 # -----------------------------------------------------------------------------
-# Service-local reverse policy
+# Service-local bounded reverse policy
 # -----------------------------------------------------------------------------
-# server.py adds ../shared to sys.path before importing model.py.  Therefore the
-# import below resolves the same reverse_learning module that brain_framework
-# will use a moment later.  Monkey-patches affect only service 81's process; no
-# files in shared/ are modified and services 58/78/80 keep their old behaviour.
-# -----------------------------------------------------------------------------
-
-def _install_service81_reverse_policy() -> None:
+def _install_service64_reverse_policy() -> None:
     try:
         import reverse_learning as rl  # type: ignore
     except Exception:
         # Allows model.py to be imported in isolated unit tests without shared/.
         return
 
-    if getattr(rl, "_S81_POLICY_INSTALLED", False):
+    if getattr(rl, "_S64_STRUCT_POLICY_INSTALLED", False):
         return
 
     # ---- 1) var must describe the economic hypothesis, not change extrema. ----
@@ -338,115 +311,414 @@ def _install_service81_reverse_policy() -> None:
 
         rl.ReverseStore.load_universe = bounded_load_universe
 
-    rl._S81_POLICY_INSTALLED = True
+    rl._S64_STRUCT_POLICY_INSTALLED = True
 
 
-_install_service81_reverse_policy()
-
+_install_service64_reverse_policy()
 
 # -----------------------------------------------------------------------------
-# Small helpers
+# Deterministic text parser — no LLM
 # -----------------------------------------------------------------------------
 
-def _as_dt(value: Any) -> datetime | None:
-    if isinstance(value, datetime):
-        return value.replace(tzinfo=None) if value.tzinfo is not None else value
-    if isinstance(value, str):
+_SPACE_RE = re.compile(r"\s+")
+_WORD_RE = re.compile(r"[a-z0-9][a-z0-9'\-]{2,}", re.I)
+
+STOP = {
+    "the","and","for","with","from","that","this","into","after","before","about",
+    "amid","over","under","more","than","says","said","say","new","latest","live",
+    "report","reports","will","would","could","should","may","might","its","their",
+    "they","them","his","her","who","what","when","where","why","how","are","was",
+    "were","been","being","have","has","had","not","but","out","off","you","your",
+}
+
+FAMILY_RULES = [
+    ("etf", (
+        "spot bitcoin etf","bitcoin etf","btc etf","spot ether etf",
+        "spot ethereum etf","ethereum etf","ether etf","eth etf",
+        "exchange-traded fund",
+    )),
+    ("monetary_policy", (
+        "federal reserve"," fed ","fomc","powell","european central bank"," ecb ",
+        "lagarde","interest rate","rate cut","rate hike","central bank",
+        "monetary policy","quantitative easing","quantitative tightening",
+    )),
+    ("inflation", (
+        "inflation","consumer price"," cpi ","producer price"," ppi ","core pce",
+        "price pressures","deflation",
+    )),
+    ("labor", (
+        "nonfarm payroll","payrolls","jobs report","unemployment","jobless claims",
+        "employment","labor market","labour market","wages",
+    )),
+    ("growth", (
+        " gdp ","gross domestic product","retail sales","manufacturing pmi",
+        "services pmi","economic growth","economic slowdown","recession",
+    )),
+    ("crypto_regulation", (
+        " sec ","securities and exchange commission"," cftc ","crypto regulation",
+        "cryptocurrency regulation","crypto regulator",
+    )),
+    ("exchange", (
+        "binance","coinbase","kraken","bitfinex","okx","bybit","crypto exchange",
+    )),
+    ("security", (
+        " hack ","hacked","cyberattack","exploit","exploited","stolen funds",
+        "stolen crypto","security breach","data breach",
+    )),
+    ("stablecoin", (
+        "stablecoin","tether"," usdt ","usd coin"," usdc ","circle",
+    )),
+    ("protocol", (
+        "bitcoin network","ethereum","blockchain","protocol upgrade","hard fork",
+        "staking"," defi ",
+    )),
+    ("banking", (
+        "bank failure","bank run","banking crisis","liquidity crisis","credit crunch",
+        "deposit outflow","bankruptcy","insolvent",
+    )),
+    ("geopolitics", (
+        "war ","invasion","missile","airstrike","military strike","ceasefire",
+        "sanctions","troops","nuclear","conflict",
+    )),
+    ("trade", (
+        "tariff","trade war","import duty","export ban","trade agreement","trade deal",
+    )),
+    ("energy", (
+        "oil price","crude oil","brent"," wti ","opec","natural gas",
+    )),
+    ("fiscal", (
+        "debt ceiling","budget deficit","treasury issuance","government spending",
+        "fiscal policy",
+    )),
+    ("corporate", (
+        "earnings","revenue","profit","acquisition","merger","takeover","layoffs",
+        "guidance","quarterly results",
+    )),
+    ("markets", (
+        "stock market","wall street","s&p 500","nasdaq","dow jones","bond market",
+        "treasury yield","market selloff","market rally","volatility",
+    )),
+]
+
+ACTION_RULES = [
+    ("RATE_HIKE", ("rate hike","raises rates","raised rates","hikes rates","hawkish")),
+    ("RATE_CUT", ("rate cut","cuts rates","cut rates","dovish","easing cycle")),
+    ("RATE_HOLD", ("holds rates","keeps rates unchanged","leaves rates unchanged","holds steady")),
+    ("APPROVE", (" approved "," approves "," approval "," greenlights "," cleared ")),
+    ("REJECT", (" rejected "," rejects "," denied "," blocks "," refused ")),
+    ("DELAY", (" delays "," delayed "," postpones "," postponed "," extends review")),
+    ("FILE", (" files for "," filed for "," filing "," submits "," submitted ")),
+    ("INFLOW", (" inflow"," inflows","funds flow into")),
+    ("OUTFLOW", (" outflow"," outflows","withdrawals surge")),
+    ("HACK", (" hack "," hacked "," cyberattack "," exploit "," exploited ")),
+    ("HALT", ("halts withdrawals","suspends withdrawals","trading halt","halts trading","suspends trading")),
+    ("RESUME", ("resumes withdrawals","restores withdrawals","resumes trading")),
+    ("BAN", (" bans "," ban on "," crackdown","prohibits","outlaws")),
+    ("SANCTION", (" sanctions "," sanctioned ")),
+    ("CEASEFIRE", ("ceasefire","peace agreement","peace deal")),
+    ("ESCALATE", ("escalates","invasion","military strike","missile attack","airstrike")),
+    ("BANKRUPTCY", ("bankruptcy","insolvent","collapse","files for chapter 11")),
+    ("DELIST", (" delists "," delisting "," delisted ")),
+    ("LIST", (" lists "," listing "," listed on ")),
+    ("ACQUIRE", (" acquisition "," acquires "," merger "," takeover ")),
+    ("LAUNCH", (" launches "," launch of "," rolls out ")),
+    ("UPGRADE", (" upgrade "," upgrades "," upgraded ")),
+    ("DOWNGRADE", (" downgrade "," downgrades "," downgraded ")),
+]
+
+OBJECT_RULES = [
+    ("BTC_ETF", ("spot bitcoin etf","bitcoin etf","btc etf")),
+    ("ETH_ETF", ("spot ether etf","spot ethereum etf","ether etf","ethereum etf","eth etf")),
+    ("INTEREST_RATE", ("interest rate","fed funds rate","deposit rate","policy rate")),
+    ("CPI", ("consumer price"," cpi ")),
+    ("PPI", ("producer price"," ppi ")),
+    ("PCE", (" pce ","personal consumption expenditures")),
+    ("JOBS", ("nonfarm payroll","payrolls","jobs report","unemployment","jobless claims")),
+    ("GDP", (" gdp ","gross domestic product")),
+    ("BITCOIN", ("bitcoin"," btc ")),
+    ("ETHEREUM", ("ethereum","ether "," eth ")),
+    ("STABLECOIN", ("stablecoin","tether"," usdt ","usd coin"," usdc ")),
+    ("EXCHANGE", ("binance","coinbase","kraken","crypto exchange")),
+    ("BANK", (" bank ","banking sector")),
+    ("OIL", ("crude oil","brent"," wti ","oil price")),
+    ("TARIFFS", ("tariff","import duty")),
+    ("SANCTIONS", ("sanctions","sanctioned")),
+]
+
+ACTOR_RULES = [
+    ("FED", "CENTRAL_BANK_US", ("federal reserve"," fed ","fomc","jerome powell","powell")),
+    ("ECB", "CENTRAL_BANK_EU", ("european central bank"," ecb ","christine lagarde","lagarde")),
+    ("SEC", "REGULATOR_US", (" sec ","securities and exchange commission")),
+    ("CFTC", "REGULATOR_US", (" cftc ",)),
+    ("US_TREASURY", "GOVERNMENT_US", ("u.s. treasury","us treasury","treasury department")),
+    ("BLS", "STATISTICS_US", ("bureau of labor statistics"," bls ")),
+    ("BEA", "STATISTICS_US", ("bureau of economic analysis"," bea ")),
+    ("BINANCE", "CRYPTO_EXCHANGE", ("binance",)),
+    ("COINBASE", "CRYPTO_EXCHANGE", ("coinbase",)),
+    ("KRAKEN", "CRYPTO_EXCHANGE", ("kraken",)),
+    ("BLACKROCK", "ETF_ISSUER", ("blackrock","ishares")),
+    ("FIDELITY", "ETF_ISSUER", ("fidelity",)),
+    ("GRAYSCALE", "ETF_ISSUER", ("grayscale",)),
+    ("TETHER", "STABLECOIN_ISSUER", ("tether",)),
+    ("CIRCLE", "STABLECOIN_ISSUER", ("circle","usd coin")),
+    ("OPEC", "ENERGY_ORG", ("opec",)),
+]
+
+POSITIVE_TONE = (
+    "beats expectations","better than expected","stronger than expected","surges",
+    "rallies","record high","deal reached","ceasefire","inflows","adoption","upgrade",
+    "profit rises","recovery","reopens","resumes",
+)
+NEGATIVE_TONE = (
+    "misses expectations","worse than expected","weaker than expected","plunges",
+    "slumps","recession","crisis","default","bankruptcy","hack","cyberattack","ban ",
+    "crackdown","invasion","sanctions","outflows","downgrade","layoffs","collapse",
+)
+
+_NUM = r"(-?\d+(?:\.\d+)?)"
+_SURPRISE_PATTERNS: list[tuple[re.Pattern, bool]] = [
+    (re.compile(rf"(?:actual|came in at|rose to|fell to|at)\s+{_NUM}\s*%?.{{0,80}}?(?:expected|forecast|estimate(?:d)?(?: at| of)?)\s+{_NUM}\s*%?", re.I), False),
+    (re.compile(rf"{_NUM}\s*%?\s+(?:vs\.?|versus)\s+(?:an?\s+)?(?:expected|forecast|estimate(?:d)?)\s+{_NUM}\s*%?", re.I), False),
+    (re.compile(rf"(?:expected|forecast|estimate(?:d)?(?: at| of)?)\s+{_NUM}\s*%?.{{0,80}}?(?:actual|came in at|rose to|fell to)\s+{_NUM}\s*%?", re.I), True),
+]
+_BPS_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:basis points|bps|bp)\b", re.I)
+_PCT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%", re.I)
+
+
+def _clean(v: Any) -> str:
+    s = html.unescape(str(v or "")).lower().replace("\x00", " ")
+    return " " + _SPACE_RE.sub(" ", s).strip() + " "
+
+
+def _contains(text: str, phrases: tuple[str, ...]) -> bool:
+    return any(p in text for p in phrases)
+
+
+def _safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return default
+    return x if math.isfinite(x) else default
+
+
+def _safe_int(v: Any, default: int = 0) -> int:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_dt(v: Any) -> datetime | None:
+    if isinstance(v, datetime):
+        return v.replace(tzinfo=None) if v.tzinfo else v
+    if v is None:
+        return None
+    try:
+        d = datetime.fromisoformat(str(v)[:19])
+        return d.replace(tzinfo=None) if d.tzinfo else d
+    except Exception:
+        return None
+
+
+def _find_rule(text: str, rules, default: str) -> str:
+    for name, phrases in rules:
+        if _contains(text, phrases):
+            return name
+    return default
+
+
+def _actor(text: str) -> tuple[str, str]:
+    for actor, actor_class, phrases in ACTOR_RULES:
+        if _contains(text, phrases):
+            return actor, actor_class
+    return "OTHER", "OTHER"
+
+
+def _orientation(action: str) -> str:
+    if action == "RATE_HIKE":
+        return "TIGHTEN"
+    if action == "RATE_CUT":
+        return "EASE"
+    if action in {"APPROVE","RESUME","CEASEFIRE","UPGRADE"}:
+        return "ENABLE"
+    if action in {"REJECT","BAN","HALT","HACK","BANKRUPTCY","SANCTION","DOWNGRADE","DELIST"}:
+        return "RESTRICT"
+    if action == "ESCALATE":
+        return "ESCALATE"
+    return "NEUTRAL"
+
+
+def _tone(text: str) -> str:
+    p = sum(1 for x in POSITIVE_TONE if x in text)
+    n = sum(1 for x in NEGATIVE_TONE if x in text)
+    return "POS" if p > n else ("NEG" if n > p else "NEU")
+
+
+def _certainty(text: str) -> str:
+    if _contains(text, ("rumor","rumour","reportedly","sources say","may ","might ","could ")):
+        return "RUMOR"
+    if _contains(text, ("plans to","proposes","proposal","considering","seeks approval","files for")):
+        return "PLANNED"
+    if _contains(text, ("confirmed","official","announced","approved","completed","effective immediately")):
+        return "CONFIRMED"
+    return "REPORTED"
+
+
+def _surprise(text: str) -> tuple[str, float | None]:
+    for pat, reverse in _SURPRISE_PATTERNS:
+        m = pat.search(text)
+        if not m:
+            continue
         try:
-            parsed = datetime.fromisoformat(value[:19])
-            return parsed.replace(tzinfo=None) if parsed.tzinfo is not None else parsed
-        except ValueError:
-            return None
-    return None
+            a = float(m.group(1))
+            b = float(m.group(2))
+            actual, forecast = (b, a) if reverse else (a, b)
+            delta = actual - forecast
+        except Exception:
+            continue
+        if abs(delta) <= 1e-12:
+            return "INLINE", 0.0
+        return ("ABOVE" if delta > 0 else "BELOW"), delta
+
+    if _contains(text, ("beats expectations","above expectations","better than expected","stronger than expected")):
+        return "BEAT", None
+    if _contains(text, ("misses expectations","below expectations","worse than expected","weaker than expected")):
+        return "MISS", None
+    return "NONE", None
 
 
-def _safe_float(value: Any, default: float = 0.0) -> float:
-    try:
-        v = float(value)
-    except (TypeError, ValueError):
-        return default
-    return v if math.isfinite(v) else default
+def _magnitude(text: str) -> str:
+    m = _BPS_RE.search(text)
+    if m:
+        v = float(m.group(1))
+        return "H" if v >= 75 else ("M" if v >= 25 else "L")
+    vals = [float(x) for x in _PCT_RE.findall(text)]
+    if vals:
+        v = max(vals)
+        return "H" if v >= 5.0 else ("M" if v >= 1.0 else "L")
+    return "U"
 
 
-def _safe_int(value: Any, default: int = -1) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
+def _story_terms(title: str, family: str, actor_class: str, action: str, obj: str) -> str:
+    words = [
+        w.lower() for w in _WORD_RE.findall(title)
+        if len(w) >= 4 and w.lower() not in STOP and not w.isdigit()
+    ]
+    ranked = sorted(set(words), key=lambda x: (-len(x), x))[:12]
+    if not ranked:
+        ranked = [x.lower() for x in (family, actor_class, action, obj) if x not in ("other","OTHER")]
+    return " ".join(ranked[:12])
 
 
-def _bucket3(value: float, mid: float, high: float) -> str:
-    if value >= high:
-        return "H"
-    if value >= mid:
-        return "M"
-    return "L"
+def _relevance(text: str, family: str, actor_class: str, obj: str) -> dict[str, int]:
+    r = {"usd": 0, "eur": 0, "btc": 0, "eth": 0}
+
+    if _contains(text, ("federal reserve"," fed ","fomc","powell","u.s. economy","us economy","dollar"," usd ")):
+        r["usd"] = 3
+    if _contains(text, ("european central bank"," ecb ","lagarde","eurozone","euro "," eur ")):
+        r["eur"] = 3
+    if _contains(text, ("bitcoin"," btc ","bitcoin etf")):
+        r["btc"] = 3
+    if _contains(text, ("ethereum","ether "," eth ","ethereum etf","ether etf")):
+        r["eth"] = 3
+
+    if obj == "BTC_ETF":
+        r["btc"] = 3
+    elif obj == "ETH_ETF":
+        r["eth"] = 3
+
+    if family in {"crypto_regulation","exchange","security","stablecoin","protocol","etf"}:
+        r["btc"] = max(r["btc"], 2)
+        r["eth"] = max(r["eth"], 2)
+
+    if family in {"monetary_policy","inflation","labor","growth","fiscal","trade"}:
+        r["usd"] = max(r["usd"], 2)
+        r["eur"] = max(r["eur"], 1)
+        r["btc"] = max(r["btc"], 1)
+        r["eth"] = max(r["eth"], 1)
+
+    if family in {"geopolitics","banking","energy","markets"}:
+        for k in r:
+            r[k] = max(r[k], 1)
+
+    if actor_class == "CENTRAL_BANK_US":
+        r["usd"] = 3
+    elif actor_class == "CENTRAL_BANK_EU":
+        r["eur"] = 3
+
+    return r
 
 
-def _count_bucket(n: int) -> str:
-    if n >= 4:
-        return "4P"
-    if n >= 2:
-        return "23"
-    return "1"
+def _importance(family: str, action: str, actor_class: str, surprise: str, magnitude: str, title: str) -> str:
+    points = 0
+    points += 1 if family != "other" else 0
+    points += 2 if action != "OTHER" else 0
+    points += 1 if actor_class != "OTHER" else 0
+    points += 2 if surprise != "NONE" else 0
+    points += 2 if magnitude == "H" else (1 if magnitude == "M" else 0)
+    points += 1 if _contains(title, ("breaking","unexpected","emergency","record","crisis")) else 0
+    return "H" if points >= 6 else ("M" if points >= 3 else "L")
 
 
-def _age_bucket(hours: float) -> str:
-    if hours <= 0.5:
-        return "30M"
-    if hours <= 1.0:
-        return "1H"
-    if hours <= 2.0:
-        return "2H"
-    return "4H"
+def _extract_static(press: str, raw: dict[str, Any]) -> dict[str, Any] | None:
+    dt = _as_dt(raw.get("date_dt"))
+    if dt is None or dt < SOURCE_WARM_FROM:
+        return None
 
+    title_raw = str(raw.get("title") or "")
+    body_raw = str(raw.get("text") or "")[:8000]
+    feed = str(raw.get("feed") or "").lower()[:64]
 
-def _event_key(row: dict[str, Any]) -> str:
-    et = str(row.get("event_type") or "").strip()
-    if et:
-        return et
-    t = _safe_int(row.get("topic_id"), -1)
-    c = _safe_int(row.get("cluster_id"), -1)
-    return f"t{t:02d}|e{c:03d}"
+    title = _clean(title_raw)
+    combined = title + " " + _clean(body_raw)
 
+    family = _find_rule(combined, FAMILY_RULES, "other")
+    action = _find_rule(combined, ACTION_RULES, "OTHER")
+    obj = _find_rule(combined, OBJECT_RULES, "OTHER")
+    actor, actor_class = _actor(combined)
+    orientation = _orientation(action)
+    tone = _tone(combined)
+    certainty = _certainty(combined)
+    surprise_class, surprise_value = _surprise(combined)
+    magnitude = _magnitude(combined)
+    relevance = _relevance(combined, family, actor_class, obj)
+    importance = _importance(family, action, actor_class, surprise_class, magnitude, title)
 
-def _topic_id(row: dict[str, Any]) -> int:
-    t = _safe_int(row.get("topic_id"), -1)
-    if t >= 0:
-        return t
-    et = _event_key(row).lower()
-    try:
-        if et.startswith("t") and "|" in et:
-            return int(et[1 : et.index("|")])
-    except Exception:
-        pass
-    return -1
+    signature = f"{family}|{actor_class}|{action}|{obj}"
+    terms = _story_terms(title_raw, family, actor_class, action, obj)
+    unexpected_hint = int(
+        surprise_class != "NONE"
+        or _contains(combined, ("unexpected","unexpectedly","surprise","shocks markets"))
+    )
 
-
-def _cluster_id(row: dict[str, Any]) -> int:
-    c = _safe_int(row.get("cluster_id"), -1)
-    if c >= 0:
-        return c
-    et = _event_key(row).lower()
-    try:
-        pos = et.find("|e")
-        if pos >= 0:
-            return int(et[pos + 2 :])
-    except Exception:
-        pass
-    return -1
-
-
-def _quality(row: dict[str, Any]) -> float:
-    # Keep the same broad safe range used by service 80; quality is used only as
-    # a ranking/impact feature, never as an externally signed trading direction.
-    q = _safe_float(row.get("quality_score"), 1.0)
-    return min(max(q, 0.25), 2.5)
-
-
-# -----------------------------------------------------------------------------
-# Price state — ONLY candles strictly before target are visible.
-# -----------------------------------------------------------------------------
+    return {
+        "date_dt": dt,
+        "press": press,
+        "source_news_id": int(raw["source_news_id"]),
+        "feed": feed,
+        "family": family,
+        "actor": actor,
+        "actor_class": actor_class,
+        "action": action,
+        "object_type": obj,
+        "orientation": orientation,
+        "tone_class": tone,
+        "certainty": certainty,
+        "importance_class": importance,
+        "magnitude_class": magnitude,
+        "surprise_class": surprise_class,
+        "surprise_value": surprise_value,
+        "unexpected_hint": unexpected_hint,
+        "event_signature": signature,
+        "event_type": signature,
+        "story_terms": terms,
+        "relevance_usd": relevance["usd"],
+        "relevance_eur": relevance["eur"],
+        "relevance_btc": relevance["btc"],
+        "relevance_eth": relevance["eth"],
+        "pct_change": 0.0,
+    }
 
 def _price_state(target: datetime, dataset_index: dict[str, Any]) -> dict[str, Any] | None:
     npr = dataset_index.get("np_rates")
@@ -562,30 +834,583 @@ def _price_state(target: datetime, dataset_index: dict[str, Any]) -> dict[str, A
         "scale24": scale24,
     }
 
+# -----------------------------------------------------------------------------
+# Enrichment tables and /rebuild_index integration
+# -----------------------------------------------------------------------------
+
+META_TABLE = f"{ENRICHED_TABLE}_meta"
+
+
+async def _ensure_tables(engine_vlad) -> None:
+    from sqlalchemy import text
+    async with engine_vlad.begin() as conn:
+        await conn.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS `{ENRICHED_TABLE}` (
+                `id` BIGINT NOT NULL AUTO_INCREMENT,
+                `date_dt` DATETIME NOT NULL,
+                `press` VARCHAR(3) NOT NULL,
+                `source_news_id` INT NOT NULL,
+                `feed` VARCHAR(64) NOT NULL DEFAULT '',
+
+                `family` VARCHAR(32) NOT NULL DEFAULT 'other',
+                `actor` VARCHAR(48) NOT NULL DEFAULT 'OTHER',
+                `actor_class` VARCHAR(32) NOT NULL DEFAULT 'OTHER',
+                `action` VARCHAR(32) NOT NULL DEFAULT 'OTHER',
+                `object_type` VARCHAR(32) NOT NULL DEFAULT 'OTHER',
+                `orientation` VARCHAR(24) NOT NULL DEFAULT 'NEUTRAL',
+                `tone_class` VARCHAR(8) NOT NULL DEFAULT 'NEU',
+                `certainty` VARCHAR(16) NOT NULL DEFAULT 'REPORTED',
+
+                `importance_class` CHAR(1) NOT NULL DEFAULT 'L',
+                `magnitude_class` CHAR(1) NOT NULL DEFAULT 'U',
+                `surprise_class` VARCHAR(16) NOT NULL DEFAULT 'NONE',
+                `surprise_value` DOUBLE NULL,
+                `unexpected_hint` TINYINT NOT NULL DEFAULT 0,
+
+                `event_signature` VARCHAR(160) NOT NULL,
+                `event_type` VARCHAR(160) NOT NULL,
+                `story_terms` VARCHAR(255) NOT NULL DEFAULT '',
+
+                `story_key` CHAR(40) NOT NULL DEFAULT '',
+                `story_stage` VARCHAR(16) NOT NULL DEFAULT 'FIRST',
+                `novelty_class` CHAR(1) NOT NULL DEFAULT 'N',
+                `expectedness_class` VARCHAR(16) NOT NULL DEFAULT 'UNKNOWN',
+
+                `article_count_1h` SMALLINT NOT NULL DEFAULT 1,
+                `article_count_4h` SMALLINT NOT NULL DEFAULT 1,
+                `source_count_1h` TINYINT NOT NULL DEFAULT 1,
+                `source_count_4h` TINYINT NOT NULL DEFAULT 1,
+                `velocity_class` CHAR(1) NOT NULL DEFAULT 'L',
+
+                `prior_signature_count_180d` INT NOT NULL DEFAULT 0,
+                `prior_signature_gap_hours` DOUBLE NULL,
+
+                `relevance_usd` TINYINT NOT NULL DEFAULT 0,
+                `relevance_eur` TINYINT NOT NULL DEFAULT 0,
+                `relevance_btc` TINYINT NOT NULL DEFAULT 0,
+                `relevance_eth` TINYINT NOT NULL DEFAULT 0,
+
+                `pct_change` DOUBLE NOT NULL DEFAULT 0.0,
+
+                `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    ON UPDATE CURRENT_TIMESTAMP,
+
+                PRIMARY KEY (`id`),
+                UNIQUE KEY `uk_source` (`press`,`source_news_id`),
+                KEY `idx_date` (`date_dt`),
+                KEY `idx_event_type` (`event_type`),
+                KEY `idx_signature_date` (`event_signature`,`date_dt`),
+                KEY `idx_story_date` (`story_key`,`date_dt`),
+                KEY `idx_family_date` (`family`,`date_dt`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """))
+
+        await conn.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS `{META_TABLE}` (
+                `meta_key` VARCHAR(64) NOT NULL,
+                `meta_value` VARCHAR(255) NOT NULL,
+                `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    ON UPDATE CURRENT_TIMESTAMP,
+                PRIMARY KEY (`meta_key`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """))
+
+
+async def _meta_get(engine_vlad, key: str) -> str | None:
+    from sqlalchemy import text
+    async with engine_vlad.connect() as conn:
+        row = (await conn.execute(
+            text(f"SELECT meta_value FROM `{META_TABLE}` WHERE meta_key=:k"),
+            {"k": key},
+        )).fetchone()
+    return str(row[0]) if row else None
+
+
+async def _meta_set(engine_vlad, key: str, value: Any) -> None:
+    from sqlalchemy import text
+    async with engine_vlad.begin() as conn:
+        await conn.execute(text(f"""
+            INSERT INTO `{META_TABLE}`(meta_key,meta_value)
+            VALUES(:k,:v)
+            ON DUPLICATE KEY UPDATE meta_value=VALUES(meta_value)
+        """), {"k": key, "v": str(value)})
+
+
+async def _fetch_raw(engine_brain, table: str, last_id: int) -> list[dict[str, Any]]:
+    from sqlalchemy import text
+    async with engine_brain.connect() as conn:
+        res = await conn.execute(text(f"""
+            SELECT
+                id AS source_news_id,
+                title,
+                text,
+                date AS date_dt,
+                feed
+            FROM `{table}`
+            WHERE id > :last_id
+              AND date IS NOT NULL
+              AND date >= :source_from
+              AND title IS NOT NULL
+              AND title <> ''
+            ORDER BY id ASC
+            LIMIT {ENRICH_BATCH}
+        """), {"last_id": int(last_id), "source_from": SOURCE_WARM_FROM})
+        return [dict(r) for r in res.mappings().all()]
+
+
+async def _source_max_id(engine_brain, table: str) -> int:
+    from sqlalchemy import text
+    async with engine_brain.connect() as conn:
+        value = (await conn.execute(text(f"SELECT COALESCE(MAX(id),0) FROM `{table}`"))).scalar()
+    return int(value or 0)
+
+
+async def _upsert_static(engine_vlad, rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    from sqlalchemy import text
+    sql = text(f"""
+        INSERT INTO `{ENRICHED_TABLE}` (
+            date_dt,press,source_news_id,feed,
+            family,actor,actor_class,action,object_type,orientation,tone_class,certainty,
+            importance_class,magnitude_class,surprise_class,surprise_value,unexpected_hint,
+            event_signature,event_type,story_terms,
+            relevance_usd,relevance_eur,relevance_btc,relevance_eth,pct_change
+        ) VALUES (
+            :date_dt,:press,:source_news_id,:feed,
+            :family,:actor,:actor_class,:action,:object_type,:orientation,:tone_class,:certainty,
+            :importance_class,:magnitude_class,:surprise_class,:surprise_value,:unexpected_hint,
+            :event_signature,:event_type,:story_terms,
+            :relevance_usd,:relevance_eur,:relevance_btc,:relevance_eth,:pct_change
+        )
+        ON DUPLICATE KEY UPDATE
+            date_dt=VALUES(date_dt), feed=VALUES(feed),
+            family=VALUES(family), actor=VALUES(actor), actor_class=VALUES(actor_class),
+            action=VALUES(action), object_type=VALUES(object_type),
+            orientation=VALUES(orientation), tone_class=VALUES(tone_class),
+            certainty=VALUES(certainty), importance_class=VALUES(importance_class),
+            magnitude_class=VALUES(magnitude_class), surprise_class=VALUES(surprise_class),
+            surprise_value=VALUES(surprise_value), unexpected_hint=VALUES(unexpected_hint),
+            event_signature=VALUES(event_signature), event_type=VALUES(event_type),
+            story_terms=VALUES(story_terms),
+            relevance_usd=VALUES(relevance_usd), relevance_eur=VALUES(relevance_eur),
+            relevance_btc=VALUES(relevance_btc), relevance_eth=VALUES(relevance_eth),
+            pct_change=VALUES(pct_change)
+    """)
+    async with engine_vlad.begin() as conn:
+        for i in range(0, len(rows), 800):
+            await conn.execute(sql, rows[i:i+800])
+
+
+def _jaccard(a: set[str], b: set[str]) -> float:
+    if not a or not b:
+        return 0.0
+    u = len(a | b)
+    return (len(a & b) / u) if u else 0.0
+
+
+def _story_score(row: dict[str, Any], story: dict[str, Any], terms: set[str]) -> float:
+    score = _jaccard(terms, story["terms"])
+    if row["family"] != "other" and row["family"] == story["family"]:
+        score += 0.12
+    if row["action"] != "OTHER" and row["action"] == story["action"]:
+        score += 0.10
+    if row["object_type"] != "OTHER" and row["object_type"] == story["object_type"]:
+        score += 0.10
+    if row["actor_class"] != "OTHER" and row["actor_class"] == story["actor_class"]:
+        score += 0.06
+    return score
+
+
+async def _causal_rebuild(engine_vlad, recompute_from: datetime) -> int:
+    """Rebuild lifecycle fields chronologically; no future row can update an older row."""
+    from sqlalchemy import text
+
+    warm_start = max(SOURCE_WARM_FROM, recompute_from - timedelta(days=EXPECTEDNESS_DAYS))
+
+    stories: dict[str, dict[str, Any]] = {}
+    term_index: dict[str, set[str]] = defaultdict(set)
+    expiry_queue: deque[tuple[datetime, str]] = deque()
+    signature_history: dict[str, deque[datetime]] = defaultdict(deque)
+
+    cursor_dt = warm_start
+    cursor_id = 0
+    updates: list[dict[str, Any]] = []
+    updated = 0
+
+    async def flush() -> None:
+        nonlocal updates, updated
+        if not updates:
+            return
+        sql = text(f"""
+            UPDATE `{ENRICHED_TABLE}`
+            SET story_key=:story_key,
+                story_stage=:story_stage,
+                novelty_class=:novelty_class,
+                expectedness_class=:expectedness_class,
+                article_count_1h=:article_count_1h,
+                article_count_4h=:article_count_4h,
+                source_count_1h=:source_count_1h,
+                source_count_4h=:source_count_4h,
+                velocity_class=:velocity_class,
+                prior_signature_count_180d=:prior_signature_count_180d,
+                prior_signature_gap_hours=:prior_signature_gap_hours
+            WHERE id=:id
+        """)
+        async with engine_vlad.begin() as conn:
+            await conn.execute(sql, updates)
+        updated += len(updates)
+        updates = []
+
+    while True:
+        async with engine_vlad.connect() as conn:
+            res = await conn.execute(text(f"""
+                SELECT
+                    id,date_dt,press,source_news_id,
+                    family,actor_class,action,object_type,
+                    event_signature,story_terms,
+                    surprise_class,unexpected_hint
+                FROM `{ENRICHED_TABLE}`
+                WHERE date_dt >= :warm_start
+                  AND (
+                        date_dt > :cursor_dt
+                        OR (date_dt = :cursor_dt AND id > :cursor_id)
+                  )
+                ORDER BY date_dt ASC,id ASC
+                LIMIT 5000
+            """), {
+                "warm_start": warm_start,
+                "cursor_dt": cursor_dt,
+                "cursor_id": cursor_id,
+            })
+            rows = [dict(r) for r in res.mappings().all()]
+
+        if not rows:
+            break
+
+        for row in rows:
+            dt = _as_dt(row["date_dt"])
+            if dt is None:
+                continue
+
+            # Expire story candidates older than 72h.
+            cutoff_story = dt - timedelta(hours=STORY_MATCH_HOURS)
+            while expiry_queue and expiry_queue[0][0] < cutoff_story:
+                old_dt, old_key = expiry_queue.popleft()
+                st_old = stories.get(old_key)
+                if st_old is None or st_old["last_dt"] != old_dt:
+                    continue
+                for term in st_old["terms"]:
+                    bucket = term_index.get(term)
+                    if bucket:
+                        bucket.discard(old_key)
+                        if not bucket:
+                            term_index.pop(term, None)
+                stories.pop(old_key, None)
+
+            # Strictly prior 180-day signature history.
+            signature = str(row.get("event_signature") or "other")
+            hist = signature_history[signature]
+            cutoff_hist = dt - timedelta(days=EXPECTEDNESS_DAYS)
+            while hist and hist[0] < cutoff_hist:
+                hist.popleft()
+
+            prior_count = len(hist)
+            gap_hours = ((dt - hist[-1]).total_seconds() / 3600.0) if hist else None
+
+            if gap_hours is None or gap_hours >= 24:
+                novelty = "N"
+            elif gap_hours >= 6:
+                novelty = "F"
+            else:
+                novelty = "R"
+
+            if int(row.get("unexpected_hint") or 0):
+                expectedness = "UNEXPECTED"
+            elif prior_count <= 1:
+                expectedness = "RARE"
+            elif prior_count >= 20:
+                expectedness = "COMMON"
+            else:
+                expectedness = "NORMAL"
+
+            # Add current event only after computing its prior state.
+            hist.append(dt)
+
+            terms = set(str(row.get("story_terms") or "").split())
+            candidate_keys: set[str] = set()
+            for term in terms:
+                candidate_keys.update(term_index.get(term, ()))
+
+            best_key = None
+            best_score = 0.0
+            for key in candidate_keys:
+                st = stories.get(key)
+                if st is None:
+                    continue
+                score = _story_score(row, st, terms)
+                if score > best_score:
+                    best_score = score
+                    best_key = key
+
+            if best_key is None or best_score < 0.48:
+                story_key = hashlib.sha1(
+                    f"{row['press']}:{row['source_news_id']}".encode("utf-8")
+                ).hexdigest()
+                st = {
+                    "last_dt": dt,
+                    "terms": set(terms),
+                    "family": row["family"],
+                    "action": row["action"],
+                    "object_type": row["object_type"],
+                    "actor_class": row["actor_class"],
+                    "events": deque(),
+                }
+                stories[story_key] = st
+                for term in terms:
+                    term_index[term].add(story_key)
+            else:
+                story_key = best_key
+                st = stories[story_key]
+                old_terms = set(st["terms"])
+                merged = sorted(old_terms | terms, key=lambda x: (-len(x), x))[:16]
+                new_terms = set(merged)
+                if new_terms != old_terms:
+                    for term in old_terms:
+                        bucket = term_index.get(term)
+                        if bucket:
+                            bucket.discard(story_key)
+                    for term in new_terms:
+                        term_index[term].add(story_key)
+                    st["terms"] = new_terms
+                st["last_dt"] = dt
+
+            expiry_queue.append((dt, story_key))
+
+            events: deque[tuple[datetime, str]] = st["events"]
+            cutoff4 = dt - timedelta(hours=4)
+            while events and events[0][0] < cutoff4:
+                events.popleft()
+
+            # Counts before current event determine FIRST/FOLLOWUP causally.
+            prior_events4 = len(events)
+            events.append((dt, str(row["press"])))
+
+            events1 = [e for e in events if e[0] >= dt - timedelta(hours=1)]
+            count1 = len(events1)
+            count4 = len(events)
+            sources1 = len({e[1] for e in events1})
+            sources4 = len({e[1] for e in events})
+
+            if prior_events4 == 0:
+                stage = "FIRST"
+            elif count4 >= 6 or sources4 >= 4:
+                stage = "SATURATED"
+            elif sources4 >= 3:
+                stage = "MULTI_SOURCE"
+            elif sources4 >= 2:
+                stage = "CONFIRMED"
+            else:
+                stage = "FOLLOWUP"
+
+            prev_1_to_4h = max(count4 - count1, 0)
+            baseline_per_hour = max(prev_1_to_4h / 3.0, 0.25)
+            velocity = count1 / baseline_per_hour
+            velocity_class = "H" if velocity >= 2.0 else ("M" if velocity >= 1.2 else "L")
+
+            if dt >= recompute_from:
+                updates.append({
+                    "id": int(row["id"]),
+                    "story_key": story_key,
+                    "story_stage": stage,
+                    "novelty_class": novelty,
+                    "expectedness_class": expectedness,
+                    "article_count_1h": count1,
+                    "article_count_4h": count4,
+                    "source_count_1h": sources1,
+                    "source_count_4h": sources4,
+                    "velocity_class": velocity_class,
+                    "prior_signature_count_180d": prior_count,
+                    "prior_signature_gap_hours": gap_hours,
+                })
+
+            if len(updates) >= 1500:
+                await flush()
+
+            cursor_dt = dt
+            cursor_id = int(row["id"])
+
+    await flush()
+    return updated
+
+
+async def _truncate_if_exists(engine_vlad, table_name: str) -> bool:
+    """Safely truncate a service-local table if it exists."""
+    from sqlalchemy import text
+
+    async with engine_vlad.connect() as conn:
+        exists = (await conn.execute(
+            text("""
+                SELECT COUNT(*)
+                FROM information_schema.tables
+                WHERE table_schema = DATABASE()
+                  AND table_name = :t
+            """),
+            {"t": table_name},
+        )).scalar()
+
+    if not int(exists or 0):
+        return False
+
+    # table_name is an internal constant, never user input.
+    async with engine_vlad.begin() as conn:
+        await conn.execute(text(f"TRUNCATE TABLE `{table_name}`"))
+    return True
+
+
+async def _build_structured_news(engine_vlad, engine_brain, *, force_full: bool = False) -> dict[str, Any]:
+    from sqlalchemy import text
+
+    await _ensure_tables(engine_vlad)
+    version = await _meta_get(engine_vlad, "schema_version")
+    full = force_full or version != SCHEMA_VERSION
+
+    reset_tables: list[str] = []
+
+    if full:
+        # Service 64 keeps the same port/URL while the model semantics are being
+        # replaced.  Old values/reverse universes use the same params_hash
+        # (type,var,param) and MUST NOT survive into the new algorithm.
+        #
+        # This branch executes only on a structured schema-version change/full
+        # rebuild, not on ordinary incremental rebuilds.
+        for stale_table in (
+            "vlad_values_cache_svc8926",
+            "vlad_reverse_universe_svc8926",
+            "vlad_reverse_jobs_svc8926",
+        ):
+            if await _truncate_if_exists(engine_vlad, stale_table):
+                reset_tables.append(stale_table)
+
+        # Recreate the structured/derived tables on a schema migration so a
+        # partially deployed older prototype cannot leave incompatible columns
+        # or stale context ids behind.
+        async with engine_vlad.begin() as conn:
+            for derived in (
+                f"{ENRICHED_TABLE}_weights",
+                f"{ENRICHED_TABLE}_indexes",
+                f"{ENRICHED_TABLE}_mask",
+                ENRICHED_TABLE,
+            ):
+                await conn.execute(text(f"DROP TABLE IF EXISTS `{derived}`"))
+
+        await _ensure_tables(engine_vlad)
+
+        for press in SOURCE_TABLES:
+            await _meta_set(engine_vlad, f"last_{press}_id", 0)
+
+        await _meta_set(engine_vlad, "schema_version", SCHEMA_VERSION)
+
+    total = 0
+    min_new_date: datetime | None = None
+    max_new_date: datetime | None = None
+    sources: dict[str, Any] = {}
+
+    for press, source_table in SOURCE_TABLES.items():
+        try:
+            last_id = int(await _meta_get(engine_vlad, f"last_{press}_id") or 0)
+        except Exception:
+            last_id = 0
+
+        count = 0
+        while True:
+            batch = await _fetch_raw(engine_brain, source_table, last_id)
+            if not batch:
+                break
+
+            out: list[dict[str, Any]] = []
+            for raw in batch:
+                parsed = _extract_static(press, raw)
+                if parsed is not None:
+                    out.append(parsed)
+                    dt = parsed["date_dt"]
+                    min_new_date = dt if min_new_date is None or dt < min_new_date else min_new_date
+                    max_new_date = dt if max_new_date is None or dt > max_new_date else max_new_date
+                last_id = max(last_id, int(raw["source_news_id"]))
+
+            await _upsert_static(engine_vlad, out)
+            count += len(out)
+            total += len(out)
+            await _meta_set(engine_vlad, f"last_{press}_id", last_id)
+
+            if len(batch) < ENRICH_BATCH:
+                break
+
+        # Advance through any source rows older than SOURCE_WARM_FROM so they are
+        # not rescanned on every incremental rebuild.
+        max_source_id = await _source_max_id(engine_brain, source_table)
+        if max_source_id > last_id:
+            last_id = max_source_id
+            await _meta_set(engine_vlad, f"last_{press}_id", last_id)
+
+        sources[press] = {"rows": count, "last_id": last_id}
+
+    causal_updated = 0
+    if full:
+        causal_updated = await _causal_rebuild(engine_vlad, SOURCE_WARM_FROM)
+    elif min_new_date is not None:
+        causal_updated = await _causal_rebuild(engine_vlad, min_new_date)
+
+    return {
+        "mode": "full" if full else ("incremental" if total else "noop"),
+        "table": ENRICHED_TABLE,
+        "articles": total,
+        "causal_rows_updated": causal_updated,
+        "min_new_date": str(min_new_date) if min_new_date else None,
+        "max_new_date": str(max_new_date) if max_new_date else None,
+        "sources": sources,
+        "reset_tables": reset_tables,
+    }
+
+
+async def enrich_dataset(engine_vlad, engine_brain):
+    """Called automatically as step 0 of Brain Framework /rebuild_index."""
+    from sqlalchemy import text
+
+    lock_name = "brain_news_structured_v2_s64"
+    async with engine_vlad.connect() as conn:
+        got = (await conn.execute(text("SELECT GET_LOCK(:n,600)"), {"n": lock_name})).scalar()
+        if int(got or 0) != 1:
+            return {"mode": "locked", "reason": "another node is rebuilding structured news"}
+        try:
+            result = await _build_structured_news(engine_vlad, engine_brain)
+            clear_runtime_caches()
+            return result
+        finally:
+            try:
+                await conn.execute(text("SELECT RELEASE_LOCK(:n)"), {"n": lock_name})
+            except Exception:
+                pass
 
 # -----------------------------------------------------------------------------
-# Causal news state
+# Runtime news state
 # -----------------------------------------------------------------------------
 
-def _rows_window(
-    source: list[dict[str, Any]],
-    target: datetime,
-    dataset_index: dict[str, Any],
-    hours_back: int,
-    *,
-    end_before_hours: int = 0,
-) -> list[dict[str, Any]]:
+def _pair_id(di: dict[str, Any]) -> int:
+    return int(RATES_TO_PAIR.get(str(di.get("rates_table") or RATES_TABLE), 1))
+
+
+def _rows_window(source: list[dict[str, Any]], target: datetime, di: dict[str, Any], hours_back: int, *, end_before_hours: int = 0) -> list[dict[str, Any]]:
     start = target - timedelta(hours=hours_back)
     end = target - timedelta(hours=end_before_hours)
-    timestamps = dataset_index.get("dataset_timestamps")
-    if timestamps is not None and len(timestamps) == len(source):
-        l = int(np.searchsorted(timestamps, int(start.timestamp()), side="left"))
-        # STRICTLY before end: publication exactly at target is not assumed
-        # tradable at the target's opening instant.
-        r = int(np.searchsorted(timestamps, int(end.timestamp()), side="left"))
+
+    ts = di.get("dataset_timestamps")
+    if ts is not None and len(ts) == len(source):
+        l = int(np.searchsorted(ts, int(start.timestamp()), side="left"))
+        r = int(np.searchsorted(ts, int(end.timestamp()), side="left"))
         return source[l:r]
 
-    dates = dataset_index.get("dates") or []
+    dates = di.get("dates") or []
     if dates and len(dates) == len(source):
         l = bisect.bisect_left(dates, start)
         r = bisect.bisect_left(dates, end)
@@ -599,276 +1424,105 @@ def _rows_window(
     return out
 
 
-def _previous_event_gap_hours(
-    event_key: str,
-    row_dt: datetime,
-    dataset_index: dict[str, Any],
-) -> float:
-    key_dates = dataset_index.get("key_dates") or {}
-    dates = key_dates.get(event_key) or key_dates.get(event_key.lower()) or []
-    if not dates:
-        return float("inf")
-    pos = bisect.bisect_left(dates, row_dt)
-    if pos <= 0:
-        return float("inf")
-    prev = dates[pos - 1]
-    return max(0.0, (row_dt - prev).total_seconds() / 3600.0)
+def _pair_rel(row: dict[str, Any], pair_id: int) -> tuple[int, int]:
+    if pair_id == 1:
+        return _safe_int(row.get("relevance_eur")), _safe_int(row.get("relevance_usd"))
+    if pair_id == 3:
+        return _safe_int(row.get("relevance_btc")), _safe_int(row.get("relevance_usd"))
+    if pair_id == 4:
+        return _safe_int(row.get("relevance_eth")), _safe_int(row.get("relevance_usd"))
+    return 0, 0
 
 
-def _causal_support(event_key: str, target: datetime, dataset_index: dict[str, Any]) -> int:
-    key_dates = dataset_index.get("key_dates") or {}
-    dates = key_dates.get(event_key) or key_dates.get(event_key.lower()) or []
-    return bisect.bisect_left(dates, target) if dates else 0
+def _impact_score(row: dict[str, Any], pair_id: int, target: datetime) -> float:
+    dt = _as_dt(row.get("date") or row.get("date_dt"))
+    if dt is None or dt >= target:
+        return -1.0
+
+    base_rel, quote_rel = _pair_rel(row, pair_id)
+    rel = max(base_rel, quote_rel)
+    if rel <= 0:
+        return -1.0
+
+    age_h = max(0.0, (target - dt).total_seconds() / 3600.0)
+    recency = 2.0 ** (-age_h / 2.0)
+
+    imp = {"H": 3.0, "M": 2.0, "L": 1.0}.get(str(row.get("importance_class") or "L"), 1.0)
+    src = max(_safe_int(row.get("source_count_4h"), 1), 1)
+    vel = {"H": 1.35, "M": 1.15, "L": 1.0}.get(str(row.get("velocity_class") or "L"), 1.0)
+    surpr = 1.30 if str(row.get("surprise_class") or "NONE") != "NONE" else 1.0
+    rare = 1.20 if str(row.get("expectedness_class") or "") in ("RARE","UNEXPECTED") else 1.0
+
+    return recency * (0.75 + 0.55 * rel) * imp * min(1.0 + 0.10 * (src - 1), 1.4) * vel * surpr * rare
 
 
-def _news_state(
-    source: list[dict[str, Any]],
-    target: datetime,
-    dataset_index: dict[str, Any],
-) -> dict[str, Any]:
-    fast4 = _rows_window(source, target, dataset_index, FAST_NEWS_HOURS)
-    fast1 = _rows_window(source, target, dataset_index, FAST_1H_HOURS)
-    slow = _rows_window(
-        source,
-        target,
-        dataset_index,
-        SLOW_NEWS_HOURS,
-        end_before_hours=FAST_NEWS_HOURS,
-    )
+def _count_bucket(n: int) -> str:
+    return "6P" if n >= 6 else ("35" if n >= 3 else ("2" if n == 2 else "1"))
 
-    result: dict[str, Any] = {
-        "has_fast": bool(fast4),
-        "fast_rows": len(fast4),
-        "fast1_rows": len(fast1),
-        "slow_rows": len(slow),
-        "codes": [],
-        "top_topics": [],
-        "top_event": None,
-        "impact": "L",
-        "attention": "L",
-        "confirmation": "1",
-        "novelty": "R",
-        "age": "4H",
-        "focus": "L",
-        "similarity": "L",
-        "quality": "L",
-        "slow_topic": None,
-    }
-    if not fast4:
-        return result
 
-    # Group same semantic event context inside the 4h pulse.  Repeated articles
-    # from one source count as attention, but confirmation is distinct sources.
-    stories: dict[str, dict[str, Any]] = {}
-    all_sources: set[str] = set()
-    newest_dt: datetime | None = None
+def _rel_bucket(n: int) -> str:
+    return "H" if n >= 3 else ("M" if n >= 2 else ("L" if n >= 1 else "0"))
 
-    for row in fast4:
-        dt = _as_dt(row.get("date") or row.get("date_dt"))
-        if dt is None or dt >= target:
-            continue
-        key = _event_key(row)
-        if not key:
-            continue
-        topic = _topic_id(row)
-        cluster = _cluster_id(row)
-        press = str(row.get("press") or "").strip().lower()
-        if press:
-            all_sources.add(press)
 
-        st = stories.get(key)
-        if st is None:
-            st = {
-                "key": key,
-                "topic": topic,
-                "cluster": cluster,
-                "rows": 0,
-                "sources": set(),
-                "first": dt,
-                "last": dt,
-                "focus": 0.0,
-                "sim": 0.0,
-                "quality": 0.25,
-                "prev_gap": _previous_event_gap_hours(key, dt, dataset_index),
-            }
-            stories[key] = st
-        st["rows"] += 1
-        if press:
-            st["sources"].add(press)
-        st["first"] = min(st["first"], dt)
-        st["last"] = max(st["last"], dt)
-        st["focus"] = max(st["focus"], _safe_float(row.get("topic_focus"), 0.0))
-        st["sim"] = max(st["sim"], _safe_float(row.get("cluster_similarity"), 0.0))
-        st["quality"] = max(st["quality"], _quality(row))
-        if newest_dt is None or dt > newest_dt:
-            newest_dt = dt
+def _event_codes(row: dict[str, Any], pair_id: int) -> list[str]:
+    family = str(row.get("family") or "other")
+    actor = str(row.get("actor") or "OTHER")
+    actor_class = str(row.get("actor_class") or "OTHER")
+    action = str(row.get("action") or "OTHER")
+    obj = str(row.get("object_type") or "OTHER")
+    ori = str(row.get("orientation") or "NEUTRAL")
+    cert = str(row.get("certainty") or "REPORTED")
+    tone = str(row.get("tone_class") or "NEU")
+    imp = str(row.get("importance_class") or "L")
+    base_rel, quote_rel = _pair_rel(row, pair_id)
 
-    if not stories or newest_dt is None:
-        return result
-
-    # Rank each semantic story using only information already known by target.
-    # The score is used only to choose top hierarchical feature codes; it is not
-    # a trading direction or target.
-    topic_scores: dict[int, float] = defaultdict(float)
-    ranked_stories = []
-    max_focus = 0.0
-    max_sim = 0.0
-    max_quality = 0.25
-    max_confirm = 1
-    any_novel = False
-    any_fresh = False
-
-    for st in stories.values():
-        age_h = max(0.0, (target - st["last"]).total_seconds() / 3600.0)
-        recency = 2.0 ** (-age_h / 2.0)  # half-life 2h inside the fast pulse
-        confirms = max(1, len(st["sources"]))
-        novelty_bonus = 1.20 if st["prev_gap"] >= NOVEL_GAP_HOURS else (
-            1.08 if st["prev_gap"] >= FRESH_GAP_HOURS else 1.0
-        )
-        score = (
-            recency
-            * (0.55 + min(st["focus"], 1.0))
-            * (0.55 + min(st["sim"], 1.0))
-            * min(max(st["quality"], 0.5), 2.0)
-            * (1.0 + 0.12 * min(confirms - 1, 3))
-            * novelty_bonus
-        )
-        st["score"] = score
-        st["support"] = _causal_support(st["key"], target, dataset_index)
-        ranked_stories.append(st)
-        if st["topic"] >= 0:
-            topic_scores[st["topic"]] += score
-        max_focus = max(max_focus, st["focus"])
-        max_sim = max(max_sim, st["sim"])
-        max_quality = max(max_quality, st["quality"])
-        max_confirm = max(max_confirm, confirms)
-        any_novel = any_novel or st["prev_gap"] >= NOVEL_GAP_HOURS
-        any_fresh = any_fresh or st["prev_gap"] >= FRESH_GAP_HOURS
-
-    ranked_stories.sort(key=lambda x: (-x["score"], x["key"]))
-    top_event = ranked_stories[0]
-    top_topics = [t for t, _ in sorted(topic_scores.items(), key=lambda kv: (-kv[1], kv[0]))[:2]]
-
-    # Attention is a point-in-time burst relative to the immediately preceding
-    # 4..48h baseline.  This adapts to different eras/source densities without
-    # using future averages.
-    baseline_per_hour = max(len(slow) / max(SLOW_NEWS_HOURS - FAST_NEWS_HOURS, 1), 0.25)
-    burst_ratio = len(fast1) / baseline_per_hour if baseline_per_hour > 0 else 0.0
-    if (burst_ratio >= 1.75 and len(fast1) >= 2) or (
-        len(top_event["sources"]) >= 3 and len(stories) >= 2
-    ):
-        attention = "H"
-    elif burst_ratio >= 1.20 or len(top_event["sources"]) >= 2:
-        attention = "M"
-    else:
-        attention = "L"
-
-    focus_bucket = _bucket3(max_focus, TOPIC_FOCUS_MID, TOPIC_FOCUS_HIGH)
-    sim_bucket = _bucket3(max_sim, CLUSTER_SIM_MID, CLUSTER_SIM_HIGH)
-    quality_bucket = _bucket3(max_quality, 0.85, 1.50)
-    confirm_bucket = "3P" if max_confirm >= 3 else ("2" if max_confirm >= 2 else "1")
-    novelty_bucket = "N" if any_novel else ("F" if any_fresh else "R")
-
-    points = 0
-    points += 2 if attention == "H" else (1 if attention == "M" else 0)
-    points += 2 if confirm_bucket == "3P" else (1 if confirm_bucket == "2" else 0)
-    points += 2 if focus_bucket == "H" else (1 if focus_bucket == "M" else 0)
-    points += 2 if sim_bucket == "H" else (1 if sim_bucket == "M" else 0)
-    points += 1 if novelty_bucket in ("N", "F") else 0
-    points += 1 if quality_bucket == "H" else 0
-    impact = "H" if points >= 6 else ("M" if points >= 3 else "L")
-
-    newest_age_h = max(0.0, (target - newest_dt).total_seconds() / 3600.0)
-
-    # Slow 4..48h information regime.  Deduplicate by event context first, then
-    # require topic concentration; otherwise broad daily news flow becomes noise.
-    slow_seen: dict[str, dict[str, Any]] = {}
-    slow_topic_scores: dict[int, float] = defaultdict(float)
-    slow_topic_sources: dict[int, set[str]] = defaultdict(set)
-    for row in slow:
-        dt = _as_dt(row.get("date") or row.get("date_dt"))
-        if dt is None or dt >= target:
-            continue
-        key = _event_key(row)
-        topic = _topic_id(row)
-        if not key or topic < 0:
-            continue
-        age_h = max(FAST_NEWS_HOURS, (target - dt).total_seconds() / 3600.0)
-        score = (2.0 ** (-age_h / 18.0)) * (0.35 + _safe_float(row.get("topic_focus"), 0.0))
-        prev = slow_seen.get(key)
-        # One semantic story contributes once; keep its strongest/most recent row.
-        if prev is None or score > prev["score"]:
-            slow_seen[key] = {"topic": topic, "score": score}
-        press = str(row.get("press") or "").strip().lower()
-        if press:
-            slow_topic_sources[topic].add(press)
-
-    for item in slow_seen.values():
-        slow_topic_scores[item["topic"]] += item["score"]
-
-    slow_topic = None
-    if slow_topic_scores:
-        ordered = sorted(slow_topic_scores.items(), key=lambda kv: (-kv[1], kv[0]))
-        total_score = sum(v for _, v in ordered)
-        t0, s0 = ordered[0]
-        dominance = s0 / total_score if total_score > 0 else 0.0
-        # Need both meaningful concentration and cross-source presence.
-        if dominance >= 0.18 and len(slow_topic_sources.get(t0, set())) >= 2:
-            slow_topic = t0
-
-    codes: list[str] = [
-        f"N.ATT.{attention}",
-        f"N.IMP.{impact}",
-        f"N.AGE.{_age_bucket(newest_age_h)}",
-        f"N.CFM.{confirm_bucket}",
-        f"N.NOV.{novelty_bucket}",
-        f"N.FOC.{focus_bucket}",
-        f"N.SIM.{sim_bucket}",
-        f"N.QLT.{quality_bucket}",
-        f"N.STY.{_count_bucket(len(stories))}",
+    codes = [
+        f"E.F.{family}",
+        f"E.ORI.{ori}",
+        f"E.CERT.{cert}",
+        f"E.IMP.{imp}",
+        f"E.TONE.{tone}",
+        f"E.REL.B.{_rel_bucket(base_rel)}",
+        f"E.REL.Q.{_rel_bucket(quote_rel)}",
     ]
-    for topic in top_topics:
-        codes.append(f"N.T.{topic}")
 
-    # Hierarchical cluster code only after enough PRIOR support.  This prevents a
-    # rare cluster from fragmenting the reverse universe and is strictly causal.
-    if (
-        top_event["support"] >= MIN_CAUSAL_CLUSTER_SUPPORT
-        and top_event["topic"] >= 0
-        and top_event["cluster"] >= 0
-        and top_event["focus"] >= TOPIC_FOCUS_MID
-        and top_event["sim"] >= CLUSTER_SIM_MID
-    ):
-        codes.append(f"N.E.{top_event['topic']}.{top_event['cluster']}")
+    if actor_class != "OTHER":
+        codes.append(f"E.AC.{actor_class}")
+    if actor != "OTHER":
+        codes.append(f"E.ACTOR.{actor}")
+    if action != "OTHER":
+        codes.append(f"E.ACT.{action}")
+    if obj != "OTHER":
+        codes.append(f"E.OBJ.{obj}")
 
-    if slow_topic is not None:
-        codes.append(f"N.SLOW.T.{slow_topic}")
+    if family != "other" and action != "OTHER":
+        codes.append(f"E.FA.{family}.{action}")
+    if actor_class != "OTHER" and action != "OTHER":
+        codes.append(f"E.AA.{actor_class}.{action}")
+    if action != "OTHER" and obj != "OTHER":
+        codes.append(f"E.AO.{action}.{obj}")
 
-    result.update(
-        {
-            "codes": codes,
-            "top_topics": top_topics,
-            "top_event": top_event,
-            "impact": impact,
-            "attention": attention,
-            "confirmation": confirm_bucket,
-            "novelty": novelty_bucket,
-            "age": _age_bucket(newest_age_h),
-            "focus": focus_bucket,
-            "similarity": sim_bucket,
-            "quality": quality_bucket,
-            "slow_topic": slow_topic,
-            "story_count": len(stories),
-            "source_count": len(all_sources),
-            "burst_ratio": burst_ratio,
-        }
-    )
-    return result
+    return codes
 
 
-# -----------------------------------------------------------------------------
-# Feature composition per var
-# -----------------------------------------------------------------------------
+def _surprise_codes(row: dict[str, Any]) -> list[str]:
+    return [
+        f"S.SUR.{str(row.get('surprise_class') or 'NONE')}",
+        f"S.MAG.{str(row.get('magnitude_class') or 'U')}",
+        f"S.EXP.{str(row.get('expectedness_class') or 'UNKNOWN')}",
+    ]
+
+
+def _story_codes(row: dict[str, Any]) -> list[str]:
+    return [
+        f"ST.STAGE.{str(row.get('story_stage') or 'FIRST')}",
+        f"ST.NOV.{str(row.get('novelty_class') or 'N')}",
+        f"ST.EXP.{str(row.get('expectedness_class') or 'UNKNOWN')}",
+        f"ST.VEL.{str(row.get('velocity_class') or 'L')}",
+        f"ST.SRC4.{_count_bucket(_safe_int(row.get('source_count_4h'),1))}",
+        f"ST.CNT4.{_count_bucket(_safe_int(row.get('article_count_4h'),1))}",
+    ]
+
 
 def _price_codes(price: dict[str, Any]) -> list[str]:
     return [
@@ -882,252 +1536,160 @@ def _price_codes(price: dict[str, Any]) -> list[str]:
     ]
 
 
-def _interaction_codes(news: dict[str, Any], price: dict[str, Any]) -> list[str]:
-    out = [
-        f"X.I{news['impact']}.D{price['direction']}",
-        f"X.A{news['attention']}.S{price['shock']}",
-        f"X.C{news['confirmation']}.D{price['direction']}",
-    ]
-    for topic in news.get("top_topics", [])[:1]:
-        out.append(f"X.T{topic}.D{price['direction']}")
-    return out
+def _build_news_state(source: list[dict[str, Any]], target: datetime, di: dict[str, Any], pair_id: int) -> dict[str, Any]:
+    fast = _rows_window(source, target, di, FAST_HOURS)
+    slow = _rows_window(source, target, di, NARRATIVE_HOURS, end_before_hours=FAST_HOURS)
+
+    ranked = []
+    for row in fast:
+        score = _impact_score(row, pair_id, target)
+        if score > 0:
+            ranked.append((score, row))
+    ranked.sort(key=lambda x: (-x[0], _safe_int(x[1].get("id"), 0)))
+
+    # Two top events keep multiple simultaneous narratives without exploding the
+    # reverse code space. Codes are factorized, not rank-specific.
+    top_rows = [row for _, row in ranked[:2]]
+
+    narrative_scores: dict[str, float] = defaultdict(float)
+    narrative_sources: dict[str, set[str]] = defaultdict(set)
+    for row in slow:
+        base_rel, quote_rel = _pair_rel(row, pair_id)
+        rel = max(base_rel, quote_rel)
+        if rel <= 0:
+            continue
+        family = str(row.get("family") or "other")
+        if family == "other":
+            continue
+        dt = _as_dt(row.get("date") or row.get("date_dt"))
+        if dt is None:
+            continue
+        age_h = max(FAST_HOURS, (target - dt).total_seconds() / 3600.0)
+        narrative_scores[family] += rel * (2.0 ** (-age_h / 12.0))
+        press = str(row.get("press") or "")
+        if press:
+            narrative_sources[family].add(press)
+
+    narrative = None
+    if narrative_scores:
+        ordered = sorted(narrative_scores.items(), key=lambda kv: (-kv[1], kv[0]))
+        total = sum(v for _, v in ordered)
+        fam, score = ordered[0]
+        dominance = score / total if total > 0 else 0.0
+        if dominance >= 0.20 and len(narrative_sources.get(fam, set())) >= 2:
+            narrative = fam
+
+    orientations = {str(r.get("orientation") or "NEUTRAL") for r in top_rows}
+    nonneutral = {x for x in orientations if x != "NEUTRAL"}
+
+    return {
+        "rows": top_rows,
+        "has_news": bool(top_rows),
+        "count4": len(ranked),
+        "narrative": narrative,
+        "orientation_conflict": len(nonneutral) >= 2,
+    }
 
 
 def _codes_for_var(snapshot: dict[str, Any], var: int) -> dict[str, float]:
     price = snapshot.get("price")
-    news = snapshot.get("news")
+    news = snapshot.get("news") or {}
+
     if price is None:
         return {}
 
     p_codes = _price_codes(price)
 
-    # PRICE_CONTROL: no news whatsoever.  This is a required benchmark, not a
-    # production recommendation by itself.
     if var == 0:
-        return {code: 1.0 for code in p_codes}
+        return {c: 1.0 for c in p_codes}
 
-    if not news or not news.get("has_fast"):
+    rows = list(news.get("rows") or [])
+    if not rows:
         return {}
 
-    n_codes = list(news.get("codes") or [])
+    pair_id = int(snapshot.get("pair_id") or 1)
+    event_codes: list[str] = []
+    for row in rows:
+        event_codes.extend(_event_codes(row, pair_id))
 
-    # NEWS_ONLY: exact same 4h availability window as the main model, but no
-    # price-state feature.  If var2 cannot beat this + var0 independently, the
-    # supposed interaction edge is questionable.
+    # Deduplicate while preserving deterministic order.
+    event_codes = list(dict.fromkeys(event_codes))
+    event_codes.append(f"N.CNT4.{_count_bucket(_safe_int(news.get('count4'),1))}")
+
+    if news.get("orientation_conflict"):
+        event_codes.append("N.ORI.CONFLICT")
+    if news.get("narrative"):
+        event_codes.append(f"N.NARR.{news['narrative']}")
+
     if var == 1:
-        return {code: 1.0 for code in n_codes}
+        return {c: 1.0 for c in event_codes}
 
-    impact = str(news.get("impact") or "L")
-    attention = str(news.get("attention") or "L")
-    direction = str(price.get("direction") or "F")
-    shock = str(price.get("shock") or "F")
-    meaningful_news = impact in ("M", "H")
-    strong_news = impact == "H"
-
-    # Main general interaction model.
     if var == 2:
-        if not meaningful_news:
+        selected = [
+            r for r in rows
+            if str(r.get("surprise_class") or "NONE") != "NONE"
+            or str(r.get("expectedness_class") or "") in ("RARE","UNEXPECTED")
+            or str(r.get("magnitude_class") or "U") in ("M","H")
+        ]
+        if not selected:
             return {}
-        codes = n_codes + p_codes + _interaction_codes(news, price)
-        return {code: 1.0 for code in codes}
+        codes = list(event_codes)
+        for row in selected:
+            codes.extend(_surprise_codes(row))
+        return {c: 1.0 for c in dict.fromkeys(codes)}
 
-    # High-impact sparse model.  No direction is hard-coded; reverse decides.
     if var == 3:
-        if not strong_news:
-            return {}
-        codes = n_codes + p_codes + _interaction_codes(news, price)
-        codes += ["HIMP.ACTIVE", f"HIMP.SHK.{shock}"]
-        return {code: 1.0 for code in codes}
+        codes = list(event_codes)
+        for row in rows:
+            codes.extend(_story_codes(row))
+        return {c: 1.0 for c in dict.fromkeys(codes)}
 
-    # Underreaction: strong information state but first closed reaction has not
-    # escaped normal noise yet.
     if var == 4:
-        if not strong_news or shock not in ("F", "N"):
-            return {}
-        codes = n_codes + p_codes
+        codes = list(event_codes) + p_codes
+        top = rows[0]
+        family = str(top.get("family") or "other")
+        action = str(top.get("action") or "OTHER")
+        ori = str(top.get("orientation") or "NEUTRAL")
+        stage = str(top.get("story_stage") or "FIRST")
         codes += [
-            "UR.ACTIVE",
-            f"UR.DIR.{direction}",
-            f"UR.ATT.{attention}",
+            f"X.F.{family}.D.{price['direction']}",
+            f"X.ORI.{ori}.D.{price['direction']}",
+            f"X.ST.{stage}.S.{price['shock']}",
         ]
-        for topic in news.get("top_topics", [])[:1]:
-            codes.append(f"UR.T.{topic}")
-        return {code: 1.0 for code in codes}
+        if action != "OTHER":
+            codes.append(f"X.ACT.{action}.D.{price['direction']}")
+        return {c: 1.0 for c in dict.fromkeys(codes)}
 
-    # Continuation candidate: a meaningful event and a directional but not yet
-    # extreme first response.  Reverse can still assign an opposite sign if the
-    # historical continuation hypothesis is wrong for a given state.
     if var == 5:
-        if not meaningful_news or direction not in ("U", "D") or shock not in ("N", "S"):
-            return {}
-        codes = n_codes + p_codes
+        codes = list(event_codes) + p_codes
+        for row in rows:
+            codes.extend(_surprise_codes(row))
+            codes.extend(_story_codes(row))
+        top = rows[0]
         codes += [
-            "CONT.ACTIVE",
-            f"CONT.DIR.{direction}",
-            f"CONT.IMP.{impact}",
+            f"X.F.{str(top.get('family') or 'other')}.D.{price['direction']}",
+            f"X.ORI.{str(top.get('orientation') or 'NEUTRAL')}.D.{price['direction']}",
+            f"X.ST.{str(top.get('story_stage') or 'FIRST')}.S.{price['shock']}",
         ]
-        for topic in news.get("top_topics", [])[:1]:
-            codes.append(f"CONT.T{topic}.D{direction}")
-        return {code: 1.0 for code in codes}
-
-    # Overreaction/fade candidate: do NOT say "fade" in the label itself.  An
-    # extreme move can continue; reverse must learn the side from history.
-    if var == 6:
-        if not strong_news or direction not in ("U", "D") or shock != "E":
-            return {}
-        codes = n_codes + p_codes
-        codes += [
-            "OVR.ACTIVE",
-            f"OVR.DIR.{direction}",
-            f"OVR.ATT.{attention}",
-        ]
-        for topic in news.get("top_topics", [])[:1]:
-            codes.append(f"OVR.T{topic}.D{direction}")
-        return {code: 1.0 for code in codes}
+        action = str(top.get("action") or "OTHER")
+        if action != "OTHER":
+            codes.append(f"X.ACT.{action}.D.{price['direction']}")
+        return {c: 1.0 for c in dict.fromkeys(codes)}
 
     return {}
 
 
 # -----------------------------------------------------------------------------
-# FAST CACHE v2
-# Calculation-preserving execution cache.
-#
-# News state does not depend on pair/rates, therefore it is shared between
-# EUR/USD, BTC/USD and ETH/USD.
-#
-# Price state depends on np_rates, therefore it has a separate per-market cache.
-#
-# IMPORTANT:
-#   _news_state() and _price_state() are NOT changed.
-#   Only their already-calculated return values are reused.
+# Calculation-preserving runtime caches
 # -----------------------------------------------------------------------------
 
-_NEWS_STATE_LOCK = threading.RLock()
-_NEWS_STATE_CACHE: "OrderedDict[tuple, dict[str, Any]]" = OrderedDict()
+_NEWS_LOCK = threading.RLock()
+_NEWS_CACHE: "OrderedDict[tuple, dict[str, Any]]" = OrderedDict()
+_NEWS_CACHE_MAX = 65536
 
-# Enough for the complete H1 period from 2025-01-15 with margin.
-_NEWS_STATE_CACHE_MAX = 32768
-
-
-_PRICE_STATE_LOCK = threading.RLock()
-_PRICE_STATE_CACHE: "OrderedDict[tuple, dict[str, Any] | None]" = OrderedDict()
-
-# 3 markets × ~14-16k H1 dates + margin.
-_PRICE_STATE_CACHE_MAX = 65536
-
-
-def _news_cache_key(
-    dataset: list[dict[str, Any]],
-    target: datetime,
-    di: dict[str, Any],
-) -> tuple:
-    source = di.get("full_dataset") or dataset
-
-    return (
-        id(source),
-        id(di.get("dataset_timestamps")),
-        id(di.get("key_dates")),
-        len(source),
-        int(target.timestamp()),
-    )
-
-
-def _price_cache_key(
-    target: datetime,
-    di: dict[str, Any],
-) -> tuple:
-    npr = di.get("np_rates") or {}
-    dates_ns = npr.get("dates_ns")
-
-    return (
-        id(dates_ns),
-        id(npr.get("open")),
-        id(npr.get("close")),
-        id(npr.get("max")),
-        id(npr.get("min")),
-        id(npr.get("ranges")),
-        len(dates_ns) if dates_ns is not None else 0,
-        int(target.timestamp()),
-    )
-
-
-def _news_state_cached(
-    dataset: list[dict[str, Any]],
-    target: datetime,
-    di: dict[str, Any],
-) -> dict[str, Any]:
-
-    key = _news_cache_key(dataset, target, di)
-
-    with _NEWS_STATE_LOCK:
-        cached = _NEWS_STATE_CACHE.get(key)
-
-        if cached is not None:
-            _NEWS_STATE_CACHE.move_to_end(key)
-            return cached
-
-    source = di.get("full_dataset") or dataset
-
-    if source:
-        built = _news_state(source, target, di)
-    else:
-        built = {
-            "has_fast": False,
-            "codes": [],
-        }
-
-    with _NEWS_STATE_LOCK:
-        existing = _NEWS_STATE_CACHE.get(key)
-
-        if existing is not None:
-            _NEWS_STATE_CACHE.move_to_end(key)
-            return existing
-
-        _NEWS_STATE_CACHE[key] = built
-
-        while len(_NEWS_STATE_CACHE) > _NEWS_STATE_CACHE_MAX:
-            _NEWS_STATE_CACHE.popitem(last=False)
-
-    return built
-
-
-def _price_state_cached(
-    target: datetime,
-    di: dict[str, Any],
-) -> dict[str, Any] | None:
-
-    key = _price_cache_key(target, di)
-
-    # None является допустимым cached result, поэтому обычный .get()
-    # здесь использовать нельзя.
-    sentinel = object()
-
-    with _PRICE_STATE_LOCK:
-        cached = _PRICE_STATE_CACHE.get(key, sentinel)
-
-        if cached is not sentinel:
-            _PRICE_STATE_CACHE.move_to_end(key)
-            return cached
-
-    built = _price_state(target, di)
-
-    with _PRICE_STATE_LOCK:
-        if key in _PRICE_STATE_CACHE:
-            _PRICE_STATE_CACHE.move_to_end(key)
-            return _PRICE_STATE_CACHE[key]
-
-        _PRICE_STATE_CACHE[key] = built
-
-        while len(_PRICE_STATE_CACHE) > _PRICE_STATE_CACHE_MAX:
-            _PRICE_STATE_CACHE.popitem(last=False)
-
-    return built
-
-
-# -----------------------------------------------------------------------------
-# Snapshot caches — the expensive point-in-time state is independent of type/var
-# and should not be rebuilt 35 times during fill_cache.
-# -----------------------------------------------------------------------------
+_PRICE_LOCK = threading.RLock()
+_PRICE_CACHE: "OrderedDict[tuple, dict[str, Any] | None]" = OrderedDict()
+_PRICE_CACHE_MAX = 65536
 
 _SNAPSHOT_LOCK = threading.RLock()
 _SNAPSHOT_CACHE: "OrderedDict[tuple, dict[str, Any]]" = OrderedDict()
@@ -1138,68 +1700,123 @@ _BATCH_CACHE: "OrderedDict[tuple, dict[datetime, dict[str, Any]]]" = OrderedDict
 _BATCH_CACHE_MAX = 32
 
 
-def _snapshot_key(dataset: list[dict[str, Any]], target: datetime, di: dict[str, Any]) -> tuple:
+def _news_key(dataset: list[dict[str, Any]], target: datetime, di: dict[str, Any], pair_id: int) -> tuple:
+    source = di.get("full_dataset") or dataset
+    return (
+        id(source),
+        id(di.get("dataset_timestamps")),
+        len(source),
+        pair_id,
+        int(target.timestamp()),
+    )
+
+
+def _price_key(target: datetime, di: dict[str, Any]) -> tuple:
+    npr = di.get("np_rates") or {}
+    dns = npr.get("dates_ns")
+    return (
+        id(dns),
+        id(npr.get("open")),
+        id(npr.get("close")),
+        id(npr.get("max")),
+        id(npr.get("min")),
+        id(npr.get("ranges")),
+        len(dns) if dns is not None else 0,
+        int(target.timestamp()),
+    )
+
+
+def _news_cached(dataset: list[dict[str, Any]], target: datetime, di: dict[str, Any], pair_id: int) -> dict[str, Any]:
+    key = _news_key(dataset, target, di, pair_id)
+    with _NEWS_LOCK:
+        hit = _NEWS_CACHE.get(key)
+        if hit is not None:
+            _NEWS_CACHE.move_to_end(key)
+            return hit
+
+    source = di.get("full_dataset") or dataset
+    built = _build_news_state(source, target, di, pair_id)
+
+    with _NEWS_LOCK:
+        old = _NEWS_CACHE.get(key)
+        if old is not None:
+            _NEWS_CACHE.move_to_end(key)
+            return old
+        _NEWS_CACHE[key] = built
+        while len(_NEWS_CACHE) > _NEWS_CACHE_MAX:
+            _NEWS_CACHE.popitem(last=False)
+    return built
+
+
+def _price_cached(target: datetime, di: dict[str, Any]) -> dict[str, Any] | None:
+    key = _price_key(target, di)
+    sentinel = object()
+    with _PRICE_LOCK:
+        hit = _PRICE_CACHE.get(key, sentinel)
+        if hit is not sentinel:
+            _PRICE_CACHE.move_to_end(key)
+            return hit
+
+    built = _price_state(target, di)
+
+    with _PRICE_LOCK:
+        if key in _PRICE_CACHE:
+            _PRICE_CACHE.move_to_end(key)
+            return _PRICE_CACHE[key]
+        _PRICE_CACHE[key] = built
+        while len(_PRICE_CACHE) > _PRICE_CACHE_MAX:
+            _PRICE_CACHE.popitem(last=False)
+    return built
+
+
+def _snapshot_key(dataset: list[dict[str, Any]], target: datetime, di: dict[str, Any], pair_id: int) -> tuple:
     source = di.get("full_dataset") or dataset
     npr = di.get("np_rates") or {}
     return (
         id(source),
         id(di.get("dataset_timestamps")),
         id(npr.get("dates_ns")),
+        pair_id,
         int(target.timestamp()),
     )
 
 
-def _build_snapshot(dataset: list[dict[str, Any]], target: datetime, di: dict[str, Any]) -> dict[str, Any]:
-    price = _price_state_cached(
-        target,
-        di,
-    )
-
-    news = _news_state_cached(
-        dataset,
-        target,
-        di,
-    )
-
-    return {"price": price, "news": news}
-
-
 def _snapshot_cached(dataset: list[dict[str, Any]], target: datetime, di: dict[str, Any]) -> dict[str, Any]:
-    key = _snapshot_key(dataset, target, di)
+    pair_id = _pair_id(di)
+    key = _snapshot_key(dataset, target, di, pair_id)
     with _SNAPSHOT_LOCK:
-        cached = _SNAPSHOT_CACHE.get(key)
-        if cached is not None:
+        hit = _SNAPSHOT_CACHE.get(key)
+        if hit is not None:
             _SNAPSHOT_CACHE.move_to_end(key)
-            return cached
+            return hit
 
-    built = _build_snapshot(dataset, target, di)
+    built = {
+        "pair_id": pair_id,
+        "price": _price_cached(target, di),
+        "news": _news_cached(dataset, target, di, pair_id),
+    }
+
     with _SNAPSHOT_LOCK:
-        existing = _SNAPSHOT_CACHE.get(key)
-        if existing is not None:
+        old = _SNAPSHOT_CACHE.get(key)
+        if old is not None:
             _SNAPSHOT_CACHE.move_to_end(key)
-            return existing
+            return old
         _SNAPSHOT_CACHE[key] = built
         while len(_SNAPSHOT_CACHE) > _SNAPSHOT_CACHE_MAX:
             _SNAPSHOT_CACHE.popitem(last=False)
     return built
 
 
-def _batch_key(
-    dataset: list[dict[str, Any]],
-    dates: list[datetime],
-    di: dict[str, Any],
-) -> tuple | None:
-
+def _batch_key(dataset: list[dict[str, Any]], dates: list[datetime], di: dict[str, Any]) -> tuple | None:
     if not dates:
         return None
-
     source = di.get("full_dataset") or dataset
     npr = di.get("np_rates") or {}
-
     return (
         id(source),
         id(di.get("dataset_timestamps")),
         id(npr.get("dates_ns")),
+        _pair_id(di),
         tuple(dates),
     )
 
@@ -1208,18 +1825,20 @@ def _batch_snapshots(dataset: list[dict[str, Any]], dates: list[datetime], di: d
     key = _batch_key(dataset, dates, di)
     if key is None:
         return {}
+
     with _BATCH_LOCK:
-        cached = _BATCH_CACHE.get(key)
-        if cached is not None:
+        hit = _BATCH_CACHE.get(key)
+        if hit is not None:
             _BATCH_CACHE.move_to_end(key)
-            return cached
+            return hit
 
     built = {d: _snapshot_cached(dataset, d, di) for d in dates}
+
     with _BATCH_LOCK:
-        existing = _BATCH_CACHE.get(key)
-        if existing is not None:
+        old = _BATCH_CACHE.get(key)
+        if old is not None:
             _BATCH_CACHE.move_to_end(key)
-            return existing
+            return old
         _BATCH_CACHE[key] = built
         while len(_BATCH_CACHE) > _BATCH_CACHE_MAX:
             _BATCH_CACHE.popitem(last=False)
@@ -1227,32 +1846,18 @@ def _batch_snapshots(dataset: list[dict[str, Any]], dates: list[datetime], di: d
 
 
 def clear_runtime_caches() -> None:
-    """
-    Clears only service-local execution caches.
-
-    Does NOT touch:
-      reverse universe
-      DB
-      dataset
-      weights
-      model logic
-    """
-
-    with _SNAPSHOT_LOCK:
-        _SNAPSHOT_CACHE.clear()
-
     with _BATCH_LOCK:
         _BATCH_CACHE.clear()
-
-    with _NEWS_STATE_LOCK:
-        _NEWS_STATE_CACHE.clear()
-
-    with _PRICE_STATE_LOCK:
-        _PRICE_STATE_CACHE.clear()
+    with _SNAPSHOT_LOCK:
+        _SNAPSHOT_CACHE.clear()
+    with _NEWS_LOCK:
+        _NEWS_CACHE.clear()
+    with _PRICE_LOCK:
+        _PRICE_CACHE.clear()
 
 
 # -----------------------------------------------------------------------------
-# Public Brain model API
+# Public model API
 # -----------------------------------------------------------------------------
 
 def model(
@@ -1270,8 +1875,6 @@ def model(
     if not dataset or date is None or dataset_index is None:
         return {}
     if date < MODEL_START:
-        # Critical: the NLP artifact was frozen at MODEL_START, therefore reverse
-        # extrema before the cutoff must not receive semantic feature codes.
         return {}
 
     t = int(type)
@@ -1281,11 +1884,10 @@ def model(
 
     di = dict(dataset_index)
     if bool(di.get("is_daily")):
-        return {}  # model 81 is intentionally H1-only
+        return {}
     di.setdefault("full_dataset", dataset)
 
-    snapshot = _snapshot_cached(dataset, date, di)
-    return _codes_for_var(snapshot, v)
+    return _codes_for_var(_snapshot_cached(dataset, date, di), v)
 
 
 def batch_model(
@@ -1315,25 +1917,6 @@ def batch_model(
         return {d: {} for d in dates}
     di.setdefault("full_dataset", dataset)
 
-    valid_dates = [d for d in dates if d >= MODEL_START]
-    snapshots = _batch_snapshots(dataset, valid_dates, di) if valid_dates else {}
-    return {
-        d: (_codes_for_var(snapshots[d], v) if d in snapshots else {})
-        for d in dates
-    }
-
-
-async def enrich_dataset(engine_vlad, engine_brain):
-    """Service 64 consumes the shared service-80 enriched dataset as-is.
-    """
-    del engine_vlad, engine_brain
-
-    # Dataset/reload boundary:
-    # old point-in-time snapshots must not survive a refreshed dataset.
-    clear_runtime_caches()
-
-    return {
-        "mode": "noop",
-        "source": "vlad_news_algo_events",
-        "reason": "service64 reuses frozen service80 NLP dataset",
-    }
+    valid = [d for d in dates if d >= MODEL_START]
+    snaps = _batch_snapshots(dataset, valid, di) if valid else {}
+    return {d: (_codes_for_var(snaps[d], v) if d in snaps else {}) for d in dates}
