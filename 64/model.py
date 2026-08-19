@@ -108,7 +108,7 @@ STORY_MATCH_HOURS = 72
 EXPECTEDNESS_DAYS = 180
 DUPLICATE_WINDOW_MINUTES = 30
 ENRICH_BATCH = 3000
-SCHEMA_VERSION = "structured-fin-events-v2.5"
+SCHEMA_VERSION = "structured-fin-events-v2.6"
 
 SOURCE_TABLES: dict[str, str] = {
     "cnn": "brain_cnn_news",
@@ -845,8 +845,6 @@ def _extract_static(press: str, raw: dict[str, Any]) -> dict[str, Any] | None:
     family = _find_rule(primary_text, FAMILY_RULES, "other")
 
     action = _find_rule(title, ACTION_RULES, "OTHER")
-    if action == "OTHER":
-        action = _find_rule(primary_text, ACTION_RULES, "OTHER")
 
     obj = _object(title)
     if obj == "OTHER":
