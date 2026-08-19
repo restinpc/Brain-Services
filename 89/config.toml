@@ -1,0 +1,45 @@
+# Technical-analysis figure model with reverse-learning.
+# The source model emits a list of chart figures from a fixed catalog;
+# brain_framework scores T1 / extremum probability, reverse_learning trains weights.
+
+[service]
+id = 89
+port = 8951
+name = "brain-ta-patterns-ml-s89"
+text = "OHLC technical-analysis figure catalog with ML/reverse-learning"
+
+[rates]
+table = "brain_rates_eur_usd"
+
+[cache]
+date_from = "2025-01-01"
+# Reverse-learning axes: train mode and extremum detection interval.
+var_range = [3, 5, 7, 9]
+types_range = [0, 1, 2, 3, 4]
+shift_window = 12
+rebuild_interval = 7200
+
+[dataset]
+parser_table = "brain_rates_eur_usd"
+enriched_table = "sasha_ta_patterns_enriched"
+index_fields = ["event_type"]
+date_field = "date_dt"
+engine = "vlad"
+model_can_filter = true
+
+[ctx]
+key_columns = ["id"]
+
+[model]
+# Uncommon figures keep the wider analog window; frequent candles stay at shift 0.
+rare_occurrence_max = 400
+
+[ml]
+enabled = true
+init_mode = "constant"
+target_precision = 0.95
+max_iter = 20
+step = 0.10
+extremum_limit = 50
+active_tail = 0
+precision_metric = "mean"
