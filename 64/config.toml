@@ -37,7 +37,7 @@ key_columns = ["id"]
 rare_occurrence_max = 0
 
 [ml]
-enabled = true
+enabled = false
 init_mode = "constant"
 target_precision = 0.62
 max_iter = 8
