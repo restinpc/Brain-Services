@@ -606,7 +606,7 @@ def _build_csr(records: list[ExtremumRecord], code_to_idx: dict[str, int]):
     ИСПРАВЛЕНИЕ (heap corruption / free(): invalid next size):
     Раньше ключ содержал id(code_to_idx). Python re-use адресов памяти после
     освобождения объектов (refcount=0) приводил к cache hit для ДРУГОГО
-    code_to_idx с тем же адресом, но другим содержимым — JIT получал индексы
+    code_to_idx с тем же адресом, но другим содержимым JIT получал индексы
     из старого CSR (0..499) для weights_arr нового размера (300) и делал
     out-of-bounds write в heap. Заменяем на tuple(code_to_idx.keys()):
     content-based ключ, учитывающий набор и порядок кодов (dict ordered).
