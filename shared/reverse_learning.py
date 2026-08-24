@@ -72,11 +72,23 @@ _NUMBA_ENABLED = (
 # CPU-bound training should not block the FastAPI event loop.
 # Keep workers low: the keyed train lock deduplicates identical jobs, while this
 # executor controls CPU pressure for independent universes.
-_RL_TRAIN_WORKERS = max(1, int(os.getenv("RL_TRAIN_WORKERS", "1")))
+# Stability first: Numba training must not run concurrently inside one service.
+# Keep this hard-limited even if an old node environment still exports a larger
+# RL_TRAIN_WORKERS value.
+_RL_TRAIN_WORKERS = 1
 _RL_TRAIN_EXECUTOR = _cf.ThreadPoolExecutor(
     max_workers=_RL_TRAIN_WORKERS,
     thread_name_prefix="rl_train",
 )
+
+
+async def warmup_train_executor() -> int:
+    """Compatibility hook for brain_framework.
+
+    This stable implementation uses a thread executor and does not create a
+    process pool, so there are no child workers to warm up.
+    """
+    return 0
 
 
 def _stable_seed(key: object) -> int:
