@@ -251,28 +251,21 @@ def _metric_id(metric: str) -> int:
     return 0
 
 
-# OPT-A: _build_csr LRU-кеш — при Numba-пути вызывается на каждый rebalance.
-# Ключ: id объектов (records+code_to_idx неизменны внутри одного train-вызова).
-# Ограничен 256 слотами чтобы не держать ссылки вечно.
-_build_csr_cache: dict = {}
-_BUILD_CSR_CACHE_MAX = 256
-
-
 def _build_csr(records: list[ExtremumRecord], code_to_idx: dict[str, int]):
     """CSR-представление records: offsets + flat indices.
 
     Важно: code_to_idx строится в порядке вставки старого dict-universe.
     Поэтому обход rec.codes сохраняет старую семантику и порядок суммирования.
 
-    OPT-A: результат кешируется по (id(records_tuple), id(code_to_idx)).
-    records — Python list; превращаем в tuple-ключ через id каждого элемента,
-    потому что ExtremumRecord неизменен в ходе одного train-цикла.
-    """
-    cache_key = (tuple(id(r) for r in records), id(code_to_idx))
-    cached = _build_csr_cache.get(cache_key)
-    if cached is not None:
-        return cached
+    CSR intentionally is not cached globally. The former cache keyed entries by
+    id(code_to_idx) and ids of short-lived records. CPython reuses those ids, so
+    an unrelated training call could receive stale indices larger than its
+    weights array. Numba then performed an unchecked out-of-bounds read/write,
+    corrupting the process heap (double free / invalid next size).
 
+    Building CSR once per training call is cheap compared with the JIT training
+    loop and keeps the accelerated path deterministic and memory-safe.
+    """
     offsets = np.empty(len(records) + 1, dtype=np.int32)
     signs = np.empty(len(records), dtype=np.int8)
     base_amps = np.empty(len(records), dtype=np.float64)
@@ -284,11 +277,7 @@ def _build_csr(records: list[ExtremumRecord], code_to_idx: dict[str, int]):
         for c in r.codes:
             flat.append(code_to_idx.get(c, -1))
         offsets[i + 1] = len(flat)
-    result = offsets, np.asarray(flat, dtype=np.int32), signs, base_amps
-    _build_csr_cache[cache_key] = result
-    if len(_build_csr_cache) > _BUILD_CSR_CACHE_MAX:
-        del _build_csr_cache[next(iter(_build_csr_cache))]
-    return result
+    return offsets, np.asarray(flat, dtype=np.int32), signs, base_amps
 
 
 if _NUMBA_ENABLED:
@@ -298,7 +287,7 @@ if _NUMBA_ENABLED:
         s_abs = 0.0
         for p in range(start, end):
             idx = rec_indices[p]
-            if idx < 0:
+            if idx < 0 or idx >= weights_arr.shape[0]:
                 continue
             w = weights_arr[idx]
             s_signed += w
@@ -370,7 +359,7 @@ if _NUMBA_ENABLED:
             base_amp = base_amps[r]
             for p in range(offsets[r], offsets[r + 1]):
                 idx = rec_indices[p]
-                if idx < 0:
+                if idx < 0 or idx >= weights_arr.shape[0]:
                     continue
                 w = weights_arr[idx]
                 if w == 0.0:
