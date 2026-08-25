@@ -1,20 +1,18 @@
 <?php
 /**
- * restart_fixed_44_48_49_89.php
+ * restart_fixed_44_48_49.php
  *
  * Последовательность:
  *   1. Проверяет SHA256 shared/brain_framework.py на всех master_nodes.
- *   2. Перезапускает исправленные сервисы 44, 48, 49 и 89 на всех нодах.
+ *   2. Перезапускает исправленные сервисы 44, 48, 49 на всех нодах.
  *   3. На Brain 1 в фоне очищает values-cache (H1 + D1), не трогая backtest.
  *   4. Параллельно пересчитывает H1 + D1 для этих четырёх сервисов.
- *   5. Для моделей с ID <= 81 сразу после успешного fill_cache запускает
- *      Reinit на всех master_nodes. Для моделей с ID > 81 выполняется только
- *      пересчёт кеша, без Reinit.
+ *   5. Для моделей 44, 48, 49 после fill_cache запускает Reinit.
  *
  * Совместимость: PHP 5.3.
  *
  * Установка:
- *   cp /brain/Brain-Services/restart_fixed_44_48_49_89.php \
+ *   cp /brain/Brain-Services/restart_fixed_44_48_49.php \
  *      /brain/Brain-Server/public_html/engine/code/restart_and_check_all_services.php
  *
  * Запуск:
@@ -24,7 +22,7 @@
 
 function _rrcr_service_ids()
 {
-    return array(44, 48, 49, 89);
+    return array(44, 48, 49);
 }
 
 function _rrcr_reinit_max_id()
@@ -378,7 +376,7 @@ BASH;
             $restartCommand
         );
 
-        echo 'STEP 1: verify framework and restart services 44,48,49,89 on all nodes'.PHP_EOL;
+        echo 'STEP 1: verify framework and restart services 44,48,49 on all nodes'.PHP_EOL;
         $taskIds = _rrcr_queue_for_nodes($nodes, $restartCommand, $userId);
         $restartOk = _rrcr_wait_tasks($nodes, $taskIds, 3600);
 
@@ -389,10 +387,10 @@ BASH;
         }
 
         $runId = date('Ymd_His').'_'.getmypid();
-        $tmpFile = '/tmp/brain_causal_cache_44_48_49_89_'.$runId.'.py';
+        $tmpFile = '/tmp/brain_causal_cache_44_48_49_'.$runId.'.py';
         $logDir = '/brain/Brain-Server/logs';
-        $logFile = $logDir.'/causal_cache_44_48_49_89_'.$runId.'.log';
-        $pidFile = '/tmp/brain_causal_cache_44_48_49_89.pid';
+        $logFile = $logDir.'/causal_cache_44_48_49_'.$runId.'.log';
+        $pidFile = '/tmp/brain_causal_cache_44_48_49.pid';
 
         if (!is_dir($logDir)) {
             @mkdir($logDir, 0775, true);
@@ -431,7 +429,7 @@ MAX_WORKERS = 4
 SPEC = os.environ.get('BRAIN_SERVICE_SPEC', '')
 PID_FILE = os.environ.get(
     'BRAIN_PID_FILE',
-    '/tmp/brain_causal_cache_44_48_49_89.pid'
+    '/tmp/brain_causal_cache_44_48_49.pid'
 )
 SELF_FILE = os.environ.get('BRAIN_PYTHON_FILE', '')
 ROOT = '/brain/Brain-Server'
@@ -816,7 +814,7 @@ out('NODE=%s START=%s' % (
     time.strftime('%Y-%m-%d %H:%M:%S')
 ))
 out(
-        'MODE=CAUSAL_FIX_CACHE_CLEAR_REFILL_44_48_49_89 '
+        'MODE=CAUSAL_FIX_CACHE_CLEAR_REFILL_44_48_49 '
     'days=0,1 backtest=NOT_TOUCHED max_workers=%d' % MAX_WORKERS
 )
 out('SERVICES=%d' % len(items))
@@ -857,8 +855,8 @@ try:
         sys.exit(1)
 
     out(
-        'FULL PIPELINE RESULT=OK; MODELS 44,48,49,89 CACHE COMPLETED; '
-        'REINIT COMPLETED ONLY FOR ID <= 81'
+        'FULL PIPELINE RESULT=OK; SERVICES 44,48,49 CACHE COMPLETED; '
+        'REINIT COMPLETED FOR MODELS 44,48,49'
     )
 finally:
     try:
@@ -896,9 +894,9 @@ PYCODE;
             );
         }
 
-        echo 'STEP 1 OK: services 44,48,49,89 restarted on all nodes'.PHP_EOL;
+        echo 'STEP 1 OK: services 44,48,49 restarted on all nodes'.PHP_EOL;
         echo 'STEP 2 STARTED: full H1+D1 cache rebuild on Brain 1'.PHP_EOL;
-        echo 'STEP 3 AUTO: Reinit after cache only for model ID <= 81; ID > 81 cache only'.PHP_EOL;
+        echo 'STEP 3 AUTO: Reinit models 44,48,49 after successful cache rebuild'.PHP_EOL;
         echo 'Background PID: '.$pid.PHP_EOL;
         echo 'Log: '.$logFile.PHP_EOL;
         echo 'PID file: '.$pidFile.PHP_EOL;
