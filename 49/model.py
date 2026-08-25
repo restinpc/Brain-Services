@@ -228,7 +228,11 @@ def get_linear_weights(n: int) -> list[float]:
     return [float(n - i) for i in range(n)]
 
 
-def get_adaptive_window(np_r: dict | None, day_flag: int) -> int:
+def get_adaptive_window(
+    np_r: dict | None,
+    day_flag: int,
+    confirmed_cut: int | None = None,
+) -> int:
     """
     Медиана расстояний между соседними вершинами (ext_max | ext_min) в барах.
     """
@@ -238,6 +242,9 @@ def get_adaptive_window(np_r: dict | None, day_flag: int) -> int:
     ext_min = np_r.get("ext_min")
     if ext_max is None or ext_min is None or len(ext_max) == 0:
         return 3
+    if confirmed_cut is not None:
+        ext_max = ext_max[:confirmed_cut]
+        ext_min = ext_min[:confirmed_cut]
     peak_idx = np.where(ext_max | ext_min)[0]
     if len(peak_idx) < 4:
         return 3
@@ -261,14 +268,15 @@ def get_modification(rates: list[dict]) -> float:
 def build_rates_lookup(rates: list[dict]) -> tuple[dict, dict]:
     """
     Оригинальная функция — сохранена для совместимости.
-    t1_map[dt]  = close - open
+    t1_map[dt]  = stored DB T1; close-open fallback запрещён
     rng_map[dt] = max - min
     """
     t1_map : dict[datetime, float] = {}
     rng_map: dict[datetime, float] = {}
     for r in rates:
         dt = r["date"]
-        t1_map[dt]  = float(r.get("close") or 0) - float(r.get("open") or 0)
+        if r.get("t1") is not None:
+            t1_map[dt] = float(r["t1"])
         rng_map[dt] = float(r.get("max")   or 0) - float(r.get("min")  or 0)
     return t1_map, rng_map
 
@@ -336,6 +344,7 @@ def prev_candle_is_bull(rates: list[dict], target_dt: datetime) -> bool | None:
 def _build_ext_arrays_np(
     np_r: dict | None,
     rates_sorted_ts: np.ndarray,   # (K,) int64 — уже готов из _build_rates_numpy
+    confirmed_cut: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Строит (ext_max_sorted_ts, ext_min_sorted_ts) как отсортированные int64-массивы,
@@ -354,7 +363,13 @@ def _build_ext_arrays_np(
     if dates_ns is None or ext_max_mask is None or ext_min_mask is None:
         return empty, empty
 
+    if confirmed_cut is not None:
+        dates_ns = dates_ns[:confirmed_cut]
+        ext_max_mask = ext_max_mask[:confirmed_cut]
+        ext_min_mask = ext_min_mask[:confirmed_cut]
     n    = len(dates_ns)
+    if n == 0:
+        return empty, empty
     idxs = dates_ns.searchsorted(rates_sorted_ts)
     safe = np.clip(idxs, 0, n - 1)
     valid = (idxs < n) & (dates_ns[safe] == rates_sorted_ts)
@@ -366,23 +381,73 @@ def _build_ext_arrays_np(
 
 def _build_rates_numpy(
     rates: list[dict],
+    np_r: dict | None = None,
+    target_date: datetime | None = None,
+    bar_delta: timedelta | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Конвертирует список свечей в три отсортированных numpy-массива:
       sorted_ts  — unix-секунды (int64), отсортированные
-      t1_arr     — close - open (float64)
+      t1_arr     — stored DB T1 (float64), never close-open
       rng_arr    — max - min   (float64)
 
     Используется как основной источник данных для всех батч-вычислений.
     Обычно rates уже отсортированы фреймворком, но argsort гарантирует порядок.
     """
-    n   = len(rates)
+    if (
+        np_r is not None
+        and target_date is not None
+        and bar_delta is not None
+        and np_r.get("dates_ns") is not None
+    ):
+        dates_ns = np.asarray(np_r["dates_ns"], dtype=np.int64)
+        cutoff_ts = int(
+            target_date.timestamp() - bar_delta.total_seconds()
+        )
+        cut = int(np.searchsorted(dates_ns, cutoff_ts, side="right"))
+        sorted_ts = dates_ns[:cut].copy()
+        stored = np_r.get("t1")
+        ranges = np_r.get("ranges")
+        t1_arr = (
+            np.asarray(stored[:cut], dtype=np.float64).copy()
+            if stored is not None
+            else np.full(cut, np.nan, dtype=np.float64)
+        )
+        if ranges is not None:
+            rng_arr = np.asarray(ranges[:cut], dtype=np.float64).copy()
+        else:
+            highs = np_r.get("max")
+            lows = np_r.get("min")
+            rng_arr = (
+                np.asarray(highs[:cut], dtype=np.float64)
+                - np.asarray(lows[:cut], dtype=np.float64)
+                if highs is not None and lows is not None
+                else np.zeros(cut, dtype=np.float64)
+            )
+        return sorted_ts, t1_arr, rng_arr
+
+    completed = []
+    for row in rates:
+        dt = row.get("date")
+        if not isinstance(dt, datetime):
+            continue
+        if (
+            target_date is not None
+            and bar_delta is not None
+            and dt + bar_delta > target_date
+        ):
+            continue
+        completed.append(row)
+
+    n   = len(completed)
     ts_ = np.empty(n, dtype=np.int64)
     t1_ = np.empty(n, dtype=np.float64)
     rn_ = np.empty(n, dtype=np.float64)
-    for i, r in enumerate(rates):
+    for i, r in enumerate(completed):
         ts_[i] = int(r["date"].timestamp())
-        t1_[i] = float(r.get("close") or 0) - float(r.get("open") or 0)
+        t1_[i] = (
+            float(r["t1"]) if r.get("t1") is not None else np.nan
+        )
         rn_[i] = float(r.get("max")   or 0) - float(r.get("min")  or 0)
     idx = np.argsort(ts_, kind="stable")
     return ts_[idx], t1_[idx], rn_[idx]
@@ -413,6 +478,13 @@ def _batch_lookup(
     """
     flat  = query_ts.ravel()
     n     = len(sorted_ts)
+    if n == 0:
+        shape = query_ts.shape
+        return (
+            np.full(shape, np.nan, dtype=np.float64),
+            np.zeros(shape, dtype=np.float64),
+            np.zeros(shape, dtype=bool),
+        )
     idxs  = sorted_ts.searchsorted(flat)
     safe  = np.clip(idxs, 0, n - 1)
     found = (idxs < n) & (sorted_ts[safe] == flat)
@@ -480,7 +552,7 @@ def _compute_t1_batch(
         value_mat = rng_mat - avg_range
     else:
         # bar должен присутствовать в rates (t1 not None)
-        active   &= found_mat
+        active   &= found_mat & np.isfinite(t1_mat)
         value_mat = np.where(
             found_mat,
             t1_mat * np.abs(t1_mat) if use_square else t1_mat,
@@ -726,10 +798,26 @@ def model(
 
     bar_delta     = timedelta(days=1) if day_flag else timedelta(hours=1)
     bar_delta_sec = int(bar_delta.total_seconds())   # горячий путь — int, не timedelta
-    modification  = get_modification(rates)
+    completed_rates = [
+        row for row in rates
+        if isinstance(row.get("date"), datetime) and row["date"] < date
+    ]
+    modification  = get_modification(completed_rates)
+
+    unit_sec = int(bar_delta.total_seconds())
+    dates_ns = (
+        np.asarray(np_r.get("dates_ns"), dtype=np.int64)
+        if np_r is not None and np_r.get("dates_ns") is not None
+        else np.empty(0, dtype=np.int64)
+    )
+    confirmed_cut = int(np.searchsorted(
+        dates_ns,
+        int(date.timestamp()) - (2 * unit_sec),
+        side="right",
+    )) if len(dates_ns) else 0
 
     # ── Адаптивное окно и линейные веса ──────────────────────────────────────
-    window     = get_adaptive_window(np_r, day_flag)
+    window     = get_adaptive_window(np_r, day_flag, confirmed_cut)
     weights    = get_linear_weights(window)           # list — для скалярных функций
     weights_np = np.array(weights, dtype=np.float64)  # numpy — для батч-функций
 
@@ -737,19 +825,22 @@ def model(
     # Заменяет build_rates_lookup (Python-dict) + build_ext_sets:
     #   Было:  2×N timestamp-конвертаций + 2 dict-построения
     #   Стало: 1×N конвертация, всё остальное через numpy
-    sorted_ts_np, t1_arr_np, rng_arr_np = _build_rates_numpy(rates)
+    sorted_ts_np, t1_arr_np, rng_arr_np = _build_rates_numpy(
+        rates, np_r, date, bar_delta
+    )
+    if len(sorted_ts_np) == 0:
+        return {}
 
     # ── avg_range ─────────────────────────────────────────────────────────────
-    if np_r is not None:
-        _rng_full = np_r.get("ranges")
-        avg_range = float(np.mean(_rng_full)) if _rng_full is not None and len(_rng_full) > 0 \
-                    else (float(np.mean(rng_arr_np)) if len(rng_arr_np) > 0 else 0.0)
-    else:
-        avg_range = float(np.mean(rng_arr_np)) if len(rng_arr_np) > 0 else 0.0
+    avg_range = (
+        float(np.mean(rng_arr_np)) if len(rng_arr_np) > 0 else 0.0
+    )
 
     # ── ext int64-массивы через _build_ext_arrays_np ──────────────────────────
     # Не создаёт datetime-set, не делает повторных .timestamp() вызовов
-    ext_max_sorted_ts, ext_min_sorted_ts = _build_ext_arrays_np(np_r, sorted_ts_np)
+    ext_max_sorted_ts, ext_min_sorted_ts = _build_ext_arrays_np(
+        np_r, sorted_ts_np, confirmed_cut
+    )
 
     # ── Тренд предыдущей свечи ────────────────────────────────────────────────
     is_bull      = prev_candle_is_bull(rates, date)
@@ -824,7 +915,8 @@ def model(
     for shift in range(SHIFT_WINDOW + 1):
         shift_sec        = shift * bar_delta_sec
         # ОПТИМИЗАЦИЯ 3: shift-window bounds в int64 (не datetime объекты)
-        check_dt_ts      = date_ts - shift_sec
+        # shift=0 is the last completed interval [date-delta, date).
+        check_dt_ts      = date_ts - shift_sec - bar_delta_sec
         check_dt_next_ts = check_dt_ts + bar_delta_sec
 
         for url, info in url_cache.items():
@@ -839,8 +931,14 @@ def model(
             if lo >= hi:
                 continue
 
-            hist_ts    = info["hist_ts"]
-            total_hist = info["total_hist"]
+            hist_ts = info["hist_ts"]
+            # Do not use the active occurrence as its own historical analog.
+            hist_ts = hist_ts[
+                (hist_ts < check_dt_ts) | (hist_ts >= check_dt_next_ts)
+            ]
+            total_hist = len(hist_ts)
+            if total_hist == 0:
+                continue
             event_id   = info["event_id"]
             currency   = info["currency"]
             importance = info["importance"]

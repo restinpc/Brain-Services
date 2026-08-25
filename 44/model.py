@@ -100,9 +100,8 @@ DATASET_QUERY  = f"""
 
 DATASET_KEY = "url"
 
-# False: dataset_index["key_dates"] строится из полного датасета,
-# поэтому shift=0 корректно видит события в [date, date+delta).
-# hist_before внутри model() всё равно обрезает по < date — нет lookahead.
+# False: dataset_index["key_dates"] строится из полного датасета, но model()
+# самостоятельно выбирает только завершённые окна [date-delta, date).
 FILTER_DATASET_BY_DATE = False
 
 URL_MAP_ENGINE = os.getenv("URL_MAP_ENGINE", "vlad")
@@ -163,15 +162,82 @@ def _rates_cache_key(rates):
     return (len(rates), first.get("date"), last.get("date"),
             float(first.get("close") or 0.0), float(last.get("close") or 0.0))
 
-def _prepare_rate_state(rates, np_r):
-    key = _rates_cache_key(rates)
+def _causal_np_cuts(np_r, target_date, bar_delta):
+    if np_r is None or np_r.get("dates_ns") is None:
+        return 0, 0
+    dates_ns = np.asarray(np_r["dates_ns"], dtype=np.int64)
+    unit = int(bar_delta.total_seconds())
+    target_ts = int(target_date.timestamp())
+    outcome_cut = int(np.searchsorted(
+        dates_ns, target_ts - unit, side="right"
+    ))
+    # A centered extremum at t uses the following candle.  That candle is
+    # completely known only at t + 2 * timeframe.
+    extremum_cut = int(np.searchsorted(
+        dates_ns, target_ts - (2 * unit), side="right"
+    ))
+    return outcome_cut, extremum_cut
+
+
+def _causal_rate_state(rates, np_r, target_date, bar_delta):
+    """Stored T1/range/extrema available strictly by target_date."""
+    t1_map: dict[datetime, float] = {}
+    rng_map: dict[datetime, float] = {}
+    ext_max_set: set[datetime] = set()
+    ext_min_set: set[datetime] = set()
+
+    outcome_cut, extremum_cut = _causal_np_cuts(
+        np_r, target_date, bar_delta
+    )
+    if np_r is not None and outcome_cut > 0:
+        dates_ns = np.asarray(np_r.get("dates_ns"), dtype=np.int64)
+        stored_t1 = np_r.get("t1")
+        ranges = np_r.get("ranges")
+        ext_max = np_r.get("ext_max")
+        ext_min = np_r.get("ext_min")
+        usable = min(outcome_cut, len(dates_ns))
+        for idx in range(usable):
+            dt = datetime.fromtimestamp(int(dates_ns[idx]))
+            if stored_t1 is not None and idx < len(stored_t1):
+                t1_map[dt] = float(stored_t1[idx])
+            if ranges is not None and idx < len(ranges):
+                rng_map[dt] = float(ranges[idx])
+        confirmed = min(extremum_cut, usable)
+        for idx in range(confirmed):
+            dt = datetime.fromtimestamp(int(dates_ns[idx]))
+            if ext_max is not None and idx < len(ext_max) and bool(ext_max[idx]):
+                ext_max_set.add(dt)
+            if ext_min is not None and idx < len(ext_min) and bool(ext_min[idx]):
+                ext_min_set.add(dt)
+    else:
+        # No silent close-open substitution: T1 keeps its DB meaning.
+        for row in rates:
+            dt = row.get("date")
+            if not isinstance(dt, datetime) or dt + bar_delta > target_date:
+                continue
+            if row.get("t1") is not None:
+                t1_map[dt] = float(row["t1"])
+            rng_map[dt] = (
+                float(row.get("max") or 0.0)
+                - float(row.get("min") or 0.0)
+            )
+
+    avg_range = (
+        float(np.mean(list(rng_map.values()))) if rng_map else 0.0
+    )
+    return t1_map, rng_map, avg_range, ext_max_set, ext_min_set
+
+
+def _prepare_rate_state(rates, np_r, target_date, bar_delta):
+    key = _rates_cache_key(rates) + (
+        int(target_date.timestamp()),
+        int(bar_delta.total_seconds()),
+        id(np_r),
+    )
     cached = _cache_get(_RATE_PREP_CACHE, key)
     if cached is not None:
         return cached
-    t1_map, rng_map = build_rates_lookup(rates)
-    avg_range = extract_avg_range(np_r, rng_map)
-    ext_max_set, ext_min_set = build_ext_sets(np_r, t1_map)
-    value = (t1_map, rng_map, avg_range, ext_max_set, ext_min_set)
+    value = _causal_rate_state(rates, np_r, target_date, bar_delta)
     _cache_put(_RATE_PREP_CACHE, key, value)
     return value
 
@@ -296,7 +362,11 @@ def get_linear_weights(n: int) -> list[float]:
     return [float(n - i) for i in range(n)]
 
 
-def get_adaptive_window(np_r: dict | None, day_flag: int) -> int:
+def get_adaptive_window(
+    np_r: dict | None,
+    day_flag: int,
+    confirmed_cut: int | None = None,
+) -> int:
     """
     Медиана расстояний между соседними вершинами (ext_max | ext_min) в барах.
     Медиана устойчива к длинным трендовым участкам без разворотов.
@@ -307,6 +377,9 @@ def get_adaptive_window(np_r: dict | None, day_flag: int) -> int:
     ext_min = np_r.get("ext_min")
     if ext_max is None or ext_min is None or len(ext_max) == 0:
         return 3
+    if confirmed_cut is not None:
+        ext_max = ext_max[:confirmed_cut]
+        ext_min = ext_min[:confirmed_cut]
     peak_idx = np.where(ext_max | ext_min)[0]
     if len(peak_idx) < 4:
         return 3
@@ -332,14 +405,15 @@ def get_modification(rates: list[dict]) -> float:
 
 def build_rates_lookup(rates: list[dict]) -> tuple[dict, dict]:
     """
-    t1_map[dt]  = close - open  (прокси для DB-колонки t1)
+    t1_map[dt]  = stored DB T1; close-open is not an equivalent fallback
     rng_map[dt] = max - min
     """
     t1_map : dict[datetime, float] = {}
     rng_map: dict[datetime, float] = {}
     for r in rates:
         dt = r["date"]
-        t1_map[dt]  = float(r.get("close") or 0) - float(r.get("open") or 0)
+        if r.get("t1") is not None:
+            t1_map[dt] = float(r["t1"])
         rng_map[dt] = float(r.get("max")   or 0) - float(r.get("min")  or 0)
     return t1_map, rng_map
 
@@ -558,14 +632,21 @@ def model(
         day_flag = 0
 
     bar_delta    = timedelta(days=1) if day_flag else timedelta(hours=1)
-    modification = get_modification(rates)
+    completed_rates = [
+        row for row in rates
+        if isinstance(row.get("date"), datetime) and row["date"] < date
+    ]
+    modification = get_modification(completed_rates)
 
     # ── Адаптивное окно и линейные веса ──────────────────────────────────────
-    window  = get_adaptive_window(np_r, day_flag)
+    _, confirmed_cut = _causal_np_cuts(np_r, date, bar_delta)
+    window  = get_adaptive_window(np_r, day_flag, confirmed_cut)
     weights = get_linear_weights(window)    # [N, N-1, ..., 1]
 
     # ── Словари ставок / диапазонов / экстремумов (cached per target) ────────
-    t1_map, rng_map, avg_range, ext_max_set, ext_min_set = _prepare_rate_state(rates, np_r)
+    t1_map, rng_map, avg_range, ext_max_set, ext_min_set = _prepare_rate_state(
+        rates, np_r, date, bar_delta
+    )
 
     # ── Тренд предыдущей свечи ────────────────────────────────────────────────
     is_bull = prev_candle_is_bull(rates, date)
@@ -585,7 +666,9 @@ def model(
     metadata = event_index["meta"]
 
     for shift in range(0, SHIFT_WINDOW + 1):
-        check_dt = date - bar_delta * shift
+        # Live-available event window.  shift=0 is the last completed
+        # timeframe [date-delta, date), never [date, date+delta).
+        check_dt = date - bar_delta * (shift + 1)
         check_dt_next = check_dt + bar_delta
         lo_global = bisect.bisect_left(timeline_dates, check_dt)
         hi_global = bisect.bisect_left(timeline_dates, check_dt_next)
@@ -615,7 +698,10 @@ def model(
             # ── Исторические даты этого url до target_date ───────────────────
             all_hist    = key_dates.get(url, [])
             idx_cut     = bisect.bisect_left(all_hist, date)   # строго < date
-            hist_before = all_hist[:idx_cut]
+            hist_before = [
+                dt for dt in all_hist[:idx_cut]
+                if not (check_dt <= dt < check_dt_next)
+            ]
             if not hist_before:
                 continue
 
