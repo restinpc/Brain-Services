@@ -1,0 +1,23 @@
+[service]
+id = 90                  
+port = 8952
+name = "brain-best-ohlc-indicators"
+text = "Eight frozen causal OHLC indicator features"
+
+[rates]
+table = "brain_rates_eur_usd"
+
+[cache]
+date_from = "2025-01-01"
+fresh_lag_days = 14
+var_range = [0]
+types_range = [0, 1, 2]
+param_range = [""]
+batch_model_size = 1000
+
+[dataset]
+model_uses_rates = true
+model_can_filter = false
+
+[ml]
+enabled = false
