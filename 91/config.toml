@@ -1,0 +1,50 @@
+# Treasury auction demand / absorption model with reverse-learning.
+# Raw source: FiscalData /v1/accounting/od/auctions_query -> vlad_tr_auctions_query.
+
+[service]
+id = 91
+port = 8953
+name = "brain-treasury-auction-demand-ml-s91"
+text = "U.S. Treasury auction demand and absorption model with causal rolling regimes + ML/reverse-learning"
+
+[cache]
+date_from = "2025-01-01"
+# In ML mode these are reverse-learning train-mode / extremum-interval axes.
+var_range = [3, 5, 7, 9]
+types_range = [0, 1, 2, 3, 4]
+# brain_framework v21 uses a causal event horizon of up to 12 H1 bars / 1 D1 bar.
+shift_window = 12
+rebuild_interval = 7200
+reload_interval = 3600
+
+[dataset]
+parser_table = "vlad_tr_auctions_query"
+enriched_table = "vlad_tr_auctions_query_enriched_s91"
+index_fields = ["event_type"]
+date_field = "date_dt"
+engine = "vlad"
+
+[ctx]
+key_columns = ["id"]
+
+[model]
+# Rolling thresholds are calculated only from PRIOR auctions of the same instrument.
+history_window = 24
+history_min = 8
+quantile_low = 0.25
+quantile_high = 0.75
+# Results are normally released quickly after the competitive close. We add a
+# conservative lag before making the event visible to H1 calculations.
+publication_safety_minutes = 30
+# Auction contexts are event-driven; allow shifted H1 codes inside the framework horizon.
+rare_occurrence_max = 1000000
+
+[ml]
+enabled = true
+init_mode = "constant"
+target_precision = 0.95
+max_iter = 20
+step = 0.10
+extremum_limit = 50
+active_tail = 0
+precision_metric = "mean"

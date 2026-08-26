@@ -5,7 +5,7 @@ import requests
 import json
 import time
 from urllib.parse import urljoin
-from datetime import datetime
+from datetime import datetime, timedelta
 import mysql.connector
 from mysql.connector import Error
 import traceback
@@ -99,6 +99,13 @@ for key, endpoint in RAW_DATASETS.items():
 PAGE_SIZE = 5000
 MAX_RETRIES = 3
 
+# Auctions_Query is event-driven and can publish several rows on the same day.
+# A strict record_date:gt:last_date incremental filter can therefore miss late
+# rows/updates from an already-seen date. Re-read a small tail and replace it
+# transactionally in MySQL.
+AUCTIONS_TABLE = "vlad_tr_auctions_query"
+AUCTIONS_OVERLAP_DAYS = 7
+
 # Колонки с датами — для определения поля фильтрации
 DATE_COLUMNS = ['record_date', 'record_date_time', 'date', 'as_of_date']
 
@@ -152,7 +159,7 @@ class TreasuryCollector:
             pass
         return None  # Колонка даты не найдена — sort/filter не будут добавлены
 
-    def fetch_all_pages(self, endpoint: str, last_date: str = None) -> list:
+    def fetch_all_pages(self, endpoint: str, last_date: str = None, inclusive: bool = False) -> list:
         """
         Загружает данные с СЕРВЕРНОЙ фильтрацией.
 
@@ -176,7 +183,8 @@ class TreasuryCollector:
             if date_col:
                 params['sort'] = date_col
                 if last_date:
-                    params['filter'] = f'{date_col}:gt:{last_date}'
+                    op = 'gte' if inclusive else 'gt'
+                    params['filter'] = f'{date_col}:{op}:{last_date}'
 
             attempts = 0
             while attempts < MAX_RETRIES:
@@ -231,7 +239,7 @@ class TreasuryCollector:
     def sanitize_column_name(self, name: str) -> str:
         return name.replace('-', '_').replace('.', '_').replace('/', '_').lower()
 
-    def insert_batch(self, data: list):
+    def insert_batch(self, data: list, replace_date_col: str = None, replace_from: str = None):
         if not data:
             return 0
         sample = data[0]
@@ -244,6 +252,17 @@ class TreasuryCollector:
         total_inserted = 0
         with self.get_db_connection() as conn:
             cursor = conn.cursor()
+            # For Auctions_Query we fetched a complete overlapping tail. Delete
+            # that exact tail only after the HTTP fetch succeeded, then insert
+            # the fresh API snapshot in the same DB transaction. This captures
+            # multiple auctions on one record_date and corrected same-day rows
+            # without accumulating duplicates.
+            if replace_date_col and replace_from:
+                safe_date_col = self.sanitize_column_name(replace_date_col)
+                cursor.execute(
+                    f"DELETE FROM `{self.table_name}` WHERE `{safe_date_col}` >= %s",
+                    (replace_from,),
+                )
             for i in range(0, len(data), batch_size):
                 batch = data[i:i + batch_size]
                 values = []
@@ -265,13 +284,33 @@ class TreasuryCollector:
     def process_dataset(self, endpoint: str):
         print(f"\n=== Обработка таблицы: {self.table_name} ===")
         last_date, date_col = self.get_last_record_date()
-        if last_date:
+        request_from = last_date
+        inclusive = False
+        replace_date_col = None
+        replace_from = None
+
+        if last_date and self.table_name == AUCTIONS_TABLE and date_col:
+            try:
+                overlap_dt = datetime.strptime(last_date, "%Y-%m-%d") - timedelta(days=AUCTIONS_OVERLAP_DAYS)
+                request_from = overlap_dt.strftime("%Y-%m-%d")
+                inclusive = True
+                replace_date_col = date_col
+                replace_from = request_from
+                print(
+                    f"    Последняя запись: {last_date} (колонка: {date_col}) → "
+                    f"перечитываем хвост с {request_from}"
+                )
+                print(f"    Серверный фильтр: filter={date_col}:gte:{request_from}")
+            except ValueError:
+                request_from = last_date
+        elif last_date:
             print(f"    Последняя запись: {last_date} (колонка: {date_col}) → загружаем только новее")
             print(f"    Серверный фильтр: filter={date_col}:gt:{last_date}")
         else:
             print(f"    Таблица пуста или нет колонки даты — полная загрузка")
+
         try:
-            all_data = self.fetch_all_pages(endpoint, last_date)
+            all_data = self.fetch_all_pages(endpoint, request_from, inclusive=inclusive)
         except Exception as e:
             print(f"    Ошибка загрузки: {e}")
             return
@@ -280,7 +319,11 @@ class TreasuryCollector:
             return
         print(f"    Получено {len(all_data)} новых строк")
         self.create_table_from_sample(all_data[0])
-        inserted = self.insert_batch(all_data)
+        inserted = self.insert_batch(
+            all_data,
+            replace_date_col=replace_date_col,
+            replace_from=replace_from,
+        )
         print(f"    Вставлено новых записей: {inserted}")
 
 
