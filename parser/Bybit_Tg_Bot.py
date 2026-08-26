@@ -56,8 +56,9 @@ COUNTER_FILES = {
 }
 
 TARGET_BOT       = "@Bybit_TradeGPT_bot"
-RESPONSE_TIMEOUT = int(os.getenv("RESPONSE_TIMEOUT", 30))
-MAX_WAIT         = int(os.getenv("MAX_WAIT", 120))
+RESPONSE_TIMEOUT = int(os.getenv("RESPONSE_TIMEOUT", 45))
+MAX_WAIT         = int(os.getenv("MAX_WAIT", 180))
+FINAL_IDLE       = int(os.getenv("FINAL_IDLE", 10))
 
 TRACE_URL   = os.getenv("TRACE_URL",   "https://server.brain-project.online/trace.php")
 NODE_NAME   = os.getenv("NODE_NAME",   "bybit_trend_bot")
@@ -136,36 +137,138 @@ def extract_asset(query: str) -> str:
 
 # ==================== РАБОТА С БОТОМ ====================
 
+def _is_unsolicited_trade_signal(text_value: str) -> bool:
+    lower = (text_value or "").lower()
+    markers = (
+        "tradegpt opening signal",
+        "tradegpt открытие сигнала",
+        "contract pair:",
+        "entry price:",
+        "контрактная пара:",
+        "входная цена:",
+    )
+    return any(marker in lower for marker in markers)
+
+
+def _is_complete_answer(text_value: str) -> bool:
+    text_value = (text_value or "").strip()
+    if not text_value or _is_unsolicited_trade_signal(text_value):
+        return False
+    lower = text_value.lower()
+    if lower in {"analyzing your query...", "analyzing your query…"}:
+        return False
+    if "hit today's limit" in lower or "still working on the last question" in lower:
+        return False
+
+    upper = text_value.upper()
+    structured = "OUTLOOK_1H=" in upper or "OUTLOOK_24H=" in upper
+    if structured and len(text_value) >= 120:
+        return True
+
+    markers = (
+        "long/short ratio",
+        "funding rate",
+        "capital inflow",
+        "24h inflow",
+        "market sentiment",
+        "support",
+        "resistance",
+        "conclusion",
+    )
+    score = sum(1 for marker in markers if marker in lower)
+    return len(text_value) >= 500 and score >= 3
+
+
 async def collect_response(client: TelegramClient, bot_id: int, query: str) -> str:
+    """Collect the bot answer, including edits of the initial 'Analyzing...' message.
+
+    Since August 2026 TradeGPT can edit an already-sent placeholder instead of
+    sending the final answer as a new Telegram message. The old collector only
+    listened to NewMessage and therefore stored the placeholder forever.
+    """
     queue: asyncio.Queue = asyncio.Queue()
 
     async def handler(event):
-        if event.message.text:
-            queue.put_nowait(event.message.text)
+        msg = event.message
+        if not msg or not msg.text:
+            return
+        reply_to = getattr(msg, "reply_to_msg_id", None)
+        queue.put_nowait((int(msg.id), msg.text, reply_to))
 
-    client.add_event_handler(handler, events.NewMessage(from_users=bot_id))
+    new_builder = events.NewMessage(from_users=bot_id)
+    edit_builder = events.MessageEdited(from_users=bot_id)
+    client.add_event_handler(handler, new_builder)
+    client.add_event_handler(handler, edit_builder)
 
     try:
         log.info(f"-> {query}")
-        await client.send_message(TARGET_BOT, query)
+        sent = await client.send_message(TARGET_BOT, query)
 
-        parts = []
-        deadline = asyncio.get_event_loop().time() + MAX_WAIT
+        latest_by_id = {}
+        accepted_ids = set()
+        first_response_id = None
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + MAX_WAIT
+        last_update_at = None
+        complete_seen = False
 
         while True:
-            remaining = deadline - asyncio.get_event_loop().time()
+            now = loop.time()
+            remaining = deadline - now
             if remaining <= 0:
-                log.warning("Таймаут сбора ответа")
-                break
-            try:
-                msg = await asyncio.wait_for(queue.get(), timeout=min(RESPONSE_TIMEOUT, remaining))
-                parts.append(msg)
-            except asyncio.TimeoutError:
+                if not complete_seen:
+                    log.warning("Таймаут сбора полного ответа")
                 break
 
-        return '\n\n'.join(parts)
+            if complete_seen and last_update_at is not None:
+                idle_left = FINAL_IDLE - (now - last_update_at)
+                if idle_left <= 0:
+                    break
+                timeout = min(RESPONSE_TIMEOUT, remaining, idle_left)
+            else:
+                timeout = min(RESPONSE_TIMEOUT, remaining)
+
+            try:
+                msg_id, msg_text, reply_to = await asyncio.wait_for(queue.get(), timeout=timeout)
+            except asyncio.TimeoutError:
+                # Before a complete response we keep waiting until MAX_WAIT.
+                # After a complete response, an idle timeout means the answer
+                # has likely finished (including possible multi-part replies).
+                if complete_seen:
+                    break
+                continue
+
+            if _is_unsolicited_trade_signal(msg_text):
+                log.info(f"Игнорирую автоматический торговый сигнал TradeGPT message_id={msg_id}")
+                continue
+
+            # Prefer an explicit Telegram reply to our query. If the bot does
+            # not set reply_to, bind the first non-signal message after sending
+            # and keep accepting edits of that same message id.
+            explicit_reply = (reply_to == sent.id)
+            if first_response_id is None:
+                first_response_id = msg_id
+                accepted_ids.add(msg_id)
+            elif explicit_reply or msg_id in accepted_ids:
+                accepted_ids.add(msg_id)
+            else:
+                # A second Q&A message may be a continuation. Accept it only if
+                # it looks like analysis, not a push notification.
+                lower = msg_text.lower()
+                analysis_markers = ("funding rate", "long/short", "market sentiment", "conclusion", "outlook_1h")
+                if not any(marker in lower for marker in analysis_markers):
+                    continue
+                accepted_ids.add(msg_id)
+
+            latest_by_id[msg_id] = msg_text
+            last_update_at = loop.time()
+            combined = '\n\n'.join(latest_by_id[k] for k in sorted(latest_by_id))
+            complete_seen = _is_complete_answer(combined)
+
+        return '\n\n'.join(latest_by_id[k] for k in sorted(latest_by_id))
     finally:
-        client.remove_event_handler(handler, events.NewMessage)
+        client.remove_event_handler(handler, new_builder)
+        client.remove_event_handler(handler, edit_builder)
 
 
 # ==================== РАБОТА С БАЗОЙ ДАННЫХ ====================
@@ -257,6 +360,8 @@ async def run_query(asset: str, query: str, engine, table_name: str):
         raw = await collect_response(client, bot_entity.id, query)
         if not raw.strip():
             log.warning("Пустой ответ от бота")
+        elif not _is_complete_answer(raw):
+            log.warning(f"{asset}: ответ неполный/служебный ({len(raw)} симв.), в БД не сохраняю")
         else:
             inserted_id = save_record(engine, table_name, asset, raw)
             if inserted_id:
