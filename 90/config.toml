@@ -1,5 +1,5 @@
 [service]
-id = 90                  
+id = 90
 port = 8952
 name = "brain-best-ohlc-indicators"
 text = "Eight frozen causal OHLC indicator features"
