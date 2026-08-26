@@ -34,6 +34,14 @@ async def initialize_model(engine_vlad: Any, engine_brain: Any) -> dict[str, Any
     return _runtime.reload()
 
 
+async def enrich_dataset(engine_vlad: Any, engine_brain: Any) -> dict[str, Any]:
+    """No-op rebuild hook: this service has no derived dataset/index to rebuild."""
+    return {
+        "mode": "noop",
+        "reason": "fixed_model_state_no_index",
+    }
+
+
 def cache_revision(pair: int, day: int, param: str = "") -> str:
     return _runtime.cache_revision(pair, day, param)
 
