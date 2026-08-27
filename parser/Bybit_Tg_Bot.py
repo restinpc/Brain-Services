@@ -60,6 +60,7 @@ TARGET_BOT       = "@Bybit_TradeGPT_bot"
 RESPONSE_TIMEOUT = int(os.getenv("RESPONSE_TIMEOUT", 45))
 MAX_WAIT         = int(os.getenv("MAX_WAIT", 180))
 FINAL_IDLE       = int(os.getenv("FINAL_IDLE", 10))
+HISTORY_POLL_INTERVAL = float(os.getenv("HISTORY_POLL_INTERVAL", 3))
 
 TRACE_URL   = os.getenv("TRACE_URL",   "https://server.brain-project.online/trace.php")
 NODE_NAME   = os.getenv("NODE_NAME",   "bybit_trend_bot")
@@ -175,7 +176,8 @@ def _is_complete_answer(text_value: str) -> bool:
 
     upper = text_value.upper()
     structured = "OUTLOOK_1H=" in upper or "OUTLOOK_24H=" in upper
-    if structured and len(text_value) >= 120:
+    final_signal = re.search(r"(?m)^\s*SIGNAL\s*=\s*(LONG|SHORT|NEUTRAL)\s*$", upper) is not None
+    if (structured or final_signal) and len(text_value) >= 120:
         return True
 
     markers = (
@@ -193,11 +195,13 @@ def _is_complete_answer(text_value: str) -> bool:
 
 
 async def collect_response(client: TelegramClient, bot_id: int, query: str) -> str:
-    """Collect the bot answer, including edits of the initial 'Analyzing...' message.
+    """Collect TradeGPT answer causally and robustly.
 
-    Since August 2026 TradeGPT can edit an already-sent placeholder instead of
-    sending the final answer as a new Telegram message. The old collector only
-    listened to NewMessage and therefore stored the placeholder forever.
+    Primary path listens to NewMessage + MessageEdited.  Some Telegram/proxy
+    combinations can occasionally miss update events, so while waiting we also
+    poll the dialog history for messages newer than our sent query.  History
+    polling sees the current edited text and therefore also recovers the common
+    TradeGPT flow: ``Analyzing your query...`` -> edited final answer.
     """
     queue: asyncio.Queue = asyncio.Queue()
 
@@ -206,7 +210,7 @@ async def collect_response(client: TelegramClient, bot_id: int, query: str) -> s
         if not msg or not msg.text:
             return
         reply_to = getattr(msg, "reply_to_msg_id", None)
-        queue.put_nowait((int(msg.id), msg.text, reply_to))
+        queue.put_nowait((int(msg.id), msg.text, reply_to, "event"))
 
     new_builder = events.NewMessage(from_users=bot_id)
     edit_builder = events.MessageEdited(from_users=bot_id)
@@ -216,6 +220,7 @@ async def collect_response(client: TelegramClient, bot_id: int, query: str) -> s
     try:
         log.info(f"-> {query}")
         sent = await client.send_message(TARGET_BOT, query)
+        log.info(f"Telegram query message_id={sent.id}")
 
         latest_by_id = {}
         accepted_ids = set()
@@ -224,40 +229,18 @@ async def collect_response(client: TelegramClient, bot_id: int, query: str) -> s
         deadline = loop.time() + MAX_WAIT
         last_update_at = None
         complete_seen = False
+        last_history_poll = 0.0
 
-        while True:
-            now = loop.time()
-            remaining = deadline - now
-            if remaining <= 0:
-                if not complete_seen:
-                    log.warning("Таймаут сбора полного ответа")
-                break
+        def ingest(msg_id: int, msg_text: str, reply_to, source: str) -> bool:
+            nonlocal first_response_id, last_update_at, complete_seen
 
-            if complete_seen and last_update_at is not None:
-                idle_left = FINAL_IDLE - (now - last_update_at)
-                if idle_left <= 0:
-                    break
-                timeout = min(RESPONSE_TIMEOUT, remaining, idle_left)
-            else:
-                timeout = min(RESPONSE_TIMEOUT, remaining)
-
-            try:
-                msg_id, msg_text, reply_to = await asyncio.wait_for(queue.get(), timeout=timeout)
-            except asyncio.TimeoutError:
-                # Before a complete response we keep waiting until MAX_WAIT.
-                # After a complete response, an idle timeout means the answer
-                # has likely finished (including possible multi-part replies).
-                if complete_seen:
-                    break
-                continue
-
+            msg_text = (msg_text or "").strip()
+            if not msg_text:
+                return False
             if _is_unsolicited_trade_signal(msg_text):
                 log.info(f"Игнорирую автоматический торговый сигнал TradeGPT message_id={msg_id}")
-                continue
+                return False
 
-            # Prefer an explicit Telegram reply to our query. If the bot does
-            # not set reply_to, bind the first non-signal message after sending
-            # and keep accepting edits of that same message id.
             explicit_reply = (reply_to == sent.id)
             if first_response_id is None:
                 first_response_id = msg_id
@@ -265,18 +248,94 @@ async def collect_response(client: TelegramClient, bot_id: int, query: str) -> s
             elif explicit_reply or msg_id in accepted_ids:
                 accepted_ids.add(msg_id)
             else:
-                # A second Q&A message may be a continuation. Accept it only if
-                # it looks like analysis, not a push notification.
+                # Multi-part answer without Telegram reply metadata.  Accept only
+                # analysis-like continuations; unrelated push alerts stay out.
                 lower = msg_text.lower()
-                analysis_markers = ("funding rate", "long/short", "market sentiment", "conclusion", "outlook_1h")
+                analysis_markers = (
+                    "funding rate", "long/short", "market sentiment",
+                    "conclusion", "outlook_1h", "signal="
+                )
                 if not any(marker in lower for marker in analysis_markers):
-                    continue
+                    return False
                 accepted_ids.add(msg_id)
+
+            old_text = latest_by_id.get(msg_id)
+            if old_text == msg_text:
+                return False
 
             latest_by_id[msg_id] = msg_text
             last_update_at = loop.time()
             combined = '\n\n'.join(latest_by_id[k] for k in sorted(latest_by_id))
             complete_seen = _is_complete_answer(combined)
+            log.info(
+                f"TradeGPT update ({source}) message_id={msg_id}: "
+                f"{len(msg_text)} симв.; complete={complete_seen}"
+            )
+            return True
+
+        async def poll_history():
+            """Recover missed NewMessage/MessageEdited updates from dialog history."""
+            try:
+                messages = await client.get_messages(TARGET_BOT, limit=20)
+            except Exception as exc:
+                log.debug(f"Не удалось проверить историю TradeGPT: {exc}")
+                return
+
+            # get_messages returns newest first; ingest chronologically.
+            for msg in reversed(messages):
+                if not msg or int(getattr(msg, "id", 0) or 0) <= int(sent.id):
+                    continue
+                if getattr(msg, "out", False):
+                    continue
+                sender_id = getattr(msg, "sender_id", None)
+                if sender_id is not None and int(sender_id) != int(bot_id):
+                    continue
+                text_value = getattr(msg, "text", None) or getattr(msg, "message", None)
+                if not text_value:
+                    continue
+                reply_to = getattr(msg, "reply_to_msg_id", None)
+                ingest(int(msg.id), text_value, reply_to, "history")
+
+        # Check immediately in case TradeGPT answered very quickly.
+        await poll_history()
+        last_history_poll = loop.time()
+
+        while True:
+            now = loop.time()
+            remaining = deadline - now
+            if remaining <= 0:
+                # Final history lookup before declaring a timeout.  This is the
+                # important recovery path when Telegram updates were missed.
+                await poll_history()
+                if not complete_seen:
+                    if latest_by_id:
+                        log.warning("Таймаут: получен только неполный ответ TradeGPT")
+                    else:
+                        log.warning("Таймаут: TradeGPT не прислал ни одного ответа")
+                break
+
+            if complete_seen and last_update_at is not None:
+                idle_left = FINAL_IDLE - (now - last_update_at)
+                if idle_left <= 0:
+                    break
+                timeout = min(HISTORY_POLL_INTERVAL, remaining, idle_left)
+            else:
+                timeout = min(HISTORY_POLL_INTERVAL, remaining)
+
+            try:
+                msg_id, msg_text, reply_to, source = await asyncio.wait_for(
+                    queue.get(), timeout=max(0.2, timeout)
+                )
+                ingest(msg_id, msg_text, reply_to, source)
+            except asyncio.TimeoutError:
+                pass
+
+            # Polling is deliberately lightweight (default once per 3 s) and
+            # makes the collector independent of event-delivery reliability.
+            now = loop.time()
+            if now - last_history_poll >= HISTORY_POLL_INTERVAL:
+                await poll_history()
+                last_history_poll = loop.time()
 
         return '\n\n'.join(latest_by_id[k] for k in sorted(latest_by_id))
     finally:
