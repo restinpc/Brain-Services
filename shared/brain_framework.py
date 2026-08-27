@@ -1,6 +1,14 @@
 """
-brain_framework.py v21.0 — refactor исходного event/outcome алгоритма.
+brain_framework.py v21.1 — param-aware tests/backtest/posttest over v21.0.
 
+
+Исправление v21.1 — PARAM/TEST-COMPAT:
+  PRETEST/BACKTEST/CREATE_SCORE учитывают PARAM_RANGE вместо hardcoded param="".
+  POSTTEST фильтрует cache по type/var/param, декодирует zlib result_json и
+  показывает как агрегат, так и отдельные результаты по каждому param-slot.
+  CREATE_SCORE сравнивает backtest с posttest ТОГО ЖЕ params_hash.
+  CLEAR_CACHE умеет очищать конкретные params и учитывает PARAM_RANGE.
+  DIAGNOSTICS при пропущенном param используют первый элемент PARAM_RANGE.
 
 Рефакторинг v21.0:
   EVENT-OUTCOME-CONTRACT: stored_t1 сохранён как исторический outcome следующего
@@ -4354,7 +4362,9 @@ def build_app(model_module) -> FastAPI:
         pair: int = Query(1),
         type: int = Query(0),
         var: int = Query(0),
-        param: str = Query(""),
+        param: str | None = Query(
+            None, description="param; если не указан, используется первый PARAM_RANGE"
+        ),
         samples: int = Query(3, ge=1, le=24),
     ):
         """Direct live diagnostics for both H1 and D1, bypassing values-cache."""
@@ -4363,15 +4373,17 @@ def build_app(model_module) -> FastAPI:
         if not s.cache_writer:
             return err_response("Диагностика прямого model() разрешена только на Brain 1")
 
+        effective_param = str(param) if param is not None else str((s.PARAM_RANGE or [""])[0])
         dataset_first, dataset_last = _diag_dataset_date_bounds()
         payload: dict[str, object] = {
             "service_id": s.SERVICE_ID,
-            "framework_diagnostics_version": "20.4-causal-daily-raw",
+            "framework_diagnostics_version": "21.1-param-aware",
             "service": s.NODE_NAME,
             "pair": pair,
             "type": type,
             "var": var,
-            "param": param,
+            "param": effective_param,
+            "param_source": "query" if param is not None else "PARAM_RANGE[0]",
             "dataset": {
                 "rows": len(s.dataset),
                 "first": dataset_first.isoformat(sep=" ") if dataset_first else None,
@@ -4397,7 +4409,7 @@ def build_app(model_module) -> FastAPI:
                     try:
                         result = await _call_raw_model(
                             pair, day_flag, date_str,
-                            calc_type=type, calc_var=var, param=param,
+                            calc_type=type, calc_var=var, param=effective_param,
                             _skip_refresh=True,
                         )
                         summary = _diag_result_summary(result)
@@ -4429,7 +4441,9 @@ def build_app(model_module) -> FastAPI:
         pair: int = Query(1),
         type: int = Query(0),
         var: int = Query(0),
-        param: str = Query(""),
+        param: str | None = Query(
+            None, description="param; если не указан, используется первый PARAM_RANGE"
+        ),
         samples: int = Query(3, ge=1, le=12),
     ):
         """Mutation test for target/future T1 on both hourly and daily frames."""
@@ -4438,14 +4452,16 @@ def build_app(model_module) -> FastAPI:
         if not s.cache_writer:
             return err_response("Диагностика прямого model() разрешена только на Brain 1")
 
+        effective_param = str(param) if param is not None else str((s.PARAM_RANGE or [""])[0])
         report = {
             "service_id": s.SERVICE_ID,
-            "framework_diagnostics_version": "20.4-causal-daily-raw",
+            "framework_diagnostics_version": "21.1-param-aware",
             "service": s.NODE_NAME,
             "pair": pair,
             "type": type,
             "var": var,
-            "param": param,
+            "param": effective_param,
+            "param_source": "query" if param is not None else "PARAM_RANGE[0]",
             "frames": {},
             "warning": (
                 "Endpoint временно подменяет T1 только под внутренним lock и всегда "
@@ -4464,7 +4480,7 @@ def build_app(model_module) -> FastAPI:
                 for target in targets:
                     try:
                         item = await _diag_future_leak_one(
-                            pair, day_flag, target, type, var, param,
+                            pair, day_flag, target, type, var, effective_param,
                         )
                     except Exception as exc:
                         item = {
@@ -4600,6 +4616,7 @@ def build_app(model_module) -> FastAPI:
         date_to:      str  = Query("", description="До даты YYYY-MM-DD — пусто = без ограничения"),
         types:        str  = Query("", description="type через запятую — пусто = все"),
         vars_:        str  = Query("", alias="vars", description="var через запятую — пусто = все"),
+        params_:      str  = Query("", alias="params", description="param через запятую — пусто = все PARAM_RANGE"),
         also_backtest: bool = Query(False, description="Также очистить vlad_backtest_results"),
         stop_fill:    bool  = Query(True,  description="Остановить fill_cache если запущен"),
     ):
@@ -4611,6 +4628,7 @@ def build_app(model_module) -> FastAPI:
             /clear_cache?pairs=1&days=0         — только EUR/USD hour
             /clear_cache?date_from=2025-01-01   — с определённой даты
             /clear_cache?types=0&vars=0,1       — конкретные type/var слоты
+            /clear_cache?params=currcir,wm2ns   — конкретные param
             /clear_cache?also_backtest=true     — + vlad_backtest_results
         """
         if not s.cache_writer:
@@ -4630,6 +4648,7 @@ def build_app(model_module) -> FastAPI:
         day_list   = [int(d.strip()) for d in days.split(",")   if d.strip().isdigit()]
         type_list  = [int(t.strip()) for t in types.split(",")  if t.strip().isdigit()]
         var_list   = [int(v.strip()) for v in vars_.split(",")  if v.strip().isdigit()]
+        param_list = [p.strip() for p in params_.split(",") if p.strip()]
 
         dt_from = _parse_date(date_from) if date_from.strip() else None
         dt_to   = _parse_date(date_to)   if date_to.strip()   else None
@@ -4661,13 +4680,15 @@ def build_app(model_module) -> FastAPI:
                 clauses.append("date_val <= :dt_to")
                 params["dt_to"] = dt_to
 
-            # Фильтр по type/var через params_hash: пересчитываем хэши
-            if type_list or var_list:
-                t_range = type_list or s.TYPES_RANGE
-                v_range = var_list  or s.VAR_RANGE
+            # Фильтр по type/var/param через params_hash. Если param явно не
+            # задан, точечный type/var-фильтр обязан охватить весь PARAM_RANGE.
+            if type_list or var_list or param_list:
+                t_range = type_list or list(s.TYPES_RANGE or [0])
+                v_range = var_list  or list(s.VAR_RANGE or [0])
+                p_range = param_list or list(s.PARAM_RANGE or [""])
                 hashes  = [
-                    _params_hash({"type": t, "var": v, "param": ""})
-                    for t in t_range for v in v_range
+                    _params_hash({"type": t, "var": v, "param": prm})
+                    for t in t_range for v in v_range for prm in p_range
                 ]
                 placeholders = ", ".join(f":ph{i}" for i in range(len(hashes)))
                 clauses.append(f"params_hash IN ({placeholders})")
@@ -4708,12 +4729,13 @@ def build_app(model_module) -> FastAPI:
                     clauses.append(f"day_flag IN ({pls})")
                     for i, d in enumerate(day_list):
                         params2[f"day{i}"] = d
-                if type_list or var_list:
-                    t_range = type_list or s.TYPES_RANGE
-                    v_range = var_list  or s.VAR_RANGE
+                if type_list or var_list or param_list:
+                    t_range = type_list or list(s.TYPES_RANGE or [0])
+                    v_range = var_list  or list(s.VAR_RANGE or [0])
+                    p_range = param_list or list(s.PARAM_RANGE or [""])
                     hashes  = [
-                        _params_hash({"type": t, "var": v, "param": ""})
-                        for t in t_range for v in v_range
+                        _params_hash({"type": t, "var": v, "param": prm})
+                        for t in t_range for v in v_range for prm in p_range
                     ]
                     pls = ", ".join(f":ph{i}" for i in range(len(hashes)))
                     clauses.append(f"params_hash IN ({pls})")
@@ -4731,7 +4753,7 @@ def build_app(model_module) -> FastAPI:
 
         # ── Сбрасываем ML-кеш если чистим всё ────────────────────────────────
         if not pair_list and not day_list and not dt_from and not dt_to \
-                and not type_list and not var_list:
+                and not type_list and not var_list and not param_list:
             s._ml_active_cache.clear()
             if s.reverse_store:
                 s.reverse_store.clear_universe_cache()
@@ -4741,8 +4763,9 @@ def build_app(model_module) -> FastAPI:
             + (f", {deleted_backtest} backtest" if also_backtest else "")
             + (f" | фильтры: pairs={pair_list or 'all'} days={day_list or 'all'}"
                f" dates=[{dt_from or '*'} → {dt_to or '*'}]"
-               f" types={type_list or 'all'} vars={var_list or 'all'}" if any(
-                   [pair_list, day_list, dt_from, dt_to, type_list, var_list]) else " (полная очистка)"),
+               f" types={type_list or 'all'} vars={var_list or 'all'}"
+               f" params={param_list or 'all'}" if any(
+                   [pair_list, day_list, dt_from, dt_to, type_list, var_list, param_list]) else " (полная очистка)"),
             s.NODE_NAME, force=True,
         )
 
@@ -4759,6 +4782,7 @@ def build_app(model_module) -> FastAPI:
                 "date_to":   dt_to.isoformat()   if dt_to   else None,
                 "types":     type_list  or "all",
                 "vars":      var_list   or "all",
+                "params":    param_list or "all",
             },
         }
         if errors:
@@ -4812,6 +4836,7 @@ def build_app(model_module) -> FastAPI:
         tier:  int = Query(0, ge=0, le=1),
         date_from: str = Query(""), date_to: str = Query(""),
         type:  int = Query(0), var: int = Query(-1),
+        param: str | None = Query(None, description="Один param; если не указан, используется PARAM_RANGE"),
     ):
         try:
             pl = [int(p.strip()) for p in pairs.split(",") if p.strip()]
@@ -4827,6 +4852,7 @@ def build_app(model_module) -> FastAPI:
             return err_response("Invalid date format")
 
         vars_to_run = s.VAR_RANGE if var == -1 else [var]
+        params_to_run = [param] if param is not None else list(s.PARAM_RANGE or [""])
         all_results = {}
 
         for bt_pair in pl:
@@ -4834,11 +4860,15 @@ def build_app(model_module) -> FastAPI:
                 key = f"pair={bt_pair} day={'d' if bt_day else 'h'}"
                 all_results[key] = {}
                 for v in vars_to_run:
-                    try:
-                        all_results[key][f"var={v}"] = await _backtest(
-                            bt_pair, bt_day, tier, {"type": type, "var": v, "param": ""}, df, dt)
-                    except Exception as e:
-                        all_results[key][f"var={v}"] = {"error": str(e)}
+                    for prm in params_to_run:
+                        result_key = (f"var={v}" if len(params_to_run) == 1
+                                      else f"var={v} param={prm!r}")
+                        try:
+                            all_results[key][result_key] = await _backtest(
+                                bt_pair, bt_day, tier,
+                                {"type": type, "var": v, "param": prm}, df, dt)
+                        except Exception as e:
+                            all_results[key][result_key] = {"error": str(e)}
                 try:
                     await _upsert_summary(bt_pair, bt_day, tier, df, dt)
                 except Exception as e:
@@ -4848,7 +4878,7 @@ def build_app(model_module) -> FastAPI:
         return ok_response({
             "pairs": pl, "days": dl, "tier": tier,
             "date_from": df.isoformat(), "date_to": dt.isoformat(),
-            "vars": vars_to_run, "results": all_results,
+            "vars": vars_to_run, "params": params_to_run, "results": all_results,
         })
 
     @app.get("/summary")
@@ -4940,31 +4970,36 @@ def build_app(model_module) -> FastAPI:
                 "execution_scope": "pretest",
             }
 
-        try:
-            _res2 = s.model_fn(
-                rates=_rf2, dataset=_ds2, date=_td2,
-                type=0, var=s.VAR_RANGE[0], param="",
-                dataset_index=dataset_index_dict2,
-            )
-            _res2, _ = _extract_detail(_res2)
-        except Exception as _e2:
-            return {"status": "error",
-                    "error": f"[Тест 2 — Структура] model() exception: {_e2}"}
+        _pretest_params = list(s.PARAM_RANGE or [""])
+        _pretest_var = (s.VAR_RANGE or [0])[0]
+        _res2_counts: dict[str, int] = {}
+        for _param2 in _pretest_params:
+            try:
+                _res2 = s.model_fn(
+                    rates=_rf2, dataset=_ds2, date=_td2,
+                    type=0, var=_pretest_var, param=_param2,
+                    dataset_index=dataset_index_dict2,
+                )
+                _res2, _ = _extract_detail(_res2)
+            except Exception as _e2:
+                return {"status": "error",
+                        "error": f"[Тест 2 — Структура] param={_param2!r}: model() exception: {_e2}"}
 
-        if _res2 is None:
-            return {"status": "error",
-                    "error": "[Тест 2 — Структура] model() вернул None"}
-        if not isinstance(_res2, dict):
-            return {"status": "error",
-                    "error": f"[Тест 2 — Структура] ожидается dict, получен {type(_res2).__name__}"}
-        for _k2, _v2 in _res2.items():
-            if not isinstance(_k2, str):
+            if _res2 is None:
                 return {"status": "error",
-                        "error": f"[Тест 2 — Структура] ключ {_k2!r} не str"}
-            if not isinstance(_v2, (int, float)) or _v2 != _v2 or abs(_v2) == float("inf"):
+                        "error": f"[Тест 2 — Структура] param={_param2!r}: model() вернул None"}
+            if not isinstance(_res2, dict):
                 return {"status": "error",
-                        "error": f"[Тест 2 — Структура] значение '{_k2}' не конечный float"}
-        log(f"   Тест 2: структура model() OK — {len(_res2)} ключей",
+                        "error": f"[Тест 2 — Структура] param={_param2!r}: ожидается dict, получен {type(_res2).__name__}"}
+            for _k2, _v2 in _res2.items():
+                if not isinstance(_k2, str):
+                    return {"status": "error",
+                            "error": f"[Тест 2 — Структура] param={_param2!r}: ключ {_k2!r} не str"}
+                if not isinstance(_v2, (int, float)) or _v2 != _v2 or abs(_v2) == float("inf"):
+                    return {"status": "error",
+                            "error": f"[Тест 2 — Структура] param={_param2!r}: значение '{_k2}' не конечный float"}
+            _res2_counts[str(_param2)] = len(_res2)
+        log(f"   Тест 2: структура model() OK — params={_res2_counts}",
             s.NODE_NAME, force=True)
 
         # ── Тест 3: 10 случайных дат по каждому из 6 инструментов (≥90%) ─────
@@ -5057,49 +5092,55 @@ def build_app(model_module) -> FastAPI:
                             "rates_table": _tbl3,
                         }
 
-                    def _mk3(_r=_rf3, _d=_ds3, _t=_td3):
-                        res, _ = _extract_detail(
-                            s.model_fn(
-                                rates=_r, dataset=_d, date=_t,
-                                type=0, var=s.VAR_RANGE[0], param="",
-                                dataset_index=dataset_index_dict3,
+                    for _param3 in _pretest_params:
+                        def _mk3(_r=_rf3, _d=_ds3, _t=_td3,
+                                 _di=dataset_index_dict3, _p=_param3, _v=_pretest_var):
+                            res, _ = _extract_detail(
+                                s.model_fn(
+                                    rates=_r, dataset=_d, date=_t,
+                                    type=0, var=_v, param=_p,
+                                    dataset_index=_di,
+                                )
                             )
-                        )
-                        # PRETEST_ALLOW_EMPTY=True: модель объявила, что {} —
-                        # валидный ответ (напр. стратегия с состоянием FLAT).
-                        # Считаем успехом любой dict, включая пустой.
-                        # PRETEST_ALLOW_EMPTY=False (умолчание): обычный
-                        # микросервис обязан возвращать непустой dict — {}
-                        # считается провалом.
-                        _allow_empty = getattr(model_module, "PRETEST_ALLOW_EMPTY", False)
-                        if _allow_empty:
-                            return res is not None and isinstance(res, dict)
-                        return bool(res)
+                            # PRETEST_ALLOW_EMPTY=True: модель объявила, что {} —
+                            # валидный ответ (напр. стратегия с состоянием FLAT).
+                            # Считаем успехом любой dict, включая пустой.
+                            # PRETEST_ALLOW_EMPTY=False (умолчание): обычный
+                            # микросервис обязан возвращать непустой dict — {}
+                            # считается провалом.
+                            _allow_empty = getattr(model_module, "PRETEST_ALLOW_EMPTY", False)
+                            if _allow_empty:
+                                return res is not None and isinstance(res, dict)
+                            return bool(res)
 
-                    _tasks3.append((_pid3, _tf3))
-                    _coros3.append(asyncio.to_thread(_mk3))
+                        _tasks3.append((_pid3, _tf3, _param3))
+                        _coros3.append(asyncio.to_thread(_mk3))
 
         _results3    = await asyncio.gather(*_coros3, return_exceptions=True)
         _instr_counts: dict = {}
-        for (_pid3, _tf3), _r3 in zip(_tasks3, _results3):
-            key = (_pid3, _tf3)
+        for (_pid3, _tf3, _param3), _r3 in zip(_tasks3, _results3):
+            key = (_pid3, _tf3, _param3)
             if key not in _instr_counts:
                 _instr_counts[key] = [0, 0]
             _instr_counts[key][1] += 1
             if isinstance(_r3, Exception):
-                log(f"     pair{_pid3}/{_tf3}: {_r3}", s.NODE_NAME, level="warning")
+                log(f"     pair{_pid3}/{_tf3} param={_param3!r}: {_r3}",
+                    s.NODE_NAME, level="warning")
             elif _r3:
                 _instr_counts[key][0] += 1
 
         _failures3: list = []
-        for (_pid3, _tf3), (_ne3, _tot3) in _instr_counts.items():
+        for (_pid3, _tf3, _param3), (_ne3, _tot3) in _instr_counts.items():
             _cov3 = _ne3 / _tot3 if _tot3 else 0
             _ok3  = _cov3 >= 0.90
-            log(f"  {chr(9989) if _ok3 else chr(10060)} pair{_pid3}/{_tf3}: "
-                f"{_ne3}/{_tot3} ({_cov3:.0%}) без ошибки, порог 90%",
+            log(f"  {chr(9989) if _ok3 else chr(10060)} pair{_pid3}/{_tf3} "
+                f"param={_param3!r}: {_ne3}/{_tot3} ({_cov3:.0%}) без ошибки, порог 90%",
                 s.NODE_NAME, force=True)
             if not _ok3:
-                _failures3.append(f"pair{_pid3}/{_tf3}: {_ne3}/{_tot3} ({_cov3:.0%}) < 90%")
+                _failures3.append(
+                    f"pair{_pid3}/{_tf3} param={_param3!r}: "
+                    f"{_ne3}/{_tot3} ({_cov3:.0%}) < 90%"
+                )
 
         if _failures3:
             log(f" PRETEST FAILED: {_failures3}", s.NODE_NAME, force=True)
@@ -5156,112 +5197,149 @@ def build_app(model_module) -> FastAPI:
     async def ep_posttest(
         pairs: str = Query("1,3,4"), days: str = Query("0,1"),
         date_from: str = Query(""), date_to: str = Query(""),
+        type: int = Query(0), var: int = Query(-1),
+        param: str | None = Query(
+            None, description="Один param; если не указан, используется PARAM_RANGE"
+        ),
     ):
+        """
+        Проверяет фактически заполненный values-cache.
+
+        v21.1: posttest больше не смешивает произвольные type/var/param строки.
+        По умолчанию берётся указанный type, все VAR_RANGE и все PARAM_RANGE;
+        для каждого params_hash возвращается отдельный slot, а legacy-поля
+        data/values/sync/hole/history считаются по агрегату выбранных slot-ов.
+        """
         try:
             pl = [int(p.strip()) for p in pairs.split(",") if p.strip()]
-            dl = [int(d.strip()) for d in days.split(",")  if d.strip()]
+            dl = [int(d.strip()) for d in days.split(",") if d.strip()]
         except ValueError:
             return err_response("pairs и days — числа через запятую")
+        if not pl or not dl:
+            return err_response("pairs и days не могут быть пустыми")
+        if not all(p in _INSTRUMENTS for p in pl):
+            return err_response("Допустимые pair: 1, 3, 4")
+        if not all(d in (0, 1) for d in dl):
+            return err_response("Допустимые day: 0, 1")
 
         dt_from = _parse_date(date_from) if date_from.strip() else _parse_date(s.CACHE_DATE_FROM)
         dt_to   = _parse_date(date_to)   if date_to.strip()   else datetime.now()
+        if dt_from is None or dt_to is None:
+            return err_response("Invalid date format")
 
-        async def _process_slot(pair_id: int, day_flag: int) -> dict:
-            tf_name  = "day" if day_flag else "hour"
-            table    = _rates_table(pair_id, day_flag)
+        vars_to_run = (list(s.VAR_RANGE or [0]) if var == -1 else [var])
+        params_to_run = ([str(param)] if param is not None
+                         else [str(v) for v in (s.PARAM_RANGE or [""])])
+        slot_specs = []
+        for v in vars_to_run:
+            for prm in params_to_run:
+                extra = {"type": int(type), "var": int(v), "param": str(prm)}
+                slot_specs.append({
+                    "type": int(type), "var": int(v), "param": str(prm),
+                    "hash": _params_hash(extra),
+                    "key": f"type={int(type)} var={int(v)} param={str(prm)!r}",
+                })
+
+        async def _process_pair_tf(pair_id: int, day_flag: int) -> dict:
+            tf_name = "day" if day_flag else "hour"
+            table = _rates_table(pair_id, day_flag)
             all_rows = s.global_rates.get(table, [])
-            rows     = [r for r in all_rows
-                        if (dt_from is None or r["date"] >= dt_from)
-                        and (dt_to   is None or r["date"] <= dt_to)]
+            rows = [r for r in all_rows
+                    if r["date"] >= dt_from and r["date"] <= dt_to]
 
-            url_p = {"url": s.service_url, "pair": pair_id, "day": day_flag,
-                     "df": dt_from, "dt": dt_to}
-            _tbl  = s.cache_table
+            slot_by_hash = {spec["hash"]: spec for spec in slot_specs}
+            per_slot: dict[str, dict] = {
+                spec["key"]: {
+                    "params": {"type": spec["type"], "var": spec["var"], "param": spec["param"]},
+                    "data_lengths": [],
+                    "plus": 0, "minus": 0,
+                    "signals": {},
+                } for spec in slot_specs
+            }
+            all_lengths: list[int] = []
+            plus_cnt = minus_cnt = 0
+            cache_signals: dict[datetime, tuple[bool, float]] = {}
 
-            data_stats = {"min": 0.0, "max": 0.0, "avg": 0.0}
+            query_params = {"url": s.service_url, "pair": pair_id, "day": day_flag,
+                            "df": dt_from, "dt": dt_to}
+            ph_marks = []
+            for i, spec in enumerate(slot_specs):
+                name = f"ph{i}"
+                ph_marks.append(f":{name}")
+                query_params[name] = spec["hash"]
+
             try:
                 async with s.engine_cache.connect() as conn:
                     res = await conn.execute(text(f"""
-                        SELECT MIN(JSON_LENGTH(result_json)),
-                               MAX(JSON_LENGTH(result_json)),
-                               AVG(JSON_LENGTH(result_json))
-                        FROM `{_tbl}`
+                        SELECT params_hash, date_val, result_json
+                        FROM `{s.cache_table}`
                         WHERE service_url=:url AND pair=:pair AND day_flag=:day
-                          AND result_json NOT IN ('{{}}', 'z:eJyrrgUAAXUA+Q==')  -- OPT-6 sentinels
-                          AND (:df IS NULL OR date_val >= :df)
-                          AND (:dt IS NULL OR date_val <= :dt)
-                    """), url_p)
-                    row = res.fetchone()
-                    if row and row[0] is not None:
-                        data_stats = {"min": float(row[0]), "max": float(row[1]),
-                                      "avg": round(float(row[2]), 4)}
-            except Exception as e:
-                log(f"   posttest t1 {pair_id}/{tf_name}: {e}",
-                    s.NODE_NAME, level="warning")
-
-            values_stats = {"plus": 0, "minus": 0}
-            try:
-                async with s.engine_cache.connect() as conn:
-                    res = await conn.execute(text(f"""
-                        SELECT result_json FROM `{_tbl}`
-                        WHERE service_url=:url AND pair=:pair AND day_flag=:day
-                          AND result_json NOT IN ('{{}}', 'z:eJyrrgUAAXUA+Q==')  -- OPT-6 sentinels
-                          AND (:df IS NULL OR date_val >= :df)
-                          AND (:dt IS NULL OR date_val <= :dt)
-                    """), url_p)
-                    plus_cnt = minus_cnt = 0
-                    for (rj_str,) in res:
-                        try:
-                            for v in _rj_decode(rj_str).values():  # OPT-6
-                                if v > 0:   plus_cnt  += 1
-                                elif v < 0: minus_cnt += 1
-                        except Exception:
-                            pass
-                    values_stats = {"plus": plus_cnt, "minus": minus_cnt}
-            except Exception as e:
-                log(f"   posttest t2 {pair_id}/{tf_name}: {e}",
-                    s.NODE_NAME, level="warning")
-
-            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            try:
-                sync_out = await _call_model(pair_id, day_flag, now_str) or {}
-            except Exception as e:
-                sync_out = {"error": str(e)}
-
-            cache_signals: dict = {}
-            try:
-                async with s.engine_cache.connect() as conn:
-                    res = await conn.execute(text(f"""
-                        SELECT date_val, result_json FROM `{_tbl}`
-                        WHERE service_url=:url AND pair=:pair AND day_flag=:day
-                          AND (:df IS NULL OR date_val >= :df)
-                          AND (:dt IS NULL OR date_val <= :dt)
+                          AND params_hash IN ({','.join(ph_marks)})
+                          AND date_val >= :df AND date_val <= :dt
                         ORDER BY date_val
-                    """), url_p)
-                    for (dt_val, rj_str) in res:
+                    """), query_params)
+                    for p_hash, dt_val, rj_str in res:
+                        spec = slot_by_hash.get(p_hash)
+                        if spec is None:
+                            continue
+                        slot = per_slot[spec["key"]]
                         try:
-                            rj = _rj_decode(rj_str)               # OPT-6
-                            cache_signals[dt_val] = (bool(rj), sum(rj.values()) if rj else 0.0)
+                            rj = _rj_decode(rj_str)
                         except Exception:
-                            cache_signals[dt_val] = (False, 0.0)
+                            rj = {}
+
+                        if rj:
+                            ln = len(rj)
+                            all_lengths.append(ln)
+                            slot["data_lengths"].append(ln)
+
+                        signal = 0.0
+                        for value in rj.values():
+                            try:
+                                fv = float(value)
+                            except Exception:
+                                continue
+                            signal += fv
+                            if fv > 0:
+                                plus_cnt += 1
+                                slot["plus"] += 1
+                            elif fv < 0:
+                                minus_cnt += 1
+                                slot["minus"] += 1
+
+                        slot["signals"][dt_val] = (bool(rj), signal)
+                        prev_non_empty, prev_signal = cache_signals.get(dt_val, (False, 0.0))
+                        cache_signals[dt_val] = (
+                            prev_non_empty or bool(rj),
+                            prev_signal + signal,
+                        )
             except Exception as e:
                 log(f"   posttest cache {pair_id}/{tf_name}: {e}",
                     s.NODE_NAME, level="warning")
 
-            def _compute_hole_and_sim():
+            def _data_stats(lengths: list[int]) -> dict:
+                if not lengths:
+                    return {"min": 0.0, "max": 0.0, "avg": 0.0}
+                return {
+                    "min": float(min(lengths)),
+                    "max": float(max(lengths)),
+                    "avg": round(float(sum(lengths) / len(lengths)), 4),
+                }
+
+            def _simulate(signal_map: dict[datetime, tuple[bool, float]]) -> tuple[int, dict]:
                 non_empty = np.array(
-                    [cache_signals.get(r["date"], (False, 0.0))[0] for r in rows], dtype=bool)
+                    [signal_map.get(r["date"], (False, 0.0))[0] for r in rows], dtype=bool
+                )
                 if len(non_empty) == 0 or np.all(non_empty):
                     hole = 0
                 elif not np.any(non_empty):
                     hole = len(rows)
                 else:
                     padded = np.concatenate(([False], ~non_empty, [False]))
-                    diffs  = np.diff(padded.astype(np.int8))
-                    runs   = np.where(diffs == -1)[0] - np.where(diffs == 1)[0]
-                    hole   = int(np.max(runs)) if len(runs) > 0 else 0
+                    diffs = np.diff(padded.astype(np.int8))
+                    runs = np.where(diffs == -1)[0] - np.where(diffs == 1)[0]
+                    hole = int(np.max(runs)) if len(runs) > 0 else 0
 
-                _, mod, lot_div = _PAIR_CFG.get(pair_id, (0.0002, 100_000.0, 50_000.0))
                 equity = 10_000.0
                 total_profit = total_dropdown = 0.0
                 wins = trades = 0
@@ -5269,7 +5347,7 @@ def build_app(model_module) -> FastAPI:
                 entry_price = direction = 0.0
 
                 for i, r in enumerate(rows):
-                    _, signal = cache_signals.get(r["date"], (False, 0.0))
+                    _, signal = signal_map.get(r["date"], (False, 0.0))
                     if i + 1 >= len(rows):
                         continue
                     op = rows[i + 1]["open"]
@@ -5278,40 +5356,100 @@ def build_app(model_module) -> FastAPI:
                     if position is not None:
                         if (signal == 0.0 or (signal > 0 and direction < 0)
                                 or (signal < 0 and direction > 0)):
-                            pnl    = equity * 0.10 * (op - entry_price) / entry_price * direction
+                            pnl = equity * 0.10 * (op - entry_price) / entry_price * direction
                             equity += pnl
                             trades += 1
-                            if pnl >= 0: total_profit   += pnl; wins += 1
-                            else:        total_dropdown += abs(pnl)
+                            if pnl >= 0:
+                                total_profit += pnl
+                                wins += 1
+                            else:
+                                total_dropdown += abs(pnl)
                             position = None
                     if signal != 0.0 and position is None:
-                        direction   = 1.0 if signal > 0 else -1.0
+                        direction = 1.0 if signal > 0 else -1.0
                         entry_price = op
-                        position    = (direction, entry_price)
+                        position = (direction, entry_price)
 
                 if position is not None and rows:
                     lp = rows[-1]["close"]
                     if lp and entry_price:
-                        pnl    = equity * 0.10 * (lp - entry_price) / entry_price * direction
+                        pnl = equity * 0.10 * (lp - entry_price) / entry_price * direction
                         equity += pnl
                         trades += 1
-                        if pnl >= 0: total_profit   += pnl; wins += 1
-                        else:        total_dropdown += abs(pnl)
+                        if pnl >= 0:
+                            total_profit += pnl
+                            wins += 1
+                        else:
+                            total_dropdown += abs(pnl)
 
                 cw = round(wins / trades, 4) if trades > 0 else 0.0
                 return hole, {
-                    "profit":   round(total_profit,   2),
+                    "profit": round(total_profit, 2),
                     "dropdown": round(total_dropdown, 2),
-                    "cw":       cw,
-                    "result":   round(total_profit - total_dropdown, 2),
+                    "cw": cw,
+                    "result": round(total_profit - total_dropdown, 2),
+                    "trade_count": trades,
                 }
 
-            hole, history_stats = await asyncio.to_thread(_compute_hole_and_sim)
-            return {"data": data_stats, "values": values_stats,
-                    "sync": sync_out, "hole": hole, "history": history_stats}
+            # Live/sync check is also done for the exact selected params.
+            async def _sync_one(spec: dict) -> tuple[str, dict]:
+                try:
+                    out = await _call_model(
+                        pair_id, day_flag, datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        calc_type=spec["type"], calc_var=spec["var"], param=spec["param"],
+                    ) or {}
+                except Exception as exc:
+                    out = {"error": str(exc)}
+                return spec["key"], out
 
-        slots   = [(p, d) for p in pl for d in dl]
-        tasks   = [asyncio.create_task(_process_slot(p, d)) for p, d in slots]
+            sync_pairs = await asyncio.gather(*[_sync_one(spec) for spec in slot_specs])
+            sync_by_slot = dict(sync_pairs)
+            sync_aggregate: dict[str, float] = {}
+            sync_errors: dict[str, str] = {}
+            for key, out in sync_pairs:
+                if not isinstance(out, dict):
+                    continue
+                if "error" in out:
+                    sync_errors[key] = str(out["error"])
+                    continue
+                for code, value in out.items():
+                    try:
+                        fv = float(value)
+                    except Exception:
+                        continue
+                    sync_aggregate[code] = sync_aggregate.get(code, 0.0) + fv
+
+            hole, history_stats = await asyncio.to_thread(_simulate, cache_signals)
+            slot_output: dict[str, dict] = {}
+            for spec in slot_specs:
+                key = spec["key"]
+                raw = per_slot[key]
+                slot_hole, slot_history = await asyncio.to_thread(_simulate, raw["signals"])
+                slot_output[key] = {
+                    "params": raw["params"],
+                    "data": _data_stats(raw["data_lengths"]),
+                    "values": {"plus": raw["plus"], "minus": raw["minus"]},
+                    "sync": sync_by_slot.get(key, {}),
+                    "hole": slot_hole,
+                    "history": slot_history,
+                }
+
+            return {
+                "type": int(type),
+                "vars": vars_to_run,
+                "params": params_to_run,
+                "data": _data_stats(all_lengths),
+                "values": {"plus": plus_cnt, "minus": minus_cnt},
+                "sync": sync_aggregate if not sync_errors else {
+                    "values": sync_aggregate, "errors": sync_errors
+                },
+                "hole": hole,
+                "history": history_stats,
+                "slots": slot_output,
+            }
+
+        slots = [(p, d) for p in pl for d in dl]
+        tasks = [asyncio.create_task(_process_pair_tf(p, d)) for p, d in slots]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         output: dict = {}
@@ -5366,34 +5504,34 @@ def build_app(model_module) -> FastAPI:
             i = j + 1
         return out
 
-    async def _create_score_post_history(pair_id: int, day_flag: int,
-                                         dt_from: datetime | None,
-                                         dt_to: datetime | None) -> dict:
-        """
-        Лёгкая версия posttest.history для /create_score.
-        Использует уже заполненный кеш, как и /posttest.
-        """
+    async def _create_score_post_history(
+        pair_id: int, day_flag: int, extra_params: dict,
+        dt_from: datetime | None, dt_to: datetime | None,
+    ) -> dict:
+        """Posttest.history для ТОГО ЖЕ type/var/param, что и выбранный backtest."""
         tf_name = "day" if day_flag else "hour"
         table = _rates_table(pair_id, day_flag)
         rows = [r for r in s.global_rates.get(table, [])
                 if (dt_from is None or r["date"] >= dt_from)
                 and (dt_to is None or r["date"] <= dt_to)]
+        p_hash = _params_hash(extra_params)
 
-        cache_signals: dict = {}
+        cache_signals: dict[datetime, float] = {}
         try:
             async with s.engine_cache.connect() as conn:
                 res = await conn.execute(text(f"""
                     SELECT date_val, result_json FROM `{s.cache_table}`
                     WHERE service_url=:url AND pair=:pair AND day_flag=:day
+                      AND params_hash=:ph
                       AND (:df IS NULL OR date_val >= :df)
                       AND (:dt IS NULL OR date_val <= :dt)
                     ORDER BY date_val
                 """), {"url": s.service_url, "pair": pair_id, "day": day_flag,
-                       "df": dt_from, "dt": dt_to})
+                       "ph": p_hash, "df": dt_from, "dt": dt_to})
                 for dt_val, rj_str in res:
                     try:
-                        rj = _rj_decode(rj_str)                    # OPT-6
-                        cache_signals[dt_val] = sum(rj.values()) if rj else 0.0
+                        rj = _rj_decode(rj_str)
+                        cache_signals[dt_val] = sum(float(v) for v in rj.values()) if rj else 0.0
                     except Exception:
                         cache_signals[dt_val] = 0.0
         except Exception as e:
@@ -5457,6 +5595,8 @@ def build_app(model_module) -> FastAPI:
                 "cw": cw,
                 "result": round(total_profit - total_dropdown, 2),
                 "trade_count": trades,
+                "params": extra_params,
+                "cache_rows": len(cache_signals),
             }
 
         return await asyncio.to_thread(_simulate)
@@ -5464,6 +5604,7 @@ def build_app(model_module) -> FastAPI:
     async def _create_score_best_backtest(pair_id: int, day_flag: int, tier: int,
                                           calc_type: int,
                                           vars_to_run: list[int],
+                                          params_to_run: list[str],
                                           df: datetime, dt: datetime,
                                           run_backtest: bool) -> dict:
         """Возвращает лучший backtest по value_score для выбранного timeframe."""
@@ -5471,13 +5612,14 @@ def build_app(model_module) -> FastAPI:
 
         if run_backtest:
             for v in vars_to_run:
-                params = {"type": calc_type, "var": v, "param": ""}
-                try:
-                    bt = await _backtest(pair_id, day_flag, tier, params, df, dt)
-                except Exception as e:
-                    bt = {"error": str(e), "params": params}
-                if "error" not in bt:
-                    results.append(bt)
+                for prm in params_to_run:
+                    params = {"type": calc_type, "var": v, "param": prm}
+                    try:
+                        bt = await _backtest(pair_id, day_flag, tier, params, df, dt)
+                    except Exception as e:
+                        bt = {"error": str(e), "params": params}
+                    if "error" not in bt:
+                        results.append(bt)
         else:
             try:
                 async with s.engine_vlad.connect() as conn:
@@ -5494,6 +5636,8 @@ def build_app(model_module) -> FastAPI:
                         if vars_to_run and params.get("var") not in vars_to_run:
                             continue
                         if params.get("type", calc_type) != calc_type:
+                            continue
+                        if params_to_run and str(params.get("param", "")) not in params_to_run:
                             continue
                         results.append({
                             "value_score": float(r["value_score"]),
@@ -5517,6 +5661,9 @@ def build_app(model_module) -> FastAPI:
         tier: int = Query(0, ge=0, le=1),
         date_from: str = Query(""), date_to: str = Query(""),
         type: int = Query(0), var: int = Query(-1),
+        param: str | None = Query(
+            None, description="Один param; если не указан, используется PARAM_RANGE"
+        ),
         run_backtest: bool = Query(True),
         accept_score: float = Query(0.60),
         watch_score: float = Query(0.30),
@@ -5557,6 +5704,8 @@ def build_app(model_module) -> FastAPI:
             return err_response("Invalid date format")
 
         vars_to_run = (s.VAR_RANGE if var == -1 else [var]) or [0]
+        params_to_run = ([str(param)] if param is not None
+                         else [str(v) for v in (s.PARAM_RANGE or [""])])
         pair_labels = {1: "EUR/USD", 3: "BTC/USD", 4: "ETH/USD"}
         tf_labels = {0: "hour", 1: "day"}
 
@@ -5564,12 +5713,20 @@ def build_app(model_module) -> FastAPI:
         for pair_id in pl:
             raw[pair_id] = {}
             for day_flag in dl:
-                bt_best, post_tf = await asyncio.gather(
-                    _create_score_best_backtest(
-                        pair_id, day_flag, tier, type, vars_to_run, df, dt, run_backtest
-                    ),
-                    _create_score_post_history(pair_id, day_flag, df, dt),
+                bt_best = await _create_score_best_backtest(
+                    pair_id, day_flag, tier, type, vars_to_run, params_to_run,
+                    df, dt, run_backtest
                 )
+                if isinstance(bt_best, dict) and isinstance(bt_best.get("params"), dict):
+                    post_tf = await _create_score_post_history(
+                        pair_id, day_flag, bt_best["params"], df, dt
+                    )
+                else:
+                    post_tf = {
+                        "profit": 0.0, "dropdown": 0.0, "cw": 0.0,
+                        "result": 0.0, "trade_count": 0,
+                        "error": "posttest skipped: no valid backtest params",
+                    }
                 raw[pair_id][day_flag] = {
                     "pair": pair_id,
                     "pair_label": pair_labels.get(pair_id, str(pair_id)),
