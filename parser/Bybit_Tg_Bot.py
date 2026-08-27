@@ -7,6 +7,7 @@ import sys
 import traceback
 import json
 import requests
+import re
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
@@ -129,10 +130,22 @@ def send_error_trace(exc: Exception, script_name: str = "Bybit_Tg_Bot.py"):
 
 
 def extract_asset(query: str) -> str:
-    for token in query.upper().split():
-        if token in ('BTC', 'ETH'):
-            return token
-    return None
+    """Определяет BTC/ETH из обычного тикера, пары или названия актива.
+
+    Поддерживаются, например: BTC, BTCUSDT, BTC/USD, BTC-USDT, Bitcoin,
+    ETH, ETHUSDT, ETH/USD, ETH-USDT, Ethereum. Если в запросе явно
+    присутствуют оба актива, возвращается None, чтобы не записать ответ
+    в неправильную таблицу/счётчик.
+    """
+    q = (query or "").upper()
+
+    patterns = {
+        "BTC": r"(?<![A-Z0-9])(?:BTC(?:[\s/_-]?(?:USD|USDT))?|BITCOIN)(?![A-Z0-9])",
+        "ETH": r"(?<![A-Z0-9])(?:ETH(?:[\s/_-]?(?:USD|USDT))?|ETHEREUM)(?![A-Z0-9])",
+    }
+
+    found = [asset for asset, pattern in patterns.items() if re.search(pattern, q)]
+    return found[0] if len(found) == 1 else None
 
 
 # ==================== РАБОТА С БОТОМ ====================
