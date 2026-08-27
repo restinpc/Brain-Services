@@ -1,0 +1,57 @@
+# Разность потенциалов инструментов по momentum последней свечки.
+# Источник данных — 272 таблицы sasha_rates_* (16 базовых + 120 кроссов,
+# каждая в часовом и дневном таймфрейме), которые наполняет parsers/SashaRates.py.
+
+[service]
+id = 93
+port = 8955
+name = "brain-momentum-potential-s93"
+text = "Cross-instrument momentum potential difference over 17 assets / 136 pairs"
+
+[rates]
+table = "brain_rates_eur_usd"
+
+[cache]
+date_from = "2025-01-01"
+# var — порог шума в базисных пунктах: свечки слабее порога не попадают ни в
+# выдачу, ни в знаковый счёт.
+var_range = [0, 2, 10]
+# 0 — обе ноги + итоги, 1 — только первая нога, 2 — только вторая,
+# 3 — только итоги, 4 — знаки вместо базисных пунктов.
+types_range = [0, 1, 2, 3, 4]
+shift_window = 12
+# Каждый ребилд догоняет котировки одним парсером (реальные, затем кроссы).
+rebuild_interval = 1800
+reload_interval = 3600
+
+[dataset]
+# Momentum читает sasha_rates_* сам. Датасет фреймворку не нужен.
+engine = "vlad"
+model_uses_rates = false
+
+[ctx]
+key_columns = ["id"]
+
+[ml]
+enabled = false
+
+[model]
+# bp — логарифмическая доходность в базисных пунктах (переживает округление
+# кеша до 4 знаков), sign — только направление свечки.
+value_mode = "bp"
+include_totals = true
+# Глубина подгружаемой истории: cache.date_from минус запас.
+history_margin_days = 60
+# background — котировки догоняются фоновым потоком, off — только по
+# /rebuild_index.
+quotes_refresh = "background"
+# Допуск сверх длительности бара: часовой считается устаревшим через 60+90 мин,
+# дневной — через 1440+90.
+quotes_max_age_minutes = 90
+refresh_cooldown_minutes = 30
+# База с таблицами sasha_rates_*: vlad = DB_*, brain = MASTER_*.
+# На сервере оставьте vlad, если парсеры пишут в DB_*; brain — если
+# sasha_rates_* лежат в той же схеме, что и brain_rates_*.
+quotes_engine = "vlad"
+quotes_prefix = "sasha_rates_"
+parser_python = ""
