@@ -1289,6 +1289,17 @@ def _compute_all_slots_for_date(
     return outputs
 
 
+# -----------------------------------------------------------------------------
+# Calculation-preserving runtime caches
+# -----------------------------------------------------------------------------
+
+_CACHE_LOCK = threading.RLock()
+_SINGLE_CACHE: "OrderedDict[tuple, dict[tuple[int, int], dict[str, float]]]" = OrderedDict()
+_SINGLE_CACHE_MAX = 4096
+_BATCH_CACHE: "OrderedDict[tuple, dict[tuple[int, int], dict[datetime, dict[str, float]]]]" = OrderedDict()
+_BATCH_CACHE_MAX = 8
+
+
 def _runtime_cache_token(dataset: list[dict], dataset_index: dict, target_dates: tuple[int, ...] | None = None) -> tuple:
     source = dataset_index.get("full_dataset") if dataset_index.get("full_dataset") is not None else dataset
     np_rates = dataset_index.get("np_rates") or {}
