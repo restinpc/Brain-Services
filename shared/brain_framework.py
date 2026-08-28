@@ -1858,15 +1858,33 @@ async def _load_dataset(s: _State):
     query = s.DATASET_QUERY or f"SELECT * FROM `{s.DATASET_TABLE}`"
     try:
         from datetime import date as _date
+        chunk_size = max(1, int(os.getenv("DATASET_STREAM_CHUNK", "4096")))
         async with _engine_for(s.DATASET_ENGINE, s).connect() as conn:
-            res  = await conn.execute(text(query))
             rows = []
-            for r in res.mappings().all():
-                row = dict(r)
-                for k, v in row.items():
-                    if type(v) is _date:
-                        row[k] = datetime(v.year, v.month, v.day)
-                rows.append(row)
+            # AsyncConnection.stream() keeps the DB cursor server-side / chunked
+            # where supported. partitions() amortizes async iteration overhead and
+            # avoids res.mappings().all(), which previously materialized a second
+            # ~million-row Python list before we built the final list[dict].
+            res = await conn.stream(
+                text(query),
+                execution_options={"yield_per": chunk_size},
+            )
+            try:
+                # Read raw Row objects in bounded partitions and build the final
+                # dict directly. This avoids both mappings().all() and creation of
+                # ~1M transient RowMapping wrappers. Column order is retained by
+                # result.keys(), so the resulting dict is observably identical.
+                keys = tuple(res.keys())
+                async for part in res.partitions(chunk_size):
+                    for r in part:
+                        row = {
+                            k: (datetime(v.year, v.month, v.day)
+                                if type(v) is _date else v)
+                            for k, v in zip(keys, r)
+                        }
+                        rows.append(row)
+            finally:
+                await res.close()
             s.dataset = rows
         _build_dataset_index(s)
         log(f"  dataset: {len(s.dataset)} rows", s.NODE_NAME)
@@ -2228,6 +2246,18 @@ def build_app(model_module) -> FastAPI:
 
     s.reverse_store = rl.ReverseStore(s.engine_vlad, port=s.PORT)
 
+    # Live non-ML model() calls used to execute directly on the FastAPI event
+    # loop. A single expensive cache miss could therefore freeze /summary and
+    # every other endpoint. Keep the old effective compute concurrency (one) but
+    # move that CPU work to one dedicated thread. The asyncio lock starts before
+    # _refresh_rates(), so another live request cannot mutate shared rate/index
+    # state while the model thread is reading it.
+    _non_ml_live_lock = asyncio.Lock()
+    _non_ml_live_executor = _cf.ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix=f"live_model_{s.SERVICE_ID}",
+    )
+
     # ── _call_model ───────────────────────────────────────────────────────────
 
     async def _call_raw_model(pair, day, date_str, calc_type=0, calc_var=0, param="",
@@ -2288,6 +2318,63 @@ def build_app(model_module) -> FastAPI:
         if not target_date:
             return None
         table = _rates_table(pair, day)
+
+        # Non-ML live calls preserve the previous one-at-a-time execution order,
+        # but the synchronous model body no longer occupies the asyncio thread.
+        # The model inputs and arithmetic are intentionally identical to the old
+        # path; only the execution thread changes.
+        if not s.USE_ML_VALUES:
+            async with _non_ml_live_lock:
+                if not _skip_refresh:
+                    await _refresh_rates(table, s)
+                np_r_live = s.np_rates.get(table)
+
+                if s.model_uses_rate_history:
+                    rates_live = _filter_rates_lte(table, target_date, s)
+                else:
+                    marker_dt = (
+                        target_date.replace(hour=0, minute=0, second=0, microsecond=0)
+                        if day else target_date
+                    )
+                    rates_live = [{"date": marker_dt}]
+
+                dataset_live = (
+                    s.dataset if s.model_can_filter_dataset_by_date
+                    else _filter_dataset_lte(target_date, s)
+                )
+                dataset_index_live = None
+                if s.model_needs_index:
+                    dataset_index_live = {
+                        "dates": s.dataset_dates,
+                        "by_key": s.dataset_by_key,
+                        "key_dates": s.dataset_key_dates,
+                        "key_field": s.dataset_key_field,
+                        "np_rates": np_r_live,
+                        "ctx_index": s.ctx_index,
+                        "url_map": s.url_map,
+                        "dataset_timestamps": getattr(s, "_dataset_ts_arr", None),
+                        "filter_dataset_by_date": bool(s.FILTER_DATASET_BY_DATE),
+                        "dataset_cutoff_ts": float(target_date.timestamp()),
+                        "is_daily": bool(day),
+                        "rates_table": table,
+                        "execution_scope": "live",
+                        "full_dataset": s.dataset,
+                    }
+
+                def _invoke_non_ml():
+                    r = s.model_fn(
+                        rates=rates_live, dataset=dataset_live, date=target_date,
+                        type=calc_type, var=calc_var, param=param,
+                        dataset_index=dataset_index_live,
+                    )
+                    r, _ = _extract_detail(r)
+                    return r or {}
+
+                loop = asyncio.get_running_loop()
+                return await loop.run_in_executor(
+                    _non_ml_live_executor, _invoke_non_ml
+                )
+
         if not _skip_refresh:
             await _refresh_rates(table, s)
         np_r = s.np_rates.get(table)
@@ -2336,9 +2423,6 @@ def build_app(model_module) -> FastAPI:
             )
             r, _ = _extract_detail(r)
             return r or {}
-
-        if not s.USE_ML_VALUES:
-            return _model_at(target_date)
 
         # ── ML-РЕЖИМ ─────────────────────────────────────────────────────────
         async def _active_codes_at(ext_dt: datetime) -> list[str]:
@@ -3949,6 +4033,7 @@ def build_app(model_module) -> FastAPI:
         yield
         task.cancel()
         s.fill_cancel.set()
+        _non_ml_live_executor.shutdown(wait=False, cancel_futures=True)
         for eng in (s.engine_vlad, s.engine_brain, s.engine_super, s.engine_cache):
             try:
                 await eng.dispose()
