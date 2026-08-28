@@ -1,5 +1,5 @@
 """
-brain_framework.py v21.1 — param-aware tests/backtest/posttest over v21.0.
+brain_framework.py v21.2 — param-aware tests + runtime/version diagnostics over v21.1.
 
 
 Исправление v21.1 — PARAM/TEST-COMPAT:
@@ -51,6 +51,8 @@ brain_framework.py v21.1 — param-aware tests/backtest/posttest over v21.0.
 """
 
 from __future__ import annotations
+
+FRAMEWORK_VERSION = "21.2-param-runtime"
 
 import asyncio
 import bisect
@@ -3904,7 +3906,50 @@ def build_app(model_module) -> FastAPI:
                    "ph": p_hash, "df": df, "dt": dt})
             cache_map = {row[0]: _rj_decode(row[1]) for row in res.fetchall()}  # OPT-6
         if not cache_map:
-            return {"error": "no cached data"}
+            # PARAM-DIAGNOSTIC: a cache miss must explain WHICH hash was requested
+            # and which parameter slots actually exist for this pair/timeframe.
+            available_params = []
+            try:
+                async with s.engine_cache.connect() as conn:
+                    diag = await conn.execute(text(f"""
+                        SELECT params_hash, params_json, COUNT(*) AS rows_count,
+                               MIN(date_val) AS first_date, MAX(date_val) AS last_date
+                        FROM `{s.cache_table}`
+                        WHERE service_url=:url AND pair=:pair AND day_flag=:day
+                          AND date_val>=:df AND date_val<=:dt
+                        GROUP BY params_hash, params_json
+                        ORDER BY rows_count DESC
+                        LIMIT 50
+                    """), {"url": s.service_url, "pair": pair, "day": day,
+                           "df": df, "dt": dt})
+                    for row in diag.mappings().all():
+                        try:
+                            parsed_params = _json.loads(row["params_json"]) if row["params_json"] else {}
+                        except Exception:
+                            parsed_params = {"raw": row["params_json"]}
+                        available_params.append({
+                            "params_hash": row["params_hash"],
+                            "params": parsed_params,
+                            "rows": int(row["rows_count"] or 0),
+                            "first_date": row["first_date"].isoformat() if row["first_date"] else None,
+                            "last_date": row["last_date"].isoformat() if row["last_date"] else None,
+                        })
+            except Exception as diag_exc:
+                available_params = [{"diagnostic_error": str(diag_exc)}]
+
+            return {
+                "error": "no cached data for requested params",
+                "framework_version": FRAMEWORK_VERSION,
+                "params": extra_params,
+                "params_hash": p_hash,
+                "cache_table": s.cache_table,
+                "available_params": available_params,
+                "hint": (
+                    "Если available_params содержит нужный param с другим hash — "
+                    "запущен несовместимый/старый framework. Если нужного param нет — "
+                    "сначала заполните этот slot через /fill_cache?param=<value>."
+                ),
+            }
 
         table  = _rates_table(pair, day)
         rows   = [r for r in s.global_rates.get(table, []) if df <= r["date"] <= dt]
@@ -4058,6 +4103,7 @@ def build_app(model_module) -> FastAPI:
             "status": "ok", "version": f"1.{version}.0",
             "mode": MODE, "name": s.NODE_NAME, "text": s.SERVICE_TEXT,
             "metadata": {
+                "framework_version":  FRAMEWORK_VERSION,
                 "weight_codes":       len(s.weight_codes),
                 "ctx_index":          len(s.ctx_index),
                 "url_map":            len(s.url_map),
@@ -4974,9 +5020,18 @@ def build_app(model_module) -> FastAPI:
                         s.NODE_NAME, level="warning")
 
         return ok_response({
+            "framework_version": FRAMEWORK_VERSION,
             "pairs": pl, "days": dl, "tier": tier,
             "date_from": df.isoformat(), "date_to": dt.isoformat(),
-            "vars": vars_to_run, "params": params_to_run, "results": all_results,
+            "vars": vars_to_run, "params": params_to_run,
+            "requested_slots": [
+                {
+                    "type": int(type), "var": int(v), "param": str(prm),
+                    "params_hash": _params_hash({"type": int(type), "var": int(v), "param": str(prm)}),
+                }
+                for v in vars_to_run for prm in params_to_run
+            ],
+            "results": all_results,
         })
 
     @app.get("/summary")
@@ -5289,7 +5344,8 @@ def build_app(model_module) -> FastAPI:
             log("   Тест 4: rebuild не настроен, пропуск", s.NODE_NAME, force=True)
 
         log(" PRETEST OK", s.NODE_NAME, force=True)
-        return {"status": "ok"}
+        return {"status": "ok", "framework_version": FRAMEWORK_VERSION,
+                "param_range": list(s.PARAM_RANGE or [""])}
 
     @app.get("/posttest")
     async def ep_posttest(
