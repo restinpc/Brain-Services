@@ -1468,6 +1468,18 @@ async def _detect_cache_role(s: _State) -> bool:
     return is_writer
 
 
+_CACHE_PROXY_SEM: asyncio.Semaphore | None = None
+
+
+def _get_cache_proxy_sem() -> asyncio.Semaphore:
+    """Bound child->Brain1 cache MISS concurrency without changing payloads."""
+    global _CACHE_PROXY_SEM
+    if _CACHE_PROXY_SEM is None:
+        limit = max(1, int(os.getenv("CACHE_UPSTREAM_CONCURRENCY", "16")))
+        _CACHE_PROXY_SEM = asyncio.Semaphore(limit)
+    return _CACHE_PROXY_SEM
+
+
 async def _proxy_values_to_brain1(
     s: _State, *, pair: int, day: int, date: str,
     calc_type: int, calc_var: int, param: str,
@@ -1502,7 +1514,8 @@ async def _proxy_values_to_brain1(
             raise RuntimeError("Brain 1 response has no payLoad")
         return payload
 
-    return await asyncio.to_thread(_request)
+    async with _get_cache_proxy_sem():
+        return await asyncio.to_thread(_request)
 
 
 def _params_hash(params: dict) -> str:
