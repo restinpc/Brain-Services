@@ -18,6 +18,10 @@ var_range = [3, 5, 7, 9]
 types_range = [0, 1, 2, 3, 4]
 shift_window = 12
 rebuild_interval = 7200
+# Stream reverse-learning fill: prewarm extrema in bounded chunks.
+ml_workers = 2
+ml_batch_size = 2000
+batch_model_size = 1000
 
 [dataset]
 parser_table = "brain_rates_eur_usd"
@@ -26,6 +30,8 @@ index_fields = ["event_type"]
 date_field = "date_dt"
 engine = "vlad"
 model_can_filter = true
+# Outcomes come from dataset_index["np_rates"], not from rates[:idx] copies.
+model_uses_rates = false
 
 [ctx]
 key_columns = ["id"]
