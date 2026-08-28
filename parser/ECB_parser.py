@@ -9,6 +9,8 @@ import io
 import traceback
 import re
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import pandas as pd
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
@@ -51,6 +53,60 @@ if HTTP_PROXY_HOST and HTTP_PROXY_HOST != "":
 else:
     HTTP_PROXY = None
 
+
+def _make_http_session(use_proxy=True):
+    """Единая HTTP-сессия для ECB с retry и опциональным proxy."""
+    session = requests.Session()
+    session.trust_env = False
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/150 Safari/537.36",
+        "Accept": "*/*",
+        "Connection": "keep-alive",
+    })
+
+    retry = Retry(
+        total=4,
+        connect=4,
+        read=4,
+        status=4,
+        backoff_factor=1.5,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(("GET", "HEAD")),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=8)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+
+    if use_proxy and HTTP_PROXY:
+        session.proxies.update(HTTP_PROXY)
+    return session
+
+
+def ecb_get(url, *, session=None, timeout=(10, 90), **kwargs):
+    """
+    GET для ECB. Если настроен HTTP_PROXY, он используется первым.
+    При ошибке proxy делается один fallback без proxy.
+    """
+    own_session = session is None
+    sess = session or _make_http_session(use_proxy=True)
+    try:
+        return sess.get(url, timeout=timeout, **kwargs)
+    except requests.exceptions.RequestException as proxy_error:
+        if not HTTP_PROXY:
+            raise
+        print(f"   HTTP через proxy не удался: {proxy_error}")
+        print("   Пробуем прямое соединение как fallback...")
+        direct = _make_http_session(use_proxy=False)
+        try:
+            return direct.get(url, timeout=timeout, **kwargs)
+        finally:
+            direct.close()
+    finally:
+        if own_session:
+            sess.close()
+
+
 # ECB SDW / Data API monetary datasets (доп. режим, не влияет на rates/items).
 MONETARY_DATASETS = {
     "sasha_ecb_emission": {
@@ -90,7 +146,7 @@ def download_and_read_zip_csv(url):
 
     try:
         print(f"1. Скачиваю архив из: {url}")
-        response = requests.get(url, timeout=15, stream=True)
+        response = ecb_get(url, timeout=(10, 120), stream=True)
         response.raise_for_status()
 
         with open(local_zip, 'wb') as f:
@@ -138,7 +194,7 @@ def download_and_read_zip_csv_memory(url):
 
     try:
         print(f"1. Скачиваю архив из: {url}")
-        response = requests.get(url, timeout=15)
+        response = ecb_get(url, timeout=(10, 120))
         response.raise_for_status()
 
         print("2. Читаю ZIP архив из памяти...")
@@ -180,7 +236,7 @@ def extract_text_from_pdf(pdf_url):
     """
     try:
         print(f"      → Скачиваем PDF: {pdf_url}")
-        response = requests.get(pdf_url, timeout=30)
+        response = ecb_get(pdf_url, timeout=(10, 120))
         response.raise_for_status()
 
         reader = PdfReader(io.BytesIO(response.content))
@@ -260,20 +316,19 @@ def fetch_monetary_series(config: dict, start_period: str = None) -> pd.DataFram
 
     url = f"https://data-api.ecb.europa.eu/service/data/{flow_ref}/{series_key}"
 
-    # Используем HTTP proxy (если настроен), как в Bybit_Tg_Bot.py.
-    session = requests.Session()
-    session.trust_env = False
+    session = _make_http_session(use_proxy=True)
     if HTTP_PROXY:
         print(f" ECB monetary: используем HTTP proxy {HTTP_PROXY_HOST}:{HTTP_PROXY_PORT}")
-        session.proxies.update(HTTP_PROXY)
     else:
         print(" ECB monetary: работаем без proxy")
 
     try:
-        response = session.get(url, params=params, timeout=45)
+        response = ecb_get(url, session=session, params=params, timeout=(10, 120))
         response.raise_for_status()
     except Exception as e:
         raise RuntimeError(f"Ошибка запроса к ECB API ({flow_ref}.{series_key}): {e}")
+    finally:
+        session.close()
 
     try:
         df = pd.read_csv(io.StringIO(response.text))
@@ -352,8 +407,11 @@ class ECBParser:
         self.items_table = f"{self.prefix}_ecb_items" if self.mode in ("all", "items") else None
         self.rates_table = f"{self.prefix}_ecb_exchange_rates" if self.mode in ("all", "rates") else None
 
-        self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+        self.session = _make_http_session(use_proxy=True)
+        if HTTP_PROXY:
+            print(f" HTTP proxy для ECB: {HTTP_PROXY_HOST}:{HTTP_PROXY_PORT}")
+        else:
+            print(" HTTP proxy для ECB отключён")
         self.init_db()
 
     def get_db_connection(self):
@@ -397,6 +455,8 @@ class ECBParser:
 
     def run_rates(self):
         print("\n Скачиваем полную историю курсов из eurofxref-hist.zip...")
+        if HTTP_PROXY:
+            print(f" HTTP proxy для ECB: {HTTP_PROXY_HOST}:{HTTP_PROXY_PORT}")
         try:
             df = download_and_read_zip_csv(ZIP_URL)
 
@@ -446,7 +506,7 @@ class ECBParser:
 
     def fetch_rss_feeds(self):
         print(f"\n Сканируем RSS-страницу → {BASE_URL_RSS}")
-        resp = self.session.get(BASE_URL_RSS, timeout=30)
+        resp = ecb_get(BASE_URL_RSS, session=self.session, timeout=(10, 120))
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
         feeds = []
@@ -492,7 +552,7 @@ class ECBParser:
         for feed_url, title in feeds:
             print(f"\n   ↓ Обрабатываем фид: {title}")
             try:
-                r = self.session.get(feed_url, timeout=45)
+                r = ecb_get(feed_url, session=self.session, timeout=(10, 120))
                 r.raise_for_status()
                 d = feedparser.parse(r.text)
 
@@ -530,7 +590,7 @@ class ECBParser:
                                 else:
                                     # Обычная HTML-страница
                                     try:
-                                        html_r = self.session.get(link, timeout=30)
+                                        html_r = ecb_get(link, session=self.session, timeout=(10, 120))
                                         html_r.raise_for_status()
                                         soup = BeautifulSoup(html_r.text, 'html.parser')
 

@@ -60,7 +60,7 @@ INDEX_TABLE = f"vlad_extremum_lvl_svc{SERVICE_ID}_index"
 _GRAPH_CACHE: dict[int, dict] = {}        # pair_id → {level: [(to, prob, dir),...]}
 _STATS_CACHE: dict[int, dict] = {}        # pair_id → {avg_candles: int, ...}
 _INDEX_CACHE: dict[tuple, dict] = {}      # (pair_id, var, type) → {bull_ratio}
-_LAST_SIGNAL_TS: dict[int, int] = {}      # pair_id → unix timestamp последнего сигнала
+_LAST_SIGNAL_TS: dict[tuple[str, int, bool, int, int], int] = {}  # scope,pair,day,type,var → ts
 
 # Ставка за соседних конкурентов (RATES_TABLES для context_idx.py)
 RATES_TABLES: dict[int, str] = {
@@ -106,6 +106,23 @@ def _get_db_cfg(db_name: str = None) -> dict:
         "password": os.getenv("DB_PASSWORD", ""),
         "database": db,
     }
+
+
+def _signal_state_key(
+    pair_id: int,
+    is_daily: bool,
+    type_id: int,
+    var: int,
+    scope: str,
+) -> tuple[str, int, bool, int, int]:
+    """Separate live/pretest/fill state and every cache slot."""
+    return (str(scope or "live"), int(pair_id), bool(is_daily), int(type_id), int(var))
+
+
+def reset_fill_cache_state(pair_id: int, day_flag: int, type_id: int, var: int) -> None:
+    """Called automatically by brain_framework before ordered cache replay."""
+    key = _signal_state_key(pair_id, bool(day_flag), type_id, var, "fill_cache")
+    _LAST_SIGNAL_TS.pop(key, None)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -285,6 +302,12 @@ def model(
                  if hasattr(rates[-1]["date"], "timestamp") \
                  else int(rates[-1]["date"])
 
+    idx_meta = dataset_index or {}
+    is_daily = bool(idx_meta.get("is_daily", False))
+    scope = str(idx_meta.get("execution_scope") or "live")
+    state_key = _signal_state_key(pair_id, is_daily, type, var, scope)
+    bar_seconds = 86_400 if is_daily else 3_600
+
     # ── Загружаем статистику пары ──────────────────────────────────────────
     stats       = _load_stats(pair_id)
     avg_candles = int(stats.get("avg_candles") or 50)
@@ -293,8 +316,8 @@ def model(
     # Проверяем только если elapsed >= 0 (даты строго после последнего сигнала).
     # Pretest передаёт даты в произвольном порядке — отрицательный elapsed
     # означает что тест-дата раньше последнего сигнала, блокировать не надо.
-    if pair_id in _LAST_SIGNAL_TS:
-        elapsed = (current_ts - _LAST_SIGNAL_TS[pair_id]) // 3600
+    if state_key in _LAST_SIGNAL_TS:
+        elapsed = (current_ts - _LAST_SIGNAL_TS[state_key]) // bar_seconds
         if 0 <= elapsed < avg_candles:
             return {}
 
@@ -335,7 +358,7 @@ def model(
     if signal_dir < 0:
         bull_ratio = 1.0 - bull_ratio
 
-    _LAST_SIGNAL_TS[pair_id] = current_ts
+    _LAST_SIGNAL_TS[state_key] = current_ts
 
     log.info(f"[graph] pair={pair_id} var={var}({steps}steps) "
              f"level={ext['level']} dir={'LONG' if signal_dir > 0 else 'SHORT'} "

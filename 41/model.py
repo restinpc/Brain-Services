@@ -132,12 +132,22 @@ def model(
 
     # ── Детектируем таймфрейм и is_bull из котировок ─────────────────────────
     last_candle = rates[-1] if rates else None
-    is_daily    = bool(last_candle) and (
-        last_candle["date"].hour == 0 and last_candle["date"].minute == 0
+    di = dataset_index or {}
+    if "is_daily" in di:
+        is_daily = bool(di.get("is_daily"))
+    elif str(di.get("rates_table") or ""):
+        is_daily = str(di.get("rates_table") or "").endswith("_day")
+    else:
+        is_daily = bool(last_candle) and (
+            last_candle["date"].hour == 0 and last_candle["date"].minute == 0
+        )
+    completed_candle = next(
+        (r for r in reversed(rates) if r.get("date") is not None and r["date"] < date),
+        last_candle,
     )
     is_bull = (
-        float(last_candle.get("close") or 0) > float(last_candle.get("open") or 0)
-    ) if last_candle else True
+        float(completed_candle.get("close") or 0) > float(completed_candle.get("open") or 0)
+    ) if completed_candle else True
 
     # ── Numpy-путь ────────────────────────────────────────────────────────────
     np_rates = (dataset_index or {}).get("np_rates")
@@ -146,7 +156,7 @@ def model(
         dates_ns = np_rates.get("dates_ns")
         if dates_ns is not None:
             import numpy as _np
-            cut = int(_np.searchsorted(dates_ns, _dt_to_ts(date), side="right"))
+            cut = int(_np.searchsorted(dates_ns, _dt_to_ts(date), side="left"))
             if cut > 0:
                 is_bull = (
                     float(np_rates["close"][cut - 1]) > float(np_rates["open"][cut - 1])
@@ -213,7 +223,25 @@ def model(
         if is_daily:
             t_date = t_date.replace(hour=0, minute=0, second=0, microsecond=0)
         if t_date >= date:
-            continue
+            if not is_daily:
+                continue
+            # D1: project to the latest actual completed candle. This handles
+            # weekends and missing daily rows without using the target candle.
+            if np_view is not None and np_view["cut"] > 0:
+                t_date = datetime.fromtimestamp(
+                    int(np_view["dates_ns"][np_view["cut"] - 1])
+                )
+            else:
+                previous = next(
+                    (r.get("date") for r in reversed(rates)
+                     if r.get("date") is not None and r["date"] < date),
+                    None,
+                )
+                if previous is None:
+                    continue
+                t_date = previous
+            if t_date >= date:
+                continue
 
         # ── T1 и Extremum ─────────────────────────────────────────────────────
         if np_view is not None:

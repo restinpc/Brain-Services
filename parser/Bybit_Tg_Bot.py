@@ -7,6 +7,7 @@ import sys
 import traceback
 import json
 import requests
+import re
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
@@ -56,8 +57,10 @@ COUNTER_FILES = {
 }
 
 TARGET_BOT       = "@Bybit_TradeGPT_bot"
-RESPONSE_TIMEOUT = int(os.getenv("RESPONSE_TIMEOUT", 30))
-MAX_WAIT         = int(os.getenv("MAX_WAIT", 120))
+RESPONSE_TIMEOUT = int(os.getenv("RESPONSE_TIMEOUT", 45))
+MAX_WAIT         = int(os.getenv("MAX_WAIT", 180))
+FINAL_IDLE       = int(os.getenv("FINAL_IDLE", 10))
+HISTORY_POLL_INTERVAL = float(os.getenv("HISTORY_POLL_INTERVAL", 3))
 
 TRACE_URL   = os.getenv("TRACE_URL",   "https://server.brain-project.online/trace.php")
 NODE_NAME   = os.getenv("NODE_NAME",   "bybit_trend_bot")
@@ -128,44 +131,216 @@ def send_error_trace(exc: Exception, script_name: str = "Bybit_Tg_Bot.py"):
 
 
 def extract_asset(query: str) -> str:
-    for token in query.upper().split():
-        if token in ('BTC', 'ETH'):
-            return token
-    return None
+    """Определяет BTC/ETH из обычного тикера, пары или названия актива.
+
+    Поддерживаются, например: BTC, BTCUSDT, BTC/USD, BTC-USDT, Bitcoin,
+    ETH, ETHUSDT, ETH/USD, ETH-USDT, Ethereum. Если в запросе явно
+    присутствуют оба актива, возвращается None, чтобы не записать ответ
+    в неправильную таблицу/счётчик.
+    """
+    q = (query or "").upper()
+
+    patterns = {
+        "BTC": r"(?<![A-Z0-9])(?:BTC(?:[\s/_-]?(?:USD|USDT))?|BITCOIN)(?![A-Z0-9])",
+        "ETH": r"(?<![A-Z0-9])(?:ETH(?:[\s/_-]?(?:USD|USDT))?|ETHEREUM)(?![A-Z0-9])",
+    }
+
+    found = [asset for asset, pattern in patterns.items() if re.search(pattern, q)]
+    return found[0] if len(found) == 1 else None
 
 
 # ==================== РАБОТА С БОТОМ ====================
 
+def _is_unsolicited_trade_signal(text_value: str) -> bool:
+    lower = (text_value or "").lower()
+    markers = (
+        "tradegpt opening signal",
+        "tradegpt открытие сигнала",
+        "contract pair:",
+        "entry price:",
+        "контрактная пара:",
+        "входная цена:",
+    )
+    return any(marker in lower for marker in markers)
+
+
+def _is_complete_answer(text_value: str) -> bool:
+    text_value = (text_value or "").strip()
+    if not text_value or _is_unsolicited_trade_signal(text_value):
+        return False
+    lower = text_value.lower()
+    if lower in {"analyzing your query...", "analyzing your query…"}:
+        return False
+    if "hit today's limit" in lower or "still working on the last question" in lower:
+        return False
+
+    upper = text_value.upper()
+    structured = "OUTLOOK_1H=" in upper or "OUTLOOK_24H=" in upper
+    final_signal = re.search(r"(?m)^\s*SIGNAL\s*=\s*(LONG|SHORT|NEUTRAL)\s*$", upper) is not None
+    if (structured or final_signal) and len(text_value) >= 120:
+        return True
+
+    markers = (
+        "long/short ratio",
+        "funding rate",
+        "capital inflow",
+        "24h inflow",
+        "market sentiment",
+        "support",
+        "resistance",
+        "conclusion",
+    )
+    score = sum(1 for marker in markers if marker in lower)
+    return len(text_value) >= 500 and score >= 3
+
+
 async def collect_response(client: TelegramClient, bot_id: int, query: str) -> str:
+    """Collect TradeGPT answer causally and robustly.
+
+    Primary path listens to NewMessage + MessageEdited.  Some Telegram/proxy
+    combinations can occasionally miss update events, so while waiting we also
+    poll the dialog history for messages newer than our sent query.  History
+    polling sees the current edited text and therefore also recovers the common
+    TradeGPT flow: ``Analyzing your query...`` -> edited final answer.
+    """
     queue: asyncio.Queue = asyncio.Queue()
 
     async def handler(event):
-        if event.message.text:
-            queue.put_nowait(event.message.text)
+        msg = event.message
+        if not msg or not msg.text:
+            return
+        reply_to = getattr(msg, "reply_to_msg_id", None)
+        queue.put_nowait((int(msg.id), msg.text, reply_to, "event"))
 
-    client.add_event_handler(handler, events.NewMessage(from_users=bot_id))
+    new_builder = events.NewMessage(from_users=bot_id)
+    edit_builder = events.MessageEdited(from_users=bot_id)
+    client.add_event_handler(handler, new_builder)
+    client.add_event_handler(handler, edit_builder)
 
     try:
         log.info(f"-> {query}")
-        await client.send_message(TARGET_BOT, query)
+        sent = await client.send_message(TARGET_BOT, query)
+        log.info(f"Telegram query message_id={sent.id}")
 
-        parts = []
-        deadline = asyncio.get_event_loop().time() + MAX_WAIT
+        latest_by_id = {}
+        accepted_ids = set()
+        first_response_id = None
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + MAX_WAIT
+        last_update_at = None
+        complete_seen = False
+        last_history_poll = 0.0
+
+        def ingest(msg_id: int, msg_text: str, reply_to, source: str) -> bool:
+            nonlocal first_response_id, last_update_at, complete_seen
+
+            msg_text = (msg_text or "").strip()
+            if not msg_text:
+                return False
+            if _is_unsolicited_trade_signal(msg_text):
+                log.info(f"Игнорирую автоматический торговый сигнал TradeGPT message_id={msg_id}")
+                return False
+
+            explicit_reply = (reply_to == sent.id)
+            if first_response_id is None:
+                first_response_id = msg_id
+                accepted_ids.add(msg_id)
+            elif explicit_reply or msg_id in accepted_ids:
+                accepted_ids.add(msg_id)
+            else:
+                # Multi-part answer without Telegram reply metadata.  Accept only
+                # analysis-like continuations; unrelated push alerts stay out.
+                lower = msg_text.lower()
+                analysis_markers = (
+                    "funding rate", "long/short", "market sentiment",
+                    "conclusion", "outlook_1h", "signal="
+                )
+                if not any(marker in lower for marker in analysis_markers):
+                    return False
+                accepted_ids.add(msg_id)
+
+            old_text = latest_by_id.get(msg_id)
+            if old_text == msg_text:
+                return False
+
+            latest_by_id[msg_id] = msg_text
+            last_update_at = loop.time()
+            combined = '\n\n'.join(latest_by_id[k] for k in sorted(latest_by_id))
+            complete_seen = _is_complete_answer(combined)
+            log.info(
+                f"TradeGPT update ({source}) message_id={msg_id}: "
+                f"{len(msg_text)} симв.; complete={complete_seen}"
+            )
+            return True
+
+        async def poll_history():
+            """Recover missed NewMessage/MessageEdited updates from dialog history."""
+            try:
+                messages = await client.get_messages(TARGET_BOT, limit=20)
+            except Exception as exc:
+                log.debug(f"Не удалось проверить историю TradeGPT: {exc}")
+                return
+
+            # get_messages returns newest first; ingest chronologically.
+            for msg in reversed(messages):
+                if not msg or int(getattr(msg, "id", 0) or 0) <= int(sent.id):
+                    continue
+                if getattr(msg, "out", False):
+                    continue
+                sender_id = getattr(msg, "sender_id", None)
+                if sender_id is not None and int(sender_id) != int(bot_id):
+                    continue
+                text_value = getattr(msg, "text", None) or getattr(msg, "message", None)
+                if not text_value:
+                    continue
+                reply_to = getattr(msg, "reply_to_msg_id", None)
+                ingest(int(msg.id), text_value, reply_to, "history")
+
+        # Check immediately in case TradeGPT answered very quickly.
+        await poll_history()
+        last_history_poll = loop.time()
 
         while True:
-            remaining = deadline - asyncio.get_event_loop().time()
+            now = loop.time()
+            remaining = deadline - now
             if remaining <= 0:
-                log.warning("Таймаут сбора ответа")
-                break
-            try:
-                msg = await asyncio.wait_for(queue.get(), timeout=min(RESPONSE_TIMEOUT, remaining))
-                parts.append(msg)
-            except asyncio.TimeoutError:
+                # Final history lookup before declaring a timeout.  This is the
+                # important recovery path when Telegram updates were missed.
+                await poll_history()
+                if not complete_seen:
+                    if latest_by_id:
+                        log.warning("Таймаут: получен только неполный ответ TradeGPT")
+                    else:
+                        log.warning("Таймаут: TradeGPT не прислал ни одного ответа")
                 break
 
-        return '\n\n'.join(parts)
+            if complete_seen and last_update_at is not None:
+                idle_left = FINAL_IDLE - (now - last_update_at)
+                if idle_left <= 0:
+                    break
+                timeout = min(HISTORY_POLL_INTERVAL, remaining, idle_left)
+            else:
+                timeout = min(HISTORY_POLL_INTERVAL, remaining)
+
+            try:
+                msg_id, msg_text, reply_to, source = await asyncio.wait_for(
+                    queue.get(), timeout=max(0.2, timeout)
+                )
+                ingest(msg_id, msg_text, reply_to, source)
+            except asyncio.TimeoutError:
+                pass
+
+            # Polling is deliberately lightweight (default once per 3 s) and
+            # makes the collector independent of event-delivery reliability.
+            now = loop.time()
+            if now - last_history_poll >= HISTORY_POLL_INTERVAL:
+                await poll_history()
+                last_history_poll = loop.time()
+
+        return '\n\n'.join(latest_by_id[k] for k in sorted(latest_by_id))
     finally:
-        client.remove_event_handler(handler, events.NewMessage)
+        client.remove_event_handler(handler, new_builder)
+        client.remove_event_handler(handler, edit_builder)
 
 
 # ==================== РАБОТА С БАЗОЙ ДАННЫХ ====================
@@ -257,6 +432,8 @@ async def run_query(asset: str, query: str, engine, table_name: str):
         raw = await collect_response(client, bot_entity.id, query)
         if not raw.strip():
             log.warning("Пустой ответ от бота")
+        elif not _is_complete_answer(raw):
+            log.warning(f"{asset}: ответ неполный/служебный ({len(raw)} симв.), в БД не сохраняю")
         else:
             inserted_id = save_record(engine, table_name, asset, raw)
             if inserted_id:

@@ -1,7 +1,49 @@
 """
-brain_framework.py v16 — сжатие result_json (zlib + полная обратная совместимость).
+brain_framework.py v21.1 — param-aware tests/backtest/posttest over v21.0.
 
-Оптимизации над v15:
+
+Исправление v21.1 — PARAM/TEST-COMPAT:
+  PRETEST/BACKTEST/CREATE_SCORE учитывают PARAM_RANGE вместо hardcoded param="".
+  POSTTEST фильтрует cache по type/var/param, декодирует zlib result_json и
+  показывает как агрегат, так и отдельные результаты по каждому param-slot.
+  CREATE_SCORE сравнивает backtest с posttest ТОГО ЖЕ params_hash.
+  CLEAR_CACHE умеет очищать конкретные params и учитывает PARAM_RANGE.
+  DIAGNOSTICS при пропущенном param используют первый элемент PARAM_RANGE.
+
+Рефакторинг v21.0:
+  EVENT-OUTCOME-CONTRACT: stored_t1 сохранён как исторический outcome следующего
+  интервала; close-open больше не подменяет T1.
+  CAUSAL-OUTCOME: исторический outcome используется только после полного закрытия
+  соответствующего часа/дня к моменту target_date.
+  CURRENT-vs-ANALOG: отдельно выбираются текущие события и их исторические аналоги.
+  SHIFT-SEMANTICS: outcome исторического аналога сдвигается так же, как событие
+  относительно целевой даты.
+  SINGLE-CORE: одиночный и fused multi-slot пути используют одну реализацию.
+  NO-SILENT-FALLBACK: при отсутствии stored_t1 framework возвращает пустой outcome,
+  а не синтезирует другое значение.
+
+Оптимизации v20 над v19:
+  AUTO-3: один проход по событиям сразу для всех type/var.
+  AUTO-4: H1 рассчитывается для каждого точного target timestamp.
+          Группировка по состоянию дня отключена как семантически небезопасная.
+  AUTO-5: объединённые bulk INSERT и однократная сериализация одинаковых результатов.
+
+Исправление v20.3:
+  DAILY-CAUSAL: отдельная функция сохраняет строгую причинность H1,
+                а для D1 при точном совпадении использует последнюю
+                завершённую дневную свечу D-1 вместо пустого результата.
+
+Критическое исправление v20.1:
+  SAFE-STATE: модели с глобальным хронологическим состоянием автоматически
+              считаются строго последовательно; fill/pretest/live разделены по scope.
+
+Сохранены оптимизации v19:
+  AUTO-1: zero-copy list views вместо rates[:idx] / dataset[:idx] на каждой свече.
+  AUTO-2: run_standard_model автоматически выбирает события только из точного
+          окна [date-shift_window, date] через NumPy searchsorted.
+          MODEL_USES_RATE_HISTORY и MODEL_CAN_FILTER_DATASET_BY_DATE не нужны.
+
+Сохранены оптимизации v18:
   OPT-1..5: fill_cache (см. v15).
   OPT-6: result_json сжимается zlib+base64 с префиксом 'z:' при записи.
           Старые строки (без префикса) читаются как обычный JSON — нулевая миграция.
@@ -38,21 +80,90 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ──────────────────────────────────────────────────────────────────────────────
+# ZERO-COPY READ-ONLY VIEWS
+# ──────────────────────────────────────────────────────────────────────────────
+
+class _ListView:
+    """Read-only list-compatible window without copying the underlying rows.
+
+    fill_cache historically built ``rates[:idx]`` for every candle.  On a long
+    H1 history this repeatedly copied millions of Python references.  This view
+    preserves the observable prefix/window semantics used by model.py while
+    making construction O(1).  An explicit slice requested *inside* a model is
+    still returned as a normal list for backward compatibility.
+    """
+    __slots__ = ("_rows", "_start", "_end")
+
+    def __init__(self, rows, start: int = 0, end: int | None = None):
+        n = len(rows)
+        start = max(0, min(int(start), n))
+        end = n if end is None else max(start, min(int(end), n))
+        self._rows = rows
+        self._start = start
+        self._end = end
+
+    def __len__(self):
+        return self._end - self._start
+
+    def __iter__(self):
+        rows = self._rows
+        for i in range(self._start, self._end):
+            yield rows[i]
+
+    def __getitem__(self, item):
+        n = len(self)
+        if isinstance(item, slice):
+            start, stop, step = item.indices(n)
+            if step == 1:
+                return list(_ListView(self._rows, self._start + start, self._start + stop))
+            return [self[i] for i in range(start, stop, step)]
+        idx = int(item)
+        if idx < 0:
+            idx += n
+        if idx < 0 or idx >= n:
+            raise IndexError("list index out of range")
+        return self._rows[self._start + idx]
+
+    def copy(self):
+        return list(self)
+
+    def __repr__(self):
+        return repr(list(self))
+
+
+def _list_view(rows, start: int = 0, end: int | None = None):
+    """Return an O(1) list window; avoid wrapping an already exact full list."""
+    n = len(rows)
+    end = n if end is None else end
+    if start <= 0 and end >= n:
+        return rows
+    return _ListView(rows, start, end)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Трассировка
 # ──────────────────────────────────────────────────────────────────────────────
 _TRACE_HANDLER = os.getenv("HANDLER", "https://server.brain-project.online").rstrip("/")
 _TRACE_URL     = f"{_TRACE_HANDLER}/trace.php"
-_ALERT_EMAIL   = os.getenv("ALERT_EMAIL", "vladyurjevitch@yandex.ru")
+_DEFAULT_DEVELOPER_EMAIL = "vladyurjevitch@yandex.ru"
+_ALERT_EMAIL = os.getenv("ALERT_EMAIL", _DEFAULT_DEVELOPER_EMAIL).strip() or _DEFAULT_DEVELOPER_EMAIL
 
 
-def _send_trace(subject: str, body: str, node: str, is_error: bool = False) -> None:
+def _send_trace(
+    subject: str,
+    body: str,
+    node: str,
+    is_error: bool = False,
+    email: str | None = None,
+) -> None:
     if _requests is None:
         return
     level = "ERROR" if is_error else "INFO"
     try:
         _requests.post(
             _TRACE_URL,
-            data={"url": "fill_cache", "node": node, "email": _ALERT_EMAIL,
+            data={"url": "fill_cache", "node": node,
+                  "email": (str(email or "").strip() or _ALERT_EMAIL),
                   "logs": f"[{level}] {subject}\n\nNode: {node}\n\n{body}"},
             timeout=10,
         )
@@ -66,9 +177,9 @@ if _here not in sys.path:
 
 from common import (
     MODE, IS_DEV,
-    log, send_error_trace,
+    log, send_error_trace, set_alert_email,
     ok_response, err_response,
-    resolve_workers, build_engines,
+    resolve_workers, build_engines, build_cache_engine,
 )
 from cache_helper import ensure_cache_table, load_service_url, cached_values
 import reverse_learning as rl
@@ -187,6 +298,49 @@ def get_service_config() -> dict:
     return _SERVICE_CONFIG
 
 
+def _valid_developer_email(value) -> str | None:
+    """Return a normalized email or None for an empty/invalid value."""
+    email = str(value or "").strip()
+    if not email or "@" not in email:
+        return None
+    local, domain = email.rsplit("@", 1)
+    if not local or not domain or "." not in domain:
+        return None
+    return email
+
+
+def _resolve_developer_email(config: dict, model_module) -> str:
+    """Resolve per-model trace email with backward-compatible fallbacks.
+
+    Priority:
+      1. config.toml/config.json: [developer].email
+      2. config alias: [service].developer_email
+      3. model.py: DEVELOPER_EMAIL
+      4. .env: ALERT_EMAIL
+      5. historical framework default
+    Invalid/empty candidates are skipped rather than breaking trace delivery.
+    """
+    developer_cfg = config.get("developer", {})
+    service_cfg = config.get("service", {})
+    if not isinstance(developer_cfg, dict):
+        developer_cfg = {}
+    if not isinstance(service_cfg, dict):
+        service_cfg = {}
+
+    candidates = (
+        developer_cfg.get("email"),
+        service_cfg.get("developer_email"),
+        getattr(model_module, "DEVELOPER_EMAIL", None),
+        os.getenv("ALERT_EMAIL"),
+        _DEFAULT_DEVELOPER_EMAIL,
+    )
+    for candidate in candidates:
+        email = _valid_developer_email(candidate)
+        if email:
+            return email
+    return _DEFAULT_DEVELOPER_EMAIL
+
+
 def _load_service_config(model_dir: str) -> dict:
     """
     Ищет конфиг в директории сервиса. Порядок приоритета:
@@ -232,7 +386,559 @@ def _load_service_config(model_dir: str) -> dict:
     return {}
 
 
-# ── run_standard_model ────────────────────────────────────────────────────────
+# ── run_standard_model v21 ────────────────────────────────────────────────────
+#
+# Контракт исходного ТЗ
+# ---------------------
+# 1. ``stored_t1`` из brain_rates_* — исторический outcome следующего интервала.
+#    Он НЕ является телом текущей свечи и никогда не заменяется на close-open.
+# 2. Сначала выбираются события, актуальные для целевой даты:
+#      • нулевой интервал: все события;
+#      • смещённые интервалы: только редкие события.
+# 3. Для каждого актуального события выбираются аналогичные события того же типа,
+#    произошедшие строго раньше целевой даты.
+# 4. Для исторического аналога outcome берётся со сдвигом:
+#        outcome_time = analog_event_time + shift * timeframe
+#    где shift = target_time - current_event_time в часах либо днях.
+# 5. Outcome разрешён только если соответствующий прогнозный интервал полностью
+#    завершился к target_date. Это устраняет утечку будущего без изменения смысла T1.
+# 6. mode=0 суммирует historical stored_t1.
+# 7. mode=1 оценивает долю исторических аналогов, попавших в нужный экстремум,
+#    переводит вероятность из [0,1] в [-1,1] и задаёт торговое направление:
+#      • ожидаемый min  -> положительный вес;
+#      • ожидаемый max  -> отрицательный вес.
+#
+# Совместимость
+# -------------
+# • Публичная сигнатура run_standard_model сохранена.
+# • type=0: mode 0 + mode 1; type=1: только mode 0; type=2: только mode 1.
+# • apply_var_fn и signal_fn сохранены.
+# • Редкость события должна быть задана явно полем is_rare/rare,
+#   event_class/frequency_class либо rare_event_fn.
+# • Для старых context-таблиц допускается явный fallback:
+#       [model]
+#       rare_occurrence_max = 24
+#   Значение по умолчанию 0, чтобы framework не придумывал классификацию.
+# • Все вычислительные пути (single и fused multi-slot) используют один core.
+
+
+def _timeframe_delta(is_daily: bool) -> timedelta:
+    return timedelta(days=1) if is_daily else timedelta(hours=1)
+
+
+def _timeframe_seconds(is_daily: bool) -> int:
+    return 86400 if is_daily else 3600
+
+
+def _normalize_frame_date(dt: datetime, is_daily: bool) -> datetime:
+    if is_daily:
+        return dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    return dt.replace(minute=0, second=0, microsecond=0)
+
+
+def _signed_shift(
+    target_date: datetime,
+    current_event_time: datetime,
+    is_daily: bool,
+) -> int:
+    """Сдвиг weight-code из ТЗ.
+
+    Событие в прошлом  -> положительный shift.
+    Событие в будущем  -> отрицательный shift.
+    Событие в нулевом интервале -> 0.
+    """
+    seconds = (target_date - current_event_time).total_seconds()
+    unit = _timeframe_seconds(is_daily)
+    if seconds >= 0:
+        return int(seconds // unit)
+    return -int((-seconds) // unit)
+
+
+def _is_zero_interval_event(
+    event_time: datetime,
+    target_date: datetime,
+    is_daily: bool,
+) -> bool:
+    """Нулевой час/день: [target - timeframe, target)."""
+    delta = _timeframe_delta(is_daily)
+    return target_date - delta <= event_time < target_date
+
+
+def _ctx_is_rare(
+    ctx_info: dict,
+    occurrence_count: int,
+    *,
+    rare_occurrence_max: int,
+    rare_event_fn: Optional[Callable[[dict], bool]] = None,
+) -> bool:
+    """Явная семантика rare/frequent с контролируемым fallback."""
+    if rare_event_fn is not None:
+        return bool(rare_event_fn(ctx_info))
+
+    for key in ("is_rare", "rare"):
+        if key in ctx_info and ctx_info.get(key) is not None:
+            return bool(ctx_info.get(key))
+
+    value = str(
+        ctx_info.get("event_class")
+        or ctx_info.get("frequency_class")
+        or ctx_info.get("event_frequency")
+        or ""
+    ).strip().lower()
+    if value in ("rare", "редкое", "low", "sparse"):
+        return True
+    if value in ("frequent", "частое", "high", "dense"):
+        return False
+
+    return int(occurrence_count) <= int(rare_occurrence_max)
+
+
+def _dataset_event_index(
+    dataset,
+    dataset_index: dict | None,
+    get_event_fn: Callable[[dict], Optional[tuple]],
+) -> dict[str, list[tuple[datetime, float, dict]]]:
+    """Индекс всех исторических событий по event_type.
+
+    Кешируется в dataset_index только для стандартного parser-а. Пользовательский
+    get_event_fn может зависеть от внешнего состояния, поэтому для него кеш не
+    используется.
+    """
+    di = dataset_index or {}
+    use_cache = get_event_fn is _std_get_event
+    cached = di.get("_standard_events_by_type") if use_cache else None
+    if isinstance(cached, dict):
+        return cached
+
+    source = di.get("full_dataset") if di.get("full_dataset") is not None else dataset
+    result: dict[str, list[tuple[datetime, float, dict]]] = {}
+    for row in source or ():
+        parsed = get_event_fn(row)
+        if parsed is None:
+            continue
+        event_time, pct, event_type = parsed
+        key = str(event_type).strip().lower()
+        if not key:
+            continue
+        result.setdefault(key, []).append((event_time, float(pct), row))
+
+    for values in result.values():
+        values.sort(key=lambda item: item[0])
+
+    if use_cache:
+        di["_standard_events_by_type"] = result
+    return result
+
+
+def _select_current_events(
+    events_by_type: dict[str, list[tuple[datetime, float, dict]]],
+    target_date: datetime,
+    *,
+    is_daily: bool,
+    shift_window: int,
+    reverse: dict[str, tuple[int, dict]],
+    rare_occurrence_max: int,
+    rare_event_fn: Optional[Callable[[dict], bool]],
+) -> list[tuple[datetime, float, str, int, dict, int]]:
+    """Выбирает события, для которых надо сформировать weight-code."""
+    # Точное окно из исходного ТЗ:
+    #   H1: редкие события в пределах ±12 часов;
+    #   D1: редкие события в пределах ±1 дня.
+    # shift_window сохранён в сигнатуре для обратной совместимости, но не
+    # подменяет это бизнес-правило.
+    horizon = timedelta(days=1) if is_daily else timedelta(hours=12)
+    left = target_date - horizon
+    right = target_date + horizon
+    selected = []
+
+    for event_type, values in events_by_type.items():
+        lookup = reverse.get(event_type)
+        if lookup is None:
+            continue
+        ctx_id, ctx_info = lookup
+        occ = int(ctx_info.get("occurrence_count") or len(values))
+        rare = _ctx_is_rare(
+            ctx_info,
+            occ,
+            rare_occurrence_max=rare_occurrence_max,
+            rare_event_fn=rare_event_fn,
+        )
+
+        dates = [item[0] for item in values]
+        lo = bisect.bisect_left(dates, left)
+        hi = bisect.bisect_right(dates, right)
+
+        for event_time, pct, _row in values[lo:hi]:
+            if _is_zero_interval_event(event_time, target_date, is_daily):
+                shift = 0
+            else:
+                if not rare:
+                    continue
+                shift = _signed_shift(target_date, event_time, is_daily)
+
+            selected.append(
+                (event_time, pct, event_type, int(ctx_id), ctx_info, int(shift))
+            )
+
+    selected.sort(key=lambda item: (item[0], item[2], item[5]))
+    return selected
+
+
+def _np_rate_exact_index(np_rates, dt: datetime) -> int | None:
+    if np_rates is None:
+        return None
+    dates_ns = np_rates.get("dates_ns")
+    if dates_ns is None:
+        return None
+    ts = int(_normalize_frame_date(dt, False).timestamp())
+    idx = int(np.searchsorted(dates_ns, ts, side="left"))
+    if idx >= len(dates_ns) or int(dates_ns[idx]) != ts:
+        return None
+    return idx
+
+
+def _lookup_historical_outcome(
+    np_rates,
+    outcome_time: datetime,
+    target_date: datetime,
+    *,
+    is_daily: bool,
+) -> tuple[float | None, bool]:
+    """Возвращает stored_t1 и попадание в экстремум без future leak."""
+    frame_start = _normalize_frame_date(outcome_time, is_daily)
+    frame_end = frame_start + _timeframe_delta(is_daily)
+
+    # В момент target_date outcome уже обязан быть полностью известен.
+    if frame_end > target_date:
+        return None, False
+
+    if np_rates is None:
+        return None, False
+
+    dates_ns = np_rates.get("dates_ns")
+    if dates_ns is None:
+        return None, False
+
+    ts = int(frame_start.timestamp())
+    idx = int(np.searchsorted(dates_ns, ts, side="left"))
+    if idx >= len(dates_ns) or int(dates_ns[idx]) != ts:
+        return None, False
+
+    stored_t1 = float(np_rates["t1"][idx])
+    return stored_t1, bool(
+        np_rates.get("ext_max", np.zeros(0, dtype=bool))[idx]
+        or np_rates.get("ext_min", np.zeros(0, dtype=bool))[idx]
+    )
+
+
+def _previous_completed_candle_direction(
+    np_rates,
+    target_date: datetime,
+) -> tuple[bool, int | None]:
+    """True = предыдущая свеча бычья, значит прогнозируется max."""
+    if np_rates is None:
+        return False, None
+    dates_ns = np_rates.get("dates_ns")
+    if dates_ns is None or len(dates_ns) == 0:
+        return False, None
+
+    cut = int(np.searchsorted(
+        dates_ns, int(target_date.timestamp()), side="left"
+    ))
+    if cut <= 0:
+        return False, None
+    idx = cut - 1
+    is_bull = (
+        float(np_rates["close"][idx])
+        > float(np_rates["open"][idx])
+    )
+    return is_bull, idx
+
+
+def _historical_analogs(
+    values: list[tuple[datetime, float, dict]],
+    target_date: datetime,
+    current_event_time: datetime,
+) -> list[tuple[datetime, float, dict]]:
+    """Все аналоги строго раньше target_date, кроме самого текущего события."""
+    dates = [item[0] for item in values]
+    end = bisect.bisect_left(dates, target_date)
+    return [
+        item for item in values[:end]
+        if item[0] != current_event_time
+    ]
+
+
+def _aggregate_event_history(
+    *,
+    current_event_time: datetime,
+    current_pct: float,
+    event_type: str,
+    shift: int,
+    ctx_info: dict,
+    events_by_type: dict[str, list[tuple[datetime, float, dict]]],
+    np_rates,
+    target_date: datetime,
+    is_daily: bool,
+    var: int,
+    apply_var_fn: Callable[[float, float, int, dict], float],
+    min_occurrence: int,
+) -> tuple[float, float, int, int]:
+    """Считает mode=0 и mode=1 для одного актуального события."""
+    analogs = _historical_analogs(
+        events_by_type.get(event_type, []),
+        target_date,
+        current_event_time,
+    )
+
+    if len(analogs) < int(min_occurrence):
+        return 0.0, 0.0, 0, 0
+
+    # Направление extremum из предыдущей завершённой свечи target_date.
+    predict_max, _prev_idx = _previous_completed_candle_direction(
+        np_rates, target_date
+    )
+
+    t1_sum = 0.0
+    outcomes = 0
+    extremum_hits = 0
+
+    unit = _timeframe_delta(is_daily)
+    ext_array_name = "ext_max" if predict_max else "ext_min"
+
+    for analog_time, analog_pct, _row in analogs:
+        outcome_time = analog_time + (unit * int(shift))
+        frame_start = _normalize_frame_date(outcome_time, is_daily)
+        frame_end = frame_start + unit
+        if frame_end > target_date:
+            continue
+
+        dates_ns = np_rates.get("dates_ns") if np_rates is not None else None
+        if dates_ns is None:
+            continue
+        ts = int(frame_start.timestamp())
+        idx = int(np.searchsorted(dates_ns, ts, side="left"))
+        if idx >= len(dates_ns) or int(dates_ns[idx]) != ts:
+            continue
+
+        stored_t1 = float(np_rates["t1"][idx])
+        weighted = float(
+            apply_var_fn(stored_t1, analog_pct, var, ctx_info)
+        )
+        t1_sum += weighted
+        outcomes += 1
+
+        ext_arr = np_rates.get(ext_array_name)
+        if ext_arr is not None and bool(ext_arr[idx]):
+            extremum_hits += 1
+
+    if outcomes < int(min_occurrence):
+        return 0.0, 0.0, outcomes, extremum_hits
+
+    probability = extremum_hits / outcomes
+    extremum_score = (probability * 2.0) - 1.0
+    if predict_max:
+        extremum_score = -extremum_score
+
+    return t1_sum, extremum_score, outcomes, extremum_hits
+
+
+def _standard_contribution(
+    *,
+    calc_type: int,
+    ctx_id: int,
+    shift: int,
+    mode0_value: float,
+    mode1_value: float,
+) -> dict[str, float]:
+    result: dict[str, float] = {}
+    if calc_type in (0, 1) and mode0_value != 0.0:
+        result[f"{ctx_id}_0_{shift}"] = round(mode0_value, 6)
+    if calc_type in (0, 2) and mode1_value != 0.0:
+        result[f"{ctx_id}_1_{shift}"] = round(mode1_value, 6)
+    return result
+
+
+def _run_standard_model_core(
+    rates,
+    dataset,
+    date: datetime,
+    *,
+    slots: list[tuple[int, int]],
+    dataset_index: dict | None,
+    shift_window: int,
+    apply_var_fn: Callable[[float, float, int, dict], float],
+    min_occurrence: int,
+    get_event_fn: Optional[Callable[[dict], Optional[tuple]]],
+    signal_fn: Optional[Callable],
+    rare_event_fn: Optional[Callable[[dict], bool]],
+    rare_occurrence_max: int,
+) -> dict[tuple[int, int], dict[str, float]]:
+    slot_list = list(dict.fromkeys((int(t), int(v)) for t, v in slots))
+    outputs = {slot: {} for slot in slot_list}
+    if not dataset or not slot_list:
+        return outputs
+
+    di = dataset_index or {}
+    ctx_index = di.get("ctx_index") or {}
+    np_rates = di.get("np_rates")
+    if not ctx_index or np_rates is None:
+        return outputs
+
+    reverse: dict[str, tuple[int, dict]] = {
+        str(info.get("event_type") or "").strip().lower(): (
+            int(info["id"]), info
+        )
+        for info in ctx_index.values()
+        if info.get("id") and info.get("event_type")
+    }
+    if not reverse:
+        return outputs
+
+    is_daily = _execution_is_daily(rates, di)
+    parser = get_event_fn or _std_get_event
+    events_by_type = _dataset_event_index(dataset, di, parser)
+    current_events = _select_current_events(
+        events_by_type,
+        date,
+        is_daily=is_daily,
+        shift_window=shift_window,
+        reverse=reverse,
+        rare_occurrence_max=rare_occurrence_max,
+        rare_event_fn=rare_event_fn,
+    )
+
+    for (
+        current_event_time,
+        current_pct,
+        event_type,
+        ctx_id,
+        ctx_info,
+        shift,
+    ) in current_events:
+        for calc_type, var in slot_list:
+            mode0, mode1, outcomes, hits = _aggregate_event_history(
+                current_event_time=current_event_time,
+                current_pct=current_pct,
+                event_type=event_type,
+                shift=shift,
+                ctx_info=ctx_info,
+                events_by_type=events_by_type,
+                np_rates=np_rates,
+                target_date=date,
+                is_daily=is_daily,
+                var=var,
+                apply_var_fn=apply_var_fn,
+                min_occurrence=min_occurrence,
+            )
+
+            if signal_fn is not None:
+                direction = 1.0 if current_pct > 0 else -1.0
+                custom = signal_fn(
+                    calc_type,
+                    ctx_id,
+                    shift,
+                    mode0,
+                    bool(hits),
+                    current_pct,
+                    outcomes,
+                    direction,
+                    ctx_info,
+                )
+                contribution = (
+                    _standard_contribution(
+                        calc_type=calc_type,
+                        ctx_id=ctx_id,
+                        shift=shift,
+                        mode0_value=mode0,
+                        mode1_value=mode1,
+                    )
+                    if custom is None
+                    else custom
+                )
+            else:
+                contribution = _standard_contribution(
+                    calc_type=calc_type,
+                    ctx_id=ctx_id,
+                    shift=shift,
+                    mode0_value=mode0,
+                    mode1_value=mode1,
+                )
+
+            out = outputs[(calc_type, var)]
+            for code, value in contribution.items():
+                value = float(value)
+                if value != 0.0:
+                    out[code] = out.get(code, 0.0) + value
+
+    return {
+        slot: {k: v for k, v in result.items() if v != 0.0}
+        for slot, result in outputs.items()
+    }
+
+
+def _run_standard_model_multi_slots(
+    rates,
+    dataset,
+    date: datetime,
+    *,
+    slots: list[tuple[int, int]],
+    dataset_index: dict | None,
+    shift_window: int,
+    apply_var_fn: Callable[[float, float, int, dict], float],
+    min_occurrence: int = 2,
+    rare_event_fn: Optional[Callable[[dict], bool]] = None,
+    rare_occurrence_max: int = 0,
+) -> dict[tuple[int, int], dict[str, float]]:
+    """Fused-расчёт, использующий тот же core, что и одиночный вызов."""
+    return _run_standard_model_core(
+        rates,
+        dataset,
+        date,
+        slots=slots,
+        dataset_index=dataset_index,
+        shift_window=shift_window,
+        apply_var_fn=apply_var_fn,
+        min_occurrence=min_occurrence,
+        get_event_fn=None,
+        signal_fn=None,
+        rare_event_fn=rare_event_fn,
+        rare_occurrence_max=rare_occurrence_max,
+    )
+
+
+def _standard_dataset_is_midnight(dataset) -> bool:
+    """True, если все события датасета привязаны ровно к полуночи."""
+    if not dataset:
+        return False
+    for row in dataset:
+        if not isinstance(row, dict):
+            return False
+        dt = row.get("date")
+        if not isinstance(dt, datetime):
+            return False
+        if dt.hour or dt.minute or dt.second or dt.microsecond:
+            return False
+    return True
+
+
+def _execution_is_daily(rates, dataset_index: dict | None = None) -> bool:
+    """Таймфрейм берётся из явного execution-контракта."""
+    di = dataset_index or {}
+    if "is_daily" in di:
+        return bool(di.get("is_daily"))
+    rates_table = str(di.get("rates_table") or "")
+    if rates_table:
+        return rates_table.endswith("_day")
+    if not rates:
+        return False
+    last_dt = rates[-1].get("date")
+    return bool(
+        isinstance(last_dt, datetime)
+        and last_dt.hour == 0
+        and last_dt.minute == 0
+    )
+
 
 def run_standard_model(
     rates: list[dict],
@@ -247,191 +953,107 @@ def run_standard_model(
     min_occurrence: int = 2,
     get_event_fn: Optional[Callable[[dict], Optional[tuple]]] = None,
     signal_fn: Optional[Callable] = None,
+    rare_event_fn: Optional[Callable[[dict], bool]] = None,
+    rare_occurrence_max: int | None = None,
 ) -> dict[str, float]:
+    """Реализация исходного алгоритма событий и исторических outcomes.
+
+    ``stored_t1`` читается только из ``dataset_index["np_rates"]["t1"]``.
+    Тело свечи ``close-open`` используется исключительно для определения
+    направления предыдущей завершённой свечи в mode=1.
     """
-    Универсальный движок модели. Вызывается из model() сервиса.
-
-    Параметры
-    ─────────
-    apply_var_fn(signed_t1, pct, var, ctx_info) → float
-        Специфична для сервиса. Как взвешивать T1.
-
-    signal_fn(type, ctx_id, shift, weighted_t1, ext_hit, pct, occ, direction, ctx_info)
-        → dict[str, float]  — свои weight_code для этого event
-        → {}                — пропустить событие
-        → None              — использовать встроенную логику (type 0/1/2)
-        Передавать только если нужны кастомные type (3, 4, 5...).
-        Для type 0/1/2 возвращать None — дублировать логику не нужно.
-
-    get_event_fn(row) → (event_time, pct, event_type) | None
-        Как парсить строку датасета.
-        Дефолт: читает готовые поля из enriched-таблицы (date_dt / event_time,
-        pct_change, event_type). Передавать только для нестандартных датасетов.
-    """
-    if not rates or not dataset:
-        return {}
-
-    ctx_index = (dataset_index or {}).get("ctx_index") or {}
-    if not ctx_index:
-        return {}
-
-    reverse: dict[str, tuple[int, dict]] = {
-        str(info.get("event_type") or "").strip().lower(): (int(info["id"]), info)
-        for _, info in ctx_index.items()
-        if info.get("id") and info.get("event_type")
-    }
-    if not reverse:
-        return {}
-
-    np_rates = (dataset_index or {}).get("np_rates")
-    np_view, is_bull = _std_slice_np(np_rates, date, rates)
-    is_daily = rates[-1]["date"].hour == 0 and rates[-1]["date"].minute == 0
-    r_t1, r_t1d, ext_set, ext_day = _std_rate_dicts(rates, is_bull, is_daily, np_view)
-
-    _get_event = get_event_fn or _std_get_event
-    result: dict[str, float] = {}
-    window_sec = shift_window * 86400
-
-    for row in dataset:
-        parsed = _get_event(row)
-        if parsed is None:
-            continue
-        event_time, pct, event_type = parsed
-
-        lookup = reverse.get(event_type)
-        if lookup is None:
-            continue
-        ctx_id, ctx_info = lookup
-        occ = int(ctx_info.get("occurrence_count") or 0)
-
-        diff_sec = (date - event_time).total_seconds()
-        if diff_sec < 0 or diff_sec > window_sec:
-            continue
-
-        shift = int(diff_sec // 86400)
-        if occ < min_occurrence and shift != 0:
-            continue
-
-        t_date = (event_time + timedelta(days=shift)).replace(
-            hour=0, minute=0, second=0, microsecond=0
+    if rare_occurrence_max is None:
+        model_cfg = get_service_config().get("model", {})
+        if not isinstance(model_cfg, dict):
+            model_cfg = {}
+        rare_occurrence_max = int(
+            model_cfg.get("rare_occurrence_max", 0)
         )
-        if t_date > date:
-            continue
 
-        t1, ext_hit = _std_candle(t_date, np_view, is_daily, r_t1, r_t1d, ext_set, ext_day)
-        direction   = 1.0 if pct > 0 else -1.0
-        weighted_t1 = apply_var_fn(t1 * direction, pct, var, ctx_info)
-
-        if signal_fn is not None:
-            contribution = signal_fn(
-                type, ctx_id, shift, weighted_t1,
-                ext_hit, pct, occ, direction, ctx_info,
-            )
-            if contribution is None:
-                contribution = _std_signal(
-                    type, ctx_id, shift, weighted_t1,
-                    ext_hit, pct, occ, direction,
-                )
-        else:
-            contribution = _std_signal(
-                type, ctx_id, shift, weighted_t1,
-                ext_hit, pct, occ, direction,
-            )
-
-        for wc, val in contribution.items():
-            if val != 0.0:
-                result[wc] = result.get(wc, 0.0) + val
-
-    return {k: v for k, v in result.items() if v != 0.0}
-
-
-def _std_signal(
-    type: int, ctx_id: int, shift: int,
-    weighted_t1: float, ext_hit: bool,
-    pct: float, occ: int, direction: float,
-) -> dict[str, float]:
-    """Встроенная логика типов 0 / 1 / 2."""
-    result: dict[str, float] = {}
-    if weighted_t1 != 0.0 and type in (0, 1):
-        result[f"{ctx_id}_0_{shift}"] = round(weighted_t1, 6)
-    if type in (0, 2) and occ > 0 and ext_hit:
-        ext = ((1.0 / occ) * 2 - 1) * direction
-        if ext != 0.0:
-            result[f"{ctx_id}_1_{shift}"] = round(ext, 6)
-    return result
+    result = _run_standard_model_core(
+        rates,
+        dataset,
+        date,
+        slots=[(int(type), int(var))],
+        dataset_index=dataset_index,
+        shift_window=int(shift_window),
+        apply_var_fn=apply_var_fn,
+        min_occurrence=int(min_occurrence),
+        get_event_fn=get_event_fn,
+        signal_fn=signal_fn,
+        rare_event_fn=rare_event_fn,
+        rare_occurrence_max=int(rare_occurrence_max),
+    )
+    return result.get((int(type), int(var)), {})
 
 
 def _std_get_event(row: dict) -> Optional[tuple]:
     """Парсит строку enriched-датасета."""
-    v = row.get("event_time") or row.get("date_dt")
-    if v is None:
+    value = row.get("event_time") or row.get("date_dt") or row.get("date")
+    if value is None:
         return None
-    if isinstance(v, str):
+    if isinstance(value, str):
+        parsed = None
         for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
             try:
-                v = datetime.strptime(v[:19], fmt)
+                parsed = datetime.strptime(value[:19], fmt)
                 break
             except ValueError:
-                pass
-        else:
+                continue
+        if parsed is None:
             return None
+        value = parsed
     try:
-        return v, float(row["pct_change"]), str(row["event_type"])
+        return (
+            value,
+            float(row.get("pct_change") or 0.0),
+            str(row["event_type"]).strip().lower(),
+        )
     except (KeyError, TypeError, ValueError):
         return None
 
 
+# Deprecated compatibility helpers. Они оставлены, чтобы внешние model.py,
+# которые импортировали приватные функции, не падали. Новый core их не использует.
+
 def _std_slice_np(np_rates, date, rates):
-    is_bull = float(rates[-1].get("close") or 0) > float(rates[-1].get("open") or 0)
-    if np_rates is None:
+    is_bull, cut_idx = _previous_completed_candle_direction(np_rates, date)
+    if np_rates is None or cut_idx is None:
         return None, is_bull
-    dn = np_rates.get("dates_ns")
-    if dn is None:
-        return None, is_bull
-    cut = int(np.searchsorted(dn, int(date.timestamp()), side="right"))
-    if cut > 0:
-        is_bull = float(np_rates["close"][cut - 1]) > float(np_rates["open"][cut - 1])
+    cut = cut_idx + 1
     return {
-        "dates_ns": dn[:cut],
-        "t1":       np_rates["t1"][:cut],
-        "ext":      (np_rates["ext_max"] if is_bull else np_rates["ext_min"])[:cut],
-        "cut":      cut,
+        "dates_ns": np_rates["dates_ns"][:cut],
+        "t1": np_rates["t1"][:cut],
+        "ext": (
+            np_rates["ext_max"] if is_bull else np_rates["ext_min"]
+        )[:cut],
+        "cut": cut,
     }, is_bull
 
 
 def _std_rate_dicts(rates, is_bull, is_daily, np_view):
+    """Запрещено синтезировать T1 через close-open.
+
+    Без np_rates stored_t1 недоступен, поэтому fallback возвращает пустые
+    outcome-структуры. Это лучше, чем молча менять экономический смысл модели.
+    """
     if np_view is not None:
         return {}, {}, set(), {}
-    t1   = {r["date"]: float((r.get("close") or 0) - (r.get("open") or 0)) for r in rates}
-    emax, emin = set(), set()
-    for i in range(1, len(rates) - 1):
-        h  = float(rates[i].get("max") or 0)
-        lo = float(rates[i].get("min") or 0)
-        if h  > float(rates[i-1].get("max") or 0) and h  > float(rates[i+1].get("max") or 0): emax.add(rates[i]["date"])
-        if lo < float(rates[i-1].get("min") or 0) and lo < float(rates[i+1].get("min") or 0): emin.add(rates[i]["date"])
-    ext  = emax if is_bull else emin
-    t1d  = {r["date"].date(): float((r.get("close") or 0) - (r.get("open") or 0)) for r in rates} if is_daily else {}
-    extd = {d.date(): True for d in ext} if is_daily else {}
-    return t1, t1d, ext, extd
+    return {}, {}, set(), {}
 
 
 def _std_candle(t_date, np_view, is_daily, r_t1, r_t1d, ext_set, ext_day):
-    if np_view is not None:
-        ts  = int(t_date.timestamp())
-        idx = int(np.searchsorted(np_view["dates_ns"], ts, side="left"))
-        if idx >= np_view["cut"] or int(np_view["dates_ns"][idx]) != ts:
-            if not is_daily:
-                return 0.0, False
-            l = int(np.searchsorted(np_view["dates_ns"], ts, side="left"))
-            r = int(np.searchsorted(np_view["dates_ns"], ts + 86400, side="left"))
-            if r <= l:
-                return 0.0, False
-            idx = r - 1
-        return float(np_view["t1"][idx]), bool(np_view["ext"][idx])
-    if is_daily:
-        dk = t_date.date()
-        return r_t1d.get(dk, 0.0), bool(ext_day.get(dk, False))
-    return r_t1.get(t_date, 0.0), t_date in ext_set
+    """Совместимый exact lookup. Не подменяет отсутствующий outcome."""
+    if np_view is None:
+        return 0.0, False
+    frame = _normalize_frame_date(t_date, is_daily)
+    ts = int(frame.timestamp())
+    idx = int(np.searchsorted(np_view["dates_ns"], ts, side="left"))
+    if idx >= len(np_view["dates_ns"]):
+        return 0.0, False
+    if int(np_view["dates_ns"][idx]) != ts:
+        return 0.0, False
+    return float(np_view["t1"][idx]), bool(np_view["ext"][idx])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -589,6 +1211,7 @@ class _State:
     PORT:         int = 9000
     NODE_NAME:    str = "brain-svc"
     SERVICE_TEXT: str = "Brain microservice"
+    DEVELOPER_EMAIL: str = _DEFAULT_DEVELOPER_EMAIL
 
     WEIGHTS_TABLE:       str | None = None
     WEIGHTS_CODE_COLUMN: str        = "weight_code"
@@ -604,7 +1227,9 @@ class _State:
     REBUILD_INTERVAL:    int        = 0
     VAR_RANGE:           list       = None
     TYPES_RANGE:         list       = None
+    PARAM_RANGE:         list       = None
     CACHE_DATE_FROM:     str        = "2025-01-15"
+    CACHE_FRESH_LAG_DAYS: int        = 14  # последние N календарных дней не кешируем
     LABEL_FN:            object     = None
 
     URL_MAP_QUERY:  str | None = None
@@ -618,6 +1243,12 @@ class _State:
     ML_EXTREMUM_LIMIT:    int   = 50
     ML_ACTIVE_TAIL:       int   = 0
     ML_PRECISION_METRIC:  str   = "mean"
+    FILL_ML_WORKERS:      int   = 1
+    FILL_ML_BATCH_SIZE:   int   = 2000
+    # Maximum chunk passed to synchronous batch_model() during fill_cache.
+    # A whole 14k+ candle history in one call creates huge temporary dicts,
+    # delays the first DB commit and can push Brain 1 into swap/GC thrash.
+    FILL_BATCH_MODEL_SIZE: int  = 1000
 
     # Новые поля для enriched-паттерна
     PARSER_TABLE:         str | None = None
@@ -630,6 +1261,7 @@ class _State:
         self.CTX_KEY_COLUMNS   = ["id"]
         self.VAR_RANGE         = []
         self.TYPES_RANGE       = [0, 1, 2, 3, 4]
+        self.PARAM_RANGE       = [""]
 
         self.model_fn          = None
         self.batch_model_fn    = None
@@ -642,6 +1274,11 @@ class _State:
         self.engine_vlad  = None
         self.engine_brain = None
         self.engine_super = None
+        # Отдельный пул, но те же SUPER_* реквизиты: общий кеш находится на Brain 1.
+        self.engine_cache = None
+        self.cache_writer: bool | None = None
+        self.cache_role: str = "unknown"
+        self.cache_upstream_url: str = ""
 
         self.weight_codes:  list       = []
         self.ctx_index:     dict       = {}
@@ -740,7 +1377,145 @@ def _rates_table(pair_id: int, day_flag: int) -> str:
 
 def _engine_for(name: str, s: _State):
     return {"vlad": s.engine_vlad, "brain": s.engine_brain,
-            "super": s.engine_super}.get(name, s.engine_vlad)
+            "super": s.engine_super, "cache": s.engine_cache}.get(name, s.engine_vlad)
+
+
+def _env_bool_override(name: str) -> bool | None:
+    raw = os.getenv(name, "auto").strip().lower()
+    if raw in {"1", "true", "yes", "on", "writer"}:
+        return True
+    if raw in {"0", "false", "no", "off", "reader"}:
+        return False
+    return None
+
+
+async def _mysql_server_identity(engine) -> tuple | None:
+    """Идентификатор физического MySQL-сервера, независимо от имени схемы."""
+    if engine is None:
+        return None
+    for query, prefix in (
+        ("SELECT @@server_uuid", "uuid"),
+        ("SELECT @@server_id, @@hostname, @@port", "server"),
+        ("SELECT @@hostname, @@port", "host"),
+    ):
+        try:
+            async with engine.connect() as conn:
+                row = (await conn.execute(text(query))).fetchone()
+            if row and row[0] is not None:
+                return (prefix, *tuple(str(v) for v in row))
+        except Exception:
+            continue
+    return None
+
+
+def _build_cache_upstream_url(port: int) -> str:
+    """URL Python-сервиса на Brain 1 для fallback при cache MISS.
+
+    По умолчанию HTTP-хост берётся из SUPER_HOST, поскольку SUPER_* уже ведёт
+    на первую ноду. При необходимости можно задать CACHE_UPSTREAM_URL:
+      http://10.0.0.1          -> порт сервиса добавится автоматически
+      http://cache/{port}      -> подстановка {port}
+      http://10.0.0.1:8916     -> используется как есть
+    """
+    raw = os.getenv("CACHE_UPSTREAM_URL", "").strip().rstrip("/")
+    if raw:
+        if "{port}" in raw:
+            return raw.format(port=port).rstrip("/")
+        try:
+            from urllib.parse import urlsplit
+            parsed = urlsplit(raw if "://" in raw else f"http://{raw}")
+            normalized = raw if "://" in raw else f"http://{raw}"
+            if parsed.port is not None:
+                return normalized.rstrip("/")
+            return f"{normalized.rstrip('/')}:{port}"
+        except Exception:
+            return f"{raw}:{port}"
+
+    host = os.getenv("SUPER_HOST", "").strip()
+    if not host:
+        return ""
+    scheme = os.getenv("CACHE_UPSTREAM_SCHEME", "http").strip() or "http"
+    return f"{scheme}://{host}:{port}"
+
+
+async def _detect_cache_role(s: _State) -> bool:
+    """Определяет, является ли текущая нода единственным cache-writer.
+
+    CACHE_WRITER=1/0 имеет приоритет. В режиме auto Brain 1 определяется по
+    совпадению физического MySQL-сервера DB_* и SUPER_*. При ошибке определения
+    выбирается безопасная роль reader, чтобы дочерняя нода не начала считать.
+    """
+    override = _env_bool_override("CACHE_WRITER")
+    local_id = super_id = None
+    if override is None:
+        local_id = await _mysql_server_identity(s.engine_vlad)
+        super_id = await _mysql_server_identity(s.engine_cache)
+        is_writer = bool(local_id and super_id and local_id == super_id)
+        source = "mysql-auto" if (local_id and super_id) else "safe-reader-fallback"
+    else:
+        is_writer = override
+        source = "CACHE_WRITER env"
+
+    s.cache_writer = is_writer
+    s.cache_role = "writer-brain1" if is_writer else "reader-child"
+    s.cache_upstream_url = _build_cache_upstream_url(s.PORT)
+    log(
+        f" central cache role={s.cache_role} source={source} "
+        f"storage=SUPER_* upstream={s.cache_upstream_url or 'not-configured'} "
+        f"local_mysql={local_id or 'n/a'} super_mysql={super_id or 'n/a'}",
+        s.NODE_NAME, force=True,
+    )
+    return is_writer
+
+
+_CACHE_PROXY_SEM: asyncio.Semaphore | None = None
+
+
+def _get_cache_proxy_sem() -> asyncio.Semaphore:
+    """Bound child->Brain1 cache MISS concurrency without changing payloads."""
+    global _CACHE_PROXY_SEM
+    if _CACHE_PROXY_SEM is None:
+        limit = max(1, int(os.getenv("CACHE_UPSTREAM_CONCURRENCY", "16")))
+        _CACHE_PROXY_SEM = asyncio.Semaphore(limit)
+    return _CACHE_PROXY_SEM
+
+
+async def _proxy_values_to_brain1(
+    s: _State, *, pair: int, day: int, date: str,
+    calc_type: int, calc_var: int, param: str,
+) -> dict:
+    """Получает cache MISS с Brain 1, не исполняя локальную model()."""
+    if _requests is None:
+        raise RuntimeError("requests package is not installed")
+    if not s.cache_upstream_url:
+        raise RuntimeError(
+            "CACHE_UPSTREAM_URL is empty and SUPER_HOST is not configured"
+        )
+
+    timeout = max(1.0, float(os.getenv("CACHE_UPSTREAM_TIMEOUT", "120")))
+    url = f"{s.cache_upstream_url.rstrip('/')}/values"
+    params = {
+        "pair": pair, "day": day, "date": date,
+        "type": calc_type, "var": calc_var, "param": param,
+        "_cache_hop": 1,
+    }
+
+    def _request():
+        response = _requests.get(url, params=params, timeout=timeout)
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, dict) or data.get("status") != "ok":
+            raise RuntimeError(
+                data.get("error", "invalid response from Brain 1")
+                if isinstance(data, dict) else "invalid JSON response from Brain 1"
+            )
+        payload = data.get("payLoad")
+        if payload is None:
+            raise RuntimeError("Brain 1 response has no payLoad")
+        return payload
+
+    async with _get_cache_proxy_sem():
+        return await asyncio.to_thread(_request)
 
 
 def _params_hash(params: dict) -> str:
@@ -759,7 +1534,7 @@ def _filter_rates_lte(table: str, date: datetime, s: _State) -> list[dict]:
         dates = [r["date"] for r in rows]
         s.global_rates_dates[table] = dates
     idx = bisect.bisect_right(dates, date)
-    return rows[:idx]
+    return _list_view(rows, 0, idx)
 
 
 # === ПАТЧ 1: _filter_dataset_lte — binary search ===
@@ -767,7 +1542,7 @@ def _filter_dataset_lte(date: datetime, s: _State) -> list[dict]:
     if not s.FILTER_DATASET_BY_DATE:
         return s.dataset
     idx = bisect.bisect_right(s.dataset_dates, date)
-    return s.dataset[:idx]
+    return _list_view(s.dataset, 0, idx)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1307,13 +2082,27 @@ def build_app(model_module) -> FastAPI:
     s.NODE_NAME    =     _get("service", "name", "NODE_NAME",    "NODE_NAME",    "brain-svc")
     s.SERVICE_TEXT =     _get("service", "text", "SERVICE_TEXT", "SERVICE_TEXT", "Brain microservice")
 
+    # Почта разработчика конкретной модели. Стандартный ключ:
+    #   [developer]
+    #   email = "developer@example.com"
+    # Старые модели без параметра продолжают использовать ALERT_EMAIL/.env
+    # либо исторический адрес vladyurjevitch@yandex.ru.
+    s.DEVELOPER_EMAIL = set_alert_email(
+        _resolve_developer_email(_c, model_module)
+    )
+
     # ── Котировки ─────────────────────────────────────────────────────────────
     s.RATES_TABLE = _get("rates", "table", "RATES_TABLE", "RATES_TABLE", "brain_rates_eur_usd")
 
     # ── Кеш ───────────────────────────────────────────────────────────────────
     s.CACHE_DATE_FROM  =      _get("cache", "date_from",        "CACHE_DATE_FROM",  "", "2025-01-15")
+    s.CACHE_FRESH_LAG_DAYS = max(0, int(_get("cache", "fresh_lag_days", "CACHE_FRESH_LAG_DAYS", "", 14)))
     s.VAR_RANGE        =      _get("cache", "var_range",        "VAR_RANGE",        "", [0])
     s.TYPES_RANGE      =      _get("cache", "types_range",      "TYPES_RANGE",      "", [0, 1, 2, 3, 4])
+    s.PARAM_RANGE      =      _get("cache", "param_range",      "PARAM_RANGE",      "", [""])
+    if not isinstance(s.PARAM_RANGE, list):
+        s.PARAM_RANGE = [str(s.PARAM_RANGE)]
+    s.PARAM_RANGE = [str(v) for v in s.PARAM_RANGE] or [""]
     s.SHIFT_WINDOW     = int( _get("cache", "shift_window",     "SHIFT_WINDOW",     "", 12))
     s.REBUILD_INTERVAL = int(_get("cache", "rebuild_interval", "REBUILD_INTERVAL", "", 0))
     s.RELOAD_INTERVAL = int(_get("cache", "reload_interval", "RELOAD_INTERVAL", "", 3600))
@@ -1349,6 +2138,12 @@ def build_app(model_module) -> FastAPI:
     s.ML_EXTREMUM_LIMIT   = int(  _get("ml", "extremum_limit",   "ML_EXTREMUM_LIMIT",   "", 50))
     s.ML_ACTIVE_TAIL      = int(  _get("ml", "active_tail",      "ML_ACTIVE_TAIL",      "", 0))
     s.ML_PRECISION_METRIC =       _get("ml", "precision_metric", "ML_PRECISION_METRIC", "", "mean")
+    s.FILL_ML_WORKERS     = max(1, int(_get("cache", "ml_workers", "FILL_ML_WORKERS", "FILL_ML_WORKERS", getattr(rl, "_RL_TRAIN_WORKERS", 1))))
+    s.FILL_ML_BATCH_SIZE  = max(100, int(_get("cache", "ml_batch_size", "FILL_ML_BATCH_SIZE", "FILL_ML_BATCH_SIZE", 2000)))
+    s.FILL_BATCH_MODEL_SIZE = max(100, int(_get(
+        "cache", "batch_model_size", "FILL_BATCH_MODEL_SIZE",
+        "FILL_BATCH_MODEL_SIZE", 1000,
+    )))
 
     # ── Прочее ────────────────────────────────────────────────────────────────
     s.LABEL_FN  = getattr(model_module, "LABEL_FN",  None)
@@ -1410,18 +2205,18 @@ def build_app(model_module) -> FastAPI:
         f"ml={'ON' if s.USE_ML_VALUES else 'off'} | "
         f"batch_model={'yes' if s.batch_model_fn else 'no'} | "
         f"enriched_table={s.ENRICHED_TABLE or 'no'} | "
-        f"model_filters_dataset={'yes' if s.model_can_filter_dataset_by_date else 'no'} | "
-        f"rate_history={'yes' if s.model_uses_rate_history else 'no'}",
+        f"normal_cache=zero-copy | standard_window=auto",
         s.NODE_NAME, force=True)
 
     s.engine_vlad, s.engine_brain, s.engine_super = build_engines()
+    s.engine_cache = build_cache_engine()
 
     # ── Patch connection pool settings ────────────────────────────────────────
     # build_engines() в common.py создаёт движки без pool_pre_ping.
     # Это приводит к "Packet sequence number wrong" при использовании
     # протухших соединений из пула. Патчим pool._pre_ping напрямую
     # (публичный API не позволяет менять это после создания движка).
-    for _eng in (s.engine_vlad, s.engine_brain, s.engine_super):
+    for _eng in (s.engine_vlad, s.engine_brain, s.engine_super, s.engine_cache):
         if _eng is None:
             continue
         try:
@@ -1435,8 +2230,60 @@ def build_app(model_module) -> FastAPI:
 
     # ── _call_model ───────────────────────────────────────────────────────────
 
+    async def _call_raw_model(pair, day, date_str, calc_type=0, calc_var=0, param="",
+                              _skip_refresh: bool = False):
+        """Execute model.py directly, bypassing values cache and ML universe."""
+        if s.cache_writer is False:
+            raise RuntimeError("Direct model() is disabled on child node")
+        target_date = _parse_date(date_str)
+        if not target_date:
+            return None
+        table = _rates_table(pair, day)
+        if not _skip_refresh:
+            await _refresh_rates(table, s)
+        np_r = s.np_rates.get(table)
+        rates_x = (
+            _filter_rates_lte(table, target_date, s)
+            if s.model_uses_rate_history
+            else [{"date": target_date.replace(hour=0, minute=0, second=0, microsecond=0) if day else target_date}]
+        )
+        dataset_x = (
+            s.dataset if s.model_can_filter_dataset_by_date
+            else _filter_dataset_lte(target_date, s)
+        )
+        dataset_index_dict = None
+        if s.model_needs_index:
+            dataset_index_dict = {
+                "dates": s.dataset_dates,
+                "by_key": s.dataset_by_key,
+                "key_dates": s.dataset_key_dates,
+                "key_field": s.dataset_key_field,
+                "np_rates": np_r,
+                "ctx_index": s.ctx_index,
+                "url_map": s.url_map,
+                "dataset_timestamps": getattr(s, "_dataset_ts_arr", None),
+                "filter_dataset_by_date": bool(s.FILTER_DATASET_BY_DATE),
+                "dataset_cutoff_ts": float(target_date.timestamp()),
+                "is_daily": bool(day),
+                "rates_table": table,
+                "execution_scope": "diagnostic_raw",
+                "full_dataset": s.dataset,
+            }
+        result = s.model_fn(
+            rates=rates_x, dataset=dataset_x, date=target_date,
+            type=calc_type, var=calc_var, param=param,
+            dataset_index=dataset_index_dict,
+        )
+        result, _ = _extract_detail(result)
+        return result or {}
+
     async def _call_model(pair, day, date_str, calc_type=0, calc_var=0, param="",
                           _skip_refresh: bool = False):
+        if s.cache_writer is False:
+            raise RuntimeError(
+                "Local model() is disabled on child node; cache MISS must be "
+                "computed by Brain 1"
+            )
         target_date = _parse_date(date_str)
         if not target_date:
             return None
@@ -1461,9 +2308,10 @@ def build_app(model_module) -> FastAPI:
                 "dataset_cutoff_ts": float(date_x.timestamp()),
                 "is_daily": bool(day),
                 "rates_table": table,
+                "execution_scope": "live",
             }
-            if s.model_can_filter_dataset_by_date:
-                di["full_dataset"] = s.dataset
+            # Safe internal accelerator for run_standard_model(); no model flag required.
+            di["full_dataset"] = s.dataset
             return di
 
         def _model_inputs_for(date_x: datetime):
@@ -1538,6 +2386,8 @@ def build_app(model_module) -> FastAPI:
     # ── _preload ──────────────────────────────────────────────────────────────
 
     async def _preload():
+        if s.cache_writer is None:
+            await _detect_cache_role(s)
         log(" FULL DATA RELOAD", s.NODE_NAME, force=True)
         s.np_built = False
         s.weight_codes.clear()
@@ -1559,15 +2409,24 @@ def build_app(model_module) -> FastAPI:
         s.service_url  = f"http://localhost:{s.PORT}"
         s._cache_table = f"vlad_values_cache_svc{s.PORT}"
 
-        try:
-            await ensure_cache_table(s.engine_vlad, s.cache_table)
-        except Exception as e:
-            log(f"   cache table: {e}", s.NODE_NAME, level="error")
+        if s.cache_writer:
+            try:
+                await ensure_cache_table(s.engine_cache, s.cache_table)
+            except Exception as e:
+                log(f"   central cache table: {e}", s.NODE_NAME, level="error")
+        else:
+            log(
+                f" central cache reader: SUPER_* / {s.cache_table}",
+                s.NODE_NAME, force=True,
+            )
 
         if s.USE_ML_VALUES:
             try:
                 await s.reverse_store.ensure_tables()
                 s._ml_active_cache.clear()
+                _warm_workers = await rl.warmup_train_executor()
+                if _warm_workers:
+                    log(f"   RL process workers ready: {_warm_workers}", s.NODE_NAME)
             except Exception as e:
                 log(f"   reverse tables: {e}", s.NODE_NAME, level="error")
 
@@ -1664,6 +2523,25 @@ def build_app(model_module) -> FastAPI:
                 log(f"   build_weights: {e}", s.NODE_NAME, level="error")
                 send_error_trace(e, s.NODE_NAME, "build_weights")
                 return {"error": str(e)}
+
+        # NEWS_79_80_FIX: refresh enriched dataset after rebuild.
+        # _preload() runs before enrich_dataset() on first service start, so the
+        # in-memory dataset can still be empty/stale even though enrichment has
+        # just materialized rows in MySQL. Reload only when enrichment actually
+        # changed the shared dataset; noop/locked means the current snapshot is
+        # already suitable (or another service owns the refresh).
+        _enrich_result = stats.get("enrich")
+        _enrich_mode = (
+            str(_enrich_result.get("mode") or "").lower()
+            if isinstance(_enrich_result, dict) else ""
+        )
+        if s.enrich_fn is not None and _enrich_mode not in ("noop", "locked"):
+            await _load_dataset(s)
+            stats["dataset_reload"] = {"rows": len(s.dataset), "mode": _enrich_mode or "changed"}
+            log(
+                f"   dataset reload after enrich: {len(s.dataset)} rows",
+                s.NODE_NAME, force=True,
+            )
 
         await _load_weight_codes(s)
         await _load_ctx_index(s)
@@ -1776,7 +2654,7 @@ def build_app(model_module) -> FastAPI:
 
     async def _cached_dates(pair, day, p_hash) -> set:
         try:
-            async with s.engine_vlad.connect() as conn:
+            async with s.engine_cache.connect() as conn:
                 res = await conn.execute(text(f"""
                     SELECT date_val FROM `{s.cache_table}`
                     WHERE service_url=:url AND pair=:pair
@@ -1786,12 +2664,40 @@ def build_app(model_module) -> FastAPI:
         except Exception:
             return set()
 
+    def _ordered_fill_control(s_state):
+        """Return (ordered, reset_fn) for models with chronological global state.
+
+        Such models must not be evaluated by several slot/chunk workers: the output
+        depends on the exact ascending date order.  Detection is automatic and does
+        not require an .env/config flag.  A model may expose
+        ``reset_fill_cache_state(pair, day_flag, type, var)`` to clear only its
+        fill-cache namespace before replaying the complete timeline.
+        """
+        fn_globals = getattr(s_state.model_fn, "__globals__", {}) or {}
+        last_signal_state = fn_globals.get("_LAST_SIGNAL_TS")
+        ordered = isinstance(last_signal_state, dict)
+        reset_fn = fn_globals.get("reset_fill_cache_state")
+        return ordered, reset_fn if callable(reset_fn) else None
+
     # ── _sync_compute для поточной обработки ─────────────────────────────────
-    def _sync_compute(candle, calc_type, calc_var, all_rows, all_dates, np_rates_pd, s_state, rates_tbl=""):
+    def _sync_compute(candle, calc_type, calc_var, calc_param, all_rows, all_dates, np_rates_pd, s_state, rates_tbl=""):
         td = candle["date"]
-        idx = bisect.bisect_right(all_dates, td)
-        rates_f = all_rows[:idx]
-        ds_f = _filter_dataset_lte(td, s_state)
+
+        # Обычный fill_cache обязан соблюдать те же capability-флаги, что /values.
+        # Раньше здесь безусловно копировался весь исторический prefix rates[:idx]
+        # и заново создавался срез dataset для КАЖДОЙ свечи, даже когда модель
+        # прямо объявила, что умеет фильтровать данные сама или не использует
+        # историю котировок. На длинной H1-истории это давало O(N^2) копирования.
+        if s_state.model_uses_rate_history:
+            idx = bisect.bisect_right(all_dates, td)
+            rates_f = _list_view(all_rows, 0, idx)
+        else:
+            is_daily = bool(str(rates_tbl or s_state.RATES_TABLE or "").endswith("_day"))
+            marker_dt = td.replace(hour=0, minute=0, second=0, microsecond=0) if is_daily else td
+            rates_f = [{"date": marker_dt}]
+
+        ds_f = (s_state.dataset if s_state.model_can_filter_dataset_by_date
+                else _filter_dataset_lte(td, s_state))
 
         dataset_index_dict = None
         if s_state.model_needs_index:
@@ -1804,13 +2710,19 @@ def build_app(model_module) -> FastAPI:
                 "ctx_index": s_state.ctx_index,
                 "url_map": s_state.url_map,
                 "dataset_timestamps": getattr(s_state, "_dataset_ts_arr", None),
+                "filter_dataset_by_date": bool(s_state.FILTER_DATASET_BY_DATE),
+                "dataset_cutoff_ts": float(td.timestamp()),
+                "is_daily": bool(str(rates_tbl or s_state.RATES_TABLE or "").endswith("_day")),
                 "rates_table": rates_tbl or s_state.RATES_TABLE,
+                "execution_scope": "fill_cache",
             }
+            # Safe internal accelerator for run_standard_model(); no model flag required.
+            dataset_index_dict["full_dataset"] = s_state.dataset
 
         try:
             res = s_state.model_fn(
                 rates=rates_f, dataset=ds_f, date=td,
-                type=calc_type, var=calc_var, param="",
+                type=calc_type, var=calc_var, param=calc_param,
                 dataset_index=dataset_index_dict,
             )
             res, _ = _extract_detail(res)
@@ -1820,6 +2732,338 @@ def build_app(model_module) -> FastAPI:
             log(f"   fill {td} t={calc_type} v={calc_var}: {_e}\n{_tb.format_exc()}",
                 s_state.NODE_NAME, level="error", force=True)
             return None
+
+    def _sync_compute_chunk(candles_chunk, calc_type, calc_var, calc_param,
+                            all_rows, all_dates, np_rates_pd, s_state, rates_tbl=""):
+        """Один executor-job обрабатывает пачку свечей вместо job на каждую свечу."""
+        return [
+            _sync_compute(
+                candle=c,
+                calc_type=calc_type,
+                calc_var=calc_var,
+                calc_param=calc_param,
+                all_rows=all_rows,
+                all_dates=all_dates,
+                np_rates_pd=np_rates_pd,
+                s_state=s_state,
+                rates_tbl=rates_tbl,
+            )
+            for c in candles_chunk
+        ]
+
+    def _standard_fast_apply_var(s_state):
+        """Detect the exact simple run_standard_model wrapper automatically."""
+        if s_state.USE_ML_VALUES or s_state.batch_model_fn is not None:
+            return None
+        fn = s_state.model_fn
+        code = getattr(fn, "__code__", None)
+        if code is None or "run_standard_model" not in set(code.co_names):
+            return None
+        apply_var = getattr(fn, "__globals__", {}).get("_apply_var")
+        if not callable(apply_var):
+            return None
+        # Custom hooks change semantics; leave them on the generic path.
+        try:
+            import ast as _ast
+            import textwrap as _textwrap
+            tree = _ast.parse(_textwrap.dedent(inspect.getsource(fn)))
+            calls = [
+                node for node in _ast.walk(tree)
+                if isinstance(node, _ast.Call)
+                and ((isinstance(node.func, _ast.Name) and node.func.id == "run_standard_model")
+                     or (isinstance(node.func, _ast.Attribute) and node.func.attr == "run_standard_model"))
+            ]
+            if len(calls) != 1:
+                return None
+            allowed = {
+                "type", "var", "dataset_index", "shift_window", "apply_var_fn"
+            }
+            keyword_names = {kw.arg for kw in calls[0].keywords if kw.arg is not None}
+            if not keyword_names.issubset(allowed):
+                return None
+        except Exception:
+            # Runtime validation below remains the final safety gate.
+            pass
+        return apply_var
+
+    def _standard_fast_compute_dates(
+        candles_chunk,
+        type_var_slots,
+        all_rows,
+        all_dates,
+        np_rates_pd,
+        rates_tbl,
+        apply_var_fn,
+        dataset_midnight,
+        s_state,
+    ):
+        """Compute all requested slots; H1 targets are always exact timestamps."""
+        dataset_index_dict = {
+            "dates": s_state.dataset_dates,
+            "by_key": s_state.dataset_by_key,
+            "key_dates": s_state.dataset_key_dates,
+            "key_field": s_state.dataset_key_field,
+            "np_rates": np_rates_pd,
+            "ctx_index": s_state.ctx_index,
+            "url_map": s_state.url_map,
+            "dataset_timestamps": getattr(s_state, "_dataset_ts_arr", None),
+            "filter_dataset_by_date": bool(s_state.FILTER_DATASET_BY_DATE),
+            "is_daily": bool(str(rates_tbl or s_state.RATES_TABLE or "").endswith("_day")),
+            "rates_table": rates_tbl or s_state.RATES_TABLE,
+            "full_dataset": s_state.dataset,
+            "execution_scope": "fill_cache",
+        }
+
+        is_hourly_table = not bool(str(rates_tbl or "").endswith("_day"))
+
+        # H1 must always be calculated for the exact target timestamp.
+        # Even with a midnight-only dataset, the causal event window, available
+        # historical outcomes and previous completed candle can change each hour.
+        # Grouping H1 timestamps by (day, legacy_daily, bull/bear) copied a
+        # representative result into non-equivalent hours.
+        can_group_day = False
+
+        group_for_date: dict[datetime, tuple] = {}
+        representatives: dict[tuple, dict] = {}
+
+        dn = np_rates_pd.get("dates_ns") if np_rates_pd is not None else None
+        opens = np_rates_pd.get("open") if np_rates_pd is not None else None
+        closes = np_rates_pd.get("close") if np_rates_pd is not None else None
+
+        for candle in candles_chunk:
+            td = candle["date"]
+            cut = bisect.bisect_right(all_dates, td)
+            if cut <= 0:
+                key = ("empty", td)
+            elif can_group_day and dn is not None and opens is not None and closes is not None:
+                # The standard model's output within an H1 day depends on:
+                #   1) midnight-vs-non-midnight (legacy is_daily semantics),
+                #   2) current candle bull/bear (selects max/min extrema),
+                # while all enriched events are fixed at midnight.
+                np_cut = int(np.searchsorted(dn, int(td.timestamp()), side="left"))
+                if np_cut <= 0:
+                    key = ("empty", td)
+                else:
+                    last_dt = all_rows[cut - 1]["date"]
+                    legacy_daily = last_dt.hour == 0 and last_dt.minute == 0
+                    is_bull = float(closes[np_cut - 1]) > float(opens[np_cut - 1])
+                    key = (td.date(), legacy_daily, is_bull)
+            else:
+                key = ("exact", td)
+            group_for_date[td] = key
+            representatives.setdefault(key, candle)
+
+        group_results: dict[tuple, dict | None] = {}
+        for key, candle in representatives.items():
+            td = candle["date"]
+            cut = bisect.bisect_right(all_dates, td)
+            rates_f = _list_view(all_rows, 0, cut)
+            try:
+                group_results[key] = _run_standard_model_multi_slots(
+                    rates_f,
+                    s_state.dataset,
+                    td,
+                    slots=type_var_slots,
+                    dataset_index=dataset_index_dict,
+                    shift_window=s_state.SHIFT_WINDOW,
+                    apply_var_fn=apply_var_fn,
+                )
+            except Exception as exc:
+                import traceback as _tb
+                log(
+                    f"   standard fast batch {td}: {exc}\n{_tb.format_exc()}",
+                    s_state.NODE_NAME,
+                    level="error",
+                    force=True,
+                )
+                group_results[key] = None
+
+        return {
+            candle["date"]: group_results.get(group_for_date[candle["date"]])
+            for candle in candles_chunk
+        }, len(representatives)
+
+    async def _try_fill_standard_fast(
+        pair_id,
+        day_flag,
+        candles,
+        type_var_slots,
+        cached_by_hash,
+        all_rows,
+        all_dates,
+        np_rates_pd,
+        rates_tbl,
+        batch_size,
+    ):
+        """Automatic fused fill for standard services; returns handled + counters."""
+        if not type_var_slots:
+            return False, 0, 0, 0
+        _ordered_model, _ = _ordered_fill_control(s)
+        if _ordered_model:
+            return False, 0, 0, 0
+        apply_var_fn = _standard_fast_apply_var(s)
+        if apply_var_fn is None or not s.model_needs_index:
+            return False, 0, 0, 0
+
+        slot_meta = []
+        for calc_type, var in type_var_slots:
+            extra = {"type": calc_type, "var": var, "param": ""}
+            p_hash = _params_hash(extra)
+            slot_meta.append((
+                (calc_type, var),
+                p_hash,
+                _json.dumps(extra, ensure_ascii=False),
+                cached_by_hash.get(p_hash, set()),
+            ))
+
+        skipped_inc = 0
+        pending = []
+        for candle in candles:
+            dv = candle["date"]
+            missing_any = False
+            for _slot, _ph, _pj, cached in slot_meta:
+                if dv in cached:
+                    skipped_inc += 1
+                else:
+                    missing_any = True
+            if missing_any:
+                pending.append(candle)
+
+        if not pending:
+            return True, 0, skipped_inc, 0
+
+        dataset_midnight = _standard_dataset_is_midnight(s.dataset)
+
+        # Safety gate: compare the fused implementation with the actual model
+        # on representative first/middle/last dates before using it for a fill.
+        sample_idx = sorted(set((0, len(pending) // 2, len(pending) - 1)))
+        sample = [pending[i] for i in sample_idx]
+        fast_sample, _ = _standard_fast_compute_dates(
+            sample,
+            type_var_slots,
+            all_rows,
+            all_dates,
+            np_rates_pd,
+            rates_tbl,
+            apply_var_fn,
+            dataset_midnight,
+            s,
+        )
+        for candle in sample:
+            td = candle["date"]
+            slot_results = fast_sample.get(td)
+            if slot_results is None:
+                return False, 0, 0, 0
+            for calc_type, var in type_var_slots:
+                expected = _sync_compute(
+                    candle=candle,
+                    calc_type=calc_type,
+                    calc_var=var,
+                    calc_param="",
+                    all_rows=all_rows,
+                    all_dates=all_dates,
+                    np_rates_pd=np_rates_pd,
+                    s_state=s,
+                    rates_tbl=rates_tbl,
+                )
+                actual = slot_results.get((calc_type, var))
+                if expected != actual:
+                    log(
+                        f"  [pair{pair_id}/{'d' if day_flag else 'h'}] "
+                        f"standard fast validation mismatch at {td} "
+                        f"t={calc_type} v={var}; generic fallback",
+                        s.NODE_NAME,
+                        level="warning",
+                        force=True,
+                    )
+                    return False, 0, 0, 0
+
+        done_inc = 0
+        errors_inc = 0
+        groups_total = 0
+        eff_batch = max(int(batch_size or 0), 5000)
+        cache_table = s.cache_table
+
+        for i in range(0, len(pending), eff_batch):
+            if s.fill_cancel.is_set():
+                break
+            chunk = pending[i:i + eff_batch]
+            by_date, groups_count = _standard_fast_compute_dates(
+                chunk,
+                type_var_slots,
+                all_rows,
+                all_dates,
+                np_rates_pd,
+                rates_tbl,
+                apply_var_fn,
+                dataset_midnight,
+                s,
+            )
+            groups_total += groups_count
+
+            insert_rows = []
+            # The same group dictionary is shared by all equivalent H1 dates;
+            # serialize each distinct result/slot only once.
+            encoded_cache: dict[tuple[int, tuple[int, int]], str] = {}
+            for candle in chunk:
+                dv = candle["date"]
+                slot_results = by_date.get(dv)
+                for slot, p_hash, params_json, cached in slot_meta:
+                    if dv in cached:
+                        continue
+                    done_inc += 1
+                    result = None if slot_results is None else slot_results.get(slot)
+                    if result is None:
+                        errors_inc += 1
+                        continue
+                    enc_key = (id(result), slot)
+                    result_json = encoded_cache.get(enc_key)
+                    if result_json is None:
+                        result_json = _rj_encode(result)
+                        encoded_cache[enc_key] = result_json
+                    insert_rows.append({
+                        "url": s.service_url,
+                        "pair": pair_id,
+                        "day": day_flag,
+                        "dv": dv,
+                        "ph": p_hash,
+                        "pj": params_json,
+                        "rj": result_json,
+                    })
+
+            if insert_rows:
+                try:
+                    async with s.engine_cache.begin() as conn:
+                        for j in range(0, len(insert_rows), 5000):
+                            await conn.execute(text(f"""
+                                INSERT IGNORE INTO `{cache_table}`
+                                    (service_url, pair, day_flag, date_val,
+                                     params_hash, params_json, result_json)
+                                VALUES (:url, :pair, :day, :dv, :ph, :pj, :rj)
+                            """), insert_rows[j:j + 5000])
+                except Exception as exc:
+                    log(
+                        f"   standard fast bulk insert: {exc}",
+                        s.NODE_NAME,
+                        level="warning",
+                    )
+
+            log(
+                f"  [pair{pair_id}/{'d' if day_flag else 'h'} fast] "
+                f"processed={min(i + len(chunk), len(pending))}/{len(pending)} "
+                f"groups={groups_total} err={errors_inc}",
+                s.NODE_NAME,
+                force=True,
+            )
+
+        log(
+            f"  [pair{pair_id}/{'d' if day_flag else 'h'}] "
+            f"standard fused path: {len(pending)} dates -> {groups_total} states, "
+            f"slots={len(type_var_slots)}",
+            s.NODE_NAME,
+            force=True,
+        )
+        return True, done_inc, skipped_inc, errors_inc
 
     # ── _prewarm_ml_active_cache ──────────────────────────────────────────────
     #
@@ -1878,19 +3122,19 @@ def build_app(model_module) -> FastAPI:
                 "is_daily": bool(day_flag),
                 "rates_table": tbl,
             }
-            if s.model_can_filter_dataset_by_date:
-                dataset_index_dict["full_dataset"] = s.dataset
+            dataset_index_dict["full_dataset"] = s.dataset
 
         # Группируем слоты по calc_var — один batch_model call на интервал
         # (train_mode не влияет на набор дат экстремумов, только на обучение).
         from itertools import groupby as _groupby
         slots_by_var: dict[int, list[int]] = {}
-        for calc_type, calc_var in type_var_slots:
-            slots_by_var.setdefault(calc_var, []).append(calc_type)
+        slots_by_var: dict[tuple[int, str], list[int]] = {}
+        for calc_type, calc_var, calc_param in type_var_slots:
+            slots_by_var.setdefault((calc_var, calc_param), []).append(calc_type)
 
         warmed = 0
 
-        for calc_var, calc_types in slots_by_var.items():
+        for (calc_var, calc_param), calc_types in slots_by_var.items():
             if s.fill_cancel.is_set():
                 break
 
@@ -1939,33 +3183,61 @@ def build_app(model_module) -> FastAPI:
 
                 missing = [
                     d for d in ext_dates
-                    if (pair_id, day_flag, int(d.timestamp()), calc_type, calc_var, "")
+                    if (pair_id, day_flag, int(d.timestamp()), calc_type, calc_var, calc_param)
                        not in s._ml_active_cache
                 ]
                 if not missing:
                     continue
 
                 try:
-                    # batch_model за один вызов — O(N) вместо O(N²).
-                    rates_for_prewarm = rows if s.model_uses_rate_history else [{"date": missing[-1]}]
-                    dataset_for_prewarm = s.dataset if s.model_can_filter_dataset_by_date else _filter_dataset_lte(missing[-1], s)
-                    batch_results = s.batch_model_fn(
-                        rates=rates_for_prewarm,
-                        dataset=dataset_for_prewarm,
-                        dates=missing,
-                        type=calc_type, var=calc_var, param="",
-                        dataset_index=dataset_index_dict,
-                    )
-                    for ext_dt, result in batch_results.items():
-                        key = (pair_id, day_flag, int(ext_dt.timestamp()),
-                               calc_type, calc_var, "")
-                        s._ml_active_cache[key] = list(result.keys())
-                        warmed += 1
-                    # FIX: страховочный лимит на _ml_active_cache (без него нет eviction)
-                    if len(s._ml_active_cache) > _ML_ACTIVE_CACHE_MAX:
-                        _evict = len(s._ml_active_cache) - _ML_ACTIVE_CACHE_MAX
-                        for _k in list(s._ml_active_cache.keys())[:_evict]:
-                            del s._ml_active_cache[_k]
+                    # Stream prewarm too.  One call with thousands of extrema
+                    # creates the same giant-result-map problem as normal fill.
+                    _prewarm_bs = max(100, min(
+                        s.FILL_ML_BATCH_SIZE, s.FILL_BATCH_MODEL_SIZE
+                    ))
+                    _prewarm_total = len(missing)
+                    _prewarm_done = 0
+                    for _j in range(0, _prewarm_total, _prewarm_bs):
+                        if s.fill_cancel.is_set():
+                            break
+                        _missing_chunk = missing[_j:_j + _prewarm_bs]
+                        rates_for_prewarm = (
+                            rows if s.model_uses_rate_history
+                            else [{"date": _missing_chunk[-1]}]
+                        )
+                        dataset_for_prewarm = (
+                            s.dataset if s.model_can_filter_dataset_by_date
+                            else _filter_dataset_lte(_missing_chunk[-1], s)
+                        )
+                        batch_results = s.batch_model_fn(
+                            rates=rates_for_prewarm,
+                            dataset=dataset_for_prewarm,
+                            dates=_missing_chunk,
+                            type=calc_type, var=calc_var, param=calc_param,
+                            dataset_index=dataset_index_dict,
+                        )
+                        for ext_dt, result in batch_results.items():
+                            key = (pair_id, day_flag, int(ext_dt.timestamp()),
+                                   calc_type, calc_var, calc_param)
+                            s._ml_active_cache[key] = list(result.keys())
+                            warmed += 1
+                        _prewarm_done += len(_missing_chunk)
+                        s.fill_status.update({
+                            "phase": "ml_prewarm",
+                            "prewarm_done": _prewarm_done,
+                            "prewarm_total": _prewarm_total,
+                            "current_pair": pair_id,
+                            "current_day": day_flag,
+                            "current_type": calc_type,
+                            "current_var": calc_var,
+                            "current_param": calc_param,
+                        })
+                        # Safety cap; with per-slot prewarm the entries currently
+                        # needed for calculation are newest and survive eviction.
+                        if len(s._ml_active_cache) > _ML_ACTIVE_CACHE_MAX:
+                            _evict = len(s._ml_active_cache) - _ML_ACTIVE_CACHE_MAX
+                            for _k in list(s._ml_active_cache.keys())[:_evict]:
+                                del s._ml_active_cache[_k]
                 except Exception as _e:
                     log(f"   prewarm pair{pair_id}/{'d' if day_flag else 'h'} "
                         f"t={calc_type} v={calc_var}: {_e}",
@@ -1975,49 +3247,71 @@ def build_app(model_module) -> FastAPI:
 
     # ── _fill_worker ──────────────────────────────────────────────────────────
 
-    async def _fill_worker(pairs, days, date_from_str, date_to_str, types, batch_size):
+    async def _fill_worker(pairs, days, date_from_str, date_to_str, types, params, batch_size):
+        if not s.cache_writer:
+            s.fill_status = {
+                "state": "error",
+                "error": "fill_cache разрешён только на Brain 1",
+                "cache_role": s.cache_role,
+            }
+            return
         s.fill_cancel.clear()
         s._fill_cache_active = True   # skip vlad_reverse_universe writes for speed
-        # Clear ML universe cache so fill_cache starts fresh
-        if s.reverse_store:
-            s.reverse_store.clear_universe_cache()
-        dt_from = _parse_date(date_from_str) if date_from_str else None
-        dt_to   = _parse_date(date_to_str)   if date_to_str   else None
+        # Preparation also needs cleanup protection.  Failures here happen
+        # before the main processing loop (for example while refreshing rates),
+        # so the loop's finally block cannot reset _fill_cache_active for us.
+        try:
+            # Clear ML universe cache so fill_cache starts fresh
+            if s.reverse_store:
+                s.reverse_store.clear_universe_cache()
+            dt_from = _parse_date(date_from_str) if date_from_str else None
+            dt_to   = _parse_date(date_to_str)   if date_to_str   else None
 
-        pd_slots       = [(p, d) for p in pairs for d in days]
-        type_var_slots = [(tp, var) for tp in types for var in s.VAR_RANGE]
-        total_slots    = len(pd_slots) * len(type_var_slots)
+            # Build one consistent data snapshot for the whole fill.  The previous
+            # ML path refreshed rates before every batch and repeatedly hit MySQL.
+            await _refresh_simple_rates(s)
 
-        total_candles = sum(
-            sum(1 for r in s.global_rates.get(_rates_table(p, d), [])
-                if (dt_from is None or r["date"] >= dt_from)
-                and (dt_to   is None or r["date"] <= dt_to))
-            for p, d in pd_slots
-        )
-        total  = total_candles * len(type_var_slots)
-        done   = skipped = errors = 0
-        s.fill_status = {
-            "state": "running", "total": total, "done": 0,
-            "skipped": 0, "errors": 0,
-            "pairs": pairs, "days": days,
-            "slots_total": total_slots, "slots_done": 0,
-            "started_at": datetime.now().isoformat(),
-        }
-        log(f" fill_cache: {len(pd_slots)} инструментов × "
-            f"{len(type_var_slots)} type/var слотов", s.NODE_NAME, force=True)
+            pd_slots       = [(p, d) for p in pairs for d in days]
+            type_var_slots = [(tp, var, param) for tp in types for var in s.VAR_RANGE for param in params]
+            total_slots    = len(pd_slots) * len(type_var_slots)
+
+            total_candles = sum(
+                sum(1 for r in s.global_rates.get(_rates_table(p, d), [])
+                    if (dt_from is None or r["date"] >= dt_from)
+                    and (dt_to   is None or r["date"] <= dt_to))
+                for p, d in pd_slots
+            )
+            total  = total_candles * len(type_var_slots)
+            done   = skipped = errors = 0
+            completed_slots = 0
+            s.fill_status = {
+                "state": "running", "phase": "preparing",
+                "total": total, "done": 0,
+                "skipped": 0, "errors": 0,
+                "pairs": pairs, "days": days,
+                "slots_total": total_slots, "slots_done": 0,
+                "started_at": datetime.now().isoformat(),
+            }
+            log(f" fill_cache: {len(pd_slots)} инструментов × "
+                f"{len(type_var_slots)} type/var/param слотов", s.NODE_NAME, force=True)
+        except Exception:
+            s._fill_cache_active = False
+            raise
 
         try:
             for slot_idx, (pair_id, day_flag) in enumerate(pd_slots):
                 if s.fill_cancel.is_set():
                     break
 
-                tbl      = _rates_table(pair_id, day_flag)
+                tbl = _rates_table(pair_id, day_flag)
+                await _refresh_rates(tbl, s)
                 all_rows = s.global_rates.get(tbl, [])
                 candles  = [r for r in all_rows
                             if (dt_from is None or r["date"] >= dt_from)
                             and (dt_to   is None or r["date"] <= dt_to)]
                 if not candles:
-                    s.fill_status["slots_done"] = slot_idx + 1
+                    completed_slots += len(type_var_slots)
+                    s.fill_status["slots_done"] = completed_slots
                     log(f"  [pair{pair_id}/{'d' if day_flag else 'h'}] нет свечей, пропуск",
                         s.NODE_NAME, force=True)
                     continue
@@ -2025,19 +3319,43 @@ def build_app(model_module) -> FastAPI:
                 np_rates_pd  = s.np_rates.get(tbl)
                 all_dates_pd = [r["date"] for r in all_rows]
                 instr_label  = f"pair{pair_id}/{'d' if day_flag else 'h'}"
+                s.fill_status.update({
+                    "phase": "cache_prefetch",
+                    "current_pair": pair_id,
+                    "current_day": day_flag,
+                })
                 log(f"  [{instr_label}] {len(candles)} свечей × "
-                    f"{len(type_var_slots)} type/var слотов", s.NODE_NAME, force=True)
+                    f"{len(type_var_slots)} type/var/param слотов", s.NODE_NAME, force=True)
 
                 # OPT-1: один prefetch всех cached_dates для данного инструмента
                 # вместо N отдельных SELECT на каждый (calc_type, var) слот.
                 _tbl_c = s.cache_table
                 cached_by_hash: dict[str, set] = {}
                 try:
-                    async with s.engine_vlad.connect() as conn:
+                    _wanted_hashes = [
+                        _params_hash({"type": ct, "var": vv, "param": prm})
+                        for ct, vv, prm in type_var_slots
+                    ]
+                    _where_ch = ["service_url=:url", "pair=:pair", "day_flag=:day"]
+                    _params_ch = {"url": s.service_url, "pair": pair_id, "day": day_flag}
+                    if dt_from is not None:
+                        _where_ch.append("date_val>=:df")
+                        _params_ch["df"] = dt_from
+                    if dt_to is not None:
+                        _where_ch.append("date_val<=:dt")
+                        _params_ch["dt"] = dt_to
+                    if _wanted_hashes:
+                        _ph_marks = []
+                        for _i, _ph in enumerate(_wanted_hashes):
+                            _name = f"ph{_i}"
+                            _ph_marks.append(f":{_name}")
+                            _params_ch[_name] = _ph
+                        _where_ch.append(f"params_hash IN ({','.join(_ph_marks)})")
+                    async with s.engine_cache.connect() as conn:
                         _res_ch = await conn.execute(text(f"""
                             SELECT params_hash, date_val FROM `{_tbl_c}`
-                            WHERE service_url=:url AND pair=:pair AND day_flag=:day
-                        """), {"url": s.service_url, "pair": pair_id, "day": day_flag})
+                            WHERE {' AND '.join(_where_ch)}
+                        """), _params_ch)
                         for _ph, _dv in _res_ch.fetchall():
                             cached_by_hash.setdefault(_ph, set()).add(_dv)
                     log(f"  [{instr_label}] cached prefetch: "
@@ -2048,54 +3366,133 @@ def build_app(model_module) -> FastAPI:
                     log(f"  [{instr_label}] cached prefetch failed: {_ce}",
                         s.NODE_NAME, level="warning")
 
-                # ── Прогрев ML-кеша через batch_model ────────────────────────────
-                # Если модель имеет batch_model и USE_ML_VALUES=True — вычисляем
-                # активные коды для всех экстремумов одним вызовом.
-                # maybe_retrain() будет получать _active_codes_at из кеша (O(1))
-                # вместо пересчёта срезов rates на каждый экстремум.
-                if s.USE_ML_VALUES and s.batch_model_fn is not None:
-                    warmed = await _prewarm_ml_active_cache(
-                        pair_id, day_flag, type_var_slots,
-                        dt_from=dt_from, dt_to=dt_to,
+                _ordered_model, _ordered_reset_fn = _ordered_fill_control(s)
+                if _ordered_model:
+                    log(
+                        f"  [{instr_label}] stateful model detected: "
+                        "strict date/slot order enabled",
+                        s.NODE_NAME,
+                        force=True,
                     )
-                    if warmed:
-                        log(f"  [{instr_label}] ML-кеш прогрет: {warmed} экстремумов",
-                            s.NODE_NAME, force=True)
+
+                # AUTO-3/4/5: exact fused path for the standard wrappers used by
+                # services 53, 56 and 62-70. Detection and result validation are automatic;
+                # custom models continue through the generic implementation below.
+                _fast_slots = [(t, v) for t, v, prm in type_var_slots] if all(prm == "" for _, _, prm in type_var_slots) else []
+                _fast_handled, _fast_done, _fast_skipped, _fast_errors = (
+                    await _try_fill_standard_fast(
+                        pair_id, day_flag, candles, _fast_slots, cached_by_hash,
+                        all_rows, all_dates_pd, np_rates_pd, tbl, batch_size,
+                    )
+                )
+                if _fast_handled:
+                    done += _fast_done
+                    skipped += _fast_skipped
+                    errors += _fast_errors
+                    completed_slots += len(type_var_slots)
+                    s.fill_status.update({
+                        "done": done, "skipped": skipped, "errors": errors,
+                        "slots_done": completed_slots,
+                    })
+                    continue
 
                 # OPT-2: параллельный запуск type_var_slots через asyncio.gather
                 # (только для не-ML пути — ML-обучение state-dependent, нельзя параллелить).
                 # Счётчики done/skipped/errors защищены asyncio-lock (однопоточный event loop).
                 _slot_lock = asyncio.Lock()
+                _ml_compute_sem = asyncio.Semaphore(max(1, s.FILL_ML_WORKERS))
 
-                async def _fill_one_slot(calc_type: int, var: int) -> None:
-                    nonlocal done, skipped, errors
+                async def _fill_one_slot(calc_type: int, var: int, calc_param: str) -> None:
+                    nonlocal done, skipped, errors, completed_slots
 
-                    extra       = {"type": calc_type, "var": var, "param": ""}
+                    extra       = {"type": calc_type, "var": var, "param": calc_param}
                     p_hash      = _params_hash(extra)
                     params_json = _json.dumps(extra, ensure_ascii=False)
 
                     # OPT-1: используем prefetch вместо отдельного SELECT
-                    cached   = cached_by_hash.get(p_hash, set())
+                    cached = cached_by_hash.get(p_hash, set())
 
-                    to_fetch  = [c for c in candles if c["date"] not in cached]
-                    async with _slot_lock:
+                    if _ordered_model:
+                        # Stateful models must replay the complete ascending timeline,
+                        # including already cached dates, to reconstruct their state.
+                        # Existing rows are not reinserted below.
+                        if _ordered_reset_fn is not None:
+                            try:
+                                _ordered_reset_fn(pair_id, day_flag, calc_type, var)
+                            except Exception as _reset_exc:
+                                log(
+                                    f"   state reset t={calc_type} v={var}: {_reset_exc}",
+                                    s.NODE_NAME, level="warning", force=True,
+                                )
+                        to_fetch = sorted(candles, key=lambda c: c["date"])
+                        skipped_local = sum(1 for c in candles if c["date"] in cached)
+                    else:
+                        to_fetch = [c for c in candles if c["date"] not in cached]
                         skipped_local = len(candles) - len(to_fetch)
+                    async with _slot_lock:
                         skipped += skipped_local
 
-                    # OPT-5: для batch_model один большой батч выгоднее
-                    # (стоимость вызова константа, нет смысла дробить).
-                    _eff_bs = (len(to_fetch)
-                               if s.batch_model_fn is not None and not s.USE_ML_VALUES
-                               else batch_size) or batch_size
+                    # Streaming batches are intentional even for batch_model().
+                    # Passing the whole 2025→now hourly range (≈14k candles) made
+                    # model-side result caches enormous and `done` stayed at zero
+                    # until one giant calculation + INSERT finished.  A bounded
+                    # chunk keeps memory flat and commits visible progress quickly.
+                    if s.batch_model_fn is not None and not s.USE_ML_VALUES:
+                        _eff_bs = min(
+                            max(1, len(to_fetch)),
+                            max(batch_size, s.FILL_BATCH_MODEL_SIZE),
+                        )
+                    elif s.USE_ML_VALUES:
+                        _eff_bs = max(batch_size, s.FILL_ML_BATCH_SIZE)
+                    else:
+                        _eff_bs = batch_size
+
+                    # ML results are slot-specific: train_mode / var / param are
+                    # part of model semantics, so never leak a state result into
+                    # another slot merely because the extremum sequence is equal.
+                    _ml_state_results: dict[tuple, dict | None] = {}
+
+                    # Prewarm only the ML slot that is about to be consumed.
+                    # The previous implementation warmed ALL type/var slots for a
+                    # pair before writing the first cache row; on 78/80 this could
+                    # spend hours in a phase invisible to fill_status.done and also
+                    # evict early prewarm entries before those slots were processed.
+                    if s.USE_ML_VALUES and s.batch_model_fn is not None and to_fetch:
+                        s.fill_status.update({
+                            "phase": "ml_prewarm",
+                            "current_pair": pair_id,
+                            "current_day": day_flag,
+                            "current_type": calc_type,
+                            "current_var": var,
+                            "current_param": calc_param,
+                        })
+                        warmed = await _prewarm_ml_active_cache(
+                            pair_id, day_flag, [(calc_type, var, calc_param)],
+                            dt_from=dt_from, dt_to=dt_to,
+                        )
+                        if warmed:
+                            log(
+                                f"  [{instr_label} t={calc_type}/v={var}] "
+                                f"ML-кеш прогрет: {warmed} экстремумов",
+                                s.NODE_NAME, force=True,
+                            )
+
                     for i in range(0, len(to_fetch), _eff_bs):
+                        s.fill_status.update({
+                            "phase": "calculating",
+                            "current_pair": pair_id,
+                            "current_day": day_flag,
+                            "current_type": calc_type,
+                            "current_var": var,
+                            "current_param": calc_param,
+                            "slot_batch_from": i,
+                            "slot_total": len(to_fetch),
+                        })
                         if s.fill_cancel.is_set():
                             break
                         batch = to_fetch[i:i + _eff_bs]
 
                         if s.USE_ML_VALUES:
-                            # Refresh rates once per batch, not per candle.
-                            await _refresh_rates(_rates_table(pair_id, day_flag), s)
-
                             # OPT-ML-BATCH: соседние свечи обычно имеют один и тот же
                             # набор последних N экстремумов. Для таких свечей результат
                             # train_at_date() идентичен, поэтому считаем ML только один
@@ -2124,26 +3521,37 @@ def build_app(model_module) -> FastAPI:
                                         s.NODE_NAME, force=True,
                                     )
 
-                                for _indices in grouped.values():
+                                async def _compute_ml_state(_state_key, _indices):
+                                    if _state_key in _ml_state_results:
+                                        return
                                     if s.fill_cancel.is_set():
-                                        break
+                                        _ml_state_results[_state_key] = None
+                                        return
                                     _rep = batch[_indices[0]]
-                                    try:
-                                        _result = await _call_model(
-                                            pair_id, day_flag,
-                                            _rep["date"].strftime("%Y-%m-%d %H:%M:%S"),
-                                            calc_type=calc_type, calc_var=var, param="",
-                                            _skip_refresh=True,
-                                        )
-                                    except Exception as _e:
-                                        import traceback as _tb
-                                        log(
-                                            f"   ml-fill {_rep['date']} t={calc_type} v={var}: "
-                                            f"{_e}\n{_tb.format_exc()}",
-                                            s.NODE_NAME, level="error", force=True,
-                                        )
-                                        _result = None
+                                    async with _ml_compute_sem:
+                                        try:
+                                            _result = await _call_model(
+                                                pair_id, day_flag,
+                                                _rep["date"].strftime("%Y-%m-%d %H:%M:%S"),
+                                                calc_type=calc_type, calc_var=var, param=calc_param,
+                                                _skip_refresh=True,
+                                            )
+                                        except Exception as _e:
+                                            import traceback as _tb
+                                            log(
+                                                f"   ml-fill {_rep['date']} t={calc_type} v={var}: "
+                                                f"{_e}\n{_tb.format_exc()}",
+                                                s.NODE_NAME, level="error", force=True,
+                                            )
+                                            _result = None
+                                    _ml_state_results[_state_key] = _result
 
+                                await asyncio.gather(*(
+                                    _compute_ml_state(_state_key, _indices)
+                                    for _state_key, _indices in grouped.items()
+                                ))
+                                for _state_key, _indices in grouped.items():
+                                    _result = _ml_state_results.get(_state_key)
                                     for _idx in _indices:
                                         results[_idx] = _result
                             except Exception as _e:
@@ -2161,7 +3569,7 @@ def build_app(model_module) -> FastAPI:
                                         result = await _call_model(
                                             pair_id, day_flag,
                                             candle["date"].strftime("%Y-%m-%d %H:%M:%S"),
-                                            calc_type=calc_type, calc_var=var, param="",
+                                            calc_type=calc_type, calc_var=var, param=calc_param,
                                             _skip_refresh=True,
                                         )
                                     except Exception as _e2:
@@ -2190,21 +3598,22 @@ def build_app(model_module) -> FastAPI:
                                     "filter_dataset_by_date": bool(s.FILTER_DATASET_BY_DATE),
                                     "is_daily": bool(day_flag),
                                 }
-                                if s.model_can_filter_dataset_by_date:
-                                    dataset_index_dict_b["full_dataset"] = s.dataset
+                                dataset_index_dict_b["full_dataset"] = s.dataset
                             try:
                                 batch_dates = [c["date"] for c in batch]
                                 # Полный срез all_rows до последней целевой даты.
                                 max_batch_date = batch_dates[-1]
                                 idx_end = bisect.bisect_right(all_dates_pd, max_batch_date)
-                                rates_for_batch = all_rows[:idx_end] if s.model_uses_rate_history else [{"date": max_batch_date}]
+                                rates_for_batch = (_list_view(all_rows, 0, idx_end)
+                                                   if s.model_uses_rate_history
+                                                   else [{"date": max_batch_date}])
                                 dataset_f_b = s.dataset if s.model_can_filter_dataset_by_date else _filter_dataset_lte(max_batch_date, s)
 
                                 batch_map = s.batch_model_fn(
                                     rates=rates_for_batch,
                                     dataset=dataset_f_b,
                                     dates=batch_dates,
-                                    type=calc_type, var=var, param="",
+                                    type=calc_type, var=var, param=calc_param,
                                     dataset_index=dataset_index_dict_b,
                                 )
                                 results = [batch_map.get(c["date"]) for c in batch]
@@ -2213,24 +3622,54 @@ def build_app(model_module) -> FastAPI:
                                 log(f"   batch_model t={calc_type} v={var}: {_e}\n{_tb.format_exc()}",
                                     s.NODE_NAME, level="error", force=True)
                                 results = [None] * len(batch)
+                        elif _ordered_model:
+                            # One executor job, one ascending sequence.  Splitting this
+                            # batch into workers would make stateful output depend on
+                            # thread scheduling rather than candle chronology.
+                            loop = asyncio.get_running_loop()
+                            results = await loop.run_in_executor(
+                                _FILL_EXECUTOR,
+                                _sync_compute_chunk,
+                                batch, calc_type, var, calc_param,
+                                all_rows, all_dates_pd, np_rates_pd, s, tbl,
+                            )
                         else:
-                            # ПАТЧ 5: параллельные потоки внутри батча
-                            loop = asyncio.get_event_loop()
+                            # Обычный model(): дробим батч максимум на число worker-ов.
+                            # Раньше создавался Future на КАЖДУЮ свечу; на лёгких моделях
+                            # диспетчеризация могла занимать больше времени, чем model().
+                            loop = asyncio.get_running_loop()
+                            workers = min(
+                                max(1, getattr(_FILL_EXECUTOR, "_max_workers", 1)),
+                                len(batch),
+                            )
+                            chunk_len = max(1, (len(batch) + workers - 1) // workers)
+                            chunks = [batch[j:j + chunk_len]
+                                      for j in range(0, len(batch), chunk_len)]
                             futs = [
                                 loop.run_in_executor(
                                     _FILL_EXECUTOR,
-                                    _sync_compute,
-                                    candle, calc_type, var,
-                                    all_rows, all_dates_pd, np_rates_pd, s, tbl
+                                    _sync_compute_chunk,
+                                    chunk, calc_type, var, calc_param,
+                                    all_rows, all_dates_pd, np_rates_pd, s, tbl,
                                 )
-                                for candle in batch
+                                for chunk in chunks
                             ]
-                            results = list(await asyncio.gather(*futs))
+                            chunk_results = await asyncio.gather(*futs)
+                            results = [item for part in chunk_results for item in part]
 
                         insert_rows = []
+                        batch_done = sum(
+                            1 for candle in batch
+                            if not (_ordered_model and candle["date"] in cached)
+                        )
                         for candle, result in zip(batch, results):
+                            already_cached = _ordered_model and candle["date"] in cached
                             if result is None:
+                                # A failure while replaying a cached date is still
+                                # relevant because subsequent state may be affected.
                                 errors += 1
+                                continue
+                            if already_cached:
                                 continue
                             insert_rows.append({
                                 "url":  s.service_url, "pair": pair_id,
@@ -2240,7 +3679,7 @@ def build_app(model_module) -> FastAPI:
                             })
                         if insert_rows:
                             try:
-                                async with s.engine_vlad.begin() as conn:
+                                async with s.engine_cache.begin() as conn:
                                     await conn.execute(text(f"""
                                         INSERT IGNORE INTO `{_tbl_c}`
                                             (service_url, pair, day_flag, date_val,
@@ -2250,29 +3689,39 @@ def build_app(model_module) -> FastAPI:
                             except Exception as e:
                                 log(f"   bulk insert: {e}", s.NODE_NAME, level="warning")
                         async with _slot_lock:
-                            done += len(batch)
+                            done += batch_done
                             s.fill_status.update({"done": done, "skipped": skipped, "errors": errors})
-                        log(f"  [{instr_label} t={calc_type}/v={var}] "
+                        log(f"  [{instr_label} t={calc_type}/v={var}/p={calc_param!r}] "
                             f"{done}/{total} err={errors}", s.NODE_NAME, force=True)
 
+                    if not s.fill_cancel.is_set():
+                        async with _slot_lock:
+                            completed_slots += 1
+                            s.fill_status["slots_done"] = completed_slots
+
                 # ── Запуск слотов ─────────────────────────────────────────────────
-                # ML-путь: последовательно (обучение зависит от предыдущего состояния).
-                # Остальные: параллельно через gather.
-                if s.USE_ML_VALUES:
-                    for calc_type, var in type_var_slots:
+                # ML/stateful path is sequential by definition.  Synchronous
+                # batch_model() also runs sequentially: wrapping 30-40 sync calls
+                # in asyncio.gather never made them CPU-parallel, but did allow many
+                # large DB inserts / result maps to coexist in memory.  Process
+                # var-first so model-side base-result caches are reused by all types.
+                if s.USE_ML_VALUES or _ordered_model or s.batch_model_fn is not None:
+                    _slots_to_run = type_var_slots
+                    if s.batch_model_fn is not None and not s.USE_ML_VALUES and not _ordered_model:
+                        _slots_to_run = sorted(
+                            type_var_slots, key=lambda x: (x[1], x[2], x[0])
+                        )
+                    for calc_type, var, calc_param in _slots_to_run:
                         if s.fill_cancel.is_set():
                             break
-                        await _fill_one_slot(calc_type, var)
+                        await _fill_one_slot(calc_type, var, calc_param)
                 else:
-                    # asyncio.gather запускает все слоты параллельно.
-                    # DB-записи в разные params_hash — конфликтов нет.
+                    # Plain model() can still use executor-backed slot parallelism.
                     await asyncio.gather(*[
-                        _fill_one_slot(ct, v)
-                        for ct, v in type_var_slots
+                        _fill_one_slot(ct, v, prm)
+                        for ct, v, prm in type_var_slots
                         if not s.fill_cancel.is_set()
                     ])
-
-                s.fill_status["slots_done"] = slot_idx + 1
 
         finally:
             # Guaranteed cleanup — runs even if an exception aborts the loop.
@@ -2281,7 +3730,10 @@ def build_app(model_module) -> FastAPI:
             s._fill_cache_active = False
 
         state = "stopped" if s.fill_cancel.is_set() else "done"
-        s.fill_status.update({"state": state, "finished_at": datetime.now().isoformat()})
+        s.fill_status.update({
+            "state": state, "phase": state,
+            "finished_at": datetime.now().isoformat(),
+        })
         log(f" fill_cache {state}: done={done} skip={skipped} err={errors}",
             s.NODE_NAME, force=True)
 
@@ -2291,14 +3743,19 @@ def build_app(model_module) -> FastAPI:
             bt_df = _parse_date(date_from_str) if date_from_str else datetime(2025, 1, 1)
             bt_dt = _parse_date(date_to_str)   if date_to_str   else datetime.now()
             for bt_pair, bt_day in pd_slots:
-                for bt_type, bt_var in type_var_slots:
+                for bt_type, bt_var, bt_param in type_var_slots:
                     try:
                         bt = await _backtest(
                             bt_pair, bt_day, tier=0,
-                            extra_params={"type": bt_type, "var": bt_var},
+                            extra_params={
+                                "type": bt_type, "var": bt_var, "param": bt_param,
+                            },
                             df=bt_df, dt=bt_dt,
                         )
-                        label = f"pair{bt_pair}/{'d' if bt_day else 'h'} t={bt_type} v={bt_var}"
+                        label = (
+                            f"pair{bt_pair}/{'d' if bt_day else 'h'} "
+                            f"t={bt_type} v={bt_var} p={bt_param!r}"
+                        )
                         if "error" in bt:
                             log(f"   backtest [{label}]: {bt['error']}",
                                 s.NODE_NAME, force=True)
@@ -2334,6 +3791,7 @@ def build_app(model_module) -> FastAPI:
                         f"Прошло : {_h}h {_m}m {_sc}s"),
             node     = s.NODE_NAME,
             is_error = (state != "done"),
+            email    = s.DEVELOPER_EMAIL,
         )
 
     # ── _backtest ─────────────────────────────────────────────────────────────
@@ -2352,7 +3810,7 @@ def build_app(model_module) -> FastAPI:
             return {"value_score": float(ex[0]), "accuracy": float(ex[1]),
                     "trade_count": int(ex[2]), "params": extra_params, "skipped": True}
 
-        async with s.engine_vlad.connect() as conn:
+        async with s.engine_cache.connect() as conn:
             res = await conn.execute(text(f"""
                 SELECT date_val, result_json FROM `{s.cache_table}`
                 WHERE service_url=:url AND pair=:pair AND day_flag=:day
@@ -2491,7 +3949,7 @@ def build_app(model_module) -> FastAPI:
         yield
         task.cancel()
         s.fill_cancel.set()
-        for eng in (s.engine_vlad, s.engine_brain, s.engine_super):
+        for eng in (s.engine_vlad, s.engine_brain, s.engine_super, s.engine_cache):
             try:
                 await eng.dispose()
             except Exception:
@@ -2521,8 +3979,13 @@ def build_app(model_module) -> FastAPI:
                 "dataset":            len(s.dataset),
                 "var_range":          s.VAR_RANGE,
                 "types_range":        s.TYPES_RANGE,
+                "param_range":        s.PARAM_RANGE,
                 "np_built":           s.np_built,
                 "simple_rates":       len(s.simple_rates),
+                "cache_role":         s.cache_role,
+                "cache_storage":      "SUPER_*",
+                "cache_table":        s.cache_table,
+                "cache_upstream":     s.cache_upstream_url if not s.cache_writer else None,
                 "last_reload":        s.last_reload.isoformat() if s.last_reload else None,
                 "last_rebuild":       s.last_rebuild.isoformat() if s.last_rebuild else None,
                 "rebuild_auto":       s.REBUILD_INTERVAL > 0 and bool(
@@ -2647,6 +4110,18 @@ def build_app(model_module) -> FastAPI:
                          ("..." if len(unmatched) > 10 else "") + ".")
         return lines
 
+    # ── Cache freshness guard ────────────────────────────────────────────────
+
+    def _cache_cutoff_dt() -> datetime:
+        """Последний календарный момент, который разрешено хранить в values-cache.
+
+        При CACHE_FRESH_LAG_DAYS=14 сегодня и предыдущие 13 календарных дней
+        всегда считаются live и не читаются/не записываются в SUPER_* cache.
+        Кеш разрешён до конца дня (today - 14 days) включительно.
+        """
+        cutoff_day = (datetime.now() - timedelta(days=s.CACHE_FRESH_LAG_DAYS)).date()
+        return datetime.combine(cutoff_day, datetime.max.time())
+
     # ── /values ───────────────────────────────────────────────────────────────
 
     @app.get("/values")
@@ -2656,19 +4131,53 @@ def build_app(model_module) -> FastAPI:
         type: int = Query(0, ge=0, le=4),
         var:  int = Query(0),
         param: str = Query(""),
+        _cache_hop: int = Query(0, ge=0, le=1, include_in_schema=False),
     ):
         if s.TYPES_RANGE and type not in s.TYPES_RANGE:
             return err_response(f"type={type} не входит в TYPES_RANGE={s.TYPES_RANGE}")
         if s.VAR_RANGE and var not in s.VAR_RANGE:
             return err_response(f"var={var} не входит в VAR_RANGE={s.VAR_RANGE}")
         try:
+            if not s.cache_writer and _cache_hop:
+                return err_response(
+                    "Central cache proxy loop detected: upstream service is not Brain 1"
+                )
+
+            # Последние CACHE_FRESH_LAG_DAYS календарных дней намеренно живут
+            # вне persistent values-cache. Это исключает залипание старого {}
+            # после того, как parser/enriched догоняет свежие даты.
+            request_dt = _parse_date(date)
+            if request_dt is None:
+                return err_response(f"Invalid date format: {date!r}")
+            if request_dt > _cache_cutoff_dt():
+                if s.cache_writer:
+                    payload = await _call_model(
+                        pair, day, date, calc_type=type, calc_var=var, param=param
+                    )
+                else:
+                    payload = await _proxy_values_to_brain1(
+                        s, pair=pair, day=day, date=date, calc_type=type,
+                        calc_var=var, param=param,
+                    )
+                payload = payload or {}
+                resp = ok_response(payload)
+                resp["details"] = _build_narrative(
+                    payload, date, 1 if day == 1 else 0, type
+                )
+                return resp
+
             resp = await cached_values(
-                engine_vlad=s.engine_vlad, service_url=s.service_url,
+                engine_vlad=s.engine_cache, service_url=s.service_url,
                 pair=pair, day=day, date=date,
                 extra_params={"type": type, "var": var, "param": param},
                 compute_fn=lambda: _call_model(pair, day, date,
                                                calc_type=type, calc_var=var, param=param),
                 node=s.NODE_NAME, table_name=s.cache_table,
+                compute_on_miss=bool(s.cache_writer),
+                miss_fn=(None if s.cache_writer else lambda: _proxy_values_to_brain1(
+                    s, pair=pair, day=day, date=date, calc_type=type,
+                    calc_var=var, param=param,
+                )),
             )
             payload = resp.get("payLoad") or {}
             resp["details"] = _build_narrative(payload, date, 1 if day == 1 else 0, type)
@@ -2683,6 +4192,10 @@ def build_app(model_module) -> FastAPI:
         pair: int = Query(1), day: int = Query(1),
         type: int = Query(0), var: int = Query(0), param: str = Query(""),
     ):
+        if not s.cache_writer:
+            return err_response(
+                "compute_batch разрешён только на Brain 1; дочерняя нода работает cache-only"
+            )
         result = {}
         for date_str in dates:
             try:
@@ -2693,10 +4206,322 @@ def build_app(model_module) -> FastAPI:
                 result[date_str] = {}
         return result
 
+    # ── Диагностика live-расчёта и утечки будущего ────────────────────────────
+
+    _diagnostic_lock = asyncio.Lock()
+
+    def _diag_dataset_date_bounds() -> tuple[datetime | None, datetime | None]:
+        """Best-effort bounds for the loaded dataset, without model-specific SQL."""
+        values: list[datetime] = []
+        for row in s.dataset:
+            if not isinstance(row, dict):
+                continue
+            raw = (
+                row.get("event_time") or row.get("date_dt") or row.get("date")
+                or row.get("event_date") or row.get("published_at")
+            )
+            if isinstance(raw, datetime):
+                values.append(raw)
+            elif isinstance(raw, str):
+                parsed = _parse_date(raw)
+                if parsed is not None:
+                    values.append(parsed)
+        if not values:
+            return None, None
+        return min(values), max(values)
+
+    async def _diag_db_last_rate(table: str) -> datetime | None:
+        try:
+            async with s.engine_brain.connect() as conn:
+                row = (await conn.execute(text(
+                    f"SELECT MAX(`date`) FROM `{table}`"
+                ))).fetchone()
+            return row[0] if row and isinstance(row[0], datetime) else None
+        except Exception:
+            return None
+
+    def _diag_result_summary(result: dict | None) -> dict:
+        payload = result if isinstance(result, dict) else {}
+        numeric = [float(v) for v in payload.values()
+                   if isinstance(v, (int, float)) and not isinstance(v, bool)]
+        return {
+            "keys": len(payload),
+            "sum": round(sum(numeric), 10) if numeric else 0.0,
+            "min": min(numeric) if numeric else None,
+            "max": max(numeric) if numeric else None,
+            "nonzero": sum(1 for v in numeric if v != 0.0),
+        }
+
+    def _diag_compare(a: dict | None, b: dict | None, tol: float = 1e-12) -> dict:
+        left = a if isinstance(a, dict) else {}
+        right = b if isinstance(b, dict) else {}
+        keys = sorted(set(left) | set(right))
+        changed: list[dict] = []
+        max_abs_delta = 0.0
+        for key in keys:
+            av = left.get(key)
+            bv = right.get(key)
+            if isinstance(av, (int, float)) and isinstance(bv, (int, float)):
+                delta = abs(float(av) - float(bv))
+                max_abs_delta = max(max_abs_delta, delta)
+                if delta > tol:
+                    changed.append({"key": key, "before": av, "after": bv,
+                                    "abs_delta": delta})
+            elif av != bv:
+                changed.append({"key": key, "before": av, "after": bv,
+                                "abs_delta": None})
+        return {
+            "equal": not changed,
+            "changed_count": len(changed),
+            "max_abs_delta": max_abs_delta,
+            "changed_preview": changed[:20],
+        }
+
+    def _diag_t1_slot(table: str, target: datetime):
+        """Return mutable T1 locations for one exact candle and their originals."""
+        slots: list[tuple[str, object, object, object]] = []
+        rates_map = s.rates.get(table) or {}
+        if target in rates_map:
+            slots.append(("dict", rates_map, target, rates_map[target]))
+
+        np_r = s.np_rates.get(table)
+        if np_r is not None and np_r.get("dates_ns") is not None:
+            dates_ns = np_r["dates_ns"]
+            idx = int(np.searchsorted(dates_ns, int(target.timestamp()), side="left"))
+            if idx < len(dates_ns) and int(dates_ns[idx]) == int(target.timestamp()):
+                slots.append(("np", np_r["t1"], idx, float(np_r["t1"][idx])))
+        return slots
+
+    def _diag_future_t1_slots(table: str, target: datetime, limit: int = 256):
+        slots: list[tuple[str, object, object, object]] = []
+        rates_map = s.rates.get(table) or {}
+        for dt in sorted((d for d in rates_map if d > target))[:limit]:
+            slots.append(("dict", rates_map, dt, rates_map[dt]))
+
+        np_r = s.np_rates.get(table)
+        if np_r is not None and np_r.get("dates_ns") is not None:
+            dates_ns = np_r["dates_ns"]
+            start = int(np.searchsorted(dates_ns, int(target.timestamp()), side="right"))
+            end = min(len(dates_ns), start + limit)
+            for idx in range(start, end):
+                slots.append(("np", np_r["t1"], idx, float(np_r["t1"][idx])))
+        return slots
+
+    def _diag_write_slots(slots, seed: float) -> None:
+        for pos, (_, owner, key, old) in enumerate(slots):
+            # Deliberately extreme, deterministic values. They are restored in finally.
+            value = seed + pos * 17.0
+            owner[key] = value
+
+    def _diag_restore_slots(slots) -> None:
+        for _, owner, key, old in slots:
+            owner[key] = old
+
+    async def _diag_future_leak_one(
+        pair: int, day: int, target: datetime,
+        calc_type: int, calc_var: int, param: str,
+    ) -> dict:
+        table = _rates_table(pair, day)
+        date_str = target.strftime("%Y-%m-%d %H:%M:%S")
+        baseline = await _call_raw_model(
+            pair, day, date_str, calc_type=calc_type, calc_var=calc_var,
+            param=param, _skip_refresh=True,
+        )
+
+        target_slots = _diag_t1_slot(table, target)
+        future_slots = _diag_future_t1_slots(table, target)
+
+        target_mutated = None
+        future_mutated = None
+        try:
+            _diag_write_slots(target_slots, 987654321.0)
+            target_mutated = await _call_raw_model(
+                pair, day, date_str, calc_type=calc_type, calc_var=calc_var,
+                param=param, _skip_refresh=True,
+            )
+        finally:
+            _diag_restore_slots(target_slots)
+
+        try:
+            _diag_write_slots(future_slots, -987654321.0)
+            future_mutated = await _call_raw_model(
+                pair, day, date_str, calc_type=calc_type, calc_var=calc_var,
+                param=param, _skip_refresh=True,
+            )
+        finally:
+            _diag_restore_slots(future_slots)
+
+        target_cmp = _diag_compare(baseline, target_mutated)
+        future_cmp = _diag_compare(baseline, future_mutated)
+        passed = target_cmp["equal"] and future_cmp["equal"]
+        return {
+            "date": date_str,
+            "table": table,
+            "baseline": _diag_result_summary(baseline),
+            "target_t1_locations": len(target_slots),
+            "future_t1_locations": len(future_slots),
+            "target_t1_mutation": target_cmp,
+            "future_t1_mutation": future_cmp,
+            "status": "PASS" if passed else "FAIL",
+            "meaning": (
+                "Результат не зависит от T1 целевой и будущих свечей."
+                if passed else
+                "Результат изменился после подмены недоступного T1: возможен просмотр в будущее."
+            ),
+        }
+
+    @app.get("/diagnostics/timeframes")
+    async def ep_diagnostics_timeframes(
+        pair: int = Query(1),
+        type: int = Query(0),
+        var: int = Query(0),
+        param: str | None = Query(
+            None, description="param; если не указан, используется первый PARAM_RANGE"
+        ),
+        samples: int = Query(3, ge=1, le=24),
+    ):
+        """Direct live diagnostics for both H1 and D1, bypassing values-cache."""
+        if pair not in _INSTRUMENTS:
+            return err_response("Допустимые pair: 1, 3, 4")
+        if not s.cache_writer:
+            return err_response("Диагностика прямого model() разрешена только на Brain 1")
+
+        effective_param = str(param) if param is not None else str((s.PARAM_RANGE or [""])[0])
+        dataset_first, dataset_last = _diag_dataset_date_bounds()
+        payload: dict[str, object] = {
+            "service_id": s.SERVICE_ID,
+            "framework_diagnostics_version": "21.1-param-aware",
+            "service": s.NODE_NAME,
+            "pair": pair,
+            "type": type,
+            "var": var,
+            "param": effective_param,
+            "param_source": "query" if param is not None else "PARAM_RANGE[0]",
+            "dataset": {
+                "rows": len(s.dataset),
+                "first": dataset_first.isoformat(sep=" ") if dataset_first else None,
+                "last": dataset_last.isoformat(sep=" ") if dataset_last else None,
+                "ctx_index": len(s.ctx_index),
+                "weights": len(s.weight_codes),
+                "last_reload": s.last_reload.isoformat() if s.last_reload else None,
+            },
+            "frames": {},
+        }
+
+        async with _diagnostic_lock:
+            for day_flag, frame_name in ((0, "hour"), (1, "day")):
+                table = _rates_table(pair, day_flag)
+                await _refresh_rates(table, s)
+                rows = s.global_rates.get(table, [])
+                ram_last = rows[-1]["date"] if rows else None
+                db_last = await _diag_db_last_rate(table)
+                targets = [r["date"] for r in rows[-samples:]] if rows else []
+                checks = []
+                for target in targets:
+                    date_str = target.strftime("%Y-%m-%d %H:%M:%S")
+                    try:
+                        result = await _call_raw_model(
+                            pair, day_flag, date_str,
+                            calc_type=type, calc_var=var, param=effective_param,
+                            _skip_refresh=True,
+                        )
+                        summary = _diag_result_summary(result)
+                        summary.update({
+                            "date": date_str,
+                            "status": "OK" if summary["keys"] else "EMPTY",
+                        })
+                    except Exception as exc:
+                        summary = {
+                            "date": date_str, "status": "ERROR",
+                            "error": f"{exc.__class__.__name__}: {exc}",
+                        }
+                    checks.append(summary)
+
+                payload["frames"][frame_name] = {
+                    "day_flag": day_flag,
+                    "table": table,
+                    "ram_rows": len(rows),
+                    "ram_last": ram_last.isoformat(sep=" ") if ram_last else None,
+                    "db_last": db_last.isoformat(sep=" ") if db_last else None,
+                    "ram_matches_db": bool(ram_last and db_last and ram_last == db_last),
+                    "checks": checks,
+                    "empty_is_not_automatically_error": True,
+                }
+        return ok_response(payload)
+
+    @app.get("/diagnostics/future_leak")
+    async def ep_diagnostics_future_leak(
+        pair: int = Query(1),
+        type: int = Query(0),
+        var: int = Query(0),
+        param: str | None = Query(
+            None, description="param; если не указан, используется первый PARAM_RANGE"
+        ),
+        samples: int = Query(3, ge=1, le=12),
+    ):
+        """Mutation test for target/future T1 on both hourly and daily frames."""
+        if pair not in _INSTRUMENTS:
+            return err_response("Допустимые pair: 1, 3, 4")
+        if not s.cache_writer:
+            return err_response("Диагностика прямого model() разрешена только на Brain 1")
+
+        effective_param = str(param) if param is not None else str((s.PARAM_RANGE or [""])[0])
+        report = {
+            "service_id": s.SERVICE_ID,
+            "framework_diagnostics_version": "21.1-param-aware",
+            "service": s.NODE_NAME,
+            "pair": pair,
+            "type": type,
+            "var": var,
+            "param": effective_param,
+            "param_source": "query" if param is not None else "PARAM_RANGE[0]",
+            "frames": {},
+            "warning": (
+                "Endpoint временно подменяет T1 только под внутренним lock и всегда "
+                "восстанавливает значения. Не запускайте несколько процессов uvicorn "
+                "с общим портом во время проверки."
+            ),
+        }
+        overall = True
+        async with _diagnostic_lock:
+            for day_flag, frame_name in ((0, "hour"), (1, "day")):
+                table = _rates_table(pair, day_flag)
+                await _refresh_rates(table, s)
+                rows = s.global_rates.get(table, [])
+                targets = [r["date"] for r in rows[-samples:]] if rows else []
+                tests = []
+                for target in targets:
+                    try:
+                        item = await _diag_future_leak_one(
+                            pair, day_flag, target, type, var, effective_param,
+                        )
+                    except Exception as exc:
+                        item = {
+                            "date": target.strftime("%Y-%m-%d %H:%M:%S"),
+                            "status": "ERROR",
+                            "error": f"{exc.__class__.__name__}: {exc}",
+                        }
+                    if item.get("status") != "PASS":
+                        overall = False
+                    tests.append(item)
+                report["frames"][frame_name] = {
+                    "day_flag": day_flag,
+                    "table": table,
+                    "tests": tests,
+                }
+        report["status"] = "PASS" if overall else "FAIL"
+        return ok_response(report)
+
     # ── fill_cache ────────────────────────────────────────────────────────────
 
     async def _start_fill(pairs_str: str, days_str: str,
-                          date_from: str, date_to: str, batch_size: int):
+                          date_from: str, date_to: str, batch_size: int,
+                          param: str | None = None):
+        if not s.cache_writer:
+            return err_response(
+                "fill_cache запрещён на дочерней ноде. Запустите его на Brain 1; "
+                "дочерние ноды читают общий кеш из SUPER_* и проксируют MISS."
+            )
         if s.fill_task and not s.fill_task.done():
             return err_response("Fill already running.")
         try:
@@ -2709,16 +4534,55 @@ def build_app(model_module) -> FastAPI:
         if not all(d in {0, 1} for d in dl):
             return err_response("Допустимые day: 0 (hourly), 1 (daily)")
         all_types  = list(s.TYPES_RANGE or [0, 1, 2, 3, 4])
+        all_params = [param] if param is not None else list(s.PARAM_RANGE or [""])
         eff_from   = date_from if date_from.strip() else s.CACHE_DATE_FROM
+
+        # Persistent cache никогда не строим внутри свежего окна. Даже если
+        # caller передал date_to позднее, жёстко ограничиваем его D-N.
+        cutoff_dt = _cache_cutoff_dt()
+        requested_to = _parse_date(date_to) if date_to.strip() else None
+        if date_to.strip() and requested_to is None:
+            return err_response("Invalid date_to format")
+        eff_to_dt = min(requested_to, cutoff_dt) if requested_to else cutoff_dt
+        eff_to = eff_to_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+        eff_from_dt = _parse_date(eff_from)
+        if eff_from_dt is None:
+            return err_response("Invalid date_from format")
+        if eff_from_dt > eff_to_dt:
+            return err_response(
+                f"date_from={eff_from} позже cache cutoff={eff_to}; "
+                f"fresh_lag_days={s.CACHE_FRESH_LAG_DAYS}"
+            )
         s.fill_cancel.clear()
+
+        async def _run_fill():
+            try:
+                await _fill_worker(
+                    pl, dl, eff_from, eff_to, all_types, all_params, batch_size
+                )
+            except Exception as exc:
+                import traceback as _tb
+                s.fill_status.update({
+                    "state": "error",
+                    "error": repr(exc),
+                    "finished_at": datetime.now().isoformat(),
+                })
+                log(
+                    f" fill_cache crashed: {exc}\n{_tb.format_exc()}",
+                    s.NODE_NAME, level="error", force=True,
+                )
+
         s.fill_task = asyncio.create_task(
-            _fill_worker(pl, dl, eff_from, date_to, all_types, batch_size))
+            _run_fill())
         return ok_response({
             "started":     True, "pairs": pl, "days": dl,
             "types":       all_types, "var_range": s.VAR_RANGE,
+            "param_range": all_params,
             "batch_size":  batch_size, "date_from": eff_from,
-            "date_to":     date_to or "now",
-            "slots_total": len(pl) * len(dl) * len(all_types) * len(s.VAR_RANGE),
+            "date_to":     eff_to,
+            "fresh_lag_days": s.CACHE_FRESH_LAG_DAYS,
+            "slots_total": len(pl) * len(dl) * len(all_types) * len(s.VAR_RANGE) * len(all_params),
         })
 
     @app.get("/fill_cache")
@@ -2726,24 +4590,27 @@ def build_app(model_module) -> FastAPI:
         pairs: str = Query("1,3,4"), days: str = Query("0,1"),
         date_from: str = Query(""), date_to: str = Query(""),
         batch_size: int = Query(300),
+        param: str | None = Query(None, description="Один param; если не указан, используется PARAM_RANGE"),
     ):
-        return await _start_fill(pairs, days, date_from, date_to, batch_size)
+        return await _start_fill(pairs, days, date_from, date_to, batch_size, param)
 
     @app.get("/fill_cache_day")
     async def ep_fill_cache_day(
         pairs: str = Query("1,3,4"),
         date_from: str = Query(""), date_to: str = Query(""),
         batch_size: int = Query(300),
+        param: str | None = Query(None, description="Один param; если не указан, используется PARAM_RANGE"),
     ):
-        return await _start_fill(pairs, "1", date_from, date_to, batch_size)
+        return await _start_fill(pairs, "1", date_from, date_to, batch_size, param)
 
     @app.get("/fill_cache_hour")
     async def ep_fill_cache_hour(
         pairs: str = Query("1,3,4"),
         date_from: str = Query(""), date_to: str = Query(""),
         batch_size: int = Query(300),
+        param: str | None = Query(None, description="Один param; если не указан, используется PARAM_RANGE"),
     ):
-        return await _start_fill(pairs, "0", date_from, date_to, batch_size)
+        return await _start_fill(pairs, "0", date_from, date_to, batch_size, param)
 
     @app.get("/fill_status")
     async def ep_fill_status():
@@ -2762,6 +4629,7 @@ def build_app(model_module) -> FastAPI:
         date_to:      str  = Query("", description="До даты YYYY-MM-DD — пусто = без ограничения"),
         types:        str  = Query("", description="type через запятую — пусто = все"),
         vars_:        str  = Query("", alias="vars", description="var через запятую — пусто = все"),
+        params_:      str  = Query("", alias="params", description="param через запятую — пусто = все PARAM_RANGE"),
         also_backtest: bool = Query(False, description="Также очистить vlad_backtest_results"),
         stop_fill:    bool  = Query(True,  description="Остановить fill_cache если запущен"),
     ):
@@ -2773,8 +4641,13 @@ def build_app(model_module) -> FastAPI:
             /clear_cache?pairs=1&days=0         — только EUR/USD hour
             /clear_cache?date_from=2025-01-01   — с определённой даты
             /clear_cache?types=0&vars=0,1       — конкретные type/var слоты
+            /clear_cache?params=currcir,wm2ns   — конкретные param
             /clear_cache?also_backtest=true     — + vlad_backtest_results
         """
+        if not s.cache_writer:
+            return err_response(
+                "clear_cache разрешён только на Brain 1; общий кеш находится в SUPER_*"
+            )
         # ── Остановить fill если запущен ──────────────────────────────────────
         was_running = False
         if stop_fill and s.fill_status.get("state") == "running":
@@ -2788,6 +4661,7 @@ def build_app(model_module) -> FastAPI:
         day_list   = [int(d.strip()) for d in days.split(",")   if d.strip().isdigit()]
         type_list  = [int(t.strip()) for t in types.split(",")  if t.strip().isdigit()]
         var_list   = [int(v.strip()) for v in vars_.split(",")  if v.strip().isdigit()]
+        param_list = [p.strip() for p in params_.split(",") if p.strip()]
 
         dt_from = _parse_date(date_from) if date_from.strip() else None
         dt_to   = _parse_date(date_to)   if date_to.strip()   else None
@@ -2819,13 +4693,15 @@ def build_app(model_module) -> FastAPI:
                 clauses.append("date_val <= :dt_to")
                 params["dt_to"] = dt_to
 
-            # Фильтр по type/var через params_hash: пересчитываем хэши
-            if type_list or var_list:
-                t_range = type_list or s.TYPES_RANGE
-                v_range = var_list  or s.VAR_RANGE
+            # Фильтр по type/var/param через params_hash. Если param явно не
+            # задан, точечный type/var-фильтр обязан охватить весь PARAM_RANGE.
+            if type_list or var_list or param_list:
+                t_range = type_list or list(s.TYPES_RANGE or [0])
+                v_range = var_list  or list(s.VAR_RANGE or [0])
+                p_range = param_list or list(s.PARAM_RANGE or [""])
                 hashes  = [
-                    _params_hash({"type": t, "var": v, "param": ""})
-                    for t in t_range for v in v_range
+                    _params_hash({"type": t, "var": v, "param": prm})
+                    for t in t_range for v in v_range for prm in p_range
                 ]
                 placeholders = ", ".join(f":ph{i}" for i in range(len(hashes)))
                 clauses.append(f"params_hash IN ({placeholders})")
@@ -2841,7 +4717,7 @@ def build_app(model_module) -> FastAPI:
         # ── Удаляем из cache-таблицы ──────────────────────────────────────────
         try:
             where, params = _build_where({})
-            async with s.engine_vlad.begin() as conn:
+            async with s.engine_cache.begin() as conn:
                 res = await conn.execute(
                     text(f"DELETE FROM `{s.cache_table}` WHERE {where}"), params
                 )
@@ -2866,12 +4742,13 @@ def build_app(model_module) -> FastAPI:
                     clauses.append(f"day_flag IN ({pls})")
                     for i, d in enumerate(day_list):
                         params2[f"day{i}"] = d
-                if type_list or var_list:
-                    t_range = type_list or s.TYPES_RANGE
-                    v_range = var_list  or s.VAR_RANGE
+                if type_list or var_list or param_list:
+                    t_range = type_list or list(s.TYPES_RANGE or [0])
+                    v_range = var_list  or list(s.VAR_RANGE or [0])
+                    p_range = param_list or list(s.PARAM_RANGE or [""])
                     hashes  = [
-                        _params_hash({"type": t, "var": v, "param": ""})
-                        for t in t_range for v in v_range
+                        _params_hash({"type": t, "var": v, "param": prm})
+                        for t in t_range for v in v_range for prm in p_range
                     ]
                     pls = ", ".join(f":ph{i}" for i in range(len(hashes)))
                     clauses.append(f"params_hash IN ({pls})")
@@ -2889,7 +4766,7 @@ def build_app(model_module) -> FastAPI:
 
         # ── Сбрасываем ML-кеш если чистим всё ────────────────────────────────
         if not pair_list and not day_list and not dt_from and not dt_to \
-                and not type_list and not var_list:
+                and not type_list and not var_list and not param_list:
             s._ml_active_cache.clear()
             if s.reverse_store:
                 s.reverse_store.clear_universe_cache()
@@ -2899,8 +4776,9 @@ def build_app(model_module) -> FastAPI:
             + (f", {deleted_backtest} backtest" if also_backtest else "")
             + (f" | фильтры: pairs={pair_list or 'all'} days={day_list or 'all'}"
                f" dates=[{dt_from or '*'} → {dt_to or '*'}]"
-               f" types={type_list or 'all'} vars={var_list or 'all'}" if any(
-                   [pair_list, day_list, dt_from, dt_to, type_list, var_list]) else " (полная очистка)"),
+               f" types={type_list or 'all'} vars={var_list or 'all'}"
+               f" params={param_list or 'all'}" if any(
+                   [pair_list, day_list, dt_from, dt_to, type_list, var_list, param_list]) else " (полная очистка)"),
             s.NODE_NAME, force=True,
         )
 
@@ -2917,6 +4795,7 @@ def build_app(model_module) -> FastAPI:
                 "date_to":   dt_to.isoformat()   if dt_to   else None,
                 "types":     type_list  or "all",
                 "vars":      var_list   or "all",
+                "params":    param_list or "all",
             },
         }
         if errors:
@@ -2970,6 +4849,7 @@ def build_app(model_module) -> FastAPI:
         tier:  int = Query(0, ge=0, le=1),
         date_from: str = Query(""), date_to: str = Query(""),
         type:  int = Query(0), var: int = Query(-1),
+        param: str | None = Query(None, description="Один param; если не указан, используется PARAM_RANGE"),
     ):
         try:
             pl = [int(p.strip()) for p in pairs.split(",") if p.strip()]
@@ -2985,6 +4865,7 @@ def build_app(model_module) -> FastAPI:
             return err_response("Invalid date format")
 
         vars_to_run = s.VAR_RANGE if var == -1 else [var]
+        params_to_run = [param] if param is not None else list(s.PARAM_RANGE or [""])
         all_results = {}
 
         for bt_pair in pl:
@@ -2992,11 +4873,15 @@ def build_app(model_module) -> FastAPI:
                 key = f"pair={bt_pair} day={'d' if bt_day else 'h'}"
                 all_results[key] = {}
                 for v in vars_to_run:
-                    try:
-                        all_results[key][f"var={v}"] = await _backtest(
-                            bt_pair, bt_day, tier, {"type": type, "var": v, "param": ""}, df, dt)
-                    except Exception as e:
-                        all_results[key][f"var={v}"] = {"error": str(e)}
+                    for prm in params_to_run:
+                        result_key = (f"var={v}" if len(params_to_run) == 1
+                                      else f"var={v} param={prm!r}")
+                        try:
+                            all_results[key][result_key] = await _backtest(
+                                bt_pair, bt_day, tier,
+                                {"type": type, "var": v, "param": prm}, df, dt)
+                        except Exception as e:
+                            all_results[key][result_key] = {"error": str(e)}
                 try:
                     await _upsert_summary(bt_pair, bt_day, tier, df, dt)
                 except Exception as e:
@@ -3006,7 +4891,7 @@ def build_app(model_module) -> FastAPI:
         return ok_response({
             "pairs": pl, "days": dl, "tier": tier,
             "date_from": df.isoformat(), "date_to": dt.isoformat(),
-            "vars": vars_to_run, "results": all_results,
+            "vars": vars_to_run, "params": params_to_run, "results": all_results,
         })
 
     @app.get("/summary")
@@ -3093,34 +4978,41 @@ def build_app(model_module) -> FastAPI:
                 "ctx_index": s.ctx_index,
                 "url_map": s.url_map,
                 "dataset_timestamps": getattr(s, "_dataset_ts_arr", None),
+                "full_dataset": s.dataset,
                 "rates_table": s.RATES_TABLE,
+                "execution_scope": "pretest",
             }
 
-        try:
-            _res2 = s.model_fn(
-                rates=_rf2, dataset=_ds2, date=_td2,
-                type=0, var=s.VAR_RANGE[0], param="",
-                dataset_index=dataset_index_dict2,
-            )
-            _res2, _ = _extract_detail(_res2)
-        except Exception as _e2:
-            return {"status": "error",
-                    "error": f"[Тест 2 — Структура] model() exception: {_e2}"}
+        _pretest_params = list(s.PARAM_RANGE or [""])
+        _pretest_var = (s.VAR_RANGE or [0])[0]
+        _res2_counts: dict[str, int] = {}
+        for _param2 in _pretest_params:
+            try:
+                _res2 = s.model_fn(
+                    rates=_rf2, dataset=_ds2, date=_td2,
+                    type=0, var=_pretest_var, param=_param2,
+                    dataset_index=dataset_index_dict2,
+                )
+                _res2, _ = _extract_detail(_res2)
+            except Exception as _e2:
+                return {"status": "error",
+                        "error": f"[Тест 2 — Структура] param={_param2!r}: model() exception: {_e2}"}
 
-        if _res2 is None:
-            return {"status": "error",
-                    "error": "[Тест 2 — Структура] model() вернул None"}
-        if not isinstance(_res2, dict):
-            return {"status": "error",
-                    "error": f"[Тест 2 — Структура] ожидается dict, получен {type(_res2).__name__}"}
-        for _k2, _v2 in _res2.items():
-            if not isinstance(_k2, str):
+            if _res2 is None:
                 return {"status": "error",
-                        "error": f"[Тест 2 — Структура] ключ {_k2!r} не str"}
-            if not isinstance(_v2, (int, float)) or _v2 != _v2 or abs(_v2) == float("inf"):
+                        "error": f"[Тест 2 — Структура] param={_param2!r}: model() вернул None"}
+            if not isinstance(_res2, dict):
                 return {"status": "error",
-                        "error": f"[Тест 2 — Структура] значение '{_k2}' не конечный float"}
-        log(f"   Тест 2: структура model() OK — {len(_res2)} ключей",
+                        "error": f"[Тест 2 — Структура] param={_param2!r}: ожидается dict, получен {type(_res2).__name__}"}
+            for _k2, _v2 in _res2.items():
+                if not isinstance(_k2, str):
+                    return {"status": "error",
+                            "error": f"[Тест 2 — Структура] param={_param2!r}: ключ {_k2!r} не str"}
+                if not isinstance(_v2, (int, float)) or _v2 != _v2 or abs(_v2) == float("inf"):
+                    return {"status": "error",
+                            "error": f"[Тест 2 — Структура] param={_param2!r}: значение '{_k2}' не конечный float"}
+            _res2_counts[str(_param2)] = len(_res2)
+        log(f"   Тест 2: структура model() OK — params={_res2_counts}",
             s.NODE_NAME, force=True)
 
         # ── Тест 3: 10 случайных дат по каждому из 6 инструментов (≥90%) ─────
@@ -3209,52 +5101,59 @@ def build_app(model_module) -> FastAPI:
                             "ctx_index": s.ctx_index,
                             "url_map": s.url_map,
                             "dataset_timestamps": getattr(s, "_dataset_ts_arr", None),
+                            "full_dataset": s.dataset,
                             "rates_table": _tbl3,
                         }
 
-                    def _mk3(_r=_rf3, _d=_ds3, _t=_td3):
-                        res, _ = _extract_detail(
-                            s.model_fn(
-                                rates=_r, dataset=_d, date=_t,
-                                type=0, var=s.VAR_RANGE[0], param="",
-                                dataset_index=dataset_index_dict3,
+                    for _param3 in _pretest_params:
+                        def _mk3(_r=_rf3, _d=_ds3, _t=_td3,
+                                 _di=dataset_index_dict3, _p=_param3, _v=_pretest_var):
+                            res, _ = _extract_detail(
+                                s.model_fn(
+                                    rates=_r, dataset=_d, date=_t,
+                                    type=0, var=_v, param=_p,
+                                    dataset_index=_di,
+                                )
                             )
-                        )
-                        # PRETEST_ALLOW_EMPTY=True: модель объявила, что {} —
-                        # валидный ответ (напр. стратегия с состоянием FLAT).
-                        # Считаем успехом любой dict, включая пустой.
-                        # PRETEST_ALLOW_EMPTY=False (умолчание): обычный
-                        # микросервис обязан возвращать непустой dict — {}
-                        # считается провалом.
-                        _allow_empty = getattr(model_module, "PRETEST_ALLOW_EMPTY", False)
-                        if _allow_empty:
-                            return res is not None and isinstance(res, dict)
-                        return bool(res)
+                            # PRETEST_ALLOW_EMPTY=True: модель объявила, что {} —
+                            # валидный ответ (напр. стратегия с состоянием FLAT).
+                            # Считаем успехом любой dict, включая пустой.
+                            # PRETEST_ALLOW_EMPTY=False (умолчание): обычный
+                            # микросервис обязан возвращать непустой dict — {}
+                            # считается провалом.
+                            _allow_empty = getattr(model_module, "PRETEST_ALLOW_EMPTY", False)
+                            if _allow_empty:
+                                return res is not None and isinstance(res, dict)
+                            return bool(res)
 
-                    _tasks3.append((_pid3, _tf3))
-                    _coros3.append(asyncio.to_thread(_mk3))
+                        _tasks3.append((_pid3, _tf3, _param3))
+                        _coros3.append(asyncio.to_thread(_mk3))
 
         _results3    = await asyncio.gather(*_coros3, return_exceptions=True)
         _instr_counts: dict = {}
-        for (_pid3, _tf3), _r3 in zip(_tasks3, _results3):
-            key = (_pid3, _tf3)
+        for (_pid3, _tf3, _param3), _r3 in zip(_tasks3, _results3):
+            key = (_pid3, _tf3, _param3)
             if key not in _instr_counts:
                 _instr_counts[key] = [0, 0]
             _instr_counts[key][1] += 1
             if isinstance(_r3, Exception):
-                log(f"     pair{_pid3}/{_tf3}: {_r3}", s.NODE_NAME, level="warning")
+                log(f"     pair{_pid3}/{_tf3} param={_param3!r}: {_r3}",
+                    s.NODE_NAME, level="warning")
             elif _r3:
                 _instr_counts[key][0] += 1
 
         _failures3: list = []
-        for (_pid3, _tf3), (_ne3, _tot3) in _instr_counts.items():
+        for (_pid3, _tf3, _param3), (_ne3, _tot3) in _instr_counts.items():
             _cov3 = _ne3 / _tot3 if _tot3 else 0
             _ok3  = _cov3 >= 0.90
-            log(f"  {chr(9989) if _ok3 else chr(10060)} pair{_pid3}/{_tf3}: "
-                f"{_ne3}/{_tot3} ({_cov3:.0%}) без ошибки, порог 90%",
+            log(f"  {chr(9989) if _ok3 else chr(10060)} pair{_pid3}/{_tf3} "
+                f"param={_param3!r}: {_ne3}/{_tot3} ({_cov3:.0%}) без ошибки, порог 90%",
                 s.NODE_NAME, force=True)
             if not _ok3:
-                _failures3.append(f"pair{_pid3}/{_tf3}: {_ne3}/{_tot3} ({_cov3:.0%}) < 90%")
+                _failures3.append(
+                    f"pair{_pid3}/{_tf3} param={_param3!r}: "
+                    f"{_ne3}/{_tot3} ({_cov3:.0%}) < 90%"
+                )
 
         if _failures3:
             log(f" PRETEST FAILED: {_failures3}", s.NODE_NAME, force=True)
@@ -3311,112 +5210,149 @@ def build_app(model_module) -> FastAPI:
     async def ep_posttest(
         pairs: str = Query("1,3,4"), days: str = Query("0,1"),
         date_from: str = Query(""), date_to: str = Query(""),
+        type: int = Query(0), var: int = Query(-1),
+        param: str | None = Query(
+            None, description="Один param; если не указан, используется PARAM_RANGE"
+        ),
     ):
+        """
+        Проверяет фактически заполненный values-cache.
+
+        v21.1: posttest больше не смешивает произвольные type/var/param строки.
+        По умолчанию берётся указанный type, все VAR_RANGE и все PARAM_RANGE;
+        для каждого params_hash возвращается отдельный slot, а legacy-поля
+        data/values/sync/hole/history считаются по агрегату выбранных slot-ов.
+        """
         try:
             pl = [int(p.strip()) for p in pairs.split(",") if p.strip()]
-            dl = [int(d.strip()) for d in days.split(",")  if d.strip()]
+            dl = [int(d.strip()) for d in days.split(",") if d.strip()]
         except ValueError:
             return err_response("pairs и days — числа через запятую")
+        if not pl or not dl:
+            return err_response("pairs и days не могут быть пустыми")
+        if not all(p in _INSTRUMENTS for p in pl):
+            return err_response("Допустимые pair: 1, 3, 4")
+        if not all(d in (0, 1) for d in dl):
+            return err_response("Допустимые day: 0, 1")
 
         dt_from = _parse_date(date_from) if date_from.strip() else _parse_date(s.CACHE_DATE_FROM)
         dt_to   = _parse_date(date_to)   if date_to.strip()   else datetime.now()
+        if dt_from is None or dt_to is None:
+            return err_response("Invalid date format")
 
-        async def _process_slot(pair_id: int, day_flag: int) -> dict:
-            tf_name  = "day" if day_flag else "hour"
-            table    = _rates_table(pair_id, day_flag)
+        vars_to_run = (list(s.VAR_RANGE or [0]) if var == -1 else [var])
+        params_to_run = ([str(param)] if param is not None
+                         else [str(v) for v in (s.PARAM_RANGE or [""])])
+        slot_specs = []
+        for v in vars_to_run:
+            for prm in params_to_run:
+                extra = {"type": int(type), "var": int(v), "param": str(prm)}
+                slot_specs.append({
+                    "type": int(type), "var": int(v), "param": str(prm),
+                    "hash": _params_hash(extra),
+                    "key": f"type={int(type)} var={int(v)} param={str(prm)!r}",
+                })
+
+        async def _process_pair_tf(pair_id: int, day_flag: int) -> dict:
+            tf_name = "day" if day_flag else "hour"
+            table = _rates_table(pair_id, day_flag)
             all_rows = s.global_rates.get(table, [])
-            rows     = [r for r in all_rows
-                        if (dt_from is None or r["date"] >= dt_from)
-                        and (dt_to   is None or r["date"] <= dt_to)]
+            rows = [r for r in all_rows
+                    if r["date"] >= dt_from and r["date"] <= dt_to]
 
-            url_p = {"url": s.service_url, "pair": pair_id, "day": day_flag,
-                     "df": dt_from, "dt": dt_to}
-            _tbl  = s.cache_table
+            slot_by_hash = {spec["hash"]: spec for spec in slot_specs}
+            per_slot: dict[str, dict] = {
+                spec["key"]: {
+                    "params": {"type": spec["type"], "var": spec["var"], "param": spec["param"]},
+                    "data_lengths": [],
+                    "plus": 0, "minus": 0,
+                    "signals": {},
+                } for spec in slot_specs
+            }
+            all_lengths: list[int] = []
+            plus_cnt = minus_cnt = 0
+            cache_signals: dict[datetime, tuple[bool, float]] = {}
 
-            data_stats = {"min": 0.0, "max": 0.0, "avg": 0.0}
+            query_params = {"url": s.service_url, "pair": pair_id, "day": day_flag,
+                            "df": dt_from, "dt": dt_to}
+            ph_marks = []
+            for i, spec in enumerate(slot_specs):
+                name = f"ph{i}"
+                ph_marks.append(f":{name}")
+                query_params[name] = spec["hash"]
+
             try:
-                async with s.engine_vlad.connect() as conn:
+                async with s.engine_cache.connect() as conn:
                     res = await conn.execute(text(f"""
-                        SELECT MIN(JSON_LENGTH(result_json)),
-                               MAX(JSON_LENGTH(result_json)),
-                               AVG(JSON_LENGTH(result_json))
-                        FROM `{_tbl}`
+                        SELECT params_hash, date_val, result_json
+                        FROM `{s.cache_table}`
                         WHERE service_url=:url AND pair=:pair AND day_flag=:day
-                          AND result_json NOT IN ('{{}}', 'z:eJyrrgUAAXUA+Q==')  -- OPT-6 sentinels
-                          AND (:df IS NULL OR date_val >= :df)
-                          AND (:dt IS NULL OR date_val <= :dt)
-                    """), url_p)
-                    row = res.fetchone()
-                    if row and row[0] is not None:
-                        data_stats = {"min": float(row[0]), "max": float(row[1]),
-                                      "avg": round(float(row[2]), 4)}
-            except Exception as e:
-                log(f"   posttest t1 {pair_id}/{tf_name}: {e}",
-                    s.NODE_NAME, level="warning")
-
-            values_stats = {"plus": 0, "minus": 0}
-            try:
-                async with s.engine_vlad.connect() as conn:
-                    res = await conn.execute(text(f"""
-                        SELECT result_json FROM `{_tbl}`
-                        WHERE service_url=:url AND pair=:pair AND day_flag=:day
-                          AND result_json NOT IN ('{{}}', 'z:eJyrrgUAAXUA+Q==')  -- OPT-6 sentinels
-                          AND (:df IS NULL OR date_val >= :df)
-                          AND (:dt IS NULL OR date_val <= :dt)
-                    """), url_p)
-                    plus_cnt = minus_cnt = 0
-                    for (rj_str,) in res:
-                        try:
-                            for v in _rj_decode(rj_str).values():  # OPT-6
-                                if v > 0:   plus_cnt  += 1
-                                elif v < 0: minus_cnt += 1
-                        except Exception:
-                            pass
-                    values_stats = {"plus": plus_cnt, "minus": minus_cnt}
-            except Exception as e:
-                log(f"   posttest t2 {pair_id}/{tf_name}: {e}",
-                    s.NODE_NAME, level="warning")
-
-            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            try:
-                sync_out = await _call_model(pair_id, day_flag, now_str) or {}
-            except Exception as e:
-                sync_out = {"error": str(e)}
-
-            cache_signals: dict = {}
-            try:
-                async with s.engine_vlad.connect() as conn:
-                    res = await conn.execute(text(f"""
-                        SELECT date_val, result_json FROM `{_tbl}`
-                        WHERE service_url=:url AND pair=:pair AND day_flag=:day
-                          AND (:df IS NULL OR date_val >= :df)
-                          AND (:dt IS NULL OR date_val <= :dt)
+                          AND params_hash IN ({','.join(ph_marks)})
+                          AND date_val >= :df AND date_val <= :dt
                         ORDER BY date_val
-                    """), url_p)
-                    for (dt_val, rj_str) in res:
+                    """), query_params)
+                    for p_hash, dt_val, rj_str in res:
+                        spec = slot_by_hash.get(p_hash)
+                        if spec is None:
+                            continue
+                        slot = per_slot[spec["key"]]
                         try:
-                            rj = _rj_decode(rj_str)               # OPT-6
-                            cache_signals[dt_val] = (bool(rj), sum(rj.values()) if rj else 0.0)
+                            rj = _rj_decode(rj_str)
                         except Exception:
-                            cache_signals[dt_val] = (False, 0.0)
+                            rj = {}
+
+                        if rj:
+                            ln = len(rj)
+                            all_lengths.append(ln)
+                            slot["data_lengths"].append(ln)
+
+                        signal = 0.0
+                        for value in rj.values():
+                            try:
+                                fv = float(value)
+                            except Exception:
+                                continue
+                            signal += fv
+                            if fv > 0:
+                                plus_cnt += 1
+                                slot["plus"] += 1
+                            elif fv < 0:
+                                minus_cnt += 1
+                                slot["minus"] += 1
+
+                        slot["signals"][dt_val] = (bool(rj), signal)
+                        prev_non_empty, prev_signal = cache_signals.get(dt_val, (False, 0.0))
+                        cache_signals[dt_val] = (
+                            prev_non_empty or bool(rj),
+                            prev_signal + signal,
+                        )
             except Exception as e:
                 log(f"   posttest cache {pair_id}/{tf_name}: {e}",
                     s.NODE_NAME, level="warning")
 
-            def _compute_hole_and_sim():
+            def _data_stats(lengths: list[int]) -> dict:
+                if not lengths:
+                    return {"min": 0.0, "max": 0.0, "avg": 0.0}
+                return {
+                    "min": float(min(lengths)),
+                    "max": float(max(lengths)),
+                    "avg": round(float(sum(lengths) / len(lengths)), 4),
+                }
+
+            def _simulate(signal_map: dict[datetime, tuple[bool, float]]) -> tuple[int, dict]:
                 non_empty = np.array(
-                    [cache_signals.get(r["date"], (False, 0.0))[0] for r in rows], dtype=bool)
+                    [signal_map.get(r["date"], (False, 0.0))[0] for r in rows], dtype=bool
+                )
                 if len(non_empty) == 0 or np.all(non_empty):
                     hole = 0
                 elif not np.any(non_empty):
                     hole = len(rows)
                 else:
                     padded = np.concatenate(([False], ~non_empty, [False]))
-                    diffs  = np.diff(padded.astype(np.int8))
-                    runs   = np.where(diffs == -1)[0] - np.where(diffs == 1)[0]
-                    hole   = int(np.max(runs)) if len(runs) > 0 else 0
+                    diffs = np.diff(padded.astype(np.int8))
+                    runs = np.where(diffs == -1)[0] - np.where(diffs == 1)[0]
+                    hole = int(np.max(runs)) if len(runs) > 0 else 0
 
-                _, mod, lot_div = _PAIR_CFG.get(pair_id, (0.0002, 100_000.0, 50_000.0))
                 equity = 10_000.0
                 total_profit = total_dropdown = 0.0
                 wins = trades = 0
@@ -3424,7 +5360,7 @@ def build_app(model_module) -> FastAPI:
                 entry_price = direction = 0.0
 
                 for i, r in enumerate(rows):
-                    _, signal = cache_signals.get(r["date"], (False, 0.0))
+                    _, signal = signal_map.get(r["date"], (False, 0.0))
                     if i + 1 >= len(rows):
                         continue
                     op = rows[i + 1]["open"]
@@ -3433,40 +5369,100 @@ def build_app(model_module) -> FastAPI:
                     if position is not None:
                         if (signal == 0.0 or (signal > 0 and direction < 0)
                                 or (signal < 0 and direction > 0)):
-                            pnl    = equity * 0.10 * (op - entry_price) / entry_price * direction
+                            pnl = equity * 0.10 * (op - entry_price) / entry_price * direction
                             equity += pnl
                             trades += 1
-                            if pnl >= 0: total_profit   += pnl; wins += 1
-                            else:        total_dropdown += abs(pnl)
+                            if pnl >= 0:
+                                total_profit += pnl
+                                wins += 1
+                            else:
+                                total_dropdown += abs(pnl)
                             position = None
                     if signal != 0.0 and position is None:
-                        direction   = 1.0 if signal > 0 else -1.0
+                        direction = 1.0 if signal > 0 else -1.0
                         entry_price = op
-                        position    = (direction, entry_price)
+                        position = (direction, entry_price)
 
                 if position is not None and rows:
                     lp = rows[-1]["close"]
                     if lp and entry_price:
-                        pnl    = equity * 0.10 * (lp - entry_price) / entry_price * direction
+                        pnl = equity * 0.10 * (lp - entry_price) / entry_price * direction
                         equity += pnl
                         trades += 1
-                        if pnl >= 0: total_profit   += pnl; wins += 1
-                        else:        total_dropdown += abs(pnl)
+                        if pnl >= 0:
+                            total_profit += pnl
+                            wins += 1
+                        else:
+                            total_dropdown += abs(pnl)
 
                 cw = round(wins / trades, 4) if trades > 0 else 0.0
                 return hole, {
-                    "profit":   round(total_profit,   2),
+                    "profit": round(total_profit, 2),
                     "dropdown": round(total_dropdown, 2),
-                    "cw":       cw,
-                    "result":   round(total_profit - total_dropdown, 2),
+                    "cw": cw,
+                    "result": round(total_profit - total_dropdown, 2),
+                    "trade_count": trades,
                 }
 
-            hole, history_stats = await asyncio.to_thread(_compute_hole_and_sim)
-            return {"data": data_stats, "values": values_stats,
-                    "sync": sync_out, "hole": hole, "history": history_stats}
+            # Live/sync check is also done for the exact selected params.
+            async def _sync_one(spec: dict) -> tuple[str, dict]:
+                try:
+                    out = await _call_model(
+                        pair_id, day_flag, datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        calc_type=spec["type"], calc_var=spec["var"], param=spec["param"],
+                    ) or {}
+                except Exception as exc:
+                    out = {"error": str(exc)}
+                return spec["key"], out
 
-        slots   = [(p, d) for p in pl for d in dl]
-        tasks   = [asyncio.create_task(_process_slot(p, d)) for p, d in slots]
+            sync_pairs = await asyncio.gather(*[_sync_one(spec) for spec in slot_specs])
+            sync_by_slot = dict(sync_pairs)
+            sync_aggregate: dict[str, float] = {}
+            sync_errors: dict[str, str] = {}
+            for key, out in sync_pairs:
+                if not isinstance(out, dict):
+                    continue
+                if "error" in out:
+                    sync_errors[key] = str(out["error"])
+                    continue
+                for code, value in out.items():
+                    try:
+                        fv = float(value)
+                    except Exception:
+                        continue
+                    sync_aggregate[code] = sync_aggregate.get(code, 0.0) + fv
+
+            hole, history_stats = await asyncio.to_thread(_simulate, cache_signals)
+            slot_output: dict[str, dict] = {}
+            for spec in slot_specs:
+                key = spec["key"]
+                raw = per_slot[key]
+                slot_hole, slot_history = await asyncio.to_thread(_simulate, raw["signals"])
+                slot_output[key] = {
+                    "params": raw["params"],
+                    "data": _data_stats(raw["data_lengths"]),
+                    "values": {"plus": raw["plus"], "minus": raw["minus"]},
+                    "sync": sync_by_slot.get(key, {}),
+                    "hole": slot_hole,
+                    "history": slot_history,
+                }
+
+            return {
+                "type": int(type),
+                "vars": vars_to_run,
+                "params": params_to_run,
+                "data": _data_stats(all_lengths),
+                "values": {"plus": plus_cnt, "minus": minus_cnt},
+                "sync": sync_aggregate if not sync_errors else {
+                    "values": sync_aggregate, "errors": sync_errors
+                },
+                "hole": hole,
+                "history": history_stats,
+                "slots": slot_output,
+            }
+
+        slots = [(p, d) for p in pl for d in dl]
+        tasks = [asyncio.create_task(_process_pair_tf(p, d)) for p, d in slots]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         output: dict = {}
@@ -3521,34 +5517,34 @@ def build_app(model_module) -> FastAPI:
             i = j + 1
         return out
 
-    async def _create_score_post_history(pair_id: int, day_flag: int,
-                                         dt_from: datetime | None,
-                                         dt_to: datetime | None) -> dict:
-        """
-        Лёгкая версия posttest.history для /create_score.
-        Использует уже заполненный кеш, как и /posttest.
-        """
+    async def _create_score_post_history(
+        pair_id: int, day_flag: int, extra_params: dict,
+        dt_from: datetime | None, dt_to: datetime | None,
+    ) -> dict:
+        """Posttest.history для ТОГО ЖЕ type/var/param, что и выбранный backtest."""
         tf_name = "day" if day_flag else "hour"
         table = _rates_table(pair_id, day_flag)
         rows = [r for r in s.global_rates.get(table, [])
                 if (dt_from is None or r["date"] >= dt_from)
                 and (dt_to is None or r["date"] <= dt_to)]
+        p_hash = _params_hash(extra_params)
 
-        cache_signals: dict = {}
+        cache_signals: dict[datetime, float] = {}
         try:
-            async with s.engine_vlad.connect() as conn:
+            async with s.engine_cache.connect() as conn:
                 res = await conn.execute(text(f"""
                     SELECT date_val, result_json FROM `{s.cache_table}`
                     WHERE service_url=:url AND pair=:pair AND day_flag=:day
+                      AND params_hash=:ph
                       AND (:df IS NULL OR date_val >= :df)
                       AND (:dt IS NULL OR date_val <= :dt)
                     ORDER BY date_val
                 """), {"url": s.service_url, "pair": pair_id, "day": day_flag,
-                       "df": dt_from, "dt": dt_to})
+                       "ph": p_hash, "df": dt_from, "dt": dt_to})
                 for dt_val, rj_str in res:
                     try:
-                        rj = _rj_decode(rj_str)                    # OPT-6
-                        cache_signals[dt_val] = sum(rj.values()) if rj else 0.0
+                        rj = _rj_decode(rj_str)
+                        cache_signals[dt_val] = sum(float(v) for v in rj.values()) if rj else 0.0
                     except Exception:
                         cache_signals[dt_val] = 0.0
         except Exception as e:
@@ -3612,6 +5608,8 @@ def build_app(model_module) -> FastAPI:
                 "cw": cw,
                 "result": round(total_profit - total_dropdown, 2),
                 "trade_count": trades,
+                "params": extra_params,
+                "cache_rows": len(cache_signals),
             }
 
         return await asyncio.to_thread(_simulate)
@@ -3619,6 +5617,7 @@ def build_app(model_module) -> FastAPI:
     async def _create_score_best_backtest(pair_id: int, day_flag: int, tier: int,
                                           calc_type: int,
                                           vars_to_run: list[int],
+                                          params_to_run: list[str],
                                           df: datetime, dt: datetime,
                                           run_backtest: bool) -> dict:
         """Возвращает лучший backtest по value_score для выбранного timeframe."""
@@ -3626,13 +5625,14 @@ def build_app(model_module) -> FastAPI:
 
         if run_backtest:
             for v in vars_to_run:
-                params = {"type": calc_type, "var": v, "param": ""}
-                try:
-                    bt = await _backtest(pair_id, day_flag, tier, params, df, dt)
-                except Exception as e:
-                    bt = {"error": str(e), "params": params}
-                if "error" not in bt:
-                    results.append(bt)
+                for prm in params_to_run:
+                    params = {"type": calc_type, "var": v, "param": prm}
+                    try:
+                        bt = await _backtest(pair_id, day_flag, tier, params, df, dt)
+                    except Exception as e:
+                        bt = {"error": str(e), "params": params}
+                    if "error" not in bt:
+                        results.append(bt)
         else:
             try:
                 async with s.engine_vlad.connect() as conn:
@@ -3649,6 +5649,8 @@ def build_app(model_module) -> FastAPI:
                         if vars_to_run and params.get("var") not in vars_to_run:
                             continue
                         if params.get("type", calc_type) != calc_type:
+                            continue
+                        if params_to_run and str(params.get("param", "")) not in params_to_run:
                             continue
                         results.append({
                             "value_score": float(r["value_score"]),
@@ -3672,6 +5674,9 @@ def build_app(model_module) -> FastAPI:
         tier: int = Query(0, ge=0, le=1),
         date_from: str = Query(""), date_to: str = Query(""),
         type: int = Query(0), var: int = Query(-1),
+        param: str | None = Query(
+            None, description="Один param; если не указан, используется PARAM_RANGE"
+        ),
         run_backtest: bool = Query(True),
         accept_score: float = Query(0.60),
         watch_score: float = Query(0.30),
@@ -3712,6 +5717,8 @@ def build_app(model_module) -> FastAPI:
             return err_response("Invalid date format")
 
         vars_to_run = (s.VAR_RANGE if var == -1 else [var]) or [0]
+        params_to_run = ([str(param)] if param is not None
+                         else [str(v) for v in (s.PARAM_RANGE or [""])])
         pair_labels = {1: "EUR/USD", 3: "BTC/USD", 4: "ETH/USD"}
         tf_labels = {0: "hour", 1: "day"}
 
@@ -3719,12 +5726,20 @@ def build_app(model_module) -> FastAPI:
         for pair_id in pl:
             raw[pair_id] = {}
             for day_flag in dl:
-                bt_best, post_tf = await asyncio.gather(
-                    _create_score_best_backtest(
-                        pair_id, day_flag, tier, type, vars_to_run, df, dt, run_backtest
-                    ),
-                    _create_score_post_history(pair_id, day_flag, df, dt),
+                bt_best = await _create_score_best_backtest(
+                    pair_id, day_flag, tier, type, vars_to_run, params_to_run,
+                    df, dt, run_backtest
                 )
+                if isinstance(bt_best, dict) and isinstance(bt_best.get("params"), dict):
+                    post_tf = await _create_score_post_history(
+                        pair_id, day_flag, bt_best["params"], df, dt
+                    )
+                else:
+                    post_tf = {
+                        "profit": 0.0, "dropdown": 0.0, "cw": 0.0,
+                        "result": 0.0, "trade_count": 0,
+                        "error": "posttest skipped: no valid backtest params",
+                    }
                 raw[pair_id][day_flag] = {
                     "pair": pair_id,
                     "pair_label": pair_labels.get(pair_id, str(pair_id)),

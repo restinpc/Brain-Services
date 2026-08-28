@@ -1,0 +1,66 @@
+# Algorithmic news topic/event model: TF-IDF -> NMF topic -> SVD -> local KMeans.
+# Services 79/80 share one enriched dataset and one frozen NLP artifact.
+
+[service]
+id = 79
+port = 8941
+name = "brain-news-algo-baseline-s79"
+text = "Algorithmic news TF-IDF/NMF/SVD hierarchical baseline (no ML)"
+
+[rates]
+table = "brain_rates_eur_usd"
+
+[cache]
+date_from = "2025-01-15"
+fresh_lag_days = 14
+var_range = [0, 1, 2, 3, 4, 5, 6, 7]
+types_range = [0, 1, 2, 3, 4]
+shift_window = 12
+reload_interval = 3600
+rebuild_interval = 7200
+ml_workers = 1
+ml_batch_size = 2000
+# Stream batch_model in bounded chunks: fast progress without giant RAM spikes.
+batch_model_size = 1000
+
+[dataset]
+parser_table = "brain_cnn_news"
+enriched_table = "vlad_news_algo_events"
+index_fields = []
+date_field = "date_dt"
+engine = "vlad"
+filter_by_date = true
+key_field = "event_type"
+model_can_filter = true
+
+[ctx]
+key_columns = ["id"]
+
+[model]
+rare_occurrence_max = 0
+
+[nlp]
+# Frozen unsupervised fit cutoff; later news only transform/predict.
+train_cutoff = "2025-01-15 00:00:00"
+sample_per_source = 20000
+max_features = 20000
+nmf_topics = 40
+svd_components = 96
+target_event_docs = 300
+min_event_support = 60
+max_local_clusters = 32
+text_chars = 1800
+period_days = 14
+novelty_days = 7
+confirmation_hours = 12
+confirmation_similarity = 0.78
+
+[ml]
+enabled = false
+init_mode = "constant"
+target_precision = 0.95
+max_iter = 20
+step = 0.10
+extremum_limit = 50
+active_tail = 0
+precision_metric = "mean"

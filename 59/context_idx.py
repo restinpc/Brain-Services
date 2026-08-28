@@ -55,6 +55,7 @@ SERVICE_ID     = _m.SERVICE_ID       # 59
 RATES_TABLES   = _m.RATES_TABLES
 SIG_DIGITS     = _m.SIG_DIGITS
 round_to_level = _m.round_to_level
+level_to_price = _m.level_to_price
 OUTPUT_KEY     = _m.OUTPUT_KEY
 
 GRAPH_TABLE = _m.GRAPH_TABLE   # vlad_extremum_graph_svc59
@@ -237,12 +238,20 @@ def _eval_sig_candidate(
     holds: tuple[int, ...],
 ) -> Optional[float]:
     """
-    Прогоняет валидационные экстремумы через РЕАЛЬНЫЙ walk_type0 (из model.py)
-    и считает forward-return для нескольких hold-периодов, усредняя Sharpe
-    (mean/std по сделкам) — устойчивее к шуму одного конкретного hold.
+    Прогоняет валидационные экстремумы через РЕАЛЬНЫЙ walk_type0 И
+    РЕАЛЬНЫЙ compute_bull_ratio (оба — из model.py, вызываются напрямую,
+    не дублируются здесь) для нескольких hold-периодов, усредняя Sharpe.
+
+    Использование _m.compute_bull_ratio напрямую (вместо копии его логики)
+    гарантирует, что подбор sig_digits оценивает ТОЧНО ТУ ЖЕ функцию,
+    которая работает в live model() — включая round_to_level/level_to_price
+    фикс глобальной монотонности. Раньше здесь была inline-копия старой
+    (проблемной) формулы сравнения уровней; расхождение между копией и
+    оригиналом — именно тот класс багов, который мы уже чинили между
+    model.py и context_idx.py для детекции экстремумов.
 
     Это калька с live model(): entry = idx + order (задержка подтверждения,
-    без look-ahead), close_level/predicted через тот же round_to_level.
+    без look-ahead).
     Возвращает None если меньше половины holds дали ≥15 сделок (мало данных).
     """
     eg = _dict_graph_to_extremgraph(graph)
@@ -251,7 +260,7 @@ def _eval_sig_candidate(
 
     for hold in holds:
         trades = []
-        for idx, price, _direction in val_ext:
+        for idx, price, direction in val_ext:
             entry = idx + order
             exitb = entry + hold
             if exitb >= n_total:
@@ -263,16 +272,11 @@ def _eval_sig_candidate(
             if node is None:
                 continue
             predicted = _m.walk_type0(eg, node.id)
-            close_level = float(round_to_level(closes[entry], sig_digits))
-            if close_level <= 0:
+            current_close = closes[entry]
+            bull_ratio = _m.compute_bull_ratio(predicted, current_close, direction, sig_digits)
+            if bull_ratio is None:
                 continue
-            diff = predicted - close_level
-            if abs(diff) < 1e-9:
-                continue
-            mod = min(abs(diff) / close_level * _m.SIGNAL_SCALE, 0.45)
-            if mod <= 0:
-                continue
-            sgn = +1 if diff > 0 else -1
+            sgn = +1 if bull_ratio > 0.5 else -1
             ret = (closes[exitb] - closes[entry]) / closes[entry] * 100
             trades.append(ret * sgn)
 
@@ -308,22 +312,31 @@ def _choose_sig_digits(
       • Слишком ГРУБО относительно объёма данных → переобучение графа
         (мало визитов на уровень, конкретные рёбра держатся на 1-2 совпадениях)
       • Слишком ТОЧНО → граф не успевает накопить статистику, шумные предсказания
-    EUR на sig=3 даёт ~94 узла на ~1000 train-экстремумов (~10 визитов/узел) —
-    маргинально; на sig=2 — ~12 узлов (~85 визитов/узел) — устойчиво.
 
     Алгоритм:
-      1. Делим confirmed extrema на train((1-val_frac))/val(val_frac) по позиции.
-      2. Для каждого sig: support = len(train)/unique_levels(train).
+      1. support = len(ВСЕ_confirmed_extrema) / unique_levels(ВСЕ) —
+         оценивается на ПОЛНОМ доступном датасете, т.к. именно с таким
+         объёмом данных будет построен финальный production-граф
+         (build_index использует 100% данных, не train/val срез).
          support < min_support → кандидат отбрасывается (анти-оверфит гейт).
-      3. Строим граф на train, конвертируем в ExtremGraph, прогоняем val
+      2. Для Sharpe-оценки ОТДЕЛЬНО делим extrema на train((1-val_frac))/val
+         по позиции — здесь срез необходим, иначе оценка производительности
+         была бы look-ahead (тестировали бы на данных, по которым строили граф).
+      3. Строим граф на train-срезе, конвертируем в ExtremGraph, прогоняем val
          через РЕАЛЬНЫЙ walk_type0 на нескольких hold-периодах (см. SIG_VAL_HOLDS),
          усредняем Sharpe.
       4. Возвращаем sig с лучшим средним Sharpe среди прошедших гейт;
          если ни один не прошёл — default_sig.
 
-    ВАЖНО: эта функция выбирает sig только для статистики/обоснования.
+    ВАЖНО (исправление): support ранее считался на train-срезе (65% данных),
+    что искусственно занижало оценку и отсекало валидные sig — например,
+    ETH sig=3 показывал support=7.2 на полных данных (прошёл бы гейт), но
+    только 4.7 на 65%-срезе (не проходил). Теперь support считается на 100%
+    данных (реалистично отражает production-граф), а train/val split
+    используется ТОЛЬКО для честной (без look-ahead) оценки Sharpe.
+
     Финальный production-граф строится на 100% данных (build_index ниже)
-    с выбранным sig_digits — train/val split используется только здесь.
+    с выбранным sig_digits.
     """
     all_ext = _extract_confirmed_extrema(highs, lows, order)
     if len(all_ext) < 100:
@@ -339,14 +352,16 @@ def _choose_sig_digits(
     valid_found = False
 
     for sig in candidates:
-        train_levels = [round_to_level(p, sig) for _, p, _ in train_ext]
-        n_unique = len(set(train_levels))
-        support  = len(train_levels) / n_unique if n_unique else 0.0
-        diag[sig] = {"support": round(support, 1), "valid": support >= min_support}
+        # Support на ПОЛНОМ датасете — отражает реальный production-граф
+        all_levels = [round_to_level(p, sig) for _, p, _ in all_ext]
+        n_unique   = len(set(all_levels))
+        support    = len(all_levels) / n_unique if n_unique else 0.0
+        diag[sig]  = {"support": round(support, 1), "valid": support >= min_support}
 
         if support < min_support:
             continue   # риск оверфита — слишком мало визитов на уровень
 
+        # Sharpe-оценка — ТОЛЬКО на train-срезе, чтобы val остался honest hold-out
         train_rounded = [(pos, round_to_level(price, sig), direction)
                           for pos, price, direction in train_ext]
         transitions = _build_transitions(train_rounded, MIN_TRANSITIONS)
@@ -502,6 +517,47 @@ async def _write_index(engine, pair_id: int, n_extremums: int) -> None:
         """), {"pair": pair_id, "cnt": n_extremums})
 
 
+async def _clear_pair(engine, pair_id: int) -> None:
+    """Атомарно удаляет все данные пары, не оставляя устаревшую статистику."""
+    async with engine.begin() as conn:
+        await conn.execute(text(f"DELETE FROM `{GRAPH_TABLE}` WHERE pair=:pair"), {"pair": pair_id})
+        await conn.execute(text(f"DELETE FROM `{STATS_TABLE}` WHERE pair=:pair"), {"pair": pair_id})
+        await conn.execute(text(f"DELETE FROM `{INDEX_TABLE}` WHERE pair=:pair"), {"pair": pair_id})
+    _m.invalidate_pair_cache(pair_id)
+
+
+async def _publish_pair(engine, pair_id: int, graph: dict, stats: dict,
+                        sig_digits: int, n_extremums: int) -> int:
+    """Публикует граф, статистику и индекс одной транзакцией."""
+    rows = []
+    for from_lvl, nexts in graph.items():
+        for to_lvl, cnt, direction, prob in nexts:
+            rows.append({"pair": pair_id, "from": from_lvl, "to": to_lvl,
+                         "dir": direction, "cnt": cnt, "prob": prob})
+    sql = f"""INSERT INTO `{GRAPH_TABLE}`
+        (pair, from_level, to_level, direction, transition_count, probability, date_updated)
+        VALUES (:pair,:from,:to,:dir,:cnt,:prob,NOW())"""
+    async with engine.begin() as conn:
+        await conn.execute(text(f"DELETE FROM `{GRAPH_TABLE}` WHERE pair=:pair"), {"pair": pair_id})
+        for i in range(0, len(rows), BATCH_SIZE):
+            await conn.execute(text(sql), rows[i:i+BATCH_SIZE])
+        await conn.execute(text(f"""INSERT INTO `{STATS_TABLE}`
+            (pair, avg_candles, min_candles, total_extremums, sig_digits, date_updated)
+            VALUES (:pair,:avg,:mn,:tot,:sig,NOW())
+            ON DUPLICATE KEY UPDATE avg_candles=VALUES(avg_candles),
+            min_candles=VALUES(min_candles), total_extremums=VALUES(total_extremums),
+            sig_digits=VALUES(sig_digits), date_updated=NOW()"""),
+            {"pair":pair_id,"avg":stats["avg_candles"],"mn":stats["min_candles"],
+             "tot":stats["total"],"sig":sig_digits})
+        await conn.execute(text(f"""INSERT INTO `{INDEX_TABLE}`
+            (weight_code,pair,bull_ratio,occurrence_count,date_updated)
+            VALUES ('output',:pair,0.5,:cnt,NOW())
+            ON DUPLICATE KEY UPDATE occurrence_count=VALUES(occurrence_count),date_updated=NOW()"""),
+            {"pair":pair_id,"cnt":n_extremums})
+    _m.invalidate_pair_cache(pair_id)
+    return len(rows)
+
+
 # ── Точка входа ───────────────────────────────────────────────────────────────
 
 async def build_index(engine_vlad, engine_brain) -> dict:
@@ -520,7 +576,8 @@ async def build_index(engine_vlad, engine_brain) -> dict:
             continue
 
         if n < 500:
-            log.warning(f"[{INDEX_TABLE}] pair={pair_id}: only {n} bars, skip")
+            log.warning(f"[{INDEX_TABLE}] pair={pair_id}: only {n} bars — очищаем stale данные")
+            await _clear_pair(engine_vlad, pair_id)
             continue
 
         log.info(f"[{INDEX_TABLE}] pair={pair_id}: {n:,} bars → building graph...")
@@ -532,11 +589,7 @@ async def build_index(engine_vlad, engine_brain) -> dict:
         extremums, graph, stats = _build_graph_and_stats(closes, highs, lows, chosen_sig)
         if not graph:
             log.warning(f"[{INDEX_TABLE}] pair={pair_id}: empty graph — очищаем старые данные")
-            # Удаляем stale-граф: без этого сервис торговал бы по устаревшим данным.
-            async with engine_vlad.begin() as conn:
-                await conn.execute(text(
-                    f"DELETE FROM `{GRAPH_TABLE}` WHERE pair = :pair"
-                ), {"pair": pair_id})
+            await _clear_pair(engine_vlad, pair_id)
             continue
 
         log.info(
@@ -546,9 +599,9 @@ async def build_index(engine_vlad, engine_brain) -> dict:
             f"avg_candles={stats['avg_candles']} | sig_digits={chosen_sig}"
         )
 
-        n_edges = await _write_graph(engine_vlad, pair_id, graph)
-        await _write_stats(engine_vlad, pair_id, stats, chosen_sig)
-        await _write_index(engine_vlad, pair_id, len(extremums))
+        n_edges = await _publish_pair(
+            engine_vlad, pair_id, graph, stats, chosen_sig, len(extremums)
+        )
 
         result["pairs"][pair_id] = {
             "extremums":   len(extremums),

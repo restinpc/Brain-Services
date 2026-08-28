@@ -19,6 +19,8 @@ model.py — Сервис 35: Веса новостей на основе NER-к
 
 from __future__ import annotations
 
+import bisect
+from collections import OrderedDict
 from datetime import timedelta
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -61,6 +63,77 @@ REBUILD_INTERVAL = 3600   # секунд между автоматическим
 
 VAR_RANGE = [0, 1, 2, 3, 4]
 
+# Небольшие bounded-cache: fill_cache многократно вызывает model() для одной
+# даты с разными type/var. Без кеша карты котировок и общий timeline событий
+# пересобирались сотни тысяч раз.
+_RATES_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
+_EVENTS_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
+_CACHE_LIMIT = 12
+
+def _lru_get(cache, key):
+    value = cache.get(key)
+    if value is not None:
+        cache.move_to_end(key)
+    return value
+
+def _lru_put(cache, key, value):
+    cache[key] = value
+    cache.move_to_end(key)
+    while len(cache) > _CACHE_LIMIT:
+        cache.popitem(last=False)
+
+def _rates_state(rates):
+    first = rates[0]
+    last = rates[-1]
+    return (
+        len(rates), first.get("date"), last.get("date"),
+        float(first.get("close") or 0.0), float(last.get("close") or 0.0),
+    )
+
+def _prepare_rates(rates):
+    key = _rates_state(rates)
+    cached = _lru_get(_RATES_CACHE, key)
+    if cached is not None:
+        return cached
+
+    rates_t1 = {}
+    candle_ranges = {}
+    ext_max = set()
+    ext_min = set()
+    for r in rates:
+        d = r["date"]
+        stored = r.get("t1")
+        t1 = float(stored) if stored is not None else float((r.get("close") or 0) - (r.get("open") or 0))
+        rng = float((r.get("max") or 0) - (r.get("min") or 0))
+        rates_t1[d] = t1
+        candle_ranges[d] = rng
+
+    avg_range = sum(candle_ranges.values()) / len(candle_ranges) if candle_ranges else 0.0
+    for i in range(1, len(rates) - 1):
+        h = float(rates[i].get("max") or 0)
+        lo = float(rates[i].get("min") or 0)
+        if h > float(rates[i - 1].get("max") or 0) and h > float(rates[i + 1].get("max") or 0):
+            ext_max.add(rates[i]["date"])
+        if lo < float(rates[i - 1].get("min") or 0) and lo < float(rates[i + 1].get("min") or 0):
+            ext_min.add(rates[i]["date"])
+
+    value = (rates_t1, candle_ranges, avg_range, ext_max, ext_min)
+    _lru_put(_RATES_CACHE, key, value)
+    return value
+
+def _event_timeline(key_dates):
+    # key_dates строится один раз при reload и затем переиспользуется.
+    total = sum(len(v) for v in key_dates.values())
+    key = (id(key_dates), len(key_dates), total)
+    cached = _lru_get(_EVENTS_CACHE, key)
+    if cached is not None:
+        return cached
+    events = sorted((dt, ctx_id) for ctx_id, dates in key_dates.items() for dt in dates)
+    dates_only = [x[0] for x in events]
+    value = (events, dates_only)
+    _lru_put(_EVENTS_CACHE, key, value)
+    return value
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # model() — ОСНОВНАЯ ФУНКЦИЯ
@@ -94,154 +167,93 @@ def model(
     if not rates or not dataset:
         return {}
 
-    # ── Предвычисление по котировкам ──────────────────────────────────────────
-    rates_t1      = {}
-    candle_ranges = {}
-    ext_max: set  = set()
-    ext_min: set  = set()
+    # ── Предвычисление по котировкам (LRU между type/var-слотами) ───────────
+    rates_t1, candle_ranges, avg_range, ext_max, ext_min = _prepare_rates(rates)
 
-    for r in rates:
-        d   = r["date"]
-        t1  = float((r.get("close") or 0) - (r.get("open") or 0))
-        rng = float((r.get("max") or 0)   - (r.get("min") or 0))
-        rates_t1[d]      = t1
-        candle_ranges[d] = rng
-
-    avg_range = (sum(candle_ranges.values()) / len(candle_ranges)
-                 if candle_ranges else 0.0)
-
-    for i in range(1, len(rates) - 1):
-        h  = float(rates[i].get("max") or 0)
-        lo = float(rates[i].get("min") or 0)
-        if h  > float(rates[i - 1].get("max") or 0) and h  > float(rates[i + 1].get("max") or 0):
-            ext_max.add(rates[i]["date"])
-        if lo < float(rates[i - 1].get("min") or 0) and lo < float(rates[i + 1].get("min") or 0):
-            ext_min.add(rates[i]["date"])
-
-    # Направление предыдущей свечи
-    prev    = rates[-1] if rates else None
+    prev = rates[-1] if rates else None
     is_bull = (
         float((prev.get("close") or 0)) > float((prev.get("open") or 0))
         if prev else True
     )
     ext_set = ext_max if is_bull else ext_min
 
-    # ── Индекс истории по ctx_id ──────────────────────────────────────────────
-    # dataset_index["key_dates"] = {ctx_id: [date1, date2, ...]}
-    # строится фреймворком из DATASET_QUERY (колонка "date" = news_date)
     key_dates: dict = (dataset_index or {}).get("key_dates") or {}
+    if not key_dates:
+        return {}
 
-    du          = timedelta(hours=1)
-    WINDOW_SEC  = SHIFT_WINDOW * 3600
+    du = timedelta(hours=1)
+    window_start = date - timedelta(hours=SHIFT_WINDOW)
+    events, event_dates = _event_timeline(key_dates)
+    lo = bisect.bisect_left(event_dates, window_start)
+    hi = bisect.bisect_right(event_dates, date)
+
     result: dict[str, float] = {}
 
-    # ── Основной цикл по свежим событиям в окне [date-SHIFT_WINDOW, date] ─────
-    for row in dataset:
-        news_dt = row.get("news_date") or row.get("date")
-        if news_dt is None:
-            continue
-
+    # Раньше здесь полностью сканировался dataset для каждого model() вызова.
+    # Теперь берётся только срез событий текущего 24-часового окна.
+    for news_dt, ctx_id in events[lo:hi]:
         diff_sec = (date - news_dt).total_seconds()
-        if diff_sec < 0 or diff_sec > WINDOW_SEC:
+        shift = int(diff_sec / 3600)
+
+        hist = key_dates.get(ctx_id, [])
+        idx_date = bisect.bisect_left(hist, date)
+        if idx_date <= 0:
             continue
 
-        shift  = int(diff_sec / 3600)
-        ctx_id = row.get("ctx_id")
-        if ctx_id is None:
+        if idx_date < RECURRING_MIN_COUNT and shift != 0:
             continue
 
-        # История вхождений этого ctx_id до текущей даты
-        valid_dts = [d for d in key_dates.get(ctx_id, []) if d < date]
-        if not valid_dts:
+        # d + shift < date  <=>  d < date - shift
+        idx_shift = bisect.bisect_left(hist, date - du * shift)
+        if idx_shift <= 0:
             continue
+        t_dates = (d + du * shift for d in hist[:idx_shift])
+        total_hist = idx_date
 
-        # Редкие контексты — только shift=0
-        if len(valid_dts) < RECURRING_MIN_COUNT and shift != 0:
-            continue
-
-        t_dates = [d + du * shift for d in valid_dts
-                   if (d + du * shift) < date]
-        if not t_dates:
-            continue
-
-        total_hist = len(valid_dts)
-
-        # ── T1 (type=0 или type=1) ────────────────────────────────────────────
         if type in (0, 1):
             if var == 0:
                 t1 = sum(rates_t1.get(d, 0.0) for d in t_dates)
             elif var == 1:
-                t1 = sum(
-                    rates_t1.get(d, 0.0) for d in t_dates
-                    if candle_ranges.get(d, 0.0) > avg_range
-                )
+                t1 = sum(rates_t1.get(d, 0.0) for d in t_dates if candle_ranges.get(d, 0.0) > avg_range)
             elif var == 2:
-                t1 = sum(
-                    (v := rates_t1.get(d, 0.0)) * abs(v)
-                    for d in t_dates
-                )
+                t1 = sum((v := rates_t1.get(d, 0.0)) * abs(v) for d in t_dates)
             elif var == 3:
-                t1 = sum(
-                    (v := rates_t1.get(d, 0.0)) * abs(v)
-                    for d in t_dates
-                    if candle_ranges.get(d, 0.0) > avg_range
-                )
+                t1 = sum((v := rates_t1.get(d, 0.0)) * abs(v) for d in t_dates if candle_ranges.get(d, 0.0) > avg_range)
             elif var == 4:
-                t1 = sum(
-                    candle_ranges.get(d, 0.0) - avg_range
-                    for d in t_dates
-                    if candle_ranges.get(d, 0.0) > avg_range
-                )
+                t1 = sum(candle_ranges.get(d, 0.0) - avg_range for d in t_dates if candle_ranges.get(d, 0.0) > avg_range)
             else:
                 t1 = 0.0
-
             if t1 != 0.0:
                 wc = f"NW{ctx_id}_0_{shift}"
                 result[wc] = result.get(wc, 0.0) + t1
 
-        # ── Extremum (type=0 или type=2) ──────────────────────────────────────
         if type in (0, 2) and prev is not None:
-            ext: float | None = None
-
+            # Генератор выше исчерпан T1-веткой, поэтому для extremum создаём его снова.
+            t_dates2 = (d + du * shift for d in hist[:idx_shift])
+            ext = None
             if var == 0:
-                hits = sum(1 for d in t_dates if d in ext_set)
-                if total_hist > 0:
-                    val  = (hits / total_hist) * 2 - 1
-                    ext  = val if val != 0 else None
-
+                hits = sum(1 for d in t_dates2 if d in ext_set)
+                val = (hits / total_hist) * 2 - 1 if total_hist > 0 else 0.0
+                ext = val if val != 0 else None
             elif var == 1:
-                pool = [d for d in t_dates if candle_ranges.get(d, 0.0) > avg_range]
+                pool = [d for d in t_dates2 if candle_ranges.get(d, 0.0) > avg_range]
                 if pool and total_hist > 0:
                     val = (sum(1 for d in pool if d in ext_set) / total_hist) * 2 - 1
                     ext = val if val != 0 else None
-
             elif var == 2:
-                pool = [d for d in t_dates if d in ext_set]
+                pool = [d for d in t_dates2 if d in ext_set]
                 if pool and total_hist > 0:
-                    val = sum(
-                        (v := rates_t1.get(d, 0.0)) * abs(v)
-                        for d in pool
-                    ) / total_hist
+                    val = sum((v := rates_t1.get(d, 0.0)) * abs(v) for d in pool) / total_hist
                     ext = val if val != 0 else None
-
             elif var == 3:
-                pool = [
-                    d for d in t_dates
-                    if d in ext_set and candle_ranges.get(d, 0.0) > avg_range
-                ]
+                pool = [d for d in t_dates2 if d in ext_set and candle_ranges.get(d, 0.0) > avg_range]
                 if pool and total_hist > 0:
                     val = (len(pool) / total_hist) * 2 - 1
                     ext = val if val != 0 else None
-
             elif var == 4:
-                pool = [d for d in t_dates if d in ext_set]
-                val  = sum(
-                    candle_ranges.get(d, 0.0) - avg_range
-                    for d in pool
-                    if candle_ranges.get(d, 0.0) > avg_range
-                )
+                pool = [d for d in t_dates2 if d in ext_set]
+                val = sum(candle_ranges.get(d, 0.0) - avg_range for d in pool if candle_ranges.get(d, 0.0) > avg_range)
                 ext = val if val != 0 else None
-
             if ext is not None:
                 wc = f"NW{ctx_id}_1_{shift}"
                 result[wc] = result.get(wc, 0.0) + ext

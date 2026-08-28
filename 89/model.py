@@ -8,6 +8,7 @@ reweights the active codes on historical extrema.
 """
 from __future__ import annotations
 
+import bisect
 from datetime import datetime
 import os
 import sys
@@ -268,6 +269,20 @@ def model(rates, dataset, date, *, type=0, var=0, param="", dataset_index=None):
         return {}
 
     cfg = _service_cfg()
+    # run_standard_model supports rare-event shifts, but it must not receive
+    # events at/after the prediction timestamp.  The framework index contains
+    # the full enriched table for analog lookup, so enforce the live-available
+    # prefix here before the standard event index is built.
+    timestamps = selected_index.get("dataset_timestamps") or []
+    causal_cut = bisect.bisect_left(timestamps, int(date.timestamp()))
+    selected_dataset = selected_dataset[:causal_cut]
+    if not selected_dataset:
+        return {}
+    selected_index["full_dataset"] = selected_dataset
+    selected_index["dataset_timestamps"] = timestamps[:causal_cut]
+    selected_index.pop("_standard_events_by_type", None)
+
+    cfg = get_service_config()
     ml_enabled = bool((cfg.get("ml") or {}).get("enabled", False))
 
     # In reverse-learning mode the public type/var values configure the

@@ -72,11 +72,23 @@ _NUMBA_ENABLED = (
 # CPU-bound training should not block the FastAPI event loop.
 # Keep workers low: the keyed train lock deduplicates identical jobs, while this
 # executor controls CPU pressure for independent universes.
-_RL_TRAIN_WORKERS = max(1, int(os.getenv("RL_TRAIN_WORKERS", "1")))
+# Stability first: Numba training must not run concurrently inside one service.
+# Keep this hard-limited even if an old node environment still exports a larger
+# RL_TRAIN_WORKERS value.
+_RL_TRAIN_WORKERS = 1
 _RL_TRAIN_EXECUTOR = _cf.ThreadPoolExecutor(
     max_workers=_RL_TRAIN_WORKERS,
     thread_name_prefix="rl_train",
 )
+
+
+async def warmup_train_executor() -> int:
+    """Compatibility hook for brain_framework.
+
+    This stable implementation uses a thread executor and does not create a
+    process pool, so there are no child workers to warm up.
+    """
+    return 0
 
 
 def _stable_seed(key: object) -> int:
@@ -239,34 +251,21 @@ def _metric_id(metric: str) -> int:
     return 0
 
 
-# OPT-A: _build_csr LRU-кеш — при Numba-пути вызывается на каждый rebalance.
-# Ключ: id объектов (records+code_to_idx неизменны внутри одного train-вызова).
-# Ограничен 256 слотами чтобы не держать ссылки вечно.
-_build_csr_cache: dict = {}
-_BUILD_CSR_CACHE_MAX = 256
-
-
 def _build_csr(records: list[ExtremumRecord], code_to_idx: dict[str, int]):
     """CSR-представление records: offsets + flat indices.
 
     Важно: code_to_idx строится в порядке вставки старого dict-universe.
     Поэтому обход rec.codes сохраняет старую семантику и порядок суммирования.
 
-    OPT-A: результат кешируется по (id(records_tuple), keys(code_to_idx)).
+    CSR intentionally is not cached globally. The former cache keyed entries by
+    id(code_to_idx) and ids of short-lived records. CPython reuses those ids, so
+    an unrelated training call could receive stale indices larger than its
+    weights array. Numba then performed an unchecked out-of-bounds read/write,
+    corrupting the process heap (double free / invalid next size).
 
-    ИСПРАВЛЕНИЕ (heap corruption / free(): invalid next size):
-    Раньше ключ содержал id(code_to_idx). Python re-use адресов памяти после
-    освобождения объектов (refcount=0) приводил к cache hit для ДРУГОГО
-    code_to_idx с тем же адресом, но другим содержимым — JIT получал индексы
-    из старого CSR (0..499) для weights_arr нового размера (300) и делал
-    out-of-bounds write в heap. Заменяем на tuple(code_to_idx.keys()):
-    content-based ключ, учитывающий набор и порядок кодов (dict ordered).
+    Building CSR once per training call is cheap compared with the JIT training
+    loop and keeps the accelerated path deterministic and memory-safe.
     """
-    cache_key = (tuple(id(r) for r in records), tuple(code_to_idx.keys()))
-    cached = _build_csr_cache.get(cache_key)
-    if cached is not None:
-        return cached
-
     offsets = np.empty(len(records) + 1, dtype=np.int32)
     signs = np.empty(len(records), dtype=np.int8)
     base_amps = np.empty(len(records), dtype=np.float64)
@@ -278,11 +277,7 @@ def _build_csr(records: list[ExtremumRecord], code_to_idx: dict[str, int]):
         for c in r.codes:
             flat.append(code_to_idx.get(c, -1))
         offsets[i + 1] = len(flat)
-    result = offsets, np.asarray(flat, dtype=np.int32), signs, base_amps
-    _build_csr_cache[cache_key] = result
-    if len(_build_csr_cache) > _BUILD_CSR_CACHE_MAX:
-        del _build_csr_cache[next(iter(_build_csr_cache))]
-    return result
+    return offsets, np.asarray(flat, dtype=np.int32), signs, base_amps
 
 
 if _NUMBA_ENABLED:
@@ -292,7 +287,7 @@ if _NUMBA_ENABLED:
         s_abs = 0.0
         for p in range(start, end):
             idx = rec_indices[p]
-            if idx < 0:
+            if idx < 0 or idx >= weights_arr.shape[0]:
                 continue
             w = weights_arr[idx]
             s_signed += w
@@ -364,7 +359,7 @@ if _NUMBA_ENABLED:
             base_amp = base_amps[r]
             for p in range(offsets[r], offsets[r + 1]):
                 idx = rec_indices[p]
-                if idx < 0:
+                if idx < 0 or idx >= weights_arr.shape[0]:
                     continue
                 w = weights_arr[idx]
                 if w == 0.0:
@@ -809,6 +804,43 @@ def _get_all_extremums(
     return result
 
 
+def _confirmed_extremum_cutoff_ts(
+    np_simple_rates: dict | None,
+    control_date: datetime,
+    *,
+    extremum_interval: int = 3,
+) -> int | None:
+    """Newest extremum-center timestamp knowable at control_date.
+
+    Extremums use a symmetric window. The center bar is valid only after all
+    right-side confirmation bars are strictly earlier than control_date.
+    """
+    if not np_simple_rates:
+        return None
+
+    dates_ns = np_simple_rates.get("dates_ns")
+    if dates_ns is None or len(dates_ns) == 0:
+        return None
+
+    try:
+        interval_i = int(extremum_interval or 3)
+    except Exception:
+        interval_i = 3
+    if interval_i < 3:
+        interval_i = 3
+
+    radius = max(1, interval_i // 2)
+    target_ts = np.int64(int(control_date.timestamp()))
+
+    # Only candles timestamped strictly before control_date are known.
+    cut = int(np.searchsorted(dates_ns, target_ts, side="left"))
+    max_center_idx = cut - radius - 1
+    if max_center_idx < 0:
+        return None
+
+    return int(dates_ns[max_center_idx])
+
+
 def collect_extremums_back(
     np_simple_rates: dict | None,
     control_date:    datetime,
@@ -829,8 +861,15 @@ def collect_extremums_back(
     if not all_ext:
         return []
 
-    ts         = int(control_date.timestamp())
-    cutoff_idx = bisect.bisect_right(all_ext_ts, ts)   # первый индекс > ts
+    safe_ts = _confirmed_extremum_cutoff_ts(
+        np_simple_rates,
+        control_date,
+        extremum_interval=extremum_interval,
+    )
+    if safe_ts is None:
+        return []
+
+    cutoff_idx = bisect.bisect_right(all_ext_ts, safe_ts)
     start      = max(0, cutoff_idx - limit)
     chunk      = all_ext[start:cutoff_idx]
 
@@ -858,8 +897,15 @@ def collect_extremums_forward(
     if not all_ext:
         return []
 
-    ts         = int(control_date.timestamp())
-    cutoff_idx = bisect.bisect_right(all_ext_ts, ts)
+    safe_ts = _confirmed_extremum_cutoff_ts(
+        np_simple_rates,
+        control_date,
+        extremum_interval=extremum_interval,
+    )
+    if safe_ts is None:
+        return []
+
+    cutoff_idx = bisect.bisect_right(all_ext_ts, safe_ts)
     start      = max(0, cutoff_idx - limit)
     chunk      = all_ext[start:cutoff_idx]
 

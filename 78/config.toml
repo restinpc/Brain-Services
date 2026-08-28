@@ -1,0 +1,49 @@
+# brain_llm ensemble / disagreement model.
+# Service 78 uses the same event algorithm as 77, with Brain Framework ML enabled.
+
+[service]
+id = 78
+port = 8940
+name = "brain-llm-ensemble-ml-s78"
+text = "brain_llm ensemble consensus/disagreement with ML/reverse-learning"
+
+[rates]
+table = "brain_rates_eur_usd"
+
+[cache]
+date_from = "2025-01-15"
+fresh_lag_days = 14
+var_range = [0, 1, 2, 3, 4, 5]
+types_range = [0, 1, 2, 3, 4]
+shift_window = 12
+reload_interval = 3600
+rebuild_interval = 7200
+# Two deterministic ML states may train concurrently; reverse_learning uses a process pool.
+ml_workers = 2
+ml_batch_size = 2000
+# Stream batch_model in bounded chunks: fast progress without giant RAM spikes.
+batch_model_size = 1000
+
+[dataset]
+parser_table = "brain_llm"
+enriched_table = "vlad_brain_llm_ensemble"
+index_fields = ["event_type"]
+date_field = "date_dt"
+engine = "vlad"
+filter_by_date = true
+
+[ctx]
+key_columns = ["id"]
+
+[model]
+rare_occurrence_max = 0
+
+[ml]
+enabled = true
+init_mode = "constant"
+target_precision = 0.95
+max_iter = 20
+step = 0.10
+extremum_limit = 50
+active_tail = 0
+precision_metric = "mean"

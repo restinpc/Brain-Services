@@ -1,0 +1,62 @@
+# Модель 28 — реакция рынка на события Investing Calendar.
+
+[service]
+id = 72
+port = 8934
+name = "brain-investing-context-weights-s28-ml"
+text = "Investing calendar event context model with reverse-learning ML"
+
+[developer]
+email = "vladyurjevitch@yandex.ru"
+
+[rates]
+table = "brain_rates_eur_usd"
+
+[cache]
+date_from = "2025-01-15"
+var_range = [0, 1, 2, 3, 4]
+types_range = [0, 1, 2, 3, 4]
+shift_window = 12
+rebuild_interval = 0
+reload_interval = 3600
+ml_workers = 1
+ml_batch_size = 2000
+
+[dataset]
+engine = "brain"
+key_field = "event_id"
+filter_by_date = false
+model_can_filter = true
+model_uses_rates = true
+query = """
+SELECT
+    event_id,
+    occurrence_time_utc AS date,
+    occurrence_time_utc,
+    importance,
+    actual,
+    forecast,
+    previous,
+    currency,
+    event_name
+FROM vlad_investing_calendar
+WHERE event_id IS NOT NULL
+  AND occurrence_time_utc IS NOT NULL
+ORDER BY occurrence_time_utc, event_id
+"""
+
+[ctx]
+table = "vlad_investing_event_context_idx"
+key_columns = ["event_id", "forecast_direction", "surprise_direction", "actual_direction"]
+weights_table = "vlad_investing_weights"
+weights_code_column = "weight_code"
+
+[ml]
+enabled = true
+init_mode = "constant"
+target_precision = 0.95
+max_iter = 20
+step = 0.10
+extremum_limit = 50
+active_tail = 0
+precision_metric = "mean"

@@ -5,7 +5,7 @@ model() ищет текущую волновую конфигурацию в ctx
 и если находит совпадение — возвращает weight codes с резонансными значениями.
 
 Коды вида: WR_{table_code}_{ctx_id}_{mode}_{shift}
-  mode=0  значение = текущий нормированный резонансный сигнал
+  mode=0  значение = последний полностью известный stored T1
   mode=1  значение = прогноз на shift баров вперёд
 
 Конфигурация сервиса:
@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from datetime import datetime, timedelta
 import numpy as np
 
 from wave_resonance import (
@@ -37,9 +38,9 @@ log = logging.getLogger(__name__)
 # КОНФИГУРАЦИЯ СЕРВИСА
 # ══════════════════════════════════════════════════════════════════════════════
 
-SERVICE_ID   = 50
-PORT         = 8900
-NODE_NAME    = "brain-wave-resonance-s50"
+SERVICE_ID   = 48
+PORT         = 8910
+NODE_NAME    = "brain-wave-resonance-s48"
 SERVICE_TEXT = "Wave Resonance — синусоидная суперпозиция с резонансом"
 
 CTX_TABLE        = CTX_TABLE
@@ -75,7 +76,24 @@ _D_MIN_PERIOD   = 4
 # ХЕЛПЕРЫ
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _extract_prices(rates, dataset_index) -> np.ndarray:
+def _timeframe_delta(rates, dataset_index) -> timedelta:
+    di = dataset_index or {}
+    if "is_daily" in di:
+        return timedelta(days=1) if bool(di.get("is_daily")) else timedelta(hours=1)
+    table = str(di.get("rates_table") or "")
+    if table:
+        return timedelta(days=1) if table.endswith("_day") else timedelta(hours=1)
+    dated = [r.get("date") for r in rates if isinstance(r.get("date"), datetime)]
+    if len(dated) >= 2:
+        return (
+            timedelta(days=1)
+            if (dated[-1] - dated[-2]).total_seconds() >= 77_760
+            else timedelta(hours=1)
+        )
+    return timedelta(hours=1)
+
+
+def _extract_prices(rates, dataset_index, target_date) -> np.ndarray:
     """
     Цены ВСЕГДА из rates (исторический срез до текущей даты).
     np_rates НЕ используется для цен — он содержит весь текущий массив,
@@ -83,6 +101,9 @@ def _extract_prices(rates, dataset_index) -> np.ndarray:
     """
     prices = []
     for r in rates:
+        dt = r.get("date")
+        if isinstance(dt, datetime) and dt >= target_date:
+            continue
         v = r.get('close') or r.get('open') or r.get('value')
         if v is not None:
             try:
@@ -92,28 +113,39 @@ def _extract_prices(rates, dataset_index) -> np.ndarray:
     return np.array(prices, dtype=np.float64)
 
 
-def _extract_t1(rates, dataset_index) -> float:
+def _extract_t1(rates, dataset_index, target_date) -> float:
     """
-    T1 — последнее значение из rates (текущий бар).
-    Фолбэк: np_rates['t1'][-1] если в rates нет поля t1.
+    Последний stored T1, который полностью известен к target_date.
+    Текущий/будущий бар и np_rates[-1] использовать запрещено.
     """
-    # Попробовать из последней записи rates
-    if rates:
-        last = rates[-1]
-        v = last.get('t1')
+    delta = _timeframe_delta(rates, dataset_index)
+    for last in reversed(rates):
+        dt = last.get("date")
+        if not isinstance(dt, datetime) or dt + delta > target_date:
+            continue
+        v = last.get("t1")
         if v is not None:
             try:
                 return round(float(v), 6)
             except (TypeError, ValueError):
                 pass
-    # Фолбэк: np_rates
+
+    # Exact causal lookup in the full numpy index.
     if dataset_index:
         np_r = dataset_index.get('np_rates')
         if np_r is not None:
+            dates_ns = np_r.get("dates_ns")
             t1_arr = np_r.get('t1')
-            if t1_arr is not None and len(t1_arr) > 0:
+            if dates_ns is not None and t1_arr is not None and len(t1_arr) > 0:
                 try:
-                    return round(float(t1_arr[-1]), 6)
+                    cutoff = int(
+                        target_date.timestamp() - delta.total_seconds()
+                    )
+                    idx = int(np.searchsorted(
+                        dates_ns, cutoff, side="right"
+                    )) - 1
+                    if 0 <= idx < len(t1_arr):
+                        return round(float(t1_arr[idx]), 6)
                 except (TypeError, ValueError):
                     pass
     return 0.0
@@ -266,7 +298,7 @@ def model(
     4. Если контекст найден — вернуть weight codes с резонансными значениями
     5. Если нет — вернуть {}
     """
-    prices = _extract_prices(rates, dataset_index)
+    prices = _extract_prices(rates, dataset_index, date)
     if len(prices) < WINDOW:
         return {}
 
@@ -319,8 +351,8 @@ def model(
     occ        = ctx_row.get('occurrence_count', 0) or 0
     shift_max  = SHIFT_MAX if occ >= RECURRING_MIN else 0
 
-    # ── T1 текущего бара (mode=0) ──────────────────────────────────────────────
-    t1_val = _extract_t1(rates, dataset_index)
+    # ── Последний завершённый stored T1 (mode=0) ──────────────────────────────
+    t1_val = _extract_t1(rates, dataset_index, date)
 
     result: dict[str, float] = {}
 

@@ -2,10 +2,10 @@
 cache_helper.py — кеш /values для всех brain-* микросервисов.
 
 Логика на каждый запрос /values:
-  1. SELECT → если в кеше есть → вернуть сразу (cache HIT)
-  2. Вычислить через compute_fn() (cache MISS)
-  3. INSERT IGNORE — атомарная защита от гонки и дублей
-  4. Вернуть результат
+  1. SELECT из общего SUPER_* кеша → если запись есть, вернуть сразу.
+  2. На Brain 1 при MISS вычислить model() и записать результат.
+  3. На дочерней ноде при MISS вызвать miss_fn (HTTP-запрос на Brain 1).
+  4. Локальная model() на дочерних нодах не вызывается.
 """
 
 import asyncio
@@ -26,6 +26,40 @@ log = logging.getLogger(__name__)
 #  Семафор 
 _DB_SEM: asyncio.Semaphore | None = None
 _DB_SEM_LOCK: asyncio.Lock | None = None
+
+# Per-process single-flight for identical /values cache misses.
+# Only coordinates execution; it does not transform/re-serialize the leader result.
+_MISS_FLIGHTS: dict[tuple, asyncio.Task] = {}
+_MISS_FLIGHTS_GUARD: asyncio.Lock | None = None
+
+
+def _get_miss_flights_guard() -> asyncio.Lock:
+    global _MISS_FLIGHTS_GUARD
+    if _MISS_FLIGHTS_GUARD is None:
+        _MISS_FLIGHTS_GUARD = asyncio.Lock()
+    return _MISS_FLIGHTS_GUARD
+
+
+async def _run_singleflight(key: tuple, factory):
+    """Run one coroutine per exact cache key and give all waiters the same response.
+
+    The returned top-level response is shallow-copied per waiter because brain_framework appends
+    a ``details`` field to the response after cached_values() returns.
+    """
+    async with _get_miss_flights_guard():
+        task = _MISS_FLIGHTS.get(key)
+        if task is None:
+            task = asyncio.create_task(factory())
+            _MISS_FLIGHTS[key] = task
+
+            def _cleanup(done_task, *, _key=key):
+                if _MISS_FLIGHTS.get(_key) is done_task:
+                    _MISS_FLIGHTS.pop(_key, None)
+
+            task.add_done_callback(_cleanup)
+
+    response = await asyncio.shield(task)
+    return dict(response)
 
 # Имя таблицы кеша по умолчанию (используется старым кодом без table_name)
 _DEFAULT_CACHE_TABLE = "vlad_values_cache"
@@ -320,6 +354,8 @@ async def cached_values(
     compute_fn,
     node:         str = "",
     table_name:   str = _DEFAULT_CACHE_TABLE,
+    compute_on_miss: bool = True,
+    miss_fn=None,
 ) -> dict:
     """
     Универсальная обёртка для endpoint /values.
@@ -328,10 +364,18 @@ async def cached_values(
     table_name — имя таблицы кеша (по умолчанию "vlad_values_cache").
     brain_framework передаёт s.cache_table для изоляции по сервисам.
 
-    compute_fn может быть:
+    compute_on_miss=False запрещает локальный model() на дочерней ноде.
+    В таком режиме miss_fn может получить значение у Brain 1 и вернуть payload.
+
+    compute_fn / miss_fn могут быть:
       - синхронной функцией, возвращающей dict/None,
       - асинхронной функцией (async def),
       - лямбдой, возвращающей корутину.
+
+    PARITY-SAFE single-flight:
+      после обычного cache MISS одинаковый exact-key исполняется только один раз;
+      лидер выполняет прежнюю MISS-ветку без изменения результата, остальные
+      await-ят тот же response. Разные ключи работают независимо.
     """
     from common import ok_response, err_response
 
@@ -343,32 +387,73 @@ async def cached_values(
 
     p_hash = cache_hash(extra_params)
 
-    #  1. Cache HIT 
+    # 1. Cache HIT — абсолютно прежний fast path.
     cached = await _cache_get(engine_vlad, service_url, pair, day, date_val, p_hash,
                               table_name=table_name)
     if cached is not None:
         log.debug(f"HIT  pair={pair} day={day} date={date} params={extra_params}")
         return ok_response(cached)
 
-    #  2. Вычисляем 
-    log.debug(f"MISS pair={pair} day={day} date={date} params={extra_params}")
+    flight_key = (
+        table_name, service_url, int(pair), int(day), date_val, p_hash,
+        bool(compute_on_miss),
+    )
 
-    callable_result = compute_fn()
+    async def _miss_once() -> dict:
+        # 2. MISS на дочерней ноде: локальный model() запрещён.
+        if not compute_on_miss:
+            if miss_fn is None:
+                msg = (
+                    "Central cache MISS and no Brain 1 fallback is configured | "
+                    f"pair={pair} day={day} date={date!r} params={extra_params}"
+                )
+                log.warning(f"cached_values: {msg} node={node}")
+                return err_response(msg)
 
-    if asyncio.iscoroutine(callable_result):
-        result = await callable_result
-    else:
-        result = await asyncio.to_thread(lambda: callable_result)
+            try:
+                upstream_call = miss_fn()
+                if asyncio.iscoroutine(upstream_call):
+                    result = await upstream_call
+                else:
+                    result = await asyncio.to_thread(lambda: upstream_call)
+            except Exception as exc:
+                msg = (
+                    f"Brain 1 cache fallback failed: {exc} | pair={pair} day={day} "
+                    f"date={date!r} params={extra_params}"
+                )
+                log.warning(f"cached_values: {msg} node={node}")
+                return err_response(msg)
 
-    if result is None:
-        msg = f"Computation returned None | date={date!r} pair={pair} day={day} params={extra_params}"
-        log.error(f"cached_values: {msg} node={node}")
-        return err_response(
-            f"Computation failed (check date or params): date={date!r} params={extra_params}"
-        )
+            if result is None:
+                msg = (
+                    "Brain 1 returned no payload for central cache MISS | "
+                    f"pair={pair} day={day} date={date!r} params={extra_params}"
+                )
+                log.warning(f"cached_values: {msg} node={node}")
+                return err_response(msg)
+            return ok_response(result)
 
-    #  3. INSERT IGNORE — атомарная защита от гонки и дублей 
-    await _cache_set(engine_vlad, service_url, pair, day, date_val,
-                     extra_params, p_hash, result, table_name=table_name)
+        # 3. MISS на Brain 1 — вычисляем локально и сохраняем в SUPER_* кеш.
+        log.debug(f"MISS pair={pair} day={day} date={date} params={extra_params}")
 
-    return ok_response(result)
+        callable_result = compute_fn()
+
+        if asyncio.iscoroutine(callable_result):
+            result = await callable_result
+        else:
+            result = await asyncio.to_thread(lambda: callable_result)
+
+        if result is None:
+            msg = f"Computation returned None | date={date!r} pair={pair} day={day} params={extra_params}"
+            log.error(f"cached_values: {msg} node={node}")
+            return err_response(
+                f"Computation failed (check date or params): date={date!r} params={extra_params}"
+            )
+
+        # INSERT IGNORE — прежняя атомарная защита от гонки и дублей.
+        await _cache_set(engine_vlad, service_url, pair, day, date_val,
+                         extra_params, p_hash, result, table_name=table_name)
+
+        return ok_response(result)
+
+    return await _run_singleflight(flight_key, _miss_once)

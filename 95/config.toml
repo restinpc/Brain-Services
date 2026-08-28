@@ -1,0 +1,59 @@
+[service]
+id = 95
+port = 8957
+name = "brain-macro-surprise-ml-s95"
+text = "TradingView economic-calendar macro surprise: causal Actual-vs-Forecast normalization + ML/reverse-learning"
+
+[rates]
+table = "brain_rates_eur_usd"
+
+[cache]
+date_from = "2024-02-01"
+var_range = [0, 1, 2, 3]
+types_range = [0, 1, 2, 3, 4]
+param_range = [""]
+shift_window = 48
+reload_interval = 3600
+rebuild_interval = 7200
+ml_workers = 2
+ml_batch_size = 2000
+batch_model_size = 1000
+
+[dataset]
+parser_table = "vlad_macro_calendar_events"
+enriched_table = "vlad_macro_surprise_events_s95"
+index_fields = ["event_type"]
+date_field = "date_dt"
+engine = "vlad"
+filter_by_date = true
+key_field = "event_type"
+model_can_filter = true
+
+[ctx]
+key_columns = ["id"]
+
+[model]
+# Minimum STRICTLY PRIOR releases of the same Country+Title before the first
+# normalized surprise is emitted. Monthly series therefore need ~6 months of warm-up.
+min_history = 6
+history_window = 60
+# A BIG surprise means the absolute forecast error is at/above the causal 75th
+# percentile of prior errors for the same indicator. No future rows enter it.
+big_quantile = 0.75
+# Safety: a release at 13:30 UTC becomes H1-available at 14:00; a release exactly
+# at 15:00 becomes available at 16:00. This avoids using the candle containing
+# the publication itself.
+strict_next_hour = true
+# Exact-zero Actual-Forecast gets its own INLINE state.
+zero_epsilon = 1e-12
+rare_occurrence_max = 0
+
+[ml]
+enabled = true
+init_mode = "constant"
+target_precision = 0.95
+max_iter = 20
+step = 0.10
+extremum_limit = 50
+active_tail = 0
+precision_metric = "mean"

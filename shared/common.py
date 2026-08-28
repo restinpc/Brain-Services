@@ -17,7 +17,18 @@ IS_DEV = MODE == "dev"
 #  Трассировка ошибок 
 _HANDLER  = os.getenv("HANDLER", "https://server.brain-project.online").rstrip("/")
 TRACE_URL = f"{_HANDLER}/trace.php"
-EMAIL     = os.getenv("ALERT_EMAIL", "vladyurjevitch@yandex.ru")
+DEFAULT_DEVELOPER_EMAIL = "vladyurjevitch@yandex.ru"
+EMAIL = os.getenv("ALERT_EMAIL", DEFAULT_DEVELOPER_EMAIL).strip() or DEFAULT_DEVELOPER_EMAIL
+
+
+def set_alert_email(email: str | None) -> str:
+    """Set the per-service trace recipient. One process hosts one model service."""
+    global EMAIL
+    value = str(email or "").strip()
+    if not value or "@" not in value:
+        value = os.getenv("ALERT_EMAIL", DEFAULT_DEVELOPER_EMAIL).strip() or DEFAULT_DEVELOPER_EMAIL
+    EMAIL = value
+    return EMAIL
 
 
 def send_error_trace(exc: Exception, node: str, script: str = "server.py") -> None:
@@ -153,6 +164,35 @@ def build_engines():
     )
 
     return engine_vlad, engine_brain, engine_super
+
+
+def build_cache_engine():
+    """
+    Отдельный AsyncEngine для общего values-cache.
+
+    Он использует ТЕ ЖЕ SUPER_* настройки, что и engine_super, поэтому кеш
+    физически хранится в БД первой (super) ноды. Отдельный пул нужен, чтобы
+    массовый fill_cache не занимал маленький служебный пул engine_super.
+    """
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    def _url(host, port, user, password, name):
+        return f"mysql+aiomysql://{user}:{password}@{host}:{port}/{name}"
+
+    return create_async_engine(
+        _url(
+            os.getenv("SUPER_HOST",     ""),
+            os.getenv("SUPER_PORT",     "3306"),
+            os.getenv("SUPER_USER",     ""),
+            os.getenv("SUPER_PASSWORD", ""),
+            os.getenv("SUPER_NAME",     "brain"),
+        ),
+        pool_size=max(1, int(os.getenv("CACHE_POOL_SIZE", "10"))),
+        max_overflow=max(0, int(os.getenv("CACHE_MAX_OVERFLOW", "10"))),
+        pool_pre_ping=False,
+        pool_recycle=900,
+        echo=False,
+    )
 
 
 #  Workers 

@@ -14,8 +14,11 @@ Storage-v2:
   - Дальше новые строки пишутся сразу в компактный формат.
 
 Переменные окружения:
-  GDELT_AUTO_MIGRATE=1              включить авто-миграцию существующей таблицы
-  GDELT_OPTIMIZE_AFTER_MIGRATION=1  выполнить OPTIMIZE TABLE после ALTER/DROP
+  GDELT_AUTO_MIGRATE=1              вручную включить авто-миграцию существующей таблицы
+                                  По умолчанию выключено, чтобы парсер не делал ALTER TABLE
+                                  во время резервного копирования.
+  GDELT_OPTIMIZE_AFTER_MIGRATION=1  вручную выполнить OPTIMIZE TABLE после ALTER/DROP
+                                  По умолчанию выключено.
 """
 
 import os, sys, argparse, time, random, traceback, hashlib
@@ -33,8 +36,8 @@ TRACE_URL = "https://server.brain-project.online/trace.php"
 NODE_NAME = os.getenv("NODE_NAME", "gdelt_events")
 EMAIL = os.getenv("ALERT_EMAIL", "vladyurjevitch@yandex.ru")
 
-AUTO_MIGRATE = os.getenv("GDELT_AUTO_MIGRATE", "1") != "0"
-OPTIMIZE_AFTER_MIGRATION = os.getenv("GDELT_OPTIMIZE_AFTER_MIGRATION", "1") != "0"
+AUTO_MIGRATE = os.getenv("GDELT_AUTO_MIGRATE", "0") == "1"
+OPTIMIZE_AFTER_MIGRATION = os.getenv("GDELT_OPTIMIZE_AFTER_MIGRATION", "0") == "1"
 
 
 def send_error_trace(exc, script_name="GDELT_events.py"):
@@ -150,6 +153,28 @@ class GDELTCollector:
         )
         return cursor.fetchone() is not None
 
+    def _is_backup_running(self, cursor):
+        """Проверяет флаг штатного backup.
+
+        Во время mysqldump нельзя делать DDL по таблице: ALTER/DROP/OPTIMIZE/ADD INDEX.
+        Иначе mysqldump может упасть с Error 1412: Table definition has changed.
+        Если brain_config недоступен, не блокируем обычную работу парсера.
+        """
+        try:
+            cursor.execute(
+                """
+                SELECT `value`
+                FROM `brain_config`
+                WHERE `name` = 'backup'
+                LIMIT 1
+                """
+            )
+            row = cursor.fetchone()
+            return row is not None and str(row[0]) == "1"
+        except mysql.connector.Error as e:
+            print(f"  ⚠️ Не удалось проверить brain_config.backup: {e}")
+            return False
+
     def _drain_cursor_results(self, cursor):
         """Считывает служебные result set'ы после OPTIMIZE/ANALYZE/ALTER.
 
@@ -190,6 +215,10 @@ class GDELTCollector:
         conn, c = self.get_db_connection()
         changed = False
         try:
+            if self._is_backup_running(c):
+                print("  backup=1: пропускаю CREATE/ALTER/OPTIMIZE для GDELT-таблицы, чтобы не ломать mysqldump")
+                return
+
             c.execute(f"""
                 CREATE TABLE IF NOT EXISTS {_safe_identifier(self.table_name)} (
                     id INT AUTO_INCREMENT PRIMARY KEY,
@@ -212,10 +241,15 @@ class GDELTCollector:
             conn.commit()
 
             if AUTO_MIGRATE:
-                changed = self.migrate_existing_table(c)
-                conn.commit()
+                if self._is_backup_running(c):
+                    print("  backup=1: авто-миграция GDELT пропущена")
+                else:
+                    changed = self.migrate_existing_table(c)
+                    conn.commit()
+            else:
+                print("  GDELT_AUTO_MIGRATE=0: авто-миграция выключена, DDL не выполняется")
 
-            if changed and OPTIMIZE_AFTER_MIGRATION:
+            if changed and OPTIMIZE_AFTER_MIGRATION and not self._is_backup_running(c):
                 # ALTER/DROP могут быть INSTANT в MySQL 8 и не всегда сразу отдают место ОС.
                 # OPTIMIZE пересобирает таблицу и физически уплотняет .ibd.
                 self._safe_execute(c, f"OPTIMIZE TABLE {_safe_identifier(self.table_name)}", "OPTIMIZE TABLE для физического освобождения места")
