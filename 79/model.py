@@ -1133,6 +1133,137 @@ def _previous_direction(np_rates: dict | None, target_date: datetime) -> tuple[b
     return predict_max, "ext_max" if predict_max else "ext_min"
 
 
+# Prepared analogue metadata is immutable for one framework dataset generation.
+# Cache only parsed/gating information; target-date causality is still evaluated
+# on every call.  Keys include list identities + boundary timestamps so a reload
+# naturally receives a different generation.
+_ANALOG_META_CACHE: "OrderedDict[tuple, tuple[object, object, np.ndarray, np.ndarray]]" = OrderedDict()
+_ANALOG_META_CACHE_MAX = 512
+_ANALOG_OUTCOME_CACHE: "OrderedDict[tuple, tuple[np.ndarray, np.ndarray]]" = OrderedDict()
+_ANALOG_OUTCOME_CACHE_MAX = 512
+_ANALOG_CACHE_LOCK = threading.RLock()
+
+
+def _analog_cache_key(
+    analog_rows: list[dict[str, Any]],
+    analog_dates: list[datetime],
+) -> tuple:
+    first = analog_dates[0] if analog_dates else None
+    last = analog_dates[-1] if analog_dates else None
+    first_row = analog_rows[0] if analog_rows else None
+    last_row = analog_rows[-1] if analog_rows else None
+    return (
+        id(analog_rows),
+        id(analog_dates),
+        id(first_row),
+        id(last_row),
+        len(analog_rows),
+        len(analog_dates),
+        int(first.timestamp()) if isinstance(first, datetime) else 0,
+        int(last.timestamp()) if isinstance(last, datetime) else 0,
+    )
+
+
+def _wall_us(value: datetime) -> int:
+    """Timezone-independent ordering key for naive framework datetimes."""
+    return (
+        value.toordinal() * 86_400_000_000
+        + value.hour * 3_600_000_000
+        + value.minute * 60_000_000
+        + value.second * 1_000_000
+        + value.microsecond
+    )
+
+
+def _prepared_analog_meta(
+    analog_rows: list[dict[str, Any]],
+    analog_dates: list[datetime],
+) -> tuple[tuple, np.ndarray, np.ndarray]:
+    key = _analog_cache_key(analog_rows, analog_dates)
+    with _ANALOG_CACHE_LOCK:
+        cached = _ANALOG_META_CACHE.get(key)
+        if cached is not None:
+            _ANALOG_META_CACHE.move_to_end(key)
+            return key, cached[2], cached[3]
+
+    n = min(len(analog_rows), len(analog_dates))
+    var_masks = np.empty(n, dtype=np.uint16)
+    q_weights = np.empty(n, dtype=np.float64)
+
+    # Run the canonical gate and quality conversion once per immutable row.
+    # This intentionally keeps all Python edge-case semantics (bad strings,
+    # NaN, "or 1.0", threshold comparisons) exactly as before.
+    for j in range(n):
+        row = analog_rows[j]
+        mask = 0
+        for var in VAR_RANGE:
+            if _var_allows_row(row, var):
+                mask |= 1 << int(var)
+        var_masks[j] = mask
+
+        quality = float(row.get("quality_score") or 1.0)
+        q_weights[j] = min(max(quality / 0.65, 0.25), 2.5)
+
+    with _ANALOG_CACHE_LOCK:
+        # Keep only boundary row objects alive. This prevents Python from
+        # reusing their ids for a different dataset generation while the cache
+        # entry exists, without retaining the whole old dataset after reload.
+        first_row = analog_rows[0] if analog_rows else None
+        last_row = analog_rows[-1] if analog_rows else None
+        _ANALOG_META_CACHE[key] = (first_row, last_row, var_masks, q_weights)
+        _ANALOG_META_CACHE.move_to_end(key)
+        while len(_ANALOG_META_CACHE) > _ANALOG_META_CACHE_MAX:
+            _ANALOG_META_CACHE.popitem(last=False)
+
+    return key, var_masks, q_weights
+
+
+def _prepared_outcome_frames(
+    meta_key: tuple,
+    analog_dates: list[datetime],
+    *,
+    is_daily: bool,
+    shift: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    key = meta_key + (bool(is_daily), int(shift))
+    with _ANALOG_CACHE_LOCK:
+        cached = _ANALOG_OUTCOME_CACHE.get(key)
+        if cached is not None:
+            _ANALOG_OUTCOME_CACHE.move_to_end(key)
+            return cached
+
+    unit = timedelta(days=1) if is_daily else timedelta(hours=1)
+    delta = unit * int(shift)
+    n = len(analog_dates)
+    outcome_ts = np.empty(n, dtype=np.int64)
+    frame_end_us = np.empty(n, dtype=np.int64)
+
+    # The old code performs datetime + timedelta -> _frame_date -> timestamp
+    # for every historical analogue on every request.  Do it once per
+    # (dataset generation, timeframe, shift) so DST/local-time semantics remain
+    # exactly the same as the canonical Python implementation.
+    for j, analog_dt in enumerate(analog_dates):
+        frame = _frame_date(analog_dt + delta, is_daily)
+        outcome_ts[j] = int(frame.timestamp())
+        frame_end_us[j] = _wall_us(frame + unit)
+
+    with _ANALOG_CACHE_LOCK:
+        _ANALOG_OUTCOME_CACHE[key] = (outcome_ts, frame_end_us)
+        _ANALOG_OUTCOME_CACHE.move_to_end(key)
+        while len(_ANALOG_OUTCOME_CACHE) > _ANALOG_OUTCOME_CACHE_MAX:
+            _ANALOG_OUTCOME_CACHE.popitem(last=False)
+
+    return outcome_ts, frame_end_us
+
+
+def _ordered_float_sum(values: np.ndarray) -> float:
+    """Same left-to-right float64 accumulation order as ``s += float(x)``."""
+    if values.size == 0:
+        return 0.0
+    arr = np.asarray(values, dtype=np.float64)
+    return float(np.cumsum(arr, dtype=np.float64)[-1])
+
+
 def _aggregate_analogs_by_var(
     analog_rows: list[dict[str, Any]],
     analog_dates: list[datetime],
@@ -1144,50 +1275,87 @@ def _aggregate_analogs_by_var(
     np_rates: dict,
     ext_name: str,
 ) -> dict[int, tuple[float, float, int, float, float, float]]:
-    """Aggregate historical outcomes once while maintaining all var subsets."""
+    """Vectorized canonical analogue aggregation with exact accumulation order."""
     end = bisect.bisect_left(analog_dates, target_date)
-    stats = {v: [0.0, 0.0, 0, 0.0, 0.0, 0.0] for v in VAR_RANGE}
+    empty = {v: (0.0, 0.0, 0, 0.0, 0.0, 0.0) for v in VAR_RANGE}
     if end <= 0:
-        return {v: tuple(x) for v, x in stats.items()}
+        return empty
 
     dates_ns = np_rates.get("dates_ns") if np_rates else None
     t1_arr = np_rates.get("t1") if np_rates else None
     ext_arr = np_rates.get(ext_name) if np_rates else None
     if dates_ns is None or t1_arr is None or ext_arr is None:
-        return {v: tuple(x) for v, x in stats.items()}
+        return empty
 
-    unit = timedelta(days=1) if is_daily else timedelta(hours=1)
-    for j in range(end):
-        analog_dt = analog_dates[j]
-        if analog_dt == current_event_time:
+    n_meta = min(len(analog_rows), len(analog_dates))
+    end = min(end, n_meta)
+    if end <= 0:
+        return empty
+
+    meta_key, var_masks, q_weights = _prepared_analog_meta(
+        analog_rows, analog_dates
+    )
+    outcome_ts, frame_end_us = _prepared_outcome_frames(
+        meta_key, analog_dates, is_daily=is_daily, shift=int(shift)
+    )
+
+    outcome_ts = outcome_ts[:end]
+    frame_end_us = frame_end_us[:end]
+    var_masks = var_masks[:end]
+    q_weights = q_weights[:end]
+
+    rates_ts = np.asarray(dates_ns)
+    rate_idx = np.searchsorted(rates_ts, outcome_ts, side="left")
+    valid = rate_idx < len(rates_ts)
+
+    # Avoid indexing out of bounds while checking exact candle existence.
+    in_bounds = np.flatnonzero(valid)
+    if in_bounds.size:
+        valid[in_bounds] &= (
+            np.asarray(rates_ts[rate_idx[in_bounds]], dtype=np.int64)
+            == outcome_ts[in_bounds]
+        )
+
+    # Canonical future guard: ``frame + unit <= target_date``.
+    valid &= frame_end_us <= _wall_us(target_date)
+
+    # Canonical code excludes every analogue sharing the exact current-event
+    # timestamp, not merely one row.
+    same_lo = bisect.bisect_left(analog_dates, current_event_time, 0, end)
+    same_hi = bisect.bisect_right(analog_dates, current_event_time, same_lo, end)
+    if same_hi > same_lo:
+        valid[same_lo:same_hi] = False
+
+    if not np.any(valid):
+        return empty
+
+    t1_np = np.asarray(t1_arr)
+    ext_np = np.asarray(ext_arr)
+    stats: dict[int, tuple[float, float, int, float, float, float]] = {}
+
+    for var in VAR_RANGE:
+        positions = np.flatnonzero(valid & ((var_masks & (1 << int(var))) != 0))
+        n = int(positions.size)
+        if n == 0:
+            stats[var] = (0.0, 0.0, 0, 0.0, 0.0, 0.0)
             continue
-        outcome_time = analog_dt + unit * int(shift)
-        frame = _frame_date(outcome_time, is_daily)
-        if frame + unit > target_date:
-            continue
-        ts = int(frame.timestamp())
-        idx = int(np.searchsorted(dates_ns, ts, side="left"))
-        if idx >= len(dates_ns) or int(dates_ns[idx]) != ts:
-            continue
 
-        analog = analog_rows[j]
-        stored_t1 = float(t1_arr[idx])
-        hit = 1.0 if bool(ext_arr[idx]) else 0.0
-        quality = float(analog.get("quality_score") or 1.0)
-        q_weight = min(max(quality / 0.65, 0.25), 2.5)
+        idx = rate_idx[positions]
+        stored_t1 = np.asarray(t1_np[idx], dtype=np.float64)
+        hits = np.asarray(ext_np[idx], dtype=bool).astype(np.float64)
+        weights = np.asarray(q_weights[positions], dtype=np.float64)
 
-        for var in VAR_RANGE:
-            if not _var_allows_row(analog, var):
-                continue
-            st = stats[var]
-            st[0] += stored_t1
-            st[1] += hit
-            st[2] += 1
-            st[3] += stored_t1 * q_weight
-            st[4] += hit * q_weight
-            st[5] += q_weight
+        raw_t1 = _ordered_float_sum(stored_t1)
+        raw_hits = _ordered_float_sum(hits)
+        # Multiplication is element-wise IEEE-754 float64; cumsum then preserves
+        # the same row order as the old Python loop.
+        w_t1 = _ordered_float_sum(stored_t1 * weights)
+        w_hits = _ordered_float_sum(hits * weights)
+        w_total = _ordered_float_sum(weights)
 
-    return {v: tuple(x) for v, x in stats.items()}
+        stats[var] = (raw_t1, raw_hits, n, w_t1, w_hits, w_total)
+
+    return stats
 
 
 def _mode1_score(hits: float, total: float, predict_max: bool) -> float:
