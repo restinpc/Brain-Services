@@ -31,7 +31,11 @@ RATES_SOURCES = {
 }
 SOURCE_TO_TABLE = {value: key for key, value in RATES_SOURCES.items()}
 
-_SELECTED_CACHE: dict[tuple[int, int, str], tuple[list[dict], list[int]]] = {}
+# selected rows + timestamps + compiled event index (shared across model/batch calls)
+_SELECTED_CACHE: dict[tuple[int, int, str], list] = {}
+_RESULT_CACHE: dict[tuple, dict] = {}
+_RESULT_CACHE_MAX = 4096
+_CFG_CACHE: dict | None = None
 
 
 def _as_datetime(value) -> datetime:
@@ -128,6 +132,7 @@ async def enrich_dataset(engine_vlad, engine_brain) -> dict:
             )
 
     _SELECTED_CACHE.clear()
+    _RESULT_CACHE.clear()
     return {
         "catalog_size": len(FIGURE_CATALOG),
         "source_rows": counts,
@@ -145,6 +150,13 @@ def _source_from_index(dataset_index: dict | None, param: str) -> str:
         return requested
     table = str((dataset_index or {}).get("rates_table") or "")
     return RATES_SOURCES.get(table, "eur_h1")
+
+
+def _service_cfg() -> dict:
+    global _CFG_CACHE
+    if _CFG_CACHE is None:
+        _CFG_CACHE = get_service_config()
+    return _CFG_CACHE
 
 
 def _select_source(
@@ -169,15 +181,63 @@ def _select_source(
             int((row.get("date") or row["date_dt"]).timestamp())
             for row in selected
         ]
-        cached = (selected, timestamps)
+        cached = [selected, timestamps, None]
         if len(_SELECTED_CACHE) >= 12:
             _SELECTED_CACHE.clear()
+            _RESULT_CACHE.clear()
         _SELECTED_CACHE[cache_key] = cached
 
-    selected, timestamps = cached
+    selected, timestamps, events = cached
     index["full_dataset"] = selected
     index["dataset_timestamps"] = timestamps
+    if events is not None:
+        index["_standard_events_by_type"] = events
+    index["_selected_cache_entry"] = cached
     return selected, index
+
+
+def _persist_event_index(index: dict) -> None:
+    entry = index.get("_selected_cache_entry")
+    events = index.get("_standard_events_by_type")
+    if isinstance(entry, list) and events is not None and entry[2] is None:
+        entry[2] = events
+
+
+def _run_source_model(
+    rates,
+    selected_dataset: list[dict],
+    date,
+    *,
+    source_name: str,
+    source_type: int,
+    source_var: int,
+    selected_index: dict,
+    ml_enabled: bool,
+    shift_window: int,
+) -> dict:
+    if ml_enabled:
+        cache_key = (id(selected_dataset), date, source_name)
+        cached = _RESULT_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+    result = run_standard_model(
+        rates,
+        selected_dataset,
+        date,
+        type=source_type,
+        var=source_var,
+        dataset_index=selected_index,
+        shift_window=shift_window,
+        apply_var_fn=_apply_var,
+    )
+    _persist_event_index(selected_index)
+
+    if ml_enabled:
+        if len(_RESULT_CACHE) >= _RESULT_CACHE_MAX:
+            _RESULT_CACHE.clear()
+        _RESULT_CACHE[cache_key] = result
+    return result
 
 
 def _apply_var(signed_t1: float, pct: float, var: int, ctx_info: dict) -> float:
@@ -208,6 +268,7 @@ def model(rates, dataset, date, *, type=0, var=0, param="", dataset_index=None):
     if not selected_dataset:
         return {}
 
+    cfg = _service_cfg()
     # run_standard_model supports rare-event shifts, but it must not receive
     # events at/after the prediction timestamp.  The framework index contains
     # the full enriched table for analog lookup, so enforce the live-available
@@ -227,16 +288,49 @@ def model(rates, dataset, date, *, type=0, var=0, param="", dataset_index=None):
     # In reverse-learning mode the public type/var values configure the
     # trainer (train mode and extremum interval).  The source model must only
     # provide the complete set of active codes, so use its unfiltered slot.
-    source_type = 0 if ml_enabled else type
-    source_var = 0 if ml_enabled else var
-
-    return run_standard_model(
+    return _run_source_model(
         rates,
         selected_dataset,
         date,
-        type=source_type,
-        var=source_var,
-        dataset_index=selected_index,
+        source_name=source_name,
+        source_type=0 if ml_enabled else type,
+        source_var=0 if ml_enabled else var,
+        selected_index=selected_index,
+        ml_enabled=ml_enabled,
         shift_window=cfg["cache"]["shift_window"],
-        apply_var_fn=_apply_var,
     )
+
+
+def batch_model(rates, dataset, dates, *, type=0, var=0, param="", dataset_index=None):
+    """Shared event index + result cache for fill_cache ML prewarm."""
+    if not dates:
+        return {}
+    source_name = _source_from_index(dataset_index, param)
+    selected_dataset, selected_index = _select_source(
+        dataset,
+        dataset_index,
+        source_name,
+    )
+    if not selected_dataset:
+        return {date: {} for date in dates}
+
+    cfg = _service_cfg()
+    ml_enabled = bool((cfg.get("ml") or {}).get("enabled", False))
+    shift_window = cfg["cache"]["shift_window"]
+    source_type = 0 if ml_enabled else type
+    source_var = 0 if ml_enabled else var
+
+    return {
+        date: _run_source_model(
+            rates,
+            selected_dataset,
+            date,
+            source_name=source_name,
+            source_type=source_type,
+            source_var=source_var,
+            selected_index=selected_index,
+            ml_enabled=ml_enabled,
+            shift_window=shift_window,
+        )
+        for date in dates
+    }
