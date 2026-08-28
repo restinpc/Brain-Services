@@ -1,0 +1,67 @@
+[service]
+id = 93
+port = 8955
+name = "brain-crypto-news-algo-ml-s93"
+text = "Unified crypto news: frozen TF-IDF/NMF/SVD events + provider-aware confirmation + ML/reverse-learning"
+
+[rates]
+table = "brain_rates_eur_usd"
+
+[cache]
+date_from = "2026-05-01"
+fresh_lag_days = 14
+var_range = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+types_range = [0, 1, 2, 3, 4]
+shift_window = 12
+reload_interval = 3600
+rebuild_interval = 7200
+ml_workers = 2
+ml_batch_size = 2000
+batch_model_size = 1000
+
+[dataset]
+parser_table = "vlad_coindesk_crypto_news"
+enriched_table = "vlad_crypto_news_algo_events_s93"
+index_fields = []
+date_field = "date_dt"
+engine = "vlad"
+filter_by_date = true
+key_field = "event_type"
+model_can_filter = true
+
+[ctx]
+key_columns = ["id"]
+
+[model]
+rare_occurrence_max = 0
+
+[nlp]
+# Fixed unsupervised fit boundary. Rows after this timestamp can NEVER alter
+# TF-IDF vocabulary, NMF topics, SVD projection or event centroids.
+train_cutoff = "2026-05-01 00:00:00"
+sample_per_source = 3000
+max_features = 8000
+nmf_topics = 20
+svd_components = 40
+target_event_docs = 180
+min_event_support = 40
+max_local_clusters = 20
+text_chars = 1800
+period_days = 10
+novelty_days = 7
+confirmation_hours = 12
+confirmation_similarity = 0.76
+duplicate_minutes = 90
+duplicate_similarity = 0.90
+fast_confirmation_minutes = 120
+max_source_age_days = 2
+
+[ml]
+enabled = true
+init_mode = "constant"
+target_precision = 0.95
+max_iter = 20
+step = 0.10
+extremum_limit = 50
+active_tail = 0
+precision_metric = "mean"
