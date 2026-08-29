@@ -237,6 +237,22 @@ _FILL_EXECUTOR = _cf.ThreadPoolExecutor(
     thread_name_prefix="fill_worker",
 )
 
+# Dedicated single-worker executor for synchronous batch_model().
+# Keeps batch_model off the FastAPI asyncio event loop while preserving
+# the previous effective one-at-a-time execution order.
+_BATCH_MODEL_EXECUTOR = _cf.ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="batch_model",
+)
+
+
+async def _run_batch_model_offloop(fn, **kwargs):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _BATCH_MODEL_EXECUTOR,
+        lambda: fn(**kwargs),
+    )
+
 # ══════════════════════════════════════════════════════════════════════════════
 # NUMPY-УТИЛИТЫ
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3295,7 +3311,7 @@ def build_app(model_module) -> FastAPI:
                             s.dataset if s.model_can_filter_dataset_by_date
                             else _filter_dataset_lte(_missing_chunk[-1], s)
                         )
-                        batch_results = s.batch_model_fn(
+                        batch_results = await _run_batch_model_offloop(s.batch_model_fn,
                             rates=rates_for_prewarm,
                             dataset=dataset_for_prewarm,
                             dates=_missing_chunk,
@@ -3695,7 +3711,7 @@ def build_app(model_module) -> FastAPI:
                                                    else [{"date": max_batch_date}])
                                 dataset_f_b = s.dataset if s.model_can_filter_dataset_by_date else _filter_dataset_lte(max_batch_date, s)
 
-                                batch_map = s.batch_model_fn(
+                                batch_map = await _run_batch_model_offloop(s.batch_model_fn,
                                     rates=rates_for_batch,
                                     dataset=dataset_f_b,
                                     dates=batch_dates,
@@ -4079,6 +4095,7 @@ def build_app(model_module) -> FastAPI:
         task.cancel()
         s.fill_cancel.set()
         _non_ml_live_executor.shutdown(wait=False, cancel_futures=True)
+        _BATCH_MODEL_EXECUTOR.shutdown(wait=False, cancel_futures=True)
         for eng in (s.engine_vlad, s.engine_brain, s.engine_super, s.engine_cache):
             try:
                 await eng.dispose()
