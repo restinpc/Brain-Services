@@ -1,6 +1,6 @@
 [service]
 id = 94
-port = 8956
+port = 8957
 name = "brain-polymarket-pressure-ml-s94"
 text = "Polymarket prediction-market probability pressure: causal H1/H6/H24 repricing + cross-market breadth + ML/reverse-learning"
 
