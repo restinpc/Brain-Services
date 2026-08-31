@@ -1,0 +1,52 @@
+# Bybit TradeGPT hourly market-context model with reverse-learning.
+# Historical sources:
+#   vlad_bybit_data_bot      -> BTC
+#   vlad_bybit_data_bot_ETH  -> ETH
+
+[service]
+id = 92
+port = 8954
+name = "brain-bybit-tradegpt-context-ml-s92"
+text = "Bybit TradeGPT market-context model: bot outlook + causal Bybit metrics with ML/reverse-learning"
+
+[cache]
+date_from = "2026-03-08"
+var_range = [3, 5, 7, 9]
+types_range = [0, 1, 2, 3, 4]
+shift_window = 12
+rebuild_interval = 7200
+reload_interval = 3600
+
+[dataset]
+parser_table = "vlad_bybit_data_bot"
+parser_table_2 = "vlad_bybit_data_bot_ETH"
+enriched_table = "vlad_bybit_tradegpt_enriched_s92"
+index_fields = ["event_type"]
+date_field = "date_dt"
+engine = "vlad"
+
+[ctx]
+key_columns = ["id"]
+
+[model]
+# Rolling thresholds use PRIOR observations only. One week of hourly history is
+# enough to adapt to regime changes without using future information.
+history_window = 168
+history_min = 24
+quantile_low = 0.25
+quantile_high = 0.75
+# Ignore bot failures / quota messages / truncated answers.
+min_response_chars = 500
+min_numeric_features = 3
+# Opinion flips can be more informative than a repeated hourly opinion.
+emit_opinion_flip = true
+
+[ml]
+enabled = true
+init_mode = "constant"
+target_precision = 0.95
+max_iter = 20
+step = 0.10
+extremum_limit = 50
+active_tail = 0
+precision_metric = "mean"
