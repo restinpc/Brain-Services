@@ -1,5 +1,5 @@
 """
-Service 93 — Unified Crypto News Algorithmic ML
+Service 92 — Unified Crypto News Algorithmic ML
 ================================================
 
 Four raw sources:
@@ -52,7 +52,7 @@ from brain_framework import get_service_config
 # Framework contract
 # ---------------------------------------------------------------------------
 
-SERVICE_ID = 93
+SERVICE_ID = 92
 PORT = 8955
 PRETEST_ALLOW_EMPTY = True
 RATES_TABLE = "brain_rates_eur_usd"
@@ -407,7 +407,7 @@ def _require_nlp_stack():
         from sklearn.feature_extraction.text import TfidfVectorizer  # noqa: F401
         from sklearn.svm import LinearSVC  # noqa: F401
     except Exception as exc:
-        raise RuntimeError("Service 93 requires scikit-learn + joblib") from exc
+        raise RuntimeError("Service 92 requires scikit-learn + joblib") from exc
 
 # ---------------------------------------------------------------------------
 # Database schema / metadata / shared artifact
@@ -447,7 +447,7 @@ async def _ensure_tables(engine_vlad, enriched_table: str, meta_table: str, arti
                 INDEX `idx_cluster_date` (`cluster_id`,`date_dt`),
                 INDEX `idx_provider_date` (`provider`,`date_dt`)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-            COMMENT='service93 frozen algorithmic crypto-news events, provider-aware'
+            COMMENT='service92 frozen algorithmic crypto-news events, provider-aware'
         """))
         await conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS `{meta_table}` (
@@ -503,7 +503,7 @@ async def _artifact_load(engine_vlad, table: str, signature: str):
         return None
     blob = bytes(row[2])
     if hashlib.sha256(blob).hexdigest() != str(row[1]):
-        raise RuntimeError("Service 93 crypto-news NLP artifact checksum mismatch")
+        raise RuntimeError("Service 92 crypto-news NLP artifact checksum mismatch")
     return joblib.load(io.BytesIO(blob))
 
 
@@ -1082,7 +1082,7 @@ async def _enrich_unlocked(engine_vlad, engine_brain) -> dict[str, Any]:
     cfg = _nlp_cfg()
     service_cfg = get_service_config() or {}
     dcfg = service_cfg.get("dataset") or {}
-    enriched_table = str(dcfg.get("enriched_table") or "vlad_crypto_news_algo_events_s93")
+    enriched_table = str(dcfg.get("enriched_table") or "vlad_crypto_news_algo_events_s92")
     meta_table = f"{enriched_table}_meta"
     artifact_table = f"{enriched_table}_artifact"
     signature = _signature(cfg)
@@ -1198,12 +1198,12 @@ async def _enrich_unlocked(engine_vlad, engine_brain) -> dict[str, Any]:
 
 
 async def enrich_dataset(engine_vlad, engine_brain) -> dict[str, Any]:
-    """Build/update the unified frozen crypto-news dataset for service 93."""
+    """Build/update the unified frozen crypto-news dataset for service 92."""
     from sqlalchemy import text
 
     cfg = get_service_config() or {}
     dcfg = cfg.get("dataset") or {}
-    enriched_table = str(dcfg.get("enriched_table") or "vlad_crypto_news_algo_events_s93")
+    enriched_table = str(dcfg.get("enriched_table") or "vlad_crypto_news_algo_events_s92")
     lock_name = f"crypto_news_algo:{enriched_table}"[:64]
 
     async with engine_vlad.connect() as lock_conn:

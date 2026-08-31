@@ -1,7 +1,7 @@
 [service]
-id = 93
+id = 92
 port = 8955
-name = "brain-crypto-news-algo-ml-s93"
+name = "brain-crypto-news-algo-ml-s92"
 text = "Unified crypto news: frozen TF-IDF/NMF/SVD events + provider-aware confirmation + ML/reverse-learning"
 
 [rates]
@@ -21,7 +21,7 @@ batch_model_size = 1000
 
 [dataset]
 parser_table = "vlad_coindesk_crypto_news"
-enriched_table = "vlad_crypto_news_algo_events_s93"
+enriched_table = "vlad_crypto_news_algo_events_s92"
 index_fields = []
 date_field = "date_dt"
 engine = "vlad"

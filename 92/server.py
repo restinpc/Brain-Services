@@ -1,4 +1,4 @@
-"""FastAPI entry point for service 93."""
+"""FastAPI entry point for service 92."""
 from __future__ import annotations
 
 import os
