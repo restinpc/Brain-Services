@@ -1,9 +1,9 @@
 # Service configuration for the Eurostat government-debt model.
 
 [service]
-id = 75
+id = 84
 port = 8946
-name = "brain-sasha_eurostat_debt-s75"
+name = "brain-sasha_eurostat_debt-s84"
 text = "Euro-area government-debt context model"
 
 [rates]

@@ -4156,7 +4156,7 @@ def build_app(model_module) -> FastAPI:
 
     @app.get("/weights")
     async def ep_weights():
-        return ok_response({"codes": s.weight_codes, "var_range": s.VAR_RANGE})
+        return ok_response(s.weight_codes)
 
     # ── _build_narrative ──────────────────────────────────────────────────────────
 
