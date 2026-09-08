@@ -1,0 +1,43 @@
+# CV-паттерны монолита: таблицы brain_index{0-6}_{eur_usd|btc_usd|eth_usd}[_day].
+# type — id алгоритма computer vision (0-6). Значение кода — сумма T1 свечек,
+# следовавших в истории за таким же квадратным блоком 1x1 / 2x2 / … / 12x12.
+
+[service]
+id = 98
+port = 8960
+name = "brain-candle-vision-patterns-s98"
+text = "Monolith CV candle-index patterns (brain_index 0-6) with next-candle T1 sums"
+
+[rates]
+table = "brain_rates_eur_usd"
+
+[cache]
+date_from = "2025-01-01"
+# 0 — суммы как есть, 1 — значение × число ячеек в блоке (как type=1 у модели 97).
+var_range = [0, 1]
+# id алгоритма computer vision, таблица brain_index{type}_*.
+types_range = [0, 1, 2, 3, 4, 5, 6]
+shift_window = 12
+rebuild_interval = 0
+reload_interval = 3600
+
+[dataset]
+# Датасета нет: паттерны читаются из brain_index* и np_rates. Заглушка нужна,
+# чтобы /pretest стартовал с непустым s.dataset.
+engine = "brain"
+query = "SELECT MAX(`date`) AS date, 'candle_vision' AS event_type, 0 AS pct_change FROM `brain_rates_eur_usd`"
+model_uses_rates = false
+model_can_filter = true
+
+[ctx]
+key_columns = ["id"]
+
+[model]
+# Глубина квадратного окна; выше 12 не поднимается — столько осей в индексе.
+max_pattern_depth = 12
+# brain = MASTER_* (где лежат brain_index*), vlad = локальная DB_*.
+index_engine = "brain"
+index_prefix = "brain_index"
+
+[ml]
+enabled = false

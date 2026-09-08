@@ -1,0 +1,47 @@
+# Весовые коды направления свечек: рост → 0, падение → 1, до 24 разрядов
+# назад в историю. Значение кода — сумма T1 свечек, следовавших в истории за
+# таким же паттерном. Источник данных — сами таблицы brain_rates_*.
+
+[service]
+id = 97
+port = 8959
+name = "brain-candle-code-patterns-s97"
+text = "Candle-direction binary pattern codes (1-24 digits) with next-candle T1 sums"
+
+[rates]
+table = "brain_rates_eur_usd"
+
+[cache]
+date_from = "2025-01-01"
+# var модель не использует: постановка не оставляет свободного параметра —
+# коды и суммы определены однозначно.
+var_range = [0]
+# 0 — значения как есть, 1 — значение × количество разрядов кода (1-24).
+types_range = [0, 1]
+# Окно фреймворка на выдачу не влияет: аналоги ищутся по всей истории.
+shift_window = 12
+# Обогащать нечего, ребилд не нужен; reload догоняет свежие свечки.
+rebuild_interval = 0
+reload_interval = 3600
+
+[dataset]
+# Датасета у модели нет: паттерны считаются прямо по котировкам. Запрос отдаёт
+# одну строку-заглушку, потому что /pretest отказывается стартовать с пустым
+# s.dataset, а полноценная таблица событий (24 кода × вся история × 6
+# инструментов) была бы кратной копией самих котировок.
+engine = "brain"
+query = "SELECT MAX(`date`) AS date, 'candle_direction' AS event_type, 0 AS pct_change FROM `brain_rates_eur_usd`"
+# Историю модель читает из dataset_index["np_rates"], срез rates[:idx] не нужен.
+model_uses_rates = false
+model_can_filter = true
+
+[ctx]
+key_columns = ["id"]
+
+[model]
+# Ограничение из постановки; выше 24 не поднимается — столько разрядов
+# помещается в код паттерна.
+max_pattern_length = 24
+
+[ml]
+enabled = false
