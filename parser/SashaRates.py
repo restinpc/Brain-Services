@@ -6,9 +6,11 @@
           Фиат (пары 0, 1, 4–10): Yahoo Finance + MOEX ISS для USD/RUB.
           Крипта (пары 2, 3, 11–15): Coinbase USD, запасной Binance USDT.
           Кроссы: A/B = (A в USD) / (B в USD), 16 активов → C(16,2) = 120 пар.
+          Для модели 93 momentum всех пар хранится в одной sasha_rates_keys.
 
 Запуск:
   python SashaRates.py sasha_rates                     # всё: фиат → крипта → кроссы
+  python SashaRates.py sasha_rates_keys                # ключи из истории БД, без скачивания
   python SashaRates.py sasha_quotes_fx                 # только фиат
   python SashaRates.py sasha_quotes_crypto             # только крипта
   python SashaRates.py sasha_quotes_cross              # только кроссы (ноги уже в БД)
@@ -25,6 +27,7 @@ import os
 import sys
 import time
 import argparse
+import re
 import traceback
 from datetime import datetime, timedelta
 
@@ -67,6 +70,9 @@ COINBASE_BASE = os.getenv("COINBASE_API_BASE", "https://api.exchange.coinbase.co
 BINANCE_BASE = os.getenv("BINANCE_API_BASE", "https://api.binance.com").rstrip("/")
 
 ALL_TABLE = "sasha_rates"
+KEYS_TABLE = os.getenv("SASHA_RATES_KEYS_TABLE", "sasha_rates_keys").strip()
+if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", KEYS_TABLE):
+    raise ValueError("Некорректное имя SASHA_RATES_KEYS_TABLE")
 ALIAS_ALL = {"sasha_rates", "sasha_quotes"}
 ALIAS_FX = "sasha_quotes_fx"
 ALIAS_CRYPTO = "sasha_quotes_crypto"
@@ -245,6 +251,24 @@ def _build_cross_datasets() -> dict:
 CROSS_DATASETS = _build_cross_datasets()
 DATASETS = {**REAL_DATASETS, **CROSS_DATASETS}
 
+# Нумерация ключей модели 93: 0..15 — активы реальных пар, 16 — USD.
+ASSET_IDS = {"usd": 16}
+for _spec in FX_PAIRS + CRYPTO_PAIRS:
+    _asset = next(code for code in _spec["code"].split("_") if code != "usd")
+    ASSET_IDS[_asset] = _spec["pair_id"]
+
+
+def key_spec(table_name: str) -> tuple[str, str, int]:
+    """Ключ min_id_max_id, таймфрейм и знак относительно исходной котировки."""
+    spec = DATASETS[table_name]
+    base, quote = (
+        (spec["base"], spec["quote"]) if spec["kind"] == "cross"
+        else spec["code"].split("_")
+    )
+    first, second = ASSET_IDS[base], ASSET_IDS[quote]
+    key = f"{min(first, second)}_{max(first, second)}"
+    return key, "day" if spec["day"] else "hour", 1 if first < second else -1
+
 
 def send_error_trace(exc: Exception, script_name: str = "SashaRates.py"):
     import threading
@@ -366,6 +390,90 @@ def get_latest_date(table_name: str):
         return None
 
 
+def ensure_keys_table():
+    conn = mysql.connector.connect(**DB_CONFIG)
+    c = conn.cursor()
+    try:
+        c.execute(f"""
+            CREATE TABLE IF NOT EXISTS `{KEYS_TABLE}` (
+                `key`        VARCHAR(16) NOT NULL,
+                timeframe    ENUM('hour', 'day') NOT NULL,
+                date         DATETIME NOT NULL,
+                momentum_bp  DOUBLE,
+                loaded_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                PRIMARY KEY (`key`, timeframe, date),
+                INDEX idx_timeframe_date (timeframe, date)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            COMMENT='Model 93 momentum; key=min_asset_id_max_asset_id, USD=16'
+        """)
+        conn.commit()
+    except mysql.connector.Error as exc:
+        if exc.errno != 1142:
+            raise
+        # Как и для исходных таблиц, допускаем работу без CREATE,
+        # только если таблица уже существует и доступна для чтения.
+        c.execute(f"SELECT 1 FROM `{KEYS_TABLE}` LIMIT 1")
+        c.fetchall()
+    finally:
+        c.close()
+        conn.close()
+
+
+def _sync_keys(c, table_name: str, start=None, end=None):
+    """Материализует momentum в БД, без выгрузки истории в память Python."""
+    key, timeframe, sign = key_spec(table_name)
+    sql = f"""
+        INSERT INTO `{KEYS_TABLE}` (`key`, timeframe, date, momentum_bp)
+        SELECT %s, %s, `date`,
+               CASE WHEN `open` > 0 AND `close` > 0
+                    THEN %s * 10000.0 * LN(`close` / `open`)
+                    ELSE NULL END
+        FROM `{table_name}` WHERE 1=1
+    """
+    params = [key, timeframe, sign]
+    if start is not None:
+        sql += " AND `date` >= %s"
+        params.append(start)
+    if end is not None:
+        sql += " AND `date` <= %s"
+        params.append(end)
+    sql += " ON DUPLICATE KEY UPDATE momentum_bp=VALUES(momentum_bp)"
+    c.execute(sql, tuple(params))
+
+
+def backfill_keys(table_name: str, *, only_missing: bool = False):
+    """Переносит историю существующей таблицы; отсутствующие источники пропускает."""
+    conn = mysql.connector.connect(**DB_CONFIG)
+    c = conn.cursor()
+    try:
+        if only_missing:
+            key, timeframe, _ = key_spec(table_name)
+            c.execute(
+                f"SELECT 1 FROM `{KEYS_TABLE}` WHERE `key`=%s AND timeframe=%s LIMIT 1",
+                (key, timeframe),
+            )
+            if c.fetchone():
+                return
+        # Отдельная проверка позволяет отличить отсутствие исходной таблицы
+        # от ошибки новой таблицы ключей в INSERT ... SELECT.
+        try:
+            c.execute(f"SELECT 1 FROM `{table_name}` LIMIT 1")
+            c.fetchall()
+        except mysql.connector.Error as exc:
+            if exc.errno == 1146:
+                return
+            raise
+        _sync_keys(c, table_name)
+        conn.commit()
+        print(f"  Ключи {table_name}: записано/обновлено {c.rowcount} строк")
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        c.close()
+        conn.close()
+
+
 def save_rows(table_name: str, rows: list, *, count_written: bool = False):
     if not rows:
         print("  Нет новых данных для записи")
@@ -382,14 +490,24 @@ def save_rows(table_name: str, rows: list, *, count_written: bool = False):
             `min`=VALUES(`min`),
             `t1`=VALUES(`t1`)
     """
-    c.executemany(sql, rows)
-    conn.commit()
+    try:
+        c.executemany(sql, rows)
+        written = c.rowcount
+        # Свечи и ключи обновляются одной транзакцией, включая исправления
+        # старых баров и полную перезагрузку истории.
+        dates = [row[0] for row in rows]
+        _sync_keys(c, table_name, min(dates), max(dates))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        c.close()
+        conn.close()
     if count_written:
         print(f"  Записано {len(rows)} строк")
     else:
-        print(f"  Записано/обновлено {c.rowcount} строк")
-    c.close()
-    conn.close()
+        print(f"  Записано/обновлено {written} строк")
 
 
 def _bar(dt, open_, high, low, close):
@@ -862,6 +980,9 @@ def process_cross(table_name: str):
 
 
 def process(table_name: str):
+    # Первый запуск после обновления переносит всю накопленную историю,
+    # даже если источник сейчас не отдаёт новых свечей.
+    backfill_keys(table_name, only_missing=True)
     kind = DATASETS[table_name]["kind"]
     if kind == "fx":
         process_fx(table_name)
@@ -892,6 +1013,7 @@ def _jobs(argument: str):
 def _print_help(unknown: str):
     print(f"Неизвестная таблица '{unknown}'. Допустимые:")
     print(f"  - {ALL_TABLE} / sasha_quotes → все реальные котировки, затем все кроссы")
+    print("  - sasha_rates_keys → построить/обновить ключи из существующих таблиц БД")
     print(f"  - {ALIAS_FX} → фиат 0,1,4–10 (hour+day)")
     print(f"  - {ALIAS_CRYPTO} → крипта 2,3,11–15 (hour+day)")
     print(f"  - {ALIAS_CROSS} → все кроссы ({len(CROSS_DATASETS) // 2} пар, hour+day)")
@@ -911,12 +1033,21 @@ def _phase_title(table_name: str) -> str | None:
 
 
 def main():
+    if args.table_name == "sasha_rates_keys":
+        ensure_keys_table()
+        for name in DATASETS:
+            backfill_keys(name)
+        print(f"ГОТОВО: {KEYS_TABLE}")
+        return
+
     names = _jobs(args.table_name)
     if names is None:
         _print_help(args.table_name)
         sys.exit(1)
 
+    ensure_keys_table()
     print("Sasha Rates Parser")
+    print(f"  Таблица ключей: {KEYS_TABLE}")
     print(f"  База: {args.host}:{args.port}/{args.database}")
     print(f"  Таблиц: {len(names)}")
     print("=" * 70)

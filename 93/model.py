@@ -26,7 +26,6 @@ model.py — разность потенциалов инструментов п
 from __future__ import annotations
 
 import asyncio
-import os
 import subprocess
 import threading
 import time
@@ -35,7 +34,7 @@ from datetime import datetime, timedelta
 import momentum as mom
 from brain_framework import get_service_config
 
-# Модель не работает с историей brain_rates_* — ей нужны свои таблицы.
+# Модель читает momentum из одной таблицы ключей парсера.
 MODEL_USES_RATE_HISTORY = False
 
 _REFRESH_LOCK = threading.Lock()
@@ -76,9 +75,9 @@ def _ensure_configured() -> dict:
 # ── Подкачка свежих котировок ────────────────────────────────────────────────
 
 def _run_parsers(python_exe: str = "") -> dict:
-    """Запускает SashaRates.py: сначала реальные котировки, затем кроссы."""
+    """Запускает SashaRates.py: котировки, кроссы и единая таблица ключей."""
     results = {}
-    env = dict(os.environ)
+    env = mom.parser_env()
     interpreter = mom.parser_python(python_exe)
     for script, table in mom.PARSER_JOBS:
         try:
@@ -133,11 +132,11 @@ async def enrich_dataset(engine_vlad, engine_brain) -> dict:
 
     Вызывается фреймворком на /rebuild_index и каждые cache.rebuild_interval
     секунд. Стандартная enriched-таблица не создаётся: модель считает momentum
-    напрямую по таблицам котировок.
+    по готовым сериям из единой таблицы ключей.
     """
     del engine_brain
     model_cfg = _ensure_configured()
-    stats: dict = {"mode": "noop", "source": "sasha_rates_*"}
+    stats: dict = {"mode": "noop", "source": mom.keys_table()}
 
     refresh = str(model_cfg.get("quotes_refresh", "background")).lower()
     slack = float(model_cfg.get("quotes_max_age_minutes", 90))

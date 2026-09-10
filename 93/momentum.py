@@ -1,12 +1,12 @@
 """
-Слой данных модели 91: momentum последней свечки по всем инструментам.
+Слой данных модели 93: momentum последней свечки из sasha_rates_keys.
 
 Вселенная — 17 активов: 16 из исходной нумерации ТЗ плюс доллар, у которого
 своей «ноги» нет, потому что он присутствует во всех базовых таблицах.
-Каждая неупорядоченная пара активов — это одна таблица sasha_rates_*:
-16 базовых (X к USD) и 120 кроссов, итого 136 пар в двух таймфреймах.
+Парсер материализует 16 базовых пар (X к USD) и 120 кроссов в одну таблицу:
+key=min_id_max_id, timeframe=hour/day, date, momentum_bp в направлении key.
 
-Таблицы не грузятся целиком: /values всегда работает с одной целевой парой,
+История не грузится целиком: /values всегда работает с одной целевой парой,
 а это лишь 30 инструментов из 136. Поэтому серии подтягиваются лениво по
 запросу и кешируются в numpy-массивах.
 """
@@ -16,6 +16,7 @@ from __future__ import annotations
 import calendar
 import math
 import os
+import re
 import sys
 import threading
 import time
@@ -46,7 +47,7 @@ TARGET_PAIRS = {
 }
 DEFAULT_TARGET = 1
 
-_DEFAULT_PREFIX = "sasha_rates_"
+_DEFAULT_KEYS_TABLE = "sasha_rates_keys"
 
 # ── Состояние ────────────────────────────────────────────────────────────────
 _LOCK = threading.RLock()
@@ -83,18 +84,20 @@ def _model_section() -> dict:
         return {}
 
 
-def table_prefix() -> str:
+def keys_table() -> str:
     raw = (
-        os.getenv("SASHA_RATES_PREFIX")
-        or _model_section().get("quotes_prefix")
-        or _DEFAULT_PREFIX
+        os.getenv("SASHA_RATES_KEYS_TABLE")
+        or _model_section().get("keys_table")
+        or _DEFAULT_KEYS_TABLE
     )
-    raw = str(raw).strip() or _DEFAULT_PREFIX
-    return raw if raw.endswith("_") else raw + "_"
+    raw = str(raw).strip()
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", raw):
+        raise ValueError("Некорректное имя таблицы ключей Sasha Rates")
+    return raw
 
 
 def _quotes_creds() -> dict:
-    """Креды только для sasha_rates_*. brain_rates_* модель не читает.
+    """Креды только для таблицы ключей. brain_rates_* модель не читает.
 
     Приоритет: SASHA_DB_* (явная база котировок) → [model].quotes_engine
     (vlad=DB_*, brain=MASTER_*) → DB_*. На MASTER без SASHA_DB_* не падаем:
@@ -129,7 +132,7 @@ def _quotes_creds() -> dict:
 
 
 def engine():
-    """Синхронный движок к БД котировок sasha_rates_*.
+    """Синхронный движок к БД с таблицей ключей.
 
     model() фреймворк вызывает синхронно, поэтому async-движки из
     enrich_dataset здесь не подходят. Драйвер pymysql уже есть в окружении
@@ -168,39 +171,39 @@ def mask(key: tuple[int, int]) -> str:
     return f"{key[0]}_{key[1]}"
 
 
-# ── Обнаружение таблиц ───────────────────────────────────────────────────────
+# ── Обнаружение ключей ───────────────────────────────────────────────────────
 
 def discover(force: bool = False) -> dict:
-    """Сопоставляет пары активов с реально существующими таблицами.
-
-    Ориентация таблицы определяется по её имени: sasha_rates_eur_btc значит,
-    что база — EUR, а котируемый — BTC. Это важно для знака momentum.
-    """
+    """Читает доступные пары только из таблицы ключей, включая пары лишь с D1."""
     global _DISCOVERED_AT
     with _LOCK:
-        if _ORIENTATION and not force:
-            return {"pairs": len(_ORIENTATION), "cached": True}
+        if not force and (_ORIENTATION or time.time() - _DISCOVERED_AT < 60):
+            return {"pairs": len(_ORIENTATION), "cached": True, "source": keys_table()}
 
-        with engine().connect() as conn:
-            prefix = table_prefix()
-            rows = conn.execute(text(f"SHOW TABLES LIKE '{prefix}%'")).fetchall()
-        existing = {row[0] for row in rows}
+        missing_table = False
+        try:
+            with engine().connect() as conn:
+                rows = conn.execute(text(f"SELECT DISTINCT `key` FROM `{keys_table()}`")).fetchall()
+        except Exception as exc:
+            # На первом запуске парсер ещё не создал таблицу. Ошибки доступа
+            # и подключения не превращаем в молчаливую пустую выдачу.
+            error_args = getattr(getattr(exc, "orig", exc), "args", ())
+            if not error_args or error_args[0] != 1146:
+                raise
+            rows = []
+            missing_table = True
+        existing = {str(row[0]) for row in rows}
 
         orientation: dict[tuple[int, int], tuple[str, int, int]] = {}
         missing: list[str] = []
         ids = sorted(ASSET_CODES)
         for i, first in enumerate(ids):
             for second in ids[i + 1:]:
-                code_a = ASSET_CODES[first]
-                code_b = ASSET_CODES[second]
-                direct = f"{prefix}{code_a}_{code_b}"
-                inverse = f"{prefix}{code_b}_{code_a}"
-                if direct in existing:
-                    orientation[(first, second)] = (direct, first, second)
-                elif inverse in existing:
-                    orientation[(first, second)] = (inverse, second, first)
+                key = mask((first, second))
+                if key in existing:
+                    orientation[(first, second)] = (key, first, second)
                 else:
-                    missing.append(f"{code_a}/{code_b}")
+                    missing.append(f"{ASSET_CODES[first]}/{ASSET_CODES[second]}")
 
         by_asset: dict[int, list[tuple[int, int]]] = {a: [] for a in ids}
         for key in orientation:
@@ -219,6 +222,8 @@ def discover(force: bool = False) -> dict:
             "missing": len(missing),
             "missing_preview": missing[:10],
             "cached": False,
+            "source": keys_table(),
+            "missing_table": missing_table,
         }
 
 
@@ -239,37 +244,30 @@ def _load_series(key: tuple[int, int], day: bool) -> tuple[np.ndarray, np.ndarra
     if info is None:
         return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float64)
 
-    table = info[0] + ("_day" if day else "")
-    query = f"SELECT `date`, `open`, `close` FROM `{table}`"
-    params: dict = {}
+    query = (
+        f"SELECT `date`, momentum_bp FROM `{keys_table()}`"
+        " WHERE `key` = :key AND timeframe = :timeframe"
+    )
+    params: dict = {"key": info[0], "timeframe": "day" if day else "hour"}
     if _HISTORY_FROM is not None:
-        query += " WHERE `date` >= :history_from"
+        query += " AND `date` >= :history_from"
         params["history_from"] = _HISTORY_FROM
     query += " ORDER BY `date`"
 
-    try:
-        with engine().connect() as conn:
-            rows = conn.execute(text(query), params).fetchall()
-    except Exception:
-        rows = []
+    with engine().connect() as conn:
+        rows = conn.execute(text(query), params).fetchall()
 
     stamps = np.empty(len(rows), dtype=np.int64)
     values = np.empty(len(rows), dtype=np.float64)
     count = 0
-    for date_value, open_value, close_value in rows:
-        if not isinstance(date_value, datetime) or open_value is None or close_value is None:
+    for date_value, momentum_bp in rows:
+        if not isinstance(date_value, datetime) or momentum_bp is None:
             continue
-        open_float = float(open_value)
-        close_float = float(close_value)
-        if open_float <= 0.0 or close_float <= 0.0:
+        value = float(momentum_bp)
+        if not math.isfinite(value):
             continue
         stamps[count] = to_epoch(date_value)
-        # Логарифмическая доходность в базисных пунктах. Знак совпадает с
-        # close-open, но величина сравнима между парами любого масштаба и
-        # строго антисимметрична при инверсии пары — что и требуется для
-        # знака второй ноги. Плюс она выживает округление кеша до 4 знаков,
-        # в отличие от сырой разницы (у EUR/BTC это порядок 1e-8).
-        values[count] = 10000.0 * math.log(close_float / open_float)
+        values[count] = value
         count += 1
 
     return stamps[:count].copy(), values[:count].copy()
@@ -289,10 +287,14 @@ def series(key: tuple[int, int], day: bool) -> tuple[np.ndarray, np.ndarray]:
 
 
 def invalidate_series() -> int:
-    """Сбрасывает кеш серий — вызывается после подкачки новых котировок."""
+    """Сбрасывает серии и список ключей после подкачки новых котировок."""
+    global _DISCOVERED_AT
     with _LOCK:
         dropped = len(_SERIES)
         _SERIES.clear()
+        _ORIENTATION.clear()
+        _PAIRS_BY_ASSET.clear()
+        _DISCOVERED_AT = 0.0
     return dropped
 
 
@@ -312,7 +314,7 @@ def asset_momentum(
 ) -> tuple[float, int] | None:
     """Momentum конкретного актива внутри пары.
 
-    Если актив стоит в знаменателе таблицы, знак инвертируется: рост EUR/BTC
+    Если актив стоит вторым в ключе, знак инвертируется: рост EUR/BTC
     означает падение BTC относительно EUR.
     """
     info = orientation(key)
@@ -330,6 +332,20 @@ def asset_momentum(
 PARSER_JOBS = (
     ("SashaRates.py", "sasha_rates"),
 )
+
+
+def parser_env() -> dict:
+    """Парсер пишет ключи в ту же БД и таблицу, из которых их читает модель."""
+    env = dict(os.environ)
+    creds = _quotes_creds()
+    for field, suffix in (
+        ("host", "HOST"), ("port", "PORT"), ("user", "USER"),
+        ("password", "PASSWORD"), ("name", "NAME"),
+    ):
+        if creds[field] is not None:
+            env[f"DB_{suffix}"] = str(creds[field])
+    env["SASHA_RATES_KEYS_TABLE"] = keys_table()
+    return env
 
 
 def parsers_dir() -> str:
@@ -354,7 +370,7 @@ def parser_python(override: str = "") -> str:
 
 
 def last_bar_age_minutes(day: bool = False) -> float | None:
-    """Возраст самой свежей свечки среди базовых таблиц, в минутах."""
+    """Возраст самой свежей свечки базовых пар из таблицы ключей, в минутах."""
     discover()
     stamps: list[int] = []
     for asset_id in ASSET_CODES:
@@ -378,5 +394,5 @@ def quotes_stale(day: bool, slack_minutes: float) -> bool:
     """
     age = last_bar_age_minutes(day)
     if age is None:
-        return False
+        return True
     return age > (1440.0 if day else 60.0) + slack_minutes
