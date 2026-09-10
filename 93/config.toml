@@ -1,6 +1,6 @@
 # Разность потенциалов инструментов по momentum последней свечки.
-# Источник данных — 272 таблицы sasha_rates_* (16 базовых + 120 кроссов,
-# каждая в часовом и дневном таймфрейме), которые наполняет parsers/SashaRates.py.
+# Источник данных — одна таблица sasha_rates_keys, которую наполняет
+# parsers/SashaRates.py: ключ пары, таймфрейм, дата, momentum в базисных пунктах.
 
 [service]
 id = 93
@@ -25,7 +25,8 @@ rebuild_interval = 1800
 reload_interval = 3600
 
 [dataset]
-# Momentum читает sasha_rates_* сам. Датасет фреймворку не нужен.
+# Momentum читает sasha_rates_keys сам, сериями по ключу и таймфрейму.
+# Датасет фреймворку не нужен: вся история не загружается в list[dict].
 engine = "vlad"
 model_uses_rates = false
 
@@ -42,16 +43,17 @@ value_mode = "bp"
 include_totals = true
 # Глубина подгружаемой истории: cache.date_from минус запас.
 history_margin_days = 60
-# background — котировки догоняются фоновым потоком, off — только по
-# /rebuild_index.
+# background — котировки и ключи догоняются фоновым потоком и при ребилде;
+# off — автоматический запуск парсера отключён, его запускают отдельно.
 quotes_refresh = "background"
 # Допуск сверх длительности бара: часовой считается устаревшим через 60+90 мин,
 # дневной — через 1440+90.
 quotes_max_age_minutes = 90
 refresh_cooldown_minutes = 30
-# База с таблицами sasha_rates_*: vlad = DB_*, brain = MASTER_*.
+# База с таблицей ключей: vlad = DB_*, brain = MASTER_*.
 # На сервере оставьте vlad, если парсеры пишут в DB_*; brain — если
-# sasha_rates_* лежат в той же схеме, что и brain_rates_*.
+# sasha_rates_keys лежит в той же схеме, что и brain_rates_*.
 quotes_engine = "vlad"
-quotes_prefix = "sasha_rates_"
+# Переопределяется SASHA_RATES_KEYS_TABLE; передаётся парсеру при автозапуске.
+keys_table = "sasha_rates_keys"
 parser_python = ""
