@@ -54,6 +54,14 @@ USE_ML_VALUES = True
 ENRICH_SCHEMA_VERSION = "3"
 ALGO_VERSION = "tfidf-nmf-svd-hierkmeans-strict-causal-v3"
 
+# Runtime LRU caches for model()/batch_model().
+# These cache already-computed results only and do not change model semantics.
+_CACHE_LOCK = threading.RLock()
+_SINGLE_CACHE = OrderedDict()
+_SINGLE_CACHE_MAX = 32
+_BATCH_CACHE = OrderedDict()
+_BATCH_CACHE_MAX = 1
+
 SOURCES: dict[str, str] = {
     "cnn": "brain_cnn_news",
     "nyt": "brain_nyt_news",
