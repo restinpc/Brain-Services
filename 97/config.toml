@@ -4,7 +4,7 @@
 
 [service]
 id = 97
-port = 8959
+port = 8960
 name = "brain-candle-code-patterns-s97"
 text = "Candle-direction binary pattern codes (1-24 digits) with next-candle T1 sums"
 

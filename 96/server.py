@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.normpath(os.path.join(_HERE, ".."))
-# Явный путь: при `cd 98 && python server.py` find_dotenv() не всегда
+# Явный путь: при `cd 96 && python server.py` find_dotenv() не всегда
 # поднимается до корневого .env, и сервис стартует без DB_*.
 load_dotenv(os.path.join(_ROOT, ".env"))
 load_dotenv(os.path.join(_HERE, ".env"), override=True)

@@ -3,9 +3,9 @@
 # следовавших в истории за таким же квадратным блоком 1x1 / 2x2 / … / 12x12.
 
 [service]
-id = 98
-port = 8960
-name = "brain-candle-vision-patterns-s98"
+id = 96
+port = 8959
+name = "brain-candle-vision-patterns-s96"
 text = "Monolith CV candle-index patterns (brain_index 0-6) with next-candle T1 sums"
 
 [rates]
