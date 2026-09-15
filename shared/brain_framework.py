@@ -1510,7 +1510,10 @@ async def _proxy_values_to_brain1(
             "CACHE_UPSTREAM_URL is empty and SUPER_HOST is not configured"
         )
 
-    timeout = max(1.0, float(os.getenv("CACHE_UPSTREAM_TIMEOUT", "120")))
+    connect_timeout = max(0.5, float(os.getenv("CACHE_UPSTREAM_CONNECT_TIMEOUT", "5")))
+    # A cache MISS on Brain 1 may execute the full model(). Match the PHP
+    # feature client budget (600s) instead of aborting a legitimate compute at 120s.
+    read_timeout = max(1.0, float(os.getenv("CACHE_UPSTREAM_TIMEOUT", "600")))
     url = f"{s.cache_upstream_url.rstrip('/')}/values"
     params = {
         "pair": pair, "day": day, "date": date,
@@ -1519,7 +1522,7 @@ async def _proxy_values_to_brain1(
     }
 
     def _request():
-        response = _requests.get(url, params=params, timeout=timeout)
+        response = _requests.get(url, params=params, timeout=(connect_timeout, read_timeout))
         response.raise_for_status()
         data = response.json()
         if not isinstance(data, dict) or data.get("status") != "ok":

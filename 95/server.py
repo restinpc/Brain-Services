@@ -17,5 +17,5 @@ app = build_app(model)
 if __name__ == "__main__":
     import uvicorn
     cfg = get_service_config() or {}
-    port = int((cfg.get("service") or {}).get("port", 8957))
+    port = int((cfg.get("service") or {}).get("port", 8958))
     uvicorn.run("server:app", host="0.0.0.0", port=port, reload=False)
