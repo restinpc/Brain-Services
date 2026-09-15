@@ -457,9 +457,19 @@ async def _table_exists(engine, name: str) -> bool:
     return bool(int(n or 0))
 
 
+async def _first_existing_table(engine, *names: str) -> str | None:
+    for name in names:
+        if name and await _table_exists(engine, name):
+            return name
+    return None
+
+
 async def _load_market_meta(engine, markets_table: str, parser_table: str) -> list[dict]:
     from sqlalchemy import text
-    if await _table_exists(engine, markets_table):
+    table = await _first_existing_table(engine, markets_table, parser_table)
+    if table is None:
+        return []
+    if table == markets_table:
         sql = text(f"""SELECT condition_id, question, end_date, tags, active, num_outcomes
                        FROM `{markets_table}` WHERE condition_id IS NOT NULL AND question IS NOT NULL""")
     else:
@@ -516,7 +526,9 @@ async def _prepare_map_table(engine, map_table: str, markets: list[dict]) -> dic
 
 async def _source_max_ts(engine, prices_table: str, parser_table: str) -> datetime | None:
     from sqlalchemy import text
-    table = prices_table if await _table_exists(engine, prices_table) else parser_table
+    table = await _first_existing_table(engine, prices_table, parser_table)
+    if table is None:
+        return None
     async with engine.connect() as conn:
         return (await conn.execute(text(f"SELECT MAX(price_timestamp) FROM `{table}`"))).scalar()
 
@@ -524,7 +536,9 @@ async def _source_max_ts(engine, prices_table: str, parser_table: str) -> dateti
 async def _load_price_chunk(engine, prices_table: str, parser_table: str, map_table: str,
                             start: datetime, end: datetime) -> list[dict]:
     from sqlalchemy import text
-    table = prices_table if await _table_exists(engine, prices_table) else parser_table
+    table = await _first_existing_table(engine, prices_table, parser_table)
+    if table is None:
+        return []
     sql = text(f"""
         SELECT p.condition_id, p.price_timestamp, p.price,
                m.family, m.orientation, m.signature, m.end_date
@@ -584,6 +598,18 @@ async def enrich_dataset(engine_vlad, engine_brain) -> dict:
     state_table = ds["state_table"]
 
     await _ensure_enriched_tables(engine_vlad, enriched, state_table)
+    market_source = await _first_existing_table(engine_vlad, markets_table, parser_table)
+    price_source = await _first_existing_table(engine_vlad, prices_table, parser_table)
+    if market_source is None or price_source is None:
+        # Source absence is an infrastructure/config state, not an instruction
+        # to erase the last known-good derived dataset.  Keep existing map/events
+        # intact so the service can start and report source_missing explicitly.
+        return {
+            "mode": "source_missing",
+            "events_written": 0,
+            "market_source": market_source,
+            "price_source": price_source,
+        }
     markets = await _load_market_meta(engine_vlad, markets_table, parser_table)
     map_stats = await _prepare_map_table(engine_vlad, map_table, markets)
     source_max = await _source_max_ts(engine_vlad, prices_table, parser_table)
