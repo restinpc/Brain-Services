@@ -10,7 +10,7 @@
 
 Запуск:
   python SashaRates.py sasha_rates                     # всё: фиат → крипта → кроссы
-  python SashaRates.py sasha_rates_keys                # ключи из истории БД, без скачивания
+  python SashaRates.py sasha_rates_keys                # все таблицы + загрузка котировок, кроссов и ключей
   python SashaRates.py sasha_quotes_fx                 # только фиат
   python SashaRates.py sasha_quotes_crypto             # только крипта
   python SashaRates.py sasha_quotes_cross              # только кроссы (ноги уже в БД)
@@ -73,7 +73,7 @@ ALL_TABLE = "sasha_rates"
 KEYS_TABLE = os.getenv("SASHA_RATES_KEYS_TABLE", "sasha_rates_keys").strip()
 if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", KEYS_TABLE):
     raise ValueError("Некорректное имя SASHA_RATES_KEYS_TABLE")
-ALIAS_ALL = {"sasha_rates", "sasha_quotes"}
+ALIAS_ALL = {"sasha_rates", "sasha_quotes", "sasha_rates_keys"}
 ALIAS_FX = "sasha_quotes_fx"
 ALIAS_CRYPTO = "sasha_quotes_crypto"
 ALIAS_CROSS = "sasha_quotes_cross"
@@ -369,7 +369,10 @@ def ensure_table(table_name: str):
         conn.commit()
     except mysql.connector.Error as exc:
         if exc.errno == 1142:
-            print(f"  CREATE запрещён для `{table_name}`, пишем в уже существующую таблицу")
+            # Запрет CREATE допустим только для уже существующей таблицы.
+            # Иначе keys-команда могла бы пропустить её и сообщить об успехе.
+            c.execute(f"SELECT 1 FROM `{table_name}` LIMIT 1")
+            c.fetchall()
         else:
             raise
     finally:
@@ -1013,7 +1016,7 @@ def _jobs(argument: str):
 def _print_help(unknown: str):
     print(f"Неизвестная таблица '{unknown}'. Допустимые:")
     print(f"  - {ALL_TABLE} / sasha_quotes → все реальные котировки, затем все кроссы")
-    print("  - sasha_rates_keys → построить/обновить ключи из существующих таблиц БД")
+    print("  - sasha_rates_keys → создать все таблицы, загрузить котировки, рассчитать кроссы и ключи")
     print(f"  - {ALIAS_FX} → фиат 0,1,4–10 (hour+day)")
     print(f"  - {ALIAS_CRYPTO} → крипта 2,3,11–15 (hour+day)")
     print(f"  - {ALIAS_CROSS} → все кроссы ({len(CROSS_DATASETS) // 2} пар, hour+day)")
@@ -1033,13 +1036,6 @@ def _phase_title(table_name: str) -> str | None:
 
 
 def main():
-    if args.table_name == "sasha_rates_keys":
-        ensure_keys_table()
-        for name in DATASETS:
-            backfill_keys(name)
-        print(f"ГОТОВО: {KEYS_TABLE}")
-        return
-
     names = _jobs(args.table_name)
     if names is None:
         _print_help(args.table_name)
@@ -1051,6 +1047,14 @@ def main():
     print(f"  База: {args.host}:{args.port}/{args.database}")
     print(f"  Таблиц: {len(names)}")
     print("=" * 70)
+    if args.table_name == "sasha_rates_keys":
+        # Создаём всю схему до запросов к поставщикам, даже если данных нет.
+        for name in names:
+            ensure_table(name)
+        # Сохраняем полный пересчёт ключей из уже накопленной истории.
+        for name in names:
+            backfill_keys(name)
+    # Далее оба полных режима выполняют один цикл: фиат → крипта → кроссы.
     current_phase = None
     for name in names:
         phase = _phase_title(name)
