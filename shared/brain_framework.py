@@ -274,8 +274,10 @@ class _RuntimeCoordinator:
     """Bound synchronous model/proxy work without occupying the FastAPI event loop.
 
     One process hosts one Brain service, so this coordinator is intentionally
-    process-local. Brain 1 remains the only cache-miss compute writer. The default
-    model concurrency is one to preserve stateful model ordering and parity.
+    process-local. Cache storage ownership and model-compute ownership are separate:
+    an assigned child node may compute a cache MISS locally while persisting the
+    result into the shared SUPER_* cache. The default model concurrency is one to
+    preserve stateful model ordering and parity.
     """
 
     def __init__(self, service_id: int):
@@ -1410,6 +1412,11 @@ class _State:
         self.engine_cache = None
         self.cache_writer: bool | None = None
         self.cache_role: str = "unknown"
+        # Compute ownership is intentionally independent from central-cache ownership.
+        # By default every service node can compute its own MISS; COMPUTE_WORKER=0
+        # switches a child back to the legacy proxy-only behaviour.
+        self.compute_worker: bool | None = None
+        self.compute_role: str = "unknown"
         self.cache_upstream_url: str = ""
         self.runtime_coordinator: _RuntimeCoordinator | None = None
 
@@ -1591,9 +1598,29 @@ async def _detect_cache_role(s: _State) -> bool:
 
     s.cache_writer = is_writer
     s.cache_role = "writer-brain1" if is_writer else "reader-child"
+
+    # A child is a local compute worker by default. This is the critical separation
+    # from CACHE_WRITER: only Brain 1 owns cache administration, but the node that
+    # actually serves /values is allowed to run model() for a MISS. This removes the
+    # child -> Brain 1 -> child/PHP 600-second timeout chain.
+    compute_override = _env_bool_override("COMPUTE_WORKER")
+    if is_writer:
+        # The cache owner must always be able to satisfy a direct request itself.
+        compute_worker = True
+        compute_source = "cache-writer-required"
+    elif compute_override is None:
+        compute_worker = True
+        compute_source = "default-local-child"
+    else:
+        compute_worker = bool(compute_override)
+        compute_source = "COMPUTE_WORKER env"
+
+    s.compute_worker = compute_worker
+    s.compute_role = "local-worker" if compute_worker else "proxy-only"
     s.cache_upstream_url = _build_cache_upstream_url(s.PORT)
     log(
         f" central cache role={s.cache_role} source={source} "
+        f"compute_role={s.compute_role} compute_source={compute_source} "
         f"storage=SUPER_* upstream={s.cache_upstream_url or 'not-configured'} "
         f"local_mysql={local_id or 'n/a'} super_mysql={super_id or 'n/a'}",
         s.NODE_NAME, force=True,
@@ -1614,9 +1641,11 @@ async def _proxy_values_to_brain1(
         )
 
     connect_timeout = max(0.5, float(os.getenv("CACHE_UPSTREAM_CONNECT_TIMEOUT", "5")))
-    # A cache MISS on Brain 1 may execute the full model(). Match the PHP
-    # feature client budget (600s) instead of aborting a legitimate compute at 120s.
-    read_timeout = max(1.0, float(os.getenv("CACHE_UPSTREAM_TIMEOUT", "600")))
+    # Proxy mode is now only a compatibility fallback (COMPUTE_WORKER=0). Keep
+    # its deadline comfortably below the PHP -> service request deadline so the
+    # service has time to serialize a useful JSON error instead of the caller
+    # receiving "0 bytes received" at the exact same deadline.
+    read_timeout = max(1.0, float(os.getenv("CACHE_UPSTREAM_TIMEOUT", "480")))
     url = f"{s.cache_upstream_url.rstrip('/')}/values"
     params = {
         "pair": pair, "day": day, "date": date,
@@ -2401,8 +2430,8 @@ def build_app(model_module) -> FastAPI:
     async def _call_raw_model_impl(pair, day, date_str, calc_type=0, calc_var=0, param="",
                               _skip_refresh: bool = False):
         """Execute model.py directly, bypassing values cache and ML universe."""
-        if s.cache_writer is False:
-            raise RuntimeError("Direct model() is disabled on child node")
+        if s.compute_worker is False:
+            raise RuntimeError("Direct model() is disabled on this proxy-only node")
         target_date = _parse_date(date_str)
         if not target_date:
             return None
@@ -2456,10 +2485,10 @@ def build_app(model_module) -> FastAPI:
 
     async def _call_model_impl(pair, day, date_str, calc_type=0, calc_var=0, param="",
                           _skip_refresh: bool = False):
-        if s.cache_writer is False:
+        if s.compute_worker is False:
             raise RuntimeError(
-                "Local model() is disabled on child node; cache MISS must be "
-                "computed by Brain 1"
+                "Local model() is disabled on this proxy-only node; cache MISS must "
+                "be provided by the configured upstream service"
             )
         target_date = _parse_date(date_str)
         if not target_date:
@@ -2646,14 +2675,18 @@ def build_app(model_module) -> FastAPI:
         s.service_url  = f"http://localhost:{s.PORT}"
         s._cache_table = f"vlad_values_cache_svc{s.PORT}"
 
-        if s.cache_writer:
+        if s.cache_writer or s.compute_worker:
+            # CREATE TABLE IF NOT EXISTS is idempotent. A remote compute worker
+            # needs the shared table to exist because it persists its local MISS
+            # result directly into SUPER_*. If its DB account has no DDL rights,
+            # the request path still works and the error is logged here explicitly.
             try:
                 await ensure_cache_table(s.engine_cache, s.cache_table)
             except Exception as e:
                 log(f"   central cache table: {e}", s.NODE_NAME, level="error")
-        else:
+        if not s.cache_writer:
             log(
-                f" central cache reader: SUPER_* / {s.cache_table}",
+                f" central cache client: SUPER_* / {s.cache_table}; compute_role={s.compute_role}",
                 s.NODE_NAME, force=True,
             )
 
@@ -4277,9 +4310,11 @@ def build_app(model_module) -> FastAPI:
                 "np_built":           s.np_built,
                 "simple_rates":       len(s.simple_rates),
                 "cache_role":         s.cache_role,
+                "compute_role":       s.compute_role,
+                "compute_worker":     bool(s.compute_worker),
                 "cache_storage":      "SUPER_*",
                 "cache_table":        s.cache_table,
-                "cache_upstream":     s.cache_upstream_url if not s.cache_writer else None,
+                "cache_upstream":     s.cache_upstream_url if not s.compute_worker else None,
                 "last_reload":        s.last_reload.isoformat() if s.last_reload else None,
                 "last_rebuild":       s.last_rebuild.isoformat() if s.last_rebuild else None,
                 "rebuild_auto":       s.REBUILD_INTERVAL > 0 and bool(
@@ -4432,9 +4467,9 @@ def build_app(model_module) -> FastAPI:
         if s.VAR_RANGE and var not in s.VAR_RANGE:
             return err_response(f"var={var} не входит в VAR_RANGE={s.VAR_RANGE}")
         try:
-            if not s.cache_writer and _cache_hop:
+            if not s.compute_worker and _cache_hop:
                 return err_response(
-                    "Central cache proxy loop detected: upstream service is not Brain 1"
+                    "Central cache proxy loop detected: upstream service is not a compute worker"
                 )
 
             # Последние CACHE_FRESH_LAG_DAYS календарных дней намеренно живут
@@ -4445,7 +4480,7 @@ def build_app(model_module) -> FastAPI:
                 return err_response(f"Invalid date format: {date!r}")
             if request_dt > _cache_cutoff_dt():
                 async def _compute_fresh_value():
-                    if s.cache_writer:
+                    if s.compute_worker:
                         return await _call_model(
                             pair, day, date, calc_type=type, calc_var=var, param=param
                         )
@@ -4457,7 +4492,7 @@ def build_app(model_module) -> FastAPI:
                 live_key = (
                     s.service_url, int(pair), int(day),
                     request_dt.isoformat(), int(type), int(var), str(param),
-                    bool(s.cache_writer),
+                    bool(s.compute_worker),
                 )
                 payload = await _run_live_singleflight(live_key, _compute_fresh_value)
                 payload = payload or {}
@@ -4474,8 +4509,8 @@ def build_app(model_module) -> FastAPI:
                 compute_fn=lambda: _call_model(pair, day, date,
                                                calc_type=type, calc_var=var, param=param),
                 node=s.NODE_NAME, table_name=s.cache_table,
-                compute_on_miss=bool(s.cache_writer),
-                miss_fn=(None if s.cache_writer else lambda: _proxy_values_to_brain1(
+                compute_on_miss=bool(s.compute_worker),
+                miss_fn=(None if s.compute_worker else lambda: _proxy_values_to_brain1(
                     s, pair=pair, day=day, date=date, calc_type=type,
                     calc_var=var, param=param,
                 )),
@@ -4493,9 +4528,9 @@ def build_app(model_module) -> FastAPI:
         pair: int = Query(1), day: int = Query(1),
         type: int = Query(0), var: int = Query(0), param: str = Query(""),
     ):
-        if not s.cache_writer:
+        if not s.compute_worker:
             return err_response(
-                "compute_batch разрешён только на Brain 1; дочерняя нода работает cache-only"
+                "compute_batch недоступен: эта нода запущена в режиме COMPUTE_WORKER=0"
             )
         result = {}
         for date_str in dates:
@@ -4684,8 +4719,8 @@ def build_app(model_module) -> FastAPI:
         """Direct live diagnostics for both H1 and D1, bypassing values-cache."""
         if pair not in _INSTRUMENTS:
             return err_response("Допустимые pair: 1, 3, 4")
-        if not s.cache_writer:
-            return err_response("Диагностика прямого model() разрешена только на Brain 1")
+        if not s.compute_worker:
+            return err_response("Диагностика прямого model() недоступна на proxy-only ноде")
 
         effective_param = str(param) if param is not None else str((s.PARAM_RANGE or [""])[0])
         dataset_first, dataset_last = _diag_dataset_date_bounds()
@@ -4763,8 +4798,8 @@ def build_app(model_module) -> FastAPI:
         """Mutation test for target/future T1 on both hourly and daily frames."""
         if pair not in _INSTRUMENTS:
             return err_response("Допустимые pair: 1, 3, 4")
-        if not s.cache_writer:
-            return err_response("Диагностика прямого model() разрешена только на Brain 1")
+        if not s.compute_worker:
+            return err_response("Диагностика прямого model() недоступна на proxy-only ноде")
 
         effective_param = str(param) if param is not None else str((s.PARAM_RANGE or [""])[0])
         report = {
