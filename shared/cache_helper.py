@@ -3,9 +3,9 @@ cache_helper.py — кеш /values для всех brain-* микросерви�
 
 Логика на каждый запрос /values:
   1. SELECT из общего SUPER_* кеша → если запись есть, вернуть сразу.
-  2. На Brain 1 при MISS вычислить model() и записать результат.
-  3. На дочерней ноде при MISS вызвать miss_fn (HTTP-запрос на Brain 1).
-  4. Локальная model() на дочерних нодах не вызывается.
+  2. На compute-worker при MISS вычислить model() и записать результат в общий cache.
+  3. На proxy-only ноде при MISS вызвать miss_fn (HTTP-запрос на upstream worker).
+  4. Результат compute-worker сохраняется в общий SUPER_* cache через INSERT IGNORE.
 """
 
 import asyncio
@@ -364,8 +364,8 @@ async def cached_values(
     table_name — имя таблицы кеша (по умолчанию "vlad_values_cache").
     brain_framework передаёт s.cache_table для изоляции по сервисам.
 
-    compute_on_miss=False запрещает локальный model() на дочерней ноде.
-    В таком режиме miss_fn может получить значение у Brain 1 и вернуть payload.
+    compute_on_miss=False запрещает локальный model() на proxy-only ноде.
+    В таком режиме miss_fn может получить значение у upstream compute-worker и вернуть payload.
 
     compute_fn / miss_fn могут быть:
       - синхронной функцией, возвращающей dict/None,
@@ -400,11 +400,11 @@ async def cached_values(
     )
 
     async def _miss_once() -> dict:
-        # 2. MISS на дочерней ноде: локальный model() запрещён.
+        # 2. MISS на proxy-only ноде: локальный model() запрещён.
         if not compute_on_miss:
             if miss_fn is None:
                 msg = (
-                    "Central cache MISS and no Brain 1 fallback is configured | "
+                    "Central cache MISS and no upstream fallback is configured | "
                     f"pair={pair} day={day} date={date!r} params={extra_params}"
                 )
                 log.warning(f"cached_values: {msg} node={node}")
@@ -418,7 +418,7 @@ async def cached_values(
                     result = await asyncio.to_thread(lambda: upstream_call)
             except Exception as exc:
                 msg = (
-                    f"Brain 1 cache fallback failed: {exc} | pair={pair} day={day} "
+                    f"Upstream cache fallback failed: {exc} | pair={pair} day={day} "
                     f"date={date!r} params={extra_params}"
                 )
                 log.warning(f"cached_values: {msg} node={node}")
@@ -426,14 +426,14 @@ async def cached_values(
 
             if result is None:
                 msg = (
-                    "Brain 1 returned no payload for central cache MISS | "
+                    "Upstream returned no payload for central cache MISS | "
                     f"pair={pair} day={day} date={date!r} params={extra_params}"
                 )
                 log.warning(f"cached_values: {msg} node={node}")
                 return err_response(msg)
             return ok_response(result)
 
-        # 3. MISS на Brain 1 — вычисляем локально и сохраняем в SUPER_* кеш.
+        # 3. MISS на compute-worker — вычисляем локально и сохраняем в SUPER_* кеш.
         log.debug(f"MISS pair={pair} day={day} date={date} params={extra_params}")
 
         callable_result = compute_fn()
