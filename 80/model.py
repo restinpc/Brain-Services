@@ -62,6 +62,13 @@ _SINGLE_CACHE_MAX = 32
 _BATCH_CACHE = OrderedDict()
 _BATCH_CACHE_MAX = 1
 
+# Bounded cache for exact timestamp -> first index lookups in immutable
+# np_rates snapshots.  Brain Framework refreshes rates with np.append(), so a
+# refreshed dates_ns is a new ndarray object; retaining the ndarray alongside
+# the lookup also prevents Python id reuse while the cache entry is alive.
+_RATE_TS_INDEX_CACHE = OrderedDict()
+_RATE_TS_INDEX_CACHE_MAX = 8
+
 SOURCES: dict[str, str] = {
     "cnn": "brain_cnn_news",
     "nyt": "brain_nyt_news",
@@ -1078,6 +1085,95 @@ def _var_allows_row(row: dict[str, Any], var: int) -> bool:
     return False
 
 
+def _var_eligibility_mask(row: dict[str, Any]) -> int:
+    """Return the exact var eligibility set after reading row features once.
+
+    Bit ``1 << var`` is set when ``_var_allows_row(row, var)`` would return
+    True for vars 0..7.  Keep the same conversion/fallback semantics as the
+    public helper: malformed causal features allow only vars 0 and 7.
+    """
+    try:
+        focus = float(row.get("topic_focus") or 0.0)
+        fit = float(row.get("cluster_similarity") or 0.0)
+        novelty = float(row.get("novelty") or 0.0)
+        confirm = int(row.get("confirmation_count") or 1)
+    except (TypeError, ValueError):
+        return (1 << 0) | (1 << 7)
+
+    mask = (1 << 0) | (1 << 7)
+    if focus >= TOPIC_FOCUS_MIN:
+        mask |= 1 << 1
+    if fit >= CLUSTER_SIM_MIN:
+        mask |= 1 << 2
+    if novelty >= NOVELTY_MIN:
+        mask |= 1 << 3
+    if confirm >= 2:
+        mask |= 1 << 4
+    if confirm >= 3:
+        mask |= 1 << 5
+    if novelty >= NOVELTY_MIN and confirm >= 2:
+        mask |= 1 << 6
+    return mask
+
+
+_VAR_MASK_TO_VARS = tuple(
+    tuple(v for v in VAR_RANGE if mask & (1 << v))
+    for mask in range(1 << 8)
+)
+
+
+def _rate_timestamp_first_index(dates_ns) -> dict[int, int] | None:
+    """Map an integer rates timestamp to its first index for one ndarray snapshot.
+
+    ``_aggregate_analogs_by_var`` historically used
+    ``np.searchsorted(dates_ns, ts, side="left")`` for every analog.  For the
+    integer ``dates_ns`` arrays produced by Brain Framework this dictionary is
+    exactly equivalent, including duplicate timestamps (the first occurrence is
+    retained).  Non-integer/foreign arrays deliberately fall back to the old
+    searchsorted path so standalone callers keep their previous edge semantics.
+    """
+    if not isinstance(dates_ns, np.ndarray) or dates_ns.ndim != 1:
+        return None
+    if not np.issubdtype(dates_ns.dtype, np.integer):
+        return None
+    n = len(dates_ns)
+    if n == 0:
+        return {}
+
+    key = (
+        id(dates_ns),
+        n,
+        dates_ns.dtype.str,
+        int(dates_ns[0]),
+        int(dates_ns[-1]),
+    )
+    with _CACHE_LOCK:
+        cached = _RATE_TS_INDEX_CACHE.get(key)
+        if cached is not None and cached[0] is dates_ns:
+            _RATE_TS_INDEX_CACHE.move_to_end(key)
+            return cached[1]
+
+    # Build outside the lock.  Future parallel model calls may race here once,
+    # but they never observe a partial mapping; the second lock section picks a
+    # single immutable result for this exact ndarray object.
+    index: dict[int, int] = {}
+    for i, raw_ts in enumerate(dates_ns):
+        ts = int(raw_ts)
+        if ts not in index:
+            index[ts] = i
+
+    with _CACHE_LOCK:
+        cached = _RATE_TS_INDEX_CACHE.get(key)
+        if cached is not None and cached[0] is dates_ns:
+            _RATE_TS_INDEX_CACHE.move_to_end(key)
+            return cached[1]
+        _RATE_TS_INDEX_CACHE[key] = (dates_ns, index)
+        _RATE_TS_INDEX_CACHE.move_to_end(key)
+        while len(_RATE_TS_INDEX_CACHE) > _RATE_TS_INDEX_CACHE_MAX:
+            _RATE_TS_INDEX_CACHE.popitem(last=False)
+    return index
+
+
 def _frame_date(dt: datetime, is_daily: bool) -> datetime:
     if is_daily:
         return dt.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -1165,6 +1261,7 @@ def _aggregate_analogs_by_var(
         return {v: tuple(x) for v, x in stats.items()}
 
     unit = timedelta(days=1) if is_daily else timedelta(hours=1)
+    date_to_idx = _rate_timestamp_first_index(dates_ns)
     for j in range(end):
         analog_dt = analog_dates[j]
         if analog_dt == current_event_time:
@@ -1174,25 +1271,32 @@ def _aggregate_analogs_by_var(
         if frame + unit > target_date:
             continue
         ts = int(frame.timestamp())
-        idx = int(np.searchsorted(dates_ns, ts, side="left"))
-        if idx >= len(dates_ns) or int(dates_ns[idx]) != ts:
-            continue
+        if date_to_idx is None:
+            # Exact compatibility fallback for non-framework rate arrays.
+            idx = int(np.searchsorted(dates_ns, ts, side="left"))
+            if idx >= len(dates_ns) or int(dates_ns[idx]) != ts:
+                continue
+        else:
+            idx = date_to_idx.get(ts)
+            if idx is None:
+                continue
 
         analog = analog_rows[j]
         stored_t1 = float(t1_arr[idx])
         hit = 1.0 if bool(ext_arr[idx]) else 0.0
         quality = float(analog.get("quality_score") or 1.0)
         q_weight = min(max(quality / 0.65, 0.25), 2.5)
+        weighted_t1 = stored_t1 * q_weight
+        weighted_hit = hit * q_weight
+        eligible_vars = _VAR_MASK_TO_VARS[_var_eligibility_mask(analog)]
 
-        for var in VAR_RANGE:
-            if not _var_allows_row(analog, var):
-                continue
+        for var in eligible_vars:
             st = stats[var]
             st[0] += stored_t1
             st[1] += hit
             st[2] += 1
-            st[3] += stored_t1 * q_weight
-            st[4] += hit * q_weight
+            st[3] += weighted_t1
+            st[4] += weighted_hit
             st[5] += q_weight
 
     return {v: tuple(x) for v, x in stats.items()}
