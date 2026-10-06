@@ -14,6 +14,8 @@ import hashlib
 import json
 import logging
 import random
+import time
+from collections import OrderedDict
 import zlib as _zlib
 from datetime import datetime
 
@@ -31,6 +33,10 @@ _DB_SEM_LOCK: asyncio.Lock | None = None
 # Only coordinates execution; it does not transform/re-serialize the leader result.
 _MISS_FLIGHTS: dict[tuple, asyncio.Task] = {}
 _MISS_FLIGHTS_GUARD: asyncio.Lock | None = None
+# Empty is a negative cache entry, never perpetual proof of no inputs.
+_EMPTY_CHECKED = OrderedDict()
+_EMPTY_RECHECK_SECONDS = 60.0
+_EMPTY_CHECKED_MAX = 4096
 
 
 def _get_miss_flights_guard() -> asyncio.Lock:
@@ -298,6 +304,14 @@ async def _cache_set(
              params_hash, params_json, result_json)
         VALUES (:url, :pair, :day, :dv, :ph, :pj, :rj)
     """)
+    if result:
+        # Repair only a recognized empty derived cache value atomically.
+        # A racing non-empty result is never replaced.
+        insert_sql = text(str(insert_sql) + """
+            ON DUPLICATE KEY UPDATE result_json =
+              IF(result_json IN ('{}', '[]', 'z:eJyrrgUAAXUA+Q==', 'z:eJyLjgUAARUAuQ=='),
+                 VALUES(result_json), result_json)
+        """)
     row_params = {
         "url":  service_url, "pair": pair, "day":  day,
         "dv":   date_val,    "ph":   p_hash,
@@ -387,17 +401,18 @@ async def cached_values(
 
     p_hash = cache_hash(extra_params)
 
-    # 1. Cache HIT — абсолютно прежний fast path.
-    cached = await _cache_get(engine_vlad, service_url, pair, day, date_val, p_hash,
-                              table_name=table_name)
-    if cached is not None:
-        log.debug(f"HIT  pair={pair} day={day} date={date} params={extra_params}")
-        return ok_response(cached)
-
     flight_key = (
         table_name, service_url, int(pair), int(day), date_val, p_hash,
         bool(compute_on_miss),
     )
+    cached = await _cache_get(engine_vlad, service_url, pair, day, date_val, p_hash,
+                              table_name=table_name)
+    # Non-empty historical data retains the exact fast path. Revalidate empty
+    # entries through normal compute/upstream, with bounded negative-cache TTL.
+    recently_checked = time.monotonic() - _EMPTY_CHECKED.get(flight_key, float("-inf")) < _EMPTY_RECHECK_SECONDS
+    if cached is not None and (cached or recently_checked):
+        log.debug(f"HIT  pair={pair} day={day} date={date} params={extra_params}")
+        return ok_response(cached)
 
     async def _miss_once() -> dict:
         # 2. MISS на proxy-only ноде: локальный model() запрещён.
@@ -454,6 +469,13 @@ async def cached_values(
         await _cache_set(engine_vlad, service_url, pair, day, date_val,
                          extra_params, p_hash, result, table_name=table_name)
 
+        if not result:
+            _EMPTY_CHECKED[flight_key] = time.monotonic()
+            _EMPTY_CHECKED.move_to_end(flight_key)
+            while len(_EMPTY_CHECKED) > _EMPTY_CHECKED_MAX:
+                _EMPTY_CHECKED.popitem(last=False)
+        else:
+            _EMPTY_CHECKED.pop(flight_key, None)
         return ok_response(result)
 
     return await _run_singleflight(flight_key, _miss_once)
