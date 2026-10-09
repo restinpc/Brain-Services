@@ -26,6 +26,8 @@ model.py — разность потенциалов инструментов п
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
 import subprocess
 import threading
 import time
@@ -80,19 +82,29 @@ def _run_parsers(python_exe: str = "") -> dict:
     env = mom.parser_env()
     interpreter = mom.parser_python(python_exe)
     for script, table in mom.PARSER_JOBS:
+        path = mom.parser_script(script)
         try:
             completed = subprocess.run(
-                [interpreter, script, table],
-                cwd=mom.parsers_dir(),
+                [interpreter, path, table],
+                cwd=os.path.dirname(path),
                 env=env,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=int(env.get("QUOTES_JOB_TIMEOUT", "1800")),
             )
+            if completed.returncode != 0:
+                detail = (completed.stderr or completed.stdout or "нет вывода").strip()[-2000:]
+                raise RuntimeError(
+                    f"{script}: exit {completed.returncode}; {detail}"
+                )
             results[script] = completed.returncode
         except Exception as exc:
-            results[script] = repr(exc)
-    mom.invalidate_series()
+            raise RuntimeError(f"Не удалось обновить котировки через {path}: {exc}") from exc
+        finally:
+            # Парсер мог записать часть данных до ошибки.
+            mom.invalidate_series()
     return results
 
 
@@ -119,6 +131,8 @@ def _maybe_refresh_in_background(model_cfg: dict, day: bool) -> None:
     def _worker():
         try:
             _run_parsers(str(model_cfg.get("parser_python", "")))
+        except Exception:
+            logging.getLogger(__name__).exception("Не удалось обновить котировки модели 93")
         finally:
             _REFRESH_LOCK.release()
 
@@ -152,6 +166,12 @@ async def enrich_dataset(engine_vlad, engine_brain) -> dict:
 
     mom.invalidate_series()
     stats.update(mom.discover(force=True))
+    if stats.get("missing_table") or not stats.get("pairs"):
+        raise RuntimeError(
+            f"Rebuild модели 93 не выполнен: таблица {mom.keys_table()} "
+            "отсутствует или не содержит ключей пар. "
+            "Проверьте базу [model].quotes_engine / SASHA_DB_* и запуск SashaRates.py."
+        )
     stats["last_bar_age_minutes"] = {
         "hour": mom.last_bar_age_minutes(False),
         "day": mom.last_bar_age_minutes(True),
