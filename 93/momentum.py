@@ -17,6 +17,7 @@ import calendar
 import math
 import os
 import re
+import shutil
 import sys
 import threading
 import time
@@ -349,8 +350,37 @@ def parser_env() -> dict:
 
 
 def parsers_dir() -> str:
+    """Каталог установленного парсера, независимый от cwd сервиса."""
+    return os.path.dirname(parser_script("SashaRates.py"))
+
+
+def parser_script(script: str) -> str:
+    """Явный путь имеет приоритет; иначе проверяем варианты раскладки сервера."""
     here = os.path.dirname(os.path.abspath(__file__))
-    return os.path.normpath(os.path.join(here, "..", "parsers"))
+    root = os.path.dirname(here)
+    configured = os.getenv("SASHA_PARSERS_DIR") or _model_section().get("parsers_dir")
+    if configured:
+        directory = os.path.expanduser(os.path.expandvars(str(configured)))
+        if not os.path.isabs(directory):
+            directory = os.path.join(here, directory)
+        candidates = [os.path.join(directory, script)]
+    else:
+        candidates = [
+            os.path.join(root, "parser", script),
+            os.path.join(root, "parsers", script),
+            os.path.join(root, "full_parsers", script),
+            os.path.join(here, "parser", script),
+            os.path.join(here, "parsers", script),
+            os.path.join(here, script),
+        ]
+    candidates = [os.path.abspath(path) for path in candidates]
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    raise FileNotFoundError(
+        f"Парсер {script} не найден. Проверены: {', '.join(candidates)}. "
+        "Установите парсер и задайте SASHA_PARSERS_DIR или [model].parsers_dir."
+    )
 
 
 def parser_python(override: str = "") -> str:
@@ -360,8 +390,14 @@ def parser_python(override: str = "") -> str:
     сервисов может не быть, поэтому предпочитаем .venv проекта, если он есть.
     """
     if override:
-        return override
-    root = os.path.dirname(parsers_dir())
+        candidate = os.path.expanduser(os.path.expandvars(override))
+        if not os.path.isabs(candidate) and ("/" in candidate or "\\" in candidate):
+            candidate = os.path.join(os.path.dirname(os.path.abspath(__file__)), candidate)
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+        raise FileNotFoundError(f"Интерпретатор [model].parser_python не найден: {candidate}")
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     for relative in ((".venv", "Scripts", "python.exe"), (".venv", "bin", "python")):
         candidate = os.path.join(root, *relative)
         if os.path.exists(candidate):

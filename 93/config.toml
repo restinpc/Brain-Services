@@ -56,4 +56,10 @@ refresh_cooldown_minutes = 30
 quotes_engine = "vlad"
 # Переопределяется SASHA_RATES_KEYS_TABLE; передаётся парсеру при автозапуске.
 keys_table = "sasha_rates_keys"
+# Каталог с SashaRates.py; относительный путь считается от папки модели 93.
+# Пусто: поиск в ../parser, ../parsers, ../full_parsers,
+# ./parser, ./parsers и папке модели.
+# SASHA_PARSERS_DIR переопределяет это значение (удобно для сервера).
+parsers_dir = ""
+# При необходимости задайте Python окружения с requirements-sasha-rates.txt.
 parser_python = ""
