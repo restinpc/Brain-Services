@@ -20,9 +20,12 @@ ml_batch_size = 2000
 batch_model_size = 1000
 
 [dataset]
-parser_table = "vlad_polymarket"
-markets_table = "vlad_polymarket_markets"
-prices_table = "vlad_polymarket_prices"
+# На сервере исходная таблица называется vlad_polymarket_direct.
+# Если компактных таблиц ещё нет, модель читает метаданные и историю
+# из parser_table; после миграции парсера использует *_markets / *_prices.
+parser_table = "vlad_polymarket_direct"
+markets_table = "vlad_polymarket_direct_markets"
+prices_table = "vlad_polymarket_direct_prices"
 enriched_table = "vlad_polymarket_pressure_events_s94"
 map_table = "vlad_polymarket_market_map_s94"
 state_table = "vlad_polymarket_pressure_state_s94"
