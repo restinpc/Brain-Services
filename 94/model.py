@@ -457,27 +457,46 @@ async def _table_exists(engine, name: str) -> bool:
     return bool(int(n or 0))
 
 
-async def _first_existing_table(engine, *names: str) -> str | None:
-    for name in names:
-        if name and await _table_exists(engine, name):
-            return name
-    return None
+async def _table_columns(engine, name: str) -> set[str]:
+    from sqlalchemy import text
+    async with engine.connect() as conn:
+        rows = await conn.execute(text("""
+            SELECT COLUMN_NAME FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=:t
+        """), {"t": name})
+        return {str(row[0]) for row in rows}
 
 
 async def _load_market_meta(engine, markets_table: str, parser_table: str) -> list[dict]:
     from sqlalchemy import text
-    table = await _first_existing_table(engine, markets_table, parser_table)
-    if table is None:
-        return []
-    if table == markets_table:
-        sql = text(f"""SELECT condition_id, question, end_date, tags, active, num_outcomes
-                       FROM `{markets_table}` WHERE condition_id IS NOT NULL AND question IS NOT NULL""")
-    else:
-        sql = text(f"""SELECT condition_id, MAX(question) question, MAX(end_date) end_date,
-                              MAX(tags) tags, MAX(active) active, MAX(num_outcomes) num_outcomes
-                       FROM `{parser_table}`
-                       WHERE condition_id IS NOT NULL AND question IS NOT NULL
-                       GROUP BY condition_id""")
+    compact = await _table_exists(engine, markets_table)
+    table = markets_table if compact else parser_table
+    columns = await _table_columns(engine, table)
+    if not columns:
+        raise ValueError(
+            f"Источник рынков модели 94 не найден: {markets_table} или {parser_table}. "
+            "Проверьте [dataset] в config.toml и базу DB_*."
+        )
+    missing = {"condition_id", "question"} - columns
+    if missing:
+        raise ValueError(f"В таблице {table} отсутствуют обязательные столбцы: {', '.join(sorted(missing))}")
+
+    # active и num_outcomes не используются моделью и могут отсутствовать
+    # в старой широкой таблице. end_date и tags — необязательные метаданные.
+    fields = ["`condition_id`"]
+    for field in ("question", "end_date", "tags"):
+        if field not in columns:
+            expression = "NULL"
+        elif compact:
+            expression = f"`{field}`"
+        else:
+            expression = f"MAX(`{field}`)"
+        fields.append(f"{expression} AS `{field}`")
+    sql = text(
+        f"SELECT {', '.join(fields)} FROM `{table}` "
+        "WHERE `condition_id` IS NOT NULL AND `question` IS NOT NULL"
+        + ("" if compact else " GROUP BY `condition_id`")
+    )
     async with engine.connect() as conn:
         return [dict(r) for r in (await conn.execute(sql)).mappings().all()]
 
