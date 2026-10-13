@@ -4,7 +4,7 @@
 
 [service]
 id = 93
-port = 8955
+port = 8956
 name = "brain-momentum-potential-s93"
 text = "Cross-instrument momentum potential difference over 17 assets / 136 pairs"
 

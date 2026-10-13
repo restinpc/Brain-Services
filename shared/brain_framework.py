@@ -1,5 +1,5 @@
 """
-brain_framework.py v21.1 — param-aware tests/backtest/posttest over v21.0.
+brain_framework.py v21.2 — param-aware tests + runtime/version diagnostics over v21.1.
 
 
 Исправление v21.1 — PARAM/TEST-COMPAT:
@@ -52,10 +52,13 @@ brain_framework.py v21.1 — param-aware tests/backtest/posttest over v21.0.
 
 from __future__ import annotations
 
+FRAMEWORK_VERSION = "21.4-shared-parallel-runtime"
+
 import asyncio
 import bisect
 import concurrent.futures as _cf
 import inspect
+import hashlib
 import json as _json
 import zlib   as _zlib
 import base64 as _b64
@@ -78,6 +81,21 @@ from sqlalchemy import text
 from dotenv import load_dotenv
 
 load_dotenv()
+
+
+def _framework_file_sha256(path: str) -> str:
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return "unavailable"
+
+
+_FRAMEWORK_LOADED_AT = datetime.now().isoformat(timespec="seconds")
+_FRAMEWORK_SHA256 = _framework_file_sha256(__file__)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # ZERO-COPY READ-ONLY VIEWS
@@ -234,6 +252,282 @@ _FILL_EXECUTOR = _cf.ThreadPoolExecutor(
     max_workers=min(8, (os.cpu_count() or 4) * 2),
     thread_name_prefix="fill_worker",
 )
+
+# Dedicated single-worker executor for synchronous batch_model().
+# Keeps batch_model off the FastAPI asyncio event loop while preserving
+# the previous effective one-at-a-time execution order.
+_BATCH_MODEL_EXECUTOR = _cf.ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="batch_model",
+)
+
+
+async def _run_batch_model_offloop(fn, **kwargs):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _BATCH_MODEL_EXECUTOR,
+        lambda: fn(**kwargs),
+    )
+
+
+
+class _AsyncRWGate:
+    """Writer-preferring asyncio RW gate for shared framework state.
+
+    Model evaluations take a read lease and may therefore run concurrently.
+    Reload/refresh/rebuild operations take the write lease and wait for active
+    readers to finish before mutating rates/dataset/index state.
+    """
+
+    def __init__(self):
+        self._cond = asyncio.Condition()
+        self._readers = 0
+        self._writer = None
+        self._write_depth = 0
+        self._waiting_writers = 0
+
+    async def acquire_read(self):
+        task = asyncio.current_task()
+        async with self._cond:
+            # A task already holding the write lease may read its own state.
+            if self._writer is task:
+                return ("writer", task)
+            while self._writer is not None or self._waiting_writers > 0:
+                await self._cond.wait()
+            self._readers += 1
+            return ("reader", task)
+
+    async def release_read(self, token):
+        kind, _task = token
+        if kind == "writer":
+            return
+        async with self._cond:
+            self._readers = max(0, self._readers - 1)
+            if self._readers == 0:
+                self._cond.notify_all()
+
+    async def acquire_write(self):
+        task = asyncio.current_task()
+        async with self._cond:
+            if self._writer is task:
+                self._write_depth += 1
+                return task
+            self._waiting_writers += 1
+            try:
+                while self._writer is not None or self._readers > 0:
+                    await self._cond.wait()
+                self._writer = task
+                self._write_depth = 1
+                return task
+            finally:
+                self._waiting_writers = max(0, self._waiting_writers - 1)
+
+    async def release_write(self, token):
+        async with self._cond:
+            if self._writer is not token:
+                raise RuntimeError("state gate write lease owner mismatch")
+            self._write_depth -= 1
+            if self._write_depth <= 0:
+                self._writer = None
+                self._write_depth = 0
+                self._cond.notify_all()
+
+    @asynccontextmanager
+    async def read(self):
+        token = await self.acquire_read()
+        try:
+            yield
+        finally:
+            await self.release_read(token)
+
+    @asynccontextmanager
+    async def write(self):
+        token = await self.acquire_write()
+        try:
+            yield
+        finally:
+            await self.release_write(token)
+
+    def snapshot(self) -> dict:
+        return {
+            "readers": self._readers,
+            "writer": self._writer is not None,
+            "waiting_writers": self._waiting_writers,
+        }
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return int(default)
+    try:
+        return int(str(raw).strip())
+    except Exception:
+        return int(default)
+
+
+def _auto_model_compute_limit() -> int:
+    """Shared default for all framework services; never model-id specific.
+
+    Keep enough CPU headroom for PHP/Rust/MySQL and for another active model on
+    the same node.  Operators can override with MODEL_COMPUTE_CONCURRENCY.
+    """
+    try:
+        cpu = max(1, len(os.sched_getaffinity(0)))
+    except Exception:
+        cpu = max(1, int(os.cpu_count() or 1))
+    divisor = max(1, _env_int("MODEL_COMPUTE_AUTO_CPU_DIVISOR", 4))
+    auto_cap = max(1, _env_int("MODEL_COMPUTE_AUTO_MAX", 32))
+    base = 1 if cpu < 4 else max(2, cpu // divisor)
+    return max(1, min(auto_cap, base))
+
+
+def _resolve_model_compute_limit(model_module, configured=None) -> tuple[int, str]:
+    # Stateful chronological models must remain ordered unless explicitly opted in.
+    model_fn = getattr(model_module, "model", None)
+    fn_globals = getattr(model_fn, "__globals__", {}) or {}
+    strict_state = (
+        isinstance(fn_globals.get("_LAST_SIGNAL_TS"), dict)
+        or bool(getattr(model_module, "MODEL_SERIAL_EXECUTION", False))
+        or getattr(model_module, "MODEL_THREAD_SAFE", True) is False
+    )
+    if strict_state:
+        return 1, "strict-model-state"
+
+    env_raw = os.getenv("MODEL_COMPUTE_CONCURRENCY")
+    if env_raw is not None and str(env_raw).strip().lower() not in {"", "0", "auto"}:
+        try:
+            return max(1, int(env_raw)), "env"
+        except Exception:
+            pass
+    if configured is not None and str(configured).strip().lower() not in {"", "0", "auto"}:
+        try:
+            return max(1, int(configured)), "config/model"
+        except Exception:
+            pass
+    return _auto_model_compute_limit(), "auto-cpu"
+
+
+class _RuntimeCoordinator:
+    """Bound synchronous model/proxy work without occupying the FastAPI event loop.
+
+    One process hosts one Brain service, so this coordinator is intentionally
+    process-local. Cache storage ownership and model-compute ownership are separate.
+    Stateless/read-only models use shared CPU-aware parallelism; models detected as
+    chronologically stateful remain serial automatically.
+    """
+
+    def __init__(self, service_id: int, *, model_limit: int = 1, model_limit_source: str = "default"):
+        self.service_id = int(service_id)
+        self.model_limit = max(1, int(model_limit))
+        self.model_limit_source = str(model_limit_source)
+        self.model_queue_limit = max(0, _env_int("MODEL_COMPUTE_QUEUE", min(self.model_limit, 8)))
+        self.model_admission_limit = self.model_limit + self.model_queue_limit
+        self.proxy_limit = max(1, int(os.getenv("CACHE_UPSTREAM_CONCURRENCY", "4")))
+        self.model_executor = _cf.ThreadPoolExecutor(
+            max_workers=self.model_limit,
+            thread_name_prefix=f"model_{self.service_id}",
+        )
+        self.proxy_executor = _cf.ThreadPoolExecutor(
+            max_workers=self.proxy_limit,
+            thread_name_prefix=f"proxy_{self.service_id}",
+        )
+        self.model_sem = asyncio.Semaphore(self.model_limit)
+        self.model_admission_sem = asyncio.Semaphore(self.model_admission_limit)
+        self.proxy_sem = asyncio.Semaphore(self.proxy_limit)
+        self.model_active = 0
+        self.model_waiting = 0
+        self.model_rejected = 0
+        self.proxy_active = 0
+        self.proxy_waiting = 0
+        self._flights: dict[tuple, asyncio.Task] = {}
+        self._flights_lock = asyncio.Lock()
+
+    async def _run_bounded(self, sem, executor, kind: str, fn, *args, **kwargs):
+        waiting_attr = f"{kind}_waiting"
+        active_attr = f"{kind}_active"
+        setattr(self, waiting_attr, getattr(self, waiting_attr) + 1)
+        acquired = False
+        try:
+            await sem.acquire()
+            acquired = True
+            setattr(self, waiting_attr, max(0, getattr(self, waiting_attr) - 1))
+            setattr(self, active_attr, getattr(self, active_attr) + 1)
+            loop = asyncio.get_running_loop()
+            fut = loop.run_in_executor(executor, lambda: fn(*args, **kwargs))
+            try:
+                return await asyncio.shield(fut)
+            except asyncio.CancelledError:
+                # The worker thread cannot be cancelled safely. Keep the slot and
+                # state accounting until it really finishes, then propagate cancel.
+                try:
+                    await asyncio.shield(fut)
+                finally:
+                    raise
+        finally:
+            if acquired:
+                setattr(self, active_attr, max(0, getattr(self, active_attr) - 1))
+                sem.release()
+            else:
+                setattr(self, waiting_attr, max(0, getattr(self, waiting_attr) - 1))
+
+    async def run_model(self, fn, *args, **kwargs):
+        # Bound accepted work before it reaches the executor. Local Brain PHP
+        # callers use the same advertised capacity and therefore normally never
+        # hit this rejection path; it protects direct/remote callers as well.
+        if self.model_admission_sem.locked():
+            self.model_rejected += 1
+            raise RuntimeError(
+                f"SERVICE_BUSY model={self.service_id} "
+                f"active={self.model_active} waiting={self.model_waiting} "
+                f"limit={self.model_limit} queue={self.model_queue_limit}"
+            )
+        await self.model_admission_sem.acquire()
+        try:
+            return await self._run_bounded(
+                self.model_sem, self.model_executor, "model", fn, *args, **kwargs
+            )
+        finally:
+            self.model_admission_sem.release()
+
+    async def run_proxy(self, fn, *args, **kwargs):
+        return await self._run_bounded(
+            self.proxy_sem, self.proxy_executor, "proxy", fn, *args, **kwargs
+        )
+
+    async def singleflight(self, key: tuple, factory):
+        """Run one coroutine per exact live key and share its result with waiters."""
+        async with self._flights_lock:
+            task = self._flights.get(key)
+            if task is None:
+                task = asyncio.create_task(factory())
+                self._flights[key] = task
+
+                def _cleanup(done_task, *, _key=key):
+                    if self._flights.get(_key) is done_task:
+                        self._flights.pop(_key, None)
+
+                task.add_done_callback(_cleanup)
+        return await asyncio.shield(task)
+
+    def snapshot(self) -> dict:
+        return {
+            "model_limit": self.model_limit,
+            "model_limit_source": self.model_limit_source,
+            "model_queue_limit": self.model_queue_limit,
+            "model_admission_limit": self.model_admission_limit,
+            "model_active": self.model_active,
+            "model_waiting": self.model_waiting,
+            "model_rejected": self.model_rejected,
+            "proxy_limit": self.proxy_limit,
+            "proxy_active": self.proxy_active,
+            "proxy_waiting": self.proxy_waiting,
+            "singleflight_keys": len(self._flights),
+        }
+
+    def shutdown(self) -> None:
+        self.model_executor.shutdown(wait=False, cancel_futures=True)
+        self.proxy_executor.shutdown(wait=False, cancel_futures=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # NUMPY-УТИЛИТЫ
@@ -1278,7 +1572,15 @@ class _State:
         self.engine_cache = None
         self.cache_writer: bool | None = None
         self.cache_role: str = "unknown"
+        # Compute ownership is intentionally independent from central-cache ownership.
+        # By default every service node can compute its own MISS; COMPUTE_WORKER=0
+        # switches a child back to the legacy proxy-only behaviour.
+        self.compute_worker: bool | None = None
+        self.compute_role: str = "unknown"
         self.cache_upstream_url: str = ""
+        self.runtime_coordinator: _RuntimeCoordinator | None = None
+        self.state_gate: _AsyncRWGate = _AsyncRWGate()
+        self.capacity_file: str = ""
 
         self.weight_codes:  list       = []
         self.ctx_index:     dict       = {}
@@ -1458,26 +1760,34 @@ async def _detect_cache_role(s: _State) -> bool:
 
     s.cache_writer = is_writer
     s.cache_role = "writer-brain1" if is_writer else "reader-child"
+
+    # A child is a local compute worker by default. This is the critical separation
+    # from CACHE_WRITER: only Brain 1 owns cache administration, but the node that
+    # actually serves /values is allowed to run model() for a MISS. This removes the
+    # child -> Brain 1 -> child/PHP 600-second timeout chain.
+    compute_override = _env_bool_override("COMPUTE_WORKER")
+    if is_writer:
+        # The cache owner must always be able to satisfy a direct request itself.
+        compute_worker = True
+        compute_source = "cache-writer-required"
+    elif compute_override is None:
+        compute_worker = True
+        compute_source = "default-local-child"
+    else:
+        compute_worker = bool(compute_override)
+        compute_source = "COMPUTE_WORKER env"
+
+    s.compute_worker = compute_worker
+    s.compute_role = "local-worker" if compute_worker else "proxy-only"
     s.cache_upstream_url = _build_cache_upstream_url(s.PORT)
     log(
         f" central cache role={s.cache_role} source={source} "
+        f"compute_role={s.compute_role} compute_source={compute_source} "
         f"storage=SUPER_* upstream={s.cache_upstream_url or 'not-configured'} "
         f"local_mysql={local_id or 'n/a'} super_mysql={super_id or 'n/a'}",
         s.NODE_NAME, force=True,
     )
     return is_writer
-
-
-_CACHE_PROXY_SEM: asyncio.Semaphore | None = None
-
-
-def _get_cache_proxy_sem() -> asyncio.Semaphore:
-    """Bound child->Brain1 cache MISS concurrency without changing payloads."""
-    global _CACHE_PROXY_SEM
-    if _CACHE_PROXY_SEM is None:
-        limit = max(1, int(os.getenv("CACHE_UPSTREAM_CONCURRENCY", "16")))
-        _CACHE_PROXY_SEM = asyncio.Semaphore(limit)
-    return _CACHE_PROXY_SEM
 
 
 async def _proxy_values_to_brain1(
@@ -1492,7 +1802,12 @@ async def _proxy_values_to_brain1(
             "CACHE_UPSTREAM_URL is empty and SUPER_HOST is not configured"
         )
 
-    timeout = max(1.0, float(os.getenv("CACHE_UPSTREAM_TIMEOUT", "120")))
+    connect_timeout = max(0.5, float(os.getenv("CACHE_UPSTREAM_CONNECT_TIMEOUT", "5")))
+    # Proxy mode is now only a compatibility fallback (COMPUTE_WORKER=0). Keep
+    # its deadline comfortably below the PHP -> service request deadline so the
+    # service has time to serialize a useful JSON error instead of the caller
+    # receiving "0 bytes received" at the exact same deadline.
+    read_timeout = max(1.0, float(os.getenv("CACHE_UPSTREAM_TIMEOUT", "480")))
     url = f"{s.cache_upstream_url.rstrip('/')}/values"
     params = {
         "pair": pair, "day": day, "date": date,
@@ -1501,7 +1816,7 @@ async def _proxy_values_to_brain1(
     }
 
     def _request():
-        response = _requests.get(url, params=params, timeout=timeout)
+        response = _requests.get(url, params=params, timeout=(connect_timeout, read_timeout))
         response.raise_for_status()
         data = response.json()
         if not isinstance(data, dict) or data.get("status") != "ok":
@@ -1514,8 +1829,10 @@ async def _proxy_values_to_brain1(
             raise RuntimeError("Brain 1 response has no payLoad")
         return payload
 
-    async with _get_cache_proxy_sem():
-        return await asyncio.to_thread(_request)
+    coordinator = s.runtime_coordinator
+    if coordinator is None:
+        raise RuntimeError("runtime coordinator is not initialized")
+    return await coordinator.run_proxy(_request)
 
 
 def _params_hash(params: dict) -> str:
@@ -1639,7 +1956,7 @@ async def _load_rates(s: _State):
         log(f"   NP_RATES build failed: {e}", s.NODE_NAME, level="error")
 
 
-async def _refresh_rates(table: str, s: _State):
+async def _refresh_rates_unlocked(table: str, s: _State):
     now  = datetime.now()
     last = s.last_rates_refresh.get(table)
     if last and (now - last).total_seconds() < 30:
@@ -1681,6 +1998,14 @@ async def _refresh_rates(table: str, s: _State):
                 log(f"   +{n} candle(s) {table}", s.NODE_NAME)
     except Exception as e:
         log(f"   refresh {table}: {e}", s.NODE_NAME, level="warning")
+
+
+async def _refresh_rates(table: str, s: _State):
+    gate = getattr(s, "state_gate", None)
+    if gate is None:
+        return await _refresh_rates_unlocked(table, s)
+    async with gate.write():
+        return await _refresh_rates_unlocked(table, s)
 
 
 # ── Котировки основного инструмента ─────────────────────────────────────────────
@@ -1741,7 +2066,7 @@ async def _load_simple_rates(s: _State) -> None:
         s.np_simple_rates = None
 
 
-async def _refresh_simple_rates(s: _State) -> None:
+async def _refresh_simple_rates_unlocked(s: _State) -> None:
     if not s.last_simple_rate_dt:
         return
     table = s.RATES_TABLE
@@ -1764,6 +2089,14 @@ async def _refresh_simple_rates(s: _State) -> None:
             log(f"   +{len(new_rows)} candle(s) {table}", s.NODE_NAME)
     except Exception as e:
         log(f"   refresh simple_rates: {e}", s.NODE_NAME, level="warning")
+
+
+async def _refresh_simple_rates(s: _State) -> None:
+    gate = getattr(s, "state_gate", None)
+    if gate is None:
+        return await _refresh_simple_rates_unlocked(s)
+    async with gate.write():
+        return await _refresh_simple_rates_unlocked(s)
 
 
 # ── Веса, контекст, датасет ───────────────────────────────────────────────────
@@ -1858,15 +2191,33 @@ async def _load_dataset(s: _State):
     query = s.DATASET_QUERY or f"SELECT * FROM `{s.DATASET_TABLE}`"
     try:
         from datetime import date as _date
+        chunk_size = max(1, int(os.getenv("DATASET_STREAM_CHUNK", "4096")))
         async with _engine_for(s.DATASET_ENGINE, s).connect() as conn:
-            res  = await conn.execute(text(query))
             rows = []
-            for r in res.mappings().all():
-                row = dict(r)
-                for k, v in row.items():
-                    if type(v) is _date:
-                        row[k] = datetime(v.year, v.month, v.day)
-                rows.append(row)
+            # AsyncConnection.stream() keeps the DB cursor server-side / chunked
+            # where supported. partitions() amortizes async iteration overhead and
+            # avoids res.mappings().all(), which previously materialized a second
+            # ~million-row Python list before we built the final list[dict].
+            res = await conn.stream(
+                text(query),
+                execution_options={"yield_per": chunk_size},
+            )
+            try:
+                # Read raw Row objects in bounded partitions and build the final
+                # dict directly. This avoids both mappings().all() and creation of
+                # ~1M transient RowMapping wrappers. Column order is retained by
+                # result.keys(), so the resulting dict is observably identical.
+                keys = tuple(res.keys())
+                async for part in res.partitions(chunk_size):
+                    for r in part:
+                        row = {
+                            k: (datetime(v.year, v.month, v.day)
+                                if type(v) is _date else v)
+                            for k, v in zip(keys, r)
+                        }
+                        rows.append(row)
+            finally:
+                await res.close()
             s.dataset = rows
         _build_dataset_index(s)
         log(f"  dataset: {len(s.dataset)} rows", s.NODE_NAME)
@@ -2081,6 +2432,17 @@ def build_app(model_module) -> FastAPI:
     s.PORT         = int(_get("service", "port", "PORT",         "PORT",         9000))
     s.NODE_NAME    =     _get("service", "name", "NODE_NAME",    "NODE_NAME",    "brain-svc")
     s.SERVICE_TEXT =     _get("service", "text", "SERVICE_TEXT", "SERVICE_TEXT", "Brain microservice")
+    _configured_parallelism = _get(
+        "runtime", "model_compute_concurrency", "MODEL_COMPUTE_CONCURRENCY", "", 0
+    )
+    _model_limit, _model_limit_source = _resolve_model_compute_limit(
+        model_module, _configured_parallelism
+    )
+    s.runtime_coordinator = _RuntimeCoordinator(
+        s.SERVICE_ID,
+        model_limit=_model_limit,
+        model_limit_source=_model_limit_source,
+    )
 
     # Почта разработчика конкретной модели. Стандартный ключ:
     #   [developer]
@@ -2228,13 +2590,35 @@ def build_app(model_module) -> FastAPI:
 
     s.reverse_store = rl.ReverseStore(s.engine_vlad, port=s.PORT)
 
+    # Shared runtime state is protected by a writer-preferring RW gate.
+    # Model calls are concurrent readers; refresh/reload/rebuild are exclusive
+    # writers. Strict chronological models are still forced to model_limit=1 by
+    # _resolve_model_compute_limit().
+    _model_state_gate = s.state_gate
+
+    async def _run_model_offloop(fn, *args, **kwargs):
+        coordinator = s.runtime_coordinator
+        if coordinator is None:
+            raise RuntimeError("runtime coordinator is not initialized")
+        return await coordinator.run_model(fn, *args, **kwargs)
+
+    async def _run_model_guarded(fn, *args, **kwargs):
+        async with _model_state_gate.read():
+            return await _run_model_offloop(fn, *args, **kwargs)
+
+    async def _run_live_singleflight(key: tuple, factory):
+        coordinator = s.runtime_coordinator
+        if coordinator is None:
+            raise RuntimeError("runtime coordinator is not initialized")
+        return await coordinator.singleflight(("fresh-values",) + tuple(key), factory)
+
     # ── _call_model ───────────────────────────────────────────────────────────
 
-    async def _call_raw_model(pair, day, date_str, calc_type=0, calc_var=0, param="",
+    async def _call_raw_model_impl(pair, day, date_str, calc_type=0, calc_var=0, param="",
                               _skip_refresh: bool = False):
         """Execute model.py directly, bypassing values cache and ML universe."""
-        if s.cache_writer is False:
-            raise RuntimeError("Direct model() is disabled on child node")
+        if s.compute_worker is False:
+            raise RuntimeError("Direct model() is disabled on this proxy-only node")
         target_date = _parse_date(date_str)
         if not target_date:
             return None
@@ -2269,7 +2653,8 @@ def build_app(model_module) -> FastAPI:
                 "execution_scope": "diagnostic_raw",
                 "full_dataset": s.dataset,
             }
-        result = s.model_fn(
+        result = await _run_model_offloop(
+            s.model_fn,
             rates=rates_x, dataset=dataset_x, date=target_date,
             type=calc_type, var=calc_var, param=param,
             dataset_index=dataset_index_dict,
@@ -2277,17 +2662,80 @@ def build_app(model_module) -> FastAPI:
         result, _ = _extract_detail(result)
         return result or {}
 
-    async def _call_model(pair, day, date_str, calc_type=0, calc_var=0, param="",
+    async def _call_raw_model(pair, day, date_str, calc_type=0, calc_var=0, param="",
+                              _skip_refresh: bool = False):
+        if not _skip_refresh:
+            target_date = _parse_date(date_str)
+            if target_date is not None:
+                await _refresh_rates(_rates_table(pair, day), s)
+        async with _model_state_gate.read():
+            return await _call_raw_model_impl(
+                pair, day, date_str, calc_type=calc_type, calc_var=calc_var,
+                param=param, _skip_refresh=True,
+            )
+
+    async def _call_model_impl(pair, day, date_str, calc_type=0, calc_var=0, param="",
                           _skip_refresh: bool = False):
-        if s.cache_writer is False:
+        if s.compute_worker is False:
             raise RuntimeError(
-                "Local model() is disabled on child node; cache MISS must be "
-                "computed by Brain 1"
+                "Local model() is disabled on this proxy-only node; cache MISS must "
+                "be provided by the configured upstream service"
             )
         target_date = _parse_date(date_str)
         if not target_date:
             return None
         table = _rates_table(pair, day)
+
+        # Non-ML live calls share the read-only state snapshot and execute through
+        # the bounded model executor. Chronologically stateful models are detected
+        # at startup and keep model_limit=1; ordinary models may run concurrently.
+        if not s.USE_ML_VALUES:
+            if not _skip_refresh:
+                await _refresh_rates(table, s)
+            np_r_live = s.np_rates.get(table)
+
+            if s.model_uses_rate_history:
+                rates_live = _filter_rates_lte(table, target_date, s)
+            else:
+                marker_dt = (
+                    target_date.replace(hour=0, minute=0, second=0, microsecond=0)
+                    if day else target_date
+                )
+                rates_live = [{"date": marker_dt}]
+
+            dataset_live = (
+                s.dataset if s.model_can_filter_dataset_by_date
+                else _filter_dataset_lte(target_date, s)
+            )
+            dataset_index_live = None
+            if s.model_needs_index:
+                dataset_index_live = {
+                    "dates": s.dataset_dates,
+                    "by_key": s.dataset_by_key,
+                    "key_dates": s.dataset_key_dates,
+                    "key_field": s.dataset_key_field,
+                    "np_rates": np_r_live,
+                    "ctx_index": s.ctx_index,
+                    "url_map": s.url_map,
+                    "dataset_timestamps": getattr(s, "_dataset_ts_arr", None),
+                    "filter_dataset_by_date": bool(s.FILTER_DATASET_BY_DATE),
+                    "dataset_cutoff_ts": float(target_date.timestamp()),
+                    "is_daily": bool(day),
+                    "rates_table": table,
+                    "execution_scope": "live",
+                    "full_dataset": s.dataset,
+                }
+
+            def _invoke_non_ml():
+                r = s.model_fn(
+                    rates=rates_live, dataset=dataset_live, date=target_date,
+                    type=calc_type, var=calc_var, param=param,
+                    dataset_index=dataset_index_live,
+                )
+                r, _ = _extract_detail(r)
+                return r or {}
+
+            return await _run_model_offloop(_invoke_non_ml)
         if not _skip_refresh:
             await _refresh_rates(table, s)
         np_r = s.np_rates.get(table)
@@ -2337,9 +2785,6 @@ def build_app(model_module) -> FastAPI:
             r, _ = _extract_detail(r)
             return r or {}
 
-        if not s.USE_ML_VALUES:
-            return _model_at(target_date)
-
         # ── ML-РЕЖИМ ─────────────────────────────────────────────────────────
         async def _active_codes_at(ext_dt: datetime) -> list[str]:
             ts  = int(ext_dt.timestamp())
@@ -2348,7 +2793,8 @@ def build_app(model_module) -> FastAPI:
             if cached is not None:
                 return cached
             try:
-                codes = list(_model_at(ext_dt).keys())
+                model_result = await _run_model_offloop(_model_at, ext_dt)
+                codes = list(model_result.keys())
             except Exception:
                 codes = []
             s._ml_active_cache[key] = codes
@@ -2383,6 +2829,18 @@ def build_app(model_module) -> FastAPI:
             send_error_trace(e, s.NODE_NAME, "ml_call_model")
             return {}
 
+    async def _call_model(pair, day, date_str, calc_type=0, calc_var=0, param="",
+                          _skip_refresh: bool = False):
+        if not _skip_refresh:
+            target_date = _parse_date(date_str)
+            if target_date is not None:
+                await _refresh_rates(_rates_table(pair, day), s)
+        async with _model_state_gate.read():
+            return await _call_model_impl(
+                pair, day, date_str, calc_type=calc_type, calc_var=calc_var,
+                param=param, _skip_refresh=True,
+            )
+
     # ── _preload ──────────────────────────────────────────────────────────────
 
     async def _preload():
@@ -2409,14 +2867,18 @@ def build_app(model_module) -> FastAPI:
         s.service_url  = f"http://localhost:{s.PORT}"
         s._cache_table = f"vlad_values_cache_svc{s.PORT}"
 
-        if s.cache_writer:
+        if s.cache_writer or s.compute_worker:
+            # CREATE TABLE IF NOT EXISTS is idempotent. A remote compute worker
+            # needs the shared table to exist because it persists its local MISS
+            # result directly into SUPER_*. If its DB account has no DDL rights,
+            # the request path still works and the error is logged here explicitly.
             try:
                 await ensure_cache_table(s.engine_cache, s.cache_table)
             except Exception as e:
                 log(f"   central cache table: {e}", s.NODE_NAME, level="error")
-        else:
+        if not s.cache_writer:
             log(
-                f" central cache reader: SUPER_* / {s.cache_table}",
+                f" central cache client: SUPER_* / {s.cache_table}; compute_role={s.compute_role}",
                 s.NODE_NAME, force=True,
             )
 
@@ -2644,7 +3106,8 @@ def build_app(model_module) -> FastAPI:
                         and (s.last_rebuild is None or
                              (datetime.now() - s.last_rebuild).total_seconds()
                              >= s.REBUILD_INTERVAL)):
-                    await _do_rebuild()
+                    async with _model_state_gate.write():
+                        await _do_rebuild()
                 s.last_reload = datetime.now()
             except Exception as e:
                 log(f" bg_reload: {e}", s.NODE_NAME, level="error", force=True)
@@ -3209,7 +3672,7 @@ def build_app(model_module) -> FastAPI:
                             s.dataset if s.model_can_filter_dataset_by_date
                             else _filter_dataset_lte(_missing_chunk[-1], s)
                         )
-                        batch_results = s.batch_model_fn(
+                        batch_results = await _run_batch_model_offloop(s.batch_model_fn,
                             rates=rates_for_prewarm,
                             dataset=dataset_for_prewarm,
                             dates=_missing_chunk,
@@ -3609,7 +4072,7 @@ def build_app(model_module) -> FastAPI:
                                                    else [{"date": max_batch_date}])
                                 dataset_f_b = s.dataset if s.model_can_filter_dataset_by_date else _filter_dataset_lte(max_batch_date, s)
 
-                                batch_map = s.batch_model_fn(
+                                batch_map = await _run_batch_model_offloop(s.batch_model_fn,
                                     rates=rates_for_batch,
                                     dataset=dataset_f_b,
                                     dates=batch_dates,
@@ -3781,7 +4244,8 @@ def build_app(model_module) -> FastAPI:
             s.fill_status.get("started_at", datetime.now().isoformat()))
         _h, _r  = divmod(int(_fc_el.total_seconds()), 3600)
         _m, _sc = divmod(_r, 60)
-        _send_trace(
+        await asyncio.to_thread(
+            _send_trace,
             subject  = f"{'' if state == 'done' else ''} fill_cache {state} — {s.service_url}",
             body     = (f"Сервис : {s.service_url}\n"
                         f"Пары   : {pairs}  Дни: {days}\n"
@@ -3820,7 +4284,50 @@ def build_app(model_module) -> FastAPI:
                    "ph": p_hash, "df": df, "dt": dt})
             cache_map = {row[0]: _rj_decode(row[1]) for row in res.fetchall()}  # OPT-6
         if not cache_map:
-            return {"error": "no cached data"}
+            # PARAM-DIAGNOSTIC: a cache miss must explain WHICH hash was requested
+            # and which parameter slots actually exist for this pair/timeframe.
+            available_params = []
+            try:
+                async with s.engine_cache.connect() as conn:
+                    diag = await conn.execute(text(f"""
+                        SELECT params_hash, params_json, COUNT(*) AS rows_count,
+                               MIN(date_val) AS first_date, MAX(date_val) AS last_date
+                        FROM `{s.cache_table}`
+                        WHERE service_url=:url AND pair=:pair AND day_flag=:day
+                          AND date_val>=:df AND date_val<=:dt
+                        GROUP BY params_hash, params_json
+                        ORDER BY rows_count DESC
+                        LIMIT 50
+                    """), {"url": s.service_url, "pair": pair, "day": day,
+                           "df": df, "dt": dt})
+                    for row in diag.mappings().all():
+                        try:
+                            parsed_params = _json.loads(row["params_json"]) if row["params_json"] else {}
+                        except Exception:
+                            parsed_params = {"raw": row["params_json"]}
+                        available_params.append({
+                            "params_hash": row["params_hash"],
+                            "params": parsed_params,
+                            "rows": int(row["rows_count"] or 0),
+                            "first_date": row["first_date"].isoformat() if row["first_date"] else None,
+                            "last_date": row["last_date"].isoformat() if row["last_date"] else None,
+                        })
+            except Exception as diag_exc:
+                available_params = [{"diagnostic_error": str(diag_exc)}]
+
+            return {
+                "error": "no cached data for requested params",
+                "framework_version": FRAMEWORK_VERSION,
+                "params": extra_params,
+                "params_hash": p_hash,
+                "cache_table": s.cache_table,
+                "available_params": available_params,
+                "hint": (
+                    "Если available_params содержит нужный param с другим hash — "
+                    "запущен несовместимый/старый framework. Если нужного param нет — "
+                    "сначала заполните этот slot через /fill_cache?param=<value>."
+                ),
+            }
 
         table  = _rates_table(pair, day)
         rows   = [r for r in s.global_rates.get(table, []) if df <= r["date"] <= dt]
@@ -3939,16 +4446,67 @@ def build_app(model_module) -> FastAPI:
     # FastAPI endpoints
     # ══════════════════════════════════════════════════════════════════════════
 
+    def _capacity_file_payload() -> dict:
+        rc = s.runtime_coordinator
+        return {
+            "service_id": int(s.SERVICE_ID),
+            "port": int(s.PORT),
+            "pid": int(os.getpid()),
+            "framework_version": FRAMEWORK_VERSION,
+            "model_compute_concurrency": int(rc.model_limit if rc else 1),
+            "http_inflight_limit": int(rc.model_limit if rc else 1),
+            "model_queue_limit": int(rc.model_queue_limit if rc else 0),
+        }
+
+    def _write_capacity_file() -> None:
+        path = f"/tmp/brain_python_service_{int(s.SERVICE_ID)}.json"
+        s.capacity_file = path
+        tmp = f"{path}.{os.getpid()}.tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                _json.dump(_capacity_file_payload(), fh, separators=(",", ":"))
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+            try:
+                os.chmod(path, 0o644)
+            except Exception:
+                pass
+        except Exception as exc:
+            log(f" capacity file write failed: {exc}", s.NODE_NAME, level="warning")
+            try:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+            except Exception:
+                pass
+
+    def _remove_capacity_file() -> None:
+        path = s.capacity_file or f"/tmp/brain_python_service_{int(s.SERVICE_ID)}.json"
+        try:
+            # One Uvicorn process is the canonical shared-framework mode. Avoid
+            # deleting a replacement process' file after a rapid restart.
+            with open(path, "r", encoding="utf-8") as fh:
+                data = _json.load(fh)
+            if int(data.get("pid") or 0) == os.getpid():
+                os.unlink(path)
+        except Exception:
+            pass
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         try:
             await _preload()
         except Exception as e:
             log(f" initial load: {e}", s.NODE_NAME, level="error", force=True)
+        _write_capacity_file()
         task = asyncio.create_task(_bg_reload())
         yield
         task.cancel()
         s.fill_cancel.set()
+        _remove_capacity_file()
+        if s.runtime_coordinator is not None:
+            s.runtime_coordinator.shutdown()
+        _BATCH_MODEL_EXECUTOR.shutdown(wait=False, cancel_futures=True)
         for eng in (s.engine_vlad, s.engine_brain, s.engine_super, s.engine_cache):
             try:
                 await eng.dispose()
@@ -3973,6 +4531,19 @@ def build_app(model_module) -> FastAPI:
             "status": "ok", "version": f"1.{version}.0",
             "mode": MODE, "name": s.NODE_NAME, "text": s.SERVICE_TEXT,
             "metadata": {
+                "framework_version":  FRAMEWORK_VERSION,
+                "framework_sha":      _FRAMEWORK_SHA256,
+                "framework_loaded_at": _FRAMEWORK_LOADED_AT,
+                "pid":                os.getpid(),
+                "model_active":       (s.runtime_coordinator.model_active if s.runtime_coordinator else 0),
+                "model_waiting":      (s.runtime_coordinator.model_waiting if s.runtime_coordinator else 0),
+                "proxy_active":       (s.runtime_coordinator.proxy_active if s.runtime_coordinator else 0),
+                "proxy_waiting":      (s.runtime_coordinator.proxy_waiting if s.runtime_coordinator else 0),
+                "singleflight_keys":  (len(s.runtime_coordinator._flights) if s.runtime_coordinator else 0),
+                "runtime":            (s.runtime_coordinator.snapshot() if s.runtime_coordinator else {}),
+                "state_gate":         s.state_gate.snapshot(),
+                "http_inflight_limit": (s.runtime_coordinator.model_limit if s.runtime_coordinator else 1),
+                "capacity_file":      s.capacity_file or None,
                 "weight_codes":       len(s.weight_codes),
                 "ctx_index":          len(s.ctx_index),
                 "url_map":            len(s.url_map),
@@ -3983,9 +4554,11 @@ def build_app(model_module) -> FastAPI:
                 "np_built":           s.np_built,
                 "simple_rates":       len(s.simple_rates),
                 "cache_role":         s.cache_role,
+                "compute_role":       s.compute_role,
+                "compute_worker":     bool(s.compute_worker),
                 "cache_storage":      "SUPER_*",
                 "cache_table":        s.cache_table,
-                "cache_upstream":     s.cache_upstream_url if not s.cache_writer else None,
+                "cache_upstream":     s.cache_upstream_url if not s.compute_worker else None,
                 "last_reload":        s.last_reload.isoformat() if s.last_reload else None,
                 "last_rebuild":       s.last_rebuild.isoformat() if s.last_rebuild else None,
                 "rebuild_auto":       s.REBUILD_INTERVAL > 0 and bool(
@@ -4008,7 +4581,7 @@ def build_app(model_module) -> FastAPI:
 
     @app.get("/weights")
     async def ep_weights():
-        return ok_response({"codes": s.weight_codes, "var_range": s.VAR_RANGE})
+        return ok_response(s.weight_codes)
 
     # ── _build_narrative ──────────────────────────────────────────────────────────
 
@@ -4138,9 +4711,9 @@ def build_app(model_module) -> FastAPI:
         if s.VAR_RANGE and var not in s.VAR_RANGE:
             return err_response(f"var={var} не входит в VAR_RANGE={s.VAR_RANGE}")
         try:
-            if not s.cache_writer and _cache_hop:
+            if not s.compute_worker and _cache_hop:
                 return err_response(
-                    "Central cache proxy loop detected: upstream service is not Brain 1"
+                    "Central cache proxy loop detected: upstream service is not a compute worker"
                 )
 
             # Последние CACHE_FRESH_LAG_DAYS календарных дней намеренно живут
@@ -4150,15 +4723,22 @@ def build_app(model_module) -> FastAPI:
             if request_dt is None:
                 return err_response(f"Invalid date format: {date!r}")
             if request_dt > _cache_cutoff_dt():
-                if s.cache_writer:
-                    payload = await _call_model(
-                        pair, day, date, calc_type=type, calc_var=var, param=param
-                    )
-                else:
-                    payload = await _proxy_values_to_brain1(
+                async def _compute_fresh_value():
+                    if s.compute_worker:
+                        return await _call_model(
+                            pair, day, date, calc_type=type, calc_var=var, param=param
+                        )
+                    return await _proxy_values_to_brain1(
                         s, pair=pair, day=day, date=date, calc_type=type,
                         calc_var=var, param=param,
                     )
+
+                live_key = (
+                    s.service_url, int(pair), int(day),
+                    request_dt.isoformat(), int(type), int(var), str(param),
+                    bool(s.compute_worker),
+                )
+                payload = await _run_live_singleflight(live_key, _compute_fresh_value)
                 payload = payload or {}
                 resp = ok_response(payload)
                 resp["details"] = _build_narrative(
@@ -4173,8 +4753,8 @@ def build_app(model_module) -> FastAPI:
                 compute_fn=lambda: _call_model(pair, day, date,
                                                calc_type=type, calc_var=var, param=param),
                 node=s.NODE_NAME, table_name=s.cache_table,
-                compute_on_miss=bool(s.cache_writer),
-                miss_fn=(None if s.cache_writer else lambda: _proxy_values_to_brain1(
+                compute_on_miss=bool(s.compute_worker),
+                miss_fn=(None if s.compute_worker else lambda: _proxy_values_to_brain1(
                     s, pair=pair, day=day, date=date, calc_type=type,
                     calc_var=var, param=param,
                 )),
@@ -4192,9 +4772,9 @@ def build_app(model_module) -> FastAPI:
         pair: int = Query(1), day: int = Query(1),
         type: int = Query(0), var: int = Query(0), param: str = Query(""),
     ):
-        if not s.cache_writer:
+        if not s.compute_worker:
             return err_response(
-                "compute_batch разрешён только на Brain 1; дочерняя нода работает cache-only"
+                "compute_batch недоступен: эта нода запущена в режиме COMPUTE_WORKER=0"
             )
         result = {}
         for date_str in dates:
@@ -4383,8 +4963,8 @@ def build_app(model_module) -> FastAPI:
         """Direct live diagnostics for both H1 and D1, bypassing values-cache."""
         if pair not in _INSTRUMENTS:
             return err_response("Допустимые pair: 1, 3, 4")
-        if not s.cache_writer:
-            return err_response("Диагностика прямого model() разрешена только на Brain 1")
+        if not s.compute_worker:
+            return err_response("Диагностика прямого model() недоступна на proxy-only ноде")
 
         effective_param = str(param) if param is not None else str((s.PARAM_RANGE or [""])[0])
         dataset_first, dataset_last = _diag_dataset_date_bounds()
@@ -4462,8 +5042,8 @@ def build_app(model_module) -> FastAPI:
         """Mutation test for target/future T1 on both hourly and daily frames."""
         if pair not in _INSTRUMENTS:
             return err_response("Допустимые pair: 1, 3, 4")
-        if not s.cache_writer:
-            return err_response("Диагностика прямого model() разрешена только на Brain 1")
+        if not s.compute_worker:
+            return err_response("Диагностика прямого model() недоступна на proxy-only ноде")
 
         effective_param = str(param) if param is not None else str((s.PARAM_RANGE or [""])[0])
         report = {
@@ -4805,7 +5385,8 @@ def build_app(model_module) -> FastAPI:
     @app.get("/reload")
     async def ep_reload():
         try:
-            await _preload()
+            async with _model_state_gate.write():
+                await _preload()
             return ok_response({"reloaded_at": s.last_reload.isoformat()})
         except Exception as e:
             send_error_trace(e, s.NODE_NAME, "reload")
@@ -4819,7 +5400,8 @@ def build_app(model_module) -> FastAPI:
                 "Rebuild не настроен. "
                 "Добавь context_idx.py + weights.py (старый стиль) "
                 "или enrich_dataset() + ENRICHED_TABLE в model.py (новый стиль).")
-        result = await _do_rebuild()
+        async with _model_state_gate.write():
+            result = await _do_rebuild()
         if "error" in result:
             return err_response(result["error"])
         return ok_response(result)
@@ -4889,9 +5471,18 @@ def build_app(model_module) -> FastAPI:
                         s.NODE_NAME, level="warning")
 
         return ok_response({
+            "framework_version": FRAMEWORK_VERSION,
             "pairs": pl, "days": dl, "tier": tier,
             "date_from": df.isoformat(), "date_to": dt.isoformat(),
-            "vars": vars_to_run, "params": params_to_run, "results": all_results,
+            "vars": vars_to_run, "params": params_to_run,
+            "requested_slots": [
+                {
+                    "type": int(type), "var": int(v), "param": str(prm),
+                    "params_hash": _params_hash({"type": int(type), "var": int(v), "param": str(prm)}),
+                }
+                for v in vars_to_run for prm in params_to_run
+            ],
+            "results": all_results,
         })
 
     @app.get("/summary")
@@ -4988,7 +5579,8 @@ def build_app(model_module) -> FastAPI:
         _res2_counts: dict[str, int] = {}
         for _param2 in _pretest_params:
             try:
-                _res2 = s.model_fn(
+                _res2 = await _run_model_guarded(
+                    s.model_fn,
                     rates=_rf2, dataset=_ds2, date=_td2,
                     type=0, var=_pretest_var, param=_param2,
                     dataset_index=dataset_index_dict2,
@@ -5127,7 +5719,7 @@ def build_app(model_module) -> FastAPI:
                             return bool(res)
 
                         _tasks3.append((_pid3, _tf3, _param3))
-                        _coros3.append(asyncio.to_thread(_mk3))
+                        _coros3.append(_run_model_guarded(_mk3))
 
         _results3    = await asyncio.gather(*_coros3, return_exceptions=True)
         _instr_counts: dict = {}
@@ -5204,7 +5796,8 @@ def build_app(model_module) -> FastAPI:
             log("   Тест 4: rebuild не настроен, пропуск", s.NODE_NAME, force=True)
 
         log(" PRETEST OK", s.NODE_NAME, force=True)
-        return {"status": "ok"}
+        return {"status": "ok", "framework_version": FRAMEWORK_VERSION,
+                "param_range": list(s.PARAM_RANGE or [""])}
 
     @app.get("/posttest")
     async def ep_posttest(
