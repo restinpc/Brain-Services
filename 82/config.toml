@@ -1,9 +1,9 @@
 # Service configuration for the U.S. monetary-supply model.
 
 [service]
-id = 73
+id = 82
 port = 8944
-name = "brain-sasha_fred_us_money_supply-s73"
+name = "brain-sasha_fred_us_money_supply-s82"
 text = "U.S. currency-in-circulation and M2 context model"
 
 [rates]

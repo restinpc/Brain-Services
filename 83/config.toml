@@ -1,9 +1,9 @@
 # Service configuration for the Euro-area monetary-supply model.
 
 [service]
-id = 74
+id = 83
 port = 8945
-name = "brain-sasha_ecb_money_supply-s74"
+name = "brain-sasha_ecb_money_supply-s83"
 text = "ECB currency-in-circulation and M3 context model"
 
 [rates]

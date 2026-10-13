@@ -3,9 +3,9 @@ cache_helper.py — кеш /values для всех brain-* микросерви�
 
 Логика на каждый запрос /values:
   1. SELECT из общего SUPER_* кеша → если запись есть, вернуть сразу.
-  2. На Brain 1 при MISS вычислить model() и записать результат.
-  3. На дочерней ноде при MISS вызвать miss_fn (HTTP-запрос на Brain 1).
-  4. Локальная model() на дочерних нодах не вызывается.
+  2. На compute-worker при MISS вычислить model() и записать результат в общий cache.
+  3. На proxy-only ноде при MISS вызвать miss_fn (HTTP-запрос на upstream worker).
+  4. Результат compute-worker сохраняется в общий SUPER_* cache через INSERT IGNORE.
 """
 
 import asyncio
@@ -14,6 +14,8 @@ import hashlib
 import json
 import logging
 import random
+import time
+from collections import OrderedDict
 import zlib as _zlib
 from datetime import datetime
 
@@ -31,6 +33,10 @@ _DB_SEM_LOCK: asyncio.Lock | None = None
 # Only coordinates execution; it does not transform/re-serialize the leader result.
 _MISS_FLIGHTS: dict[tuple, asyncio.Task] = {}
 _MISS_FLIGHTS_GUARD: asyncio.Lock | None = None
+# Empty is a negative cache entry, never perpetual proof of no inputs.
+_EMPTY_CHECKED = OrderedDict()
+_EMPTY_RECHECK_SECONDS = 60.0
+_EMPTY_CHECKED_MAX = 4096
 
 
 def _get_miss_flights_guard() -> asyncio.Lock:
@@ -298,6 +304,14 @@ async def _cache_set(
              params_hash, params_json, result_json)
         VALUES (:url, :pair, :day, :dv, :ph, :pj, :rj)
     """)
+    if result:
+        # Repair only a recognized empty derived cache value atomically.
+        # A racing non-empty result is never replaced.
+        insert_sql = text(str(insert_sql) + """
+            ON DUPLICATE KEY UPDATE result_json =
+              IF(result_json IN ('{}', '[]', 'z:eJyrrgUAAXUA+Q==', 'z:eJyLjgUAARUAuQ=='),
+                 VALUES(result_json), result_json)
+        """)
     row_params = {
         "url":  service_url, "pair": pair, "day":  day,
         "dv":   date_val,    "ph":   p_hash,
@@ -364,8 +378,8 @@ async def cached_values(
     table_name — имя таблицы кеша (по умолчанию "vlad_values_cache").
     brain_framework передаёт s.cache_table для изоляции по сервисам.
 
-    compute_on_miss=False запрещает локальный model() на дочерней ноде.
-    В таком режиме miss_fn может получить значение у Brain 1 и вернуть payload.
+    compute_on_miss=False запрещает локальный model() на proxy-only ноде.
+    В таком режиме miss_fn может получить значение у upstream compute-worker и вернуть payload.
 
     compute_fn / miss_fn могут быть:
       - синхронной функцией, возвращающей dict/None,
@@ -387,24 +401,25 @@ async def cached_values(
 
     p_hash = cache_hash(extra_params)
 
-    # 1. Cache HIT — абсолютно прежний fast path.
-    cached = await _cache_get(engine_vlad, service_url, pair, day, date_val, p_hash,
-                              table_name=table_name)
-    if cached is not None:
-        log.debug(f"HIT  pair={pair} day={day} date={date} params={extra_params}")
-        return ok_response(cached)
-
     flight_key = (
         table_name, service_url, int(pair), int(day), date_val, p_hash,
         bool(compute_on_miss),
     )
+    cached = await _cache_get(engine_vlad, service_url, pair, day, date_val, p_hash,
+                              table_name=table_name)
+    # Non-empty historical data retains the exact fast path. Revalidate empty
+    # entries through normal compute/upstream, with bounded negative-cache TTL.
+    recently_checked = time.monotonic() - _EMPTY_CHECKED.get(flight_key, float("-inf")) < _EMPTY_RECHECK_SECONDS
+    if cached is not None and (cached or recently_checked):
+        log.debug(f"HIT  pair={pair} day={day} date={date} params={extra_params}")
+        return ok_response(cached)
 
     async def _miss_once() -> dict:
-        # 2. MISS на дочерней ноде: локальный model() запрещён.
+        # 2. MISS на proxy-only ноде: локальный model() запрещён.
         if not compute_on_miss:
             if miss_fn is None:
                 msg = (
-                    "Central cache MISS and no Brain 1 fallback is configured | "
+                    "Central cache MISS and no upstream fallback is configured | "
                     f"pair={pair} day={day} date={date!r} params={extra_params}"
                 )
                 log.warning(f"cached_values: {msg} node={node}")
@@ -418,7 +433,7 @@ async def cached_values(
                     result = await asyncio.to_thread(lambda: upstream_call)
             except Exception as exc:
                 msg = (
-                    f"Brain 1 cache fallback failed: {exc} | pair={pair} day={day} "
+                    f"Upstream cache fallback failed: {exc} | pair={pair} day={day} "
                     f"date={date!r} params={extra_params}"
                 )
                 log.warning(f"cached_values: {msg} node={node}")
@@ -426,14 +441,14 @@ async def cached_values(
 
             if result is None:
                 msg = (
-                    "Brain 1 returned no payload for central cache MISS | "
+                    "Upstream returned no payload for central cache MISS | "
                     f"pair={pair} day={day} date={date!r} params={extra_params}"
                 )
                 log.warning(f"cached_values: {msg} node={node}")
                 return err_response(msg)
             return ok_response(result)
 
-        # 3. MISS на Brain 1 — вычисляем локально и сохраняем в SUPER_* кеш.
+        # 3. MISS на compute-worker — вычисляем локально и сохраняем в SUPER_* кеш.
         log.debug(f"MISS pair={pair} day={day} date={date} params={extra_params}")
 
         callable_result = compute_fn()
@@ -454,6 +469,13 @@ async def cached_values(
         await _cache_set(engine_vlad, service_url, pair, day, date_val,
                          extra_params, p_hash, result, table_name=table_name)
 
+        if not result:
+            _EMPTY_CHECKED[flight_key] = time.monotonic()
+            _EMPTY_CHECKED.move_to_end(flight_key)
+            while len(_EMPTY_CHECKED) > _EMPTY_CHECKED_MAX:
+                _EMPTY_CHECKED.popitem(last=False)
+        else:
+            _EMPTY_CHECKED.pop(flight_key, None)
         return ok_response(result)
 
     return await _run_singleflight(flight_key, _miss_once)

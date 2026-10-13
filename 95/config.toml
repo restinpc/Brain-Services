@@ -1,6 +1,6 @@
 [service]
 id = 95
-port = 8957
+port = 8958
 name = "brain-macro-surprise-ml-s95"
 text = "TradingView economic-calendar macro surprise: causal Actual-vs-Forecast normalization + ML/reverse-learning"
 
