@@ -542,7 +542,15 @@ def process(args, sink):
             download(session, MANIFEST, index)
             print(f"GDELT: индекс скачан ({index.stat().st_size:,} байт)", flush=True)
         with index.open(encoding="utf-8") as lines:
-            for entry in manifest_entries(lines, args.start, args.end, args.streams.split(",")):
+            entries = manifest_entries(lines, args.start, args.end, args.streams.split(","))
+            if getattr(args, "recent_hours", 0):
+                recent_entries = []
+                for entry in entries:
+                    recent_entries.append(entry)
+                    if len(recent_entries) > 576:
+                        raise ValueError("GDELT recent manifest exceeds bounded window")
+                entries = sorted(recent_entries, key=lambda item: item["stamp"], reverse=True)
+            for entry in entries:
                 selected += 1
                 # Re-read v1 checkpoints once to backfill the new derived fields in place.
                 unit = [CHECKPOINT_VERSION, entry["url"], entry["md5"]]
@@ -570,7 +578,31 @@ def main():
     parser.add_argument("--streams", default="export,mentions,gkg", help="export,mentions,gkg или их подмножество")
     parser.add_argument("--manifest-file", type=Path, help="Локальный masterfilelist вместо загрузки индекса")
     parser.add_argument("--archive-dir", type=Path, help="Локальные ZIP вместо HTTP (для повторного импорта)")
+    parser.add_argument("--recent-hours", type=int, default=0, help="Bounded recent UTC window; historical checkpoints retained")
     args = parser.parse_args()
+    recent_lock = None
+    if args.recent_hours:
+        if not 1 <= args.recent_hours <= 48 or args.replay or args.jsonl or args.manifest_file or args.archive_dir:
+            parser.error("recent mode requires 1..48 hours and no replay/alternate input")
+        import fcntl
+        from datetime import timedelta
+        recent_lock = open("/run/lock/brain-gdelt-current.lock", "a")
+        try:
+            fcntl.flock(recent_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("GDELT: already running", flush=True)
+            return
+        import signal
+        def budget_expired(signum, frame):
+            raise TimeoutError("GDELT recent stage budget exceeded; partial state retained")
+        signal.signal(signal.SIGALRM, budget_expired)
+        signal.alarm(180)
+        end = utc_now()
+        args.start = (end - timedelta(hours=args.recent_hours)).isoformat()
+        args.end = end.isoformat()
+        args.streams = "gkg"
+        args.max_units = min(args.max_units or 8, 8)
+        args.batch_size = min(args.batch_size, 128)
     validate_args(args)
     if args.start < timestamp("2015-02-19"):
         parser.error("GDELT 2.0 поддерживается с 2015-02-19")
@@ -578,6 +610,9 @@ def main():
         parser.error("Допустимые streams: export,mentions,gkg")
     with NewsSink(args) as sink:
         print(f"GDELT: таблица {args.table_name}; период {args.start} — {args.end} UTC", flush=True)
+        if args.recent_hours:
+            with sink.conn.cursor() as cur:
+                cur.execute("SET SESSION MAX_EXECUTION_TIME=1000,lock_wait_timeout=2,innodb_lock_wait_timeout=2")
         process(args, sink)
 
 

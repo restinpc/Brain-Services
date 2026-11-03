@@ -457,46 +457,27 @@ async def _table_exists(engine, name: str) -> bool:
     return bool(int(n or 0))
 
 
-async def _table_columns(engine, name: str) -> set[str]:
-    from sqlalchemy import text
-    async with engine.connect() as conn:
-        rows = await conn.execute(text("""
-            SELECT COLUMN_NAME FROM information_schema.COLUMNS
-            WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=:t
-        """), {"t": name})
-        return {str(row[0]) for row in rows}
+async def _first_existing_table(engine, *names: str) -> str | None:
+    for name in names:
+        if name and await _table_exists(engine, name):
+            return name
+    return None
 
 
 async def _load_market_meta(engine, markets_table: str, parser_table: str) -> list[dict]:
     from sqlalchemy import text
-    compact = await _table_exists(engine, markets_table)
-    table = markets_table if compact else parser_table
-    columns = await _table_columns(engine, table)
-    if not columns:
-        raise ValueError(
-            f"Источник рынков модели 94 не найден: {markets_table} или {parser_table}. "
-            "Проверьте [dataset] в config.toml и базу DB_*."
-        )
-    missing = {"condition_id", "question"} - columns
-    if missing:
-        raise ValueError(f"В таблице {table} отсутствуют обязательные столбцы: {', '.join(sorted(missing))}")
-
-    # active и num_outcomes не используются моделью и могут отсутствовать
-    # в старой широкой таблице. end_date и tags — необязательные метаданные.
-    fields = ["`condition_id`"]
-    for field in ("question", "end_date", "tags"):
-        if field not in columns:
-            expression = "NULL"
-        elif compact:
-            expression = f"`{field}`"
-        else:
-            expression = f"MAX(`{field}`)"
-        fields.append(f"{expression} AS `{field}`")
-    sql = text(
-        f"SELECT {', '.join(fields)} FROM `{table}` "
-        "WHERE `condition_id` IS NOT NULL AND `question` IS NOT NULL"
-        + ("" if compact else " GROUP BY `condition_id`")
-    )
+    table = await _first_existing_table(engine, markets_table, parser_table)
+    if table is None:
+        return []
+    if table == markets_table:
+        sql = text(f"""SELECT condition_id, question, end_date, tags, active, num_outcomes
+                       FROM `{markets_table}` WHERE condition_id IS NOT NULL AND question IS NOT NULL""")
+    else:
+        sql = text(f"""SELECT condition_id, MAX(question) question, MAX(end_date) end_date,
+                              MAX(tags) tags, MAX(num_outcomes) num_outcomes
+                       FROM `{parser_table}`
+                       WHERE condition_id IS NOT NULL AND question IS NOT NULL
+                       GROUP BY condition_id""")
     async with engine.connect() as conn:
         return [dict(r) for r in (await conn.execute(sql)).mappings().all()]
 
@@ -552,23 +533,30 @@ async def _source_max_ts(engine, prices_table: str, parser_table: str) -> dateti
         return (await conn.execute(text(f"SELECT MAX(price_timestamp) FROM `{table}`"))).scalar()
 
 
-async def _load_price_chunk(engine, prices_table: str, parser_table: str, map_table: str,
+async def _load_price_chunk(engine, prices_table: str, parser_table: str, mapped_markets: dict,
                             start: datetime, end: datetime) -> list[dict]:
-    from sqlalchemy import text
+    from sqlalchemy import bindparam, text
     table = await _first_existing_table(engine, prices_table, parser_table)
-    if table is None:
+    if table is None or not mapped_markets:
         return []
+    condition_ids = list(mapped_markets)
     sql = text(f"""
-        SELECT p.condition_id, p.price_timestamp, p.price,
-               m.family, m.orientation, m.signature, m.end_date
+        SELECT p.condition_id, p.price_timestamp, p.price
         FROM `{table}` p
-        JOIN `{map_table}` m ON m.condition_id = p.condition_id
-        WHERE p.price_timestamp >= :start AND p.price_timestamp < :end
+        WHERE p.condition_id IN :condition_ids
+          AND p.price_timestamp >= :start AND p.price_timestamp < :end
           AND p.price IS NOT NULL
         ORDER BY p.condition_id, p.price_timestamp
-    """)
+    """).bindparams(bindparam("condition_ids", expanding=True))
     async with engine.connect() as conn:
-        return [dict(r) for r in (await conn.execute(sql, {"start": start, "end": end})).mappings().all()]
+        rows = [dict(r) for r in (await conn.execute(
+            sql, {"condition_ids": condition_ids, "start": start, "end": end}
+        )).mappings().all()]
+    for row in rows:
+        mapped = mapped_markets.get(str(row["condition_id"]))
+        if mapped:
+            row.update({k: mapped[k] for k in ("family", "orientation", "signature", "end_date")})
+    return [r for r in rows if "family" in r]
 
 
 async def _ensure_enriched_tables(engine, enriched: str, state_table: str):
@@ -610,6 +598,7 @@ async def enrich_dataset(engine_vlad, engine_brain) -> dict:
     ds = cfg["dataset"]
     mc = dict(cfg.get("model") or {})
     parser_table = ds["parser_table"]
+    source_engine = engine_brain if ds.get("source_database") == "brain" else engine_vlad
     markets_table = ds.get("markets_table", f"{parser_table}_markets")
     prices_table = ds.get("prices_table", f"{parser_table}_prices")
     enriched = ds["enriched_table"]
@@ -617,21 +606,35 @@ async def enrich_dataset(engine_vlad, engine_brain) -> dict:
     state_table = ds["state_table"]
 
     await _ensure_enriched_tables(engine_vlad, enriched, state_table)
-    market_source = await _first_existing_table(engine_vlad, markets_table, parser_table)
-    price_source = await _first_existing_table(engine_vlad, prices_table, parser_table)
+    canonical_split_configured = "markets_table" in ds or "prices_table" in ds
+    if canonical_split_configured:
+        if not ds.get("markets_table") or not ds.get("prices_table"):
+            market_source = price_source = None
+        else:
+            market_source = markets_table if await _table_exists(source_engine, markets_table) else None
+            price_source = prices_table if await _table_exists(source_engine, prices_table) else None
+    else:
+        market_source = await _first_existing_table(source_engine, markets_table, parser_table)
+        price_source = await _first_existing_table(source_engine, prices_table, parser_table)
     if market_source is None or price_source is None:
-        # Source absence is an infrastructure/config state, not an instruction
-        # to erase the last known-good derived dataset.  Keep existing map/events
-        # intact so the service can start and report source_missing explicitly.
-        return {
-            "mode": "source_missing",
-            "events_written": 0,
-            "market_source": market_source,
-            "price_source": price_source,
-        }
-    markets = await _load_market_meta(engine_vlad, markets_table, parser_table)
+        # Explicit canonical sources are mandatory. Fail before touching the
+        # published derived state; the framework retains its last good snapshot.
+        missing_tables = [
+            name for name, source in (
+                (markets_table, market_source), (prices_table, price_source)
+            ) if source is None
+        ]
+        raise RuntimeError(
+            "canonical_parser_source_missing:" + ",".join(missing_tables)
+        )
+    markets = await _load_market_meta(source_engine, market_source, market_source)
     map_stats = await _prepare_map_table(engine_vlad, map_table, markets)
-    source_max = await _source_max_ts(engine_vlad, prices_table, parser_table)
+    async with engine_vlad.connect() as conn:
+        map_rows = (await conn.execute(text(
+            f"SELECT condition_id,family,orientation,signature,end_date FROM `{map_table}`"
+        ))).mappings().all()
+    mapped_markets = {str(row["condition_id"]): dict(row) for row in map_rows}
+    source_max = await _source_max_ts(source_engine, price_source, price_source)
     if source_max is None:
         return {**map_stats, "mode": "empty", "events_written": 0}
     source_max = _coerce_dt(source_max)
@@ -667,7 +670,7 @@ async def enrich_dataset(engine_vlad, engine_brain) -> dict:
     while cur <= source_max:
         write_end = min(source_max + timedelta(seconds=1), cur + timedelta(days=chunk_days))
         context_start = max(date_from, cur - timedelta(hours=context_h))
-        raw = await _load_price_chunk(engine_vlad, prices_table, parser_table, map_table, context_start, write_end)
+        raw = await _load_price_chunk(source_engine, price_source, price_source, mapped_markets, context_start, write_end)
         total_source += len(raw)
         ev, st = build_events(raw, cfg=mc, write_from=cur, write_to=write_end)
         total_events += len(ev)
