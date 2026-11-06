@@ -1,0 +1,64 @@
+[service]
+id = 99
+port = 8961
+name = "brain-earthquake-regimes-ml-s99"
+text = "USGS earthquake magnitude/depth/location, local sequences and causal activity regimes with ML/reverse-learning"
+
+[rates]
+table = "brain_rates_eur_usd"
+
+[cache]
+date_from = "2025-01-01"
+var_range = [0, 1, 2, 3]
+types_range = [0, 1, 2, 3, 4]
+param_range = [""]
+shift_window = 12
+reload_interval = 3600
+rebuild_interval = 7200
+ml_workers = 2
+ml_batch_size = 2000
+batch_model_size = 1000
+
+[dataset]
+parser_table = "vlad_usgs_earthquakes"
+# Model 41 reads the raw table from MASTER_*. Change explicitly if it was moved.
+source_engine = "brain"
+enriched_table = "vlad_usgs_regimes_s99"
+index_fields = ["event_type"]
+date_field = "date_dt"
+engine = "vlad"
+filter_by_date = true
+key_field = "event_type"
+model_can_filter = true
+model_uses_rates = false
+
+[ctx]
+key_columns = ["id"]
+
+[model]
+min_magnitude = 4.5
+# event_time: historical replay with an assumed publication delay, not a vintage archive.
+# first_seen: also wait for loaded_at; old backfills become available on ingestion.
+availability_mode = "event_time"
+publication_lag_minutes = 60
+cluster_hours = 72
+cluster_radius_km = 300.0
+escalation_magnitude = 0.3
+baseline_days = 30
+baseline_min_days = 7
+activity_elevated = 2.0
+activity_extreme = 4.0
+min_analogs = 8
+history_days = 730
+extremum_prior = 4.0
+rare_occurrence_max = 0
+
+[ml]
+enabled = true
+init_mode = "constant"
+target_precision = 0.95
+max_iter = 20
+step = 0.10
+extremum_limit = 50
+active_tail = 0
+precision_metric = "mean"
