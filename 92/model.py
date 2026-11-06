@@ -45,8 +45,17 @@ from datetime import datetime, timedelta
 from typing import Any
 
 import numpy as np
+from brain_strict_reduction import strict_masked_reduce
 
 from brain_framework import get_service_config
+
+# Runtime memoization state shared by single and batch model entry points.
+# Same bounded cache contract as the sibling algorithm service.
+_CACHE_LOCK = threading.RLock()
+_SINGLE_CACHE = OrderedDict()
+_SINGLE_CACHE_MAX = 32
+_BATCH_CACHE = OrderedDict()
+_BATCH_CACHE_MAX = 1
 
 # ---------------------------------------------------------------------------
 # Framework contract
@@ -1328,7 +1337,7 @@ def _previous_direction(np_rates: dict | None, target_date: datetime) -> tuple[b
     return predict_max, "ext_max" if predict_max else "ext_min"
 
 
-def _aggregate_analogs_by_var(
+def _aggregate_analogs_by_var_reference(
     analog_rows: list[dict[str, Any]],
     analog_dates: list[datetime],
     target_date: datetime,
@@ -1385,6 +1394,68 @@ def _aggregate_analogs_by_var(
     return {v: tuple(x) for v, x in stats.items()}
 
 
+
+def _aggregate_analogs_by_var(
+    analog_rows, analog_dates, target_date, current_event_time, shift,
+    *, is_daily, np_rates, ext_name, _prepared=None,
+):
+    # Cache belongs ONLY to this one target-date evaluation, never a live tail.
+    cache = _prepared if _prepared is not None else {}
+    end = bisect.bisect_left(analog_dates, target_date)
+    if end <= 0:
+        return {v: (0.0, 0.0, 0, 0.0, 0.0, 0.0) for v in VAR_RANGE}
+    if end > 100_000 or len(VAR_RANGE) > 256:
+        return _aggregate_analogs_by_var_reference(analog_rows, analog_dates, target_date, current_event_time, shift, is_daily=is_daily, np_rates=np_rates, ext_name=ext_name)
+    dates_ns = np_rates.get("dates_ns") if np_rates else None
+    t1_arr = np_rates.get("t1") if np_rates else None
+    ext_arr = np_rates.get(ext_name) if np_rates else None
+    if dates_ns is None or t1_arr is None or ext_arr is None:
+        return {v: (0.0, 0.0, 0, 0.0, 0.0, 0.0) for v in VAR_RANGE}
+    key = (id(analog_rows), id(analog_dates), end, int(shift), bool(is_daily), id(np_rates), ext_name)
+    def ordinal_us(dt):
+        if dt.tzinfo is not None:
+            raise ValueError("AWARE_DATETIME_REFERENCE_FALLBACK")
+        return ((dt.toordinal() * 86400 + dt.hour * 3600 + dt.minute * 60 + dt.second) * 1000000 + dt.microsecond)
+    try:
+        arrays = cache.get(key)
+        if arrays is None:
+            unit = timedelta(days=1) if is_daily else timedelta(hours=1)
+            dates = analog_dates[:end]
+            frames = [_frame_date(dt + unit * int(shift), is_daily) for dt in dates]
+            timestamps = np.array([int(f.timestamp()) for f in frames], dtype=np.int64)
+            idx = np.searchsorted(dates_ns, timestamps, side="left")
+            valid = np.array([j < len(dates_ns) and int(dates_ns[j]) == int(ts) for j, ts in zip(idx, timestamps)], dtype=np.uint8)
+            raw = np.zeros(end, dtype=np.float64)
+            hits = np.zeros(end, dtype=np.float64)
+            weights = np.zeros(end, dtype=np.float64)
+            mask_key = ("masks", id(analog_rows), end, tuple(VAR_RANGE))
+            masks = cache.get(mask_key)
+            if masks is None:
+                masks = np.array([[int(_var_allows_row(analog_rows[j], v)) for v in VAR_RANGE] for j in range(end)], dtype=np.uint8)
+                if cache.get("_bytes", 0) + masks.nbytes <= 16 * 1024**2:
+                    cache[mask_key] = masks
+                    cache["_bytes"] = cache.get("_bytes", 0) + masks.nbytes
+            for j in range(end):
+                if not valid[j]:
+                    continue
+                raw[j] = float(t1_arr[idx[j]])
+                hits[j] = 1.0 if bool(ext_arr[idx[j]]) else 0.0
+                quality = float(analog_rows[j].get("quality_score") or 1.0)
+                weights[j] = min(max(quality / 0.65, 0.25), 2.5)
+            dates_ord = np.array([ordinal_us(dt) for dt in dates], dtype=np.int64)
+            ends_ord = np.array([ordinal_us(f + unit) for f in frames], dtype=np.int64)
+            arrays = (raw, hits, weights, masks, dates_ord, ends_ord, valid)
+            size = sum(a.nbytes for a in arrays)
+            if cache.get("_bytes", 0) + size <= 16 * 1024**2:
+                cache[key] = arrays
+                cache["_bytes"] = cache.get("_bytes", 0) + size
+        stats = strict_masked_reduce(*arrays, end, ordinal_us(current_event_time), ordinal_us(target_date))
+        return {v: (float(stats[i,0]), float(stats[i,1]), int(stats[i,2]), float(stats[i,3]), float(stats[i,4]), float(stats[i,5])) for i,v in enumerate(VAR_RANGE)}
+    except (TypeError, ValueError, OverflowError, IndexError):
+        # Unsupported input shapes preserve the old validation/error semantics.
+        return _aggregate_analogs_by_var_reference(analog_rows, analog_dates, target_date, current_event_time, shift, is_daily=is_daily, np_rates=np_rates, ext_name=ext_name)
+
+
 def _mode1_score(hits: float, total: float, predict_max: bool) -> float:
     if total <= 0:
         return 0.0
@@ -1422,6 +1493,7 @@ def _compute_all_slots_for_date(
     unit_seconds = 86400 if is_daily else 3600
     predict_max, ext_name = _previous_direction(np_rates, target_date)
     current = _current_rows(source, target_date, di, is_daily)
+    _prepared = {}
 
     for row in current:
         event_dt = row.get("date") or row.get("date_dt")
@@ -1447,7 +1519,7 @@ def _compute_all_slots_for_date(
 
         by_var = _aggregate_analogs_by_var(
             analog_rows, analog_dates, target_date, event_dt, shift,
-            is_daily=is_daily, np_rates=np_rates, ext_name=ext_name,
+            is_daily=is_daily, np_rates=np_rates, ext_name=ext_name, _prepared=_prepared,
         )
 
         for var in VAR_RANGE:

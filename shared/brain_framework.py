@@ -57,6 +57,7 @@ FRAMEWORK_VERSION = "21.4-shared-parallel-runtime"
 import asyncio
 import bisect
 import concurrent.futures as _cf
+import copy as _copy
 import inspect
 import hashlib
 import json as _json
@@ -66,6 +67,7 @@ import math
 import os
 import random
 import sys
+import time as _time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 
@@ -92,6 +94,54 @@ def _framework_file_sha256(path: str) -> str:
         return h.hexdigest()
     except Exception:
         return "unavailable"
+
+
+def _hourly_rebuild_target_minute(service_identity: str) -> int:
+    """Stable per-service minute in the framework's :30..:34 rebuild window."""
+    digest = hashlib.sha256(str(service_identity).encode("utf-8")).digest()
+    return 30 + (digest[0] % 5)
+
+
+def _hourly_rebuild_slot(now: datetime, target_minute: int) -> tuple[str, datetime]:
+    target = now.replace(minute=target_minute, second=0, microsecond=0)
+    if now < target:
+        target -= timedelta(hours=1)
+    return target.strftime("%Y-%m-%dT%H"), target
+
+
+def _hourly_rebuild_marker_path(service_identity: str) -> str:
+    key = hashlib.sha256(str(service_identity).encode("utf-8")).hexdigest()[:24]
+    return f"/tmp/brain_framework_hourly_rebuild_{key}.json"
+
+
+def _hourly_rebuild_lock_path(service_identity: str) -> str:
+    key = hashlib.sha256(str(service_identity).encode("utf-8")).hexdigest()[:24]
+    return f"/tmp/brain_framework_hourly_rebuild_{key}.lock"
+
+
+def _hourly_rebuild_retry_decision(
+    marker: dict | None, slot: str, now: datetime, max_attempts: int = 2
+) -> tuple[int | None, str | None]:
+    """Return (next attempt, skip reason); STARTED is retryable after lock loss."""
+    if not marker or marker.get("slot") != slot:
+        return 1, None
+    if marker.get("status") == "PASS":
+        return None, "ALREADY_DONE"
+    if marker.get("status") == "STARTED":
+        # A process restart while STARTED is ambiguous: the rebuild may have
+        # completed before its PASS marker was persisted. Fail closed this slot.
+        return None, "INTERRUPTED_STARTED"
+    attempts = int(marker.get("attempts") or 0)
+    if attempts >= max_attempts:
+        return None, "RETRY_LIMIT"
+    retry_after = marker.get("retry_after")
+    if marker.get("status") == "FAIL" and retry_after:
+        try:
+            if datetime.fromisoformat(retry_after) > now:
+                return None, "RETRY_WAIT"
+        except (TypeError, ValueError):
+            pass
+    return attempts + 1, None
 
 
 _FRAMEWORK_LOADED_AT = datetime.now().isoformat(timespec="seconds")
@@ -2101,7 +2151,7 @@ async def _refresh_simple_rates(s: _State) -> None:
 
 # ── Веса, контекст, датасет ───────────────────────────────────────────────────
 
-async def _load_weight_codes(s: _State):
+async def _load_weight_codes(s: _State, *, strict: bool = False):
     if not s.WEIGHTS_TABLE:
         s.weight_codes = []
         return
@@ -2115,9 +2165,11 @@ async def _load_weight_codes(s: _State):
     except Exception as e:
         s.weight_codes = []
         log(f"   weight_codes: {e}", s.NODE_NAME, level="error")
+        if strict:
+            raise
 
 
-async def _load_ctx_index(s: _State):
+async def _load_ctx_index(s: _State, *, strict: bool = False):
     if not s.CTX_TABLE and not s.CTX_QUERY:
         s.ctx_index = {}
         return
@@ -2134,9 +2186,11 @@ async def _load_ctx_index(s: _State):
     except Exception as e:
         s.ctx_index = {}
         log(f"   ctx_index: {e}", s.NODE_NAME, level="error")
+        if strict:
+            raise
 
 
-async def _load_url_map(s: _State):
+async def _load_url_map(s: _State, *, strict: bool = False):
     if not s.URL_MAP_QUERY:
         s.url_map = {}
         return
@@ -2149,6 +2203,8 @@ async def _load_url_map(s: _State):
     except Exception as e:
         s.url_map = {}
         log(f"   url_map: {e}", s.NODE_NAME, level="error")
+        if strict:
+            raise
 
 
 def _build_label_from_row(info: dict, ctx_id: int) -> str:
@@ -2166,7 +2222,7 @@ def _build_label_from_row(info: dict, ctx_id: int) -> str:
     return label or f"ctx_id={ctx_id}"
 
 
-async def _load_label_cache(s: _State):
+async def _load_label_cache(s: _State, *, strict: bool = False):
     if not s.CTX_TABLE:
         return
     try:
@@ -2182,9 +2238,11 @@ async def _load_label_cache(s: _State):
         log(f"  label_cache: {len(s._label_cache)}", s.NODE_NAME)
     except Exception as e:
         log(f"   label_cache: {e}", s.NODE_NAME, level="warning")
+        if strict:
+            raise
 
 
-async def _load_dataset(s: _State):
+async def _load_dataset(s: _State, *, strict: bool = False):
     if not s.DATASET_QUERY and not s.DATASET_TABLE:
         s.dataset = []
         return
@@ -2224,6 +2282,8 @@ async def _load_dataset(s: _State):
     except Exception as e:
         s.dataset = []
         log(f"   dataset: {e}", s.NODE_NAME, level="error")
+        if strict:
+            raise
 
 
 # === ПАТЧ 2: _build_dataset_index — сортировка + numpy timestamps ===
@@ -2792,11 +2852,10 @@ def build_app(model_module) -> FastAPI:
             cached = s._ml_active_cache.get(key)
             if cached is not None:
                 return cached
-            try:
-                model_result = await _run_model_offloop(_model_at, ext_dt)
-                codes = list(model_result.keys())
-            except Exception:
-                codes = []
+            # A failed provider is not a successful empty universe.
+            # Memoize only successfully computed codes, including legitimate [].
+            model_result = await _run_model_offloop(_model_at, ext_dt)
+            codes = list(model_result.keys())
             s._ml_active_cache[key] = codes
             return codes
 
@@ -2827,7 +2886,7 @@ def build_app(model_module) -> FastAPI:
             log(f"   ML _call_model {target_date}: {e}",
                 s.NODE_NAME, level="error")
             send_error_trace(e, s.NODE_NAME, "ml_call_model")
-            return {}
+            raise
 
     async def _call_model(pair, day, date_str, calc_type=0, calc_var=0, param="",
                           _skip_refresh: bool = False):
@@ -2908,7 +2967,19 @@ def build_app(model_module) -> FastAPI:
 
     # ── _do_rebuild [C] ───────────────────────────────────────────────────────
 
-    async def _do_rebuild() -> dict:
+    _rebuild_lock = asyncio.Lock()
+
+    def _rebuild_supported() -> bool:
+        # Keep hourly capability identical to the established /rebuild_index
+        # contract; enrich_fn alone is not the complete contract.
+        return bool(
+            s.index_builder_fn is not None
+            or s.weight_builder_fn is not None
+            or s.enrich_fn is not None
+            or s.ENRICHED_TABLE
+        )
+
+    async def _do_rebuild_locked() -> dict:
         stats = {}
 
         # Шаг 0: enrich_dataset() — трансформация raw → enriched
@@ -2939,6 +3010,8 @@ def build_app(model_module) -> FastAPI:
                     "indexes_table": f"{s.ENRICHED_TABLE}_indexes",
                 }
                 stats["auto_weights"] = await _auto_build_weights()
+                if isinstance(stats["auto_weights"], dict) and stats["auto_weights"].get("error"):
+                    raise RuntimeError(stats["auto_weights"]["error"])
                 log(f"   dataset_indexer: {s.ENRICHED_TABLE}", s.NODE_NAME, force=True)
             except Exception as e:
                 log(f"   dataset_indexer: {e}", s.NODE_NAME, level="error")
@@ -2997,19 +3070,32 @@ def build_app(model_module) -> FastAPI:
             str(_enrich_result.get("mode") or "").lower()
             if isinstance(_enrich_result, dict) else ""
         )
+        staged = _copy.copy(s)
         if s.enrich_fn is not None and _enrich_mode not in ("noop", "locked"):
-            await _load_dataset(s)
-            stats["dataset_reload"] = {"rows": len(s.dataset), "mode": _enrich_mode or "changed"}
+            await _load_dataset(staged, strict=True)
+            stats["dataset_reload"] = {"rows": len(staged.dataset), "mode": _enrich_mode or "changed"}
             log(
-                f"   dataset reload after enrich: {len(s.dataset)} rows",
+                f"   dataset reload after enrich: {len(staged.dataset)} rows",
                 s.NODE_NAME, force=True,
             )
 
-        await _load_weight_codes(s)
-        await _load_ctx_index(s)
-        await _load_label_cache(s)
-        await _load_url_map(s)
-        s.last_rebuild = datetime.now()
+        await _load_weight_codes(staged, strict=True)
+        await _load_ctx_index(staged, strict=True)
+        await _load_label_cache(staged, strict=True)
+        await _load_url_map(staged, strict=True)
+        rebuilt_at = datetime.now()
+        staged.last_rebuild = rebuilt_at
+        # Build while readers continue using the old good snapshot. Publish only
+        # after every staged loader has succeeded.
+        async with _model_state_gate.write():
+            for name in (
+                "dataset", "dataset_dates", "dataset_by_key", "dataset_key_dates",
+                "_dataset_ts_arr", "weight_codes", "weights_row_count",
+                "ctx_index", "ctx_row_count", "_label_cache", "url_map",
+                "last_rebuild",
+            ):
+                if hasattr(staged, name):
+                    setattr(s, name, getattr(staged, name))
         log(
             f" rebuild done: weights={len(s.weight_codes)} ctx={len(s.ctx_index)}",
             s.NODE_NAME, force=True,
@@ -3020,6 +3106,10 @@ def build_app(model_module) -> FastAPI:
             "weights_total": len(s.weight_codes),
             "rebuilt_at":    s.last_rebuild.isoformat(),
         }
+
+    async def _do_rebuild() -> dict:
+        async with _rebuild_lock:
+            return await _do_rebuild_locked()
 
     async def _auto_build_weights() -> dict:
         """
@@ -3062,9 +3152,6 @@ def build_app(model_module) -> FastAPI:
             for mode in (0, 1)
             for shift in range(0, (s.SHIFT_WINDOW if (occ or 0) >= 2 else 0) + 1)
         ]
-        if not rows:
-            return {"weights": 0}
-
         async with s.engine_vlad.begin() as conn:
             await conn.execute(text(f"""
                 CREATE TABLE IF NOT EXISTS `{s.WEIGHTS_TABLE}` (
@@ -3088,30 +3175,232 @@ def build_app(model_module) -> FastAPI:
 
         return {"contexts": len(ctx_rows), "weights": len(rows)}
 
-    # ── _bg_reload ────────────────────────────────────────────────────────────
+    # ── _bg_reload + framework-default hourly rebuild ────────────────────────
+
+    _hourly_identity = f"{s.NODE_NAME}:{int(s.SERVICE_ID)}:{int(s.PORT)}"
+    _hourly_marker = _hourly_rebuild_marker_path(_hourly_identity)
+    _hourly_lock_path = _hourly_rebuild_lock_path(_hourly_identity)
+    _hourly_seen_slot = None
+    _hourly_seen_unsupported_slot = None
+
+    def _hourly_source_watermark(stats: dict):
+        def _find(value):
+            if isinstance(value, dict):
+                for key in ("source_watermark", "source_max_ts", "watermark"):
+                    if value.get(key) is not None:
+                        return value[key]
+                for child in value.values():
+                    found = _find(child)
+                    if found is not None:
+                        return found
+            elif isinstance(value, (list, tuple)):
+                for child in value:
+                    found = _find(child)
+                    if found is not None:
+                        return found
+            return None
+        return _find(stats)
+
+    def _hourly_read_marker():
+        try:
+            with open(_hourly_marker, "r", encoding="utf-8") as fh:
+                marker = _json.load(fh)
+            if not isinstance(marker, dict):
+                raise ValueError("marker root is not an object")
+            return marker
+        except FileNotFoundError:
+            return None
+
+    def _hourly_write_marker(marker: dict):
+        tmp = f"{_hourly_marker}.{os.getpid()}.{_time.time_ns()}.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                _json.dump(marker, fh, sort_keys=True, separators=(",", ":"))
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, _hourly_marker)
+        finally:
+            try:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+            except OSError:
+                pass
+
+    async def _run_hourly_rebuild(slot: str, scheduled_at: datetime):
+        nonlocal _hourly_seen_slot, _hourly_seen_unsupported_slot
+        if not _rebuild_supported():
+            if _hourly_seen_unsupported_slot != slot:
+                log(
+                    f"FRAMEWORK_HOURLY_REBUILD_SKIP service={s.SERVICE_ID} "
+                    f"slot={slot} reason=UNSUPPORTED",
+                    s.NODE_NAME, force=True,
+                )
+                _hourly_seen_unsupported_slot = slot
+            return
+        if _hourly_seen_slot == slot:
+            return
+
+        try:
+            import fcntl as _fcntl
+        except ImportError as exc:
+            log(
+                f"FRAMEWORK_HOURLY_REBUILD_FAIL service={s.SERVICE_ID} "
+                f"slot={slot} reason=FLOCK_UNAVAILABLE",
+                s.NODE_NAME, level="error", force=True,
+            )
+            _hourly_seen_slot = slot
+            return
+
+        lock_fd = os.open(_hourly_lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            try:
+                _fcntl.flock(lock_fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+            except BlockingIOError:
+                log(
+                    f"FRAMEWORK_HOURLY_REBUILD_SKIP service={s.SERVICE_ID} "
+                    f"slot={slot} reason=ACTIVE",
+                    s.NODE_NAME,
+                )
+                return
+
+            try:
+                marker = _hourly_read_marker()
+            except Exception as exc:
+                log(
+                    f"FRAMEWORK_HOURLY_REBUILD_FAIL service={s.SERVICE_ID} "
+                    f"slot={slot} reason=INVALID_SLOT_STATE error={exc}",
+                    s.NODE_NAME, level="error", force=True,
+                )
+                _hourly_seen_slot = slot
+                return
+
+            attempt, skip_reason = _hourly_rebuild_retry_decision(
+                marker, slot, datetime.now(), max_attempts=2
+            )
+            if skip_reason:
+                if skip_reason != "RETRY_WAIT":
+                    log(
+                        f"FRAMEWORK_HOURLY_REBUILD_SKIP service={s.SERVICE_ID} "
+                        f"slot={slot} reason={skip_reason}",
+                        s.NODE_NAME,
+                    )
+                if skip_reason != "RETRY_WAIT":
+                    _hourly_seen_slot = slot
+                return
+
+            started_at = datetime.now()
+            marker = {
+                "slot": slot,
+                "status": "STARTED",
+                "attempts": attempt,
+                "pid": os.getpid(),
+                "started_at": started_at.isoformat(),
+                "scheduled_at": scheduled_at.isoformat(),
+            }
+            _hourly_write_marker(marker)
+            log(
+                f"FRAMEWORK_HOURLY_REBUILD_START service={s.SERVICE_ID} "
+                f"slot={slot} attempt={attempt}",
+                s.NODE_NAME, force=True,
+            )
+            try:
+                stats = await _do_rebuild()
+                if not isinstance(stats, dict) or stats.get("error"):
+                    raise RuntimeError((stats or {}).get("error") or "invalid rebuild result")
+            except Exception as exc:
+                failed_at = datetime.now()
+                can_retry = attempt < 2
+                try:
+                    _hourly_write_marker({
+                        **marker,
+                        "status": "FAIL",
+                        "failed_at": failed_at.isoformat(),
+                        "retry_after": (failed_at + timedelta(seconds=60)).isoformat()
+                            if can_retry else None,
+                        "error": str(exc)[:1000],
+                    })
+                except Exception as state_exc:
+                    can_retry = False
+                    log(
+                        f"FRAMEWORK_HOURLY_REBUILD_FAIL service={s.SERVICE_ID} "
+                        f"slot={slot} reason=SLOT_STATE_WRITE error={state_exc}",
+                        s.NODE_NAME, level="error", force=True,
+                    )
+                log(
+                    f"FRAMEWORK_HOURLY_REBUILD_FAIL service={s.SERVICE_ID} "
+                    f"slot={slot} attempt={attempt} retry={int(can_retry)} reason={exc}",
+                    s.NODE_NAME, level="error", force=True,
+                )
+                send_error_trace(exc, s.NODE_NAME, "hourly_rebuild")
+                if not can_retry:
+                    _hourly_seen_slot = slot
+                return
+
+            watermark = _hourly_source_watermark(stats)
+            completed_at = datetime.now()
+            try:
+                _hourly_write_marker({
+                    **marker,
+                    "status": "PASS",
+                    "completed_at": completed_at.isoformat(),
+                    "duration_ms": int((completed_at - started_at).total_seconds() * 1000),
+                    "source_watermark": str(watermark) if watermark is not None else None,
+                })
+            except Exception as state_exc:
+                # STARTED remains durable; do not retry an operation that already
+                # returned success because its completion marker could not persist.
+                _hourly_seen_slot = slot
+                log(
+                    f"FRAMEWORK_HOURLY_REBUILD_FAIL service={s.SERVICE_ID} "
+                    f"slot={slot} reason=PASS_STATE_WRITE error={state_exc}",
+                    s.NODE_NAME, level="error", force=True,
+                )
+                return
+            log(
+                f"FRAMEWORK_HOURLY_REBUILD_PASS service={s.SERVICE_ID} "
+                f"slot={slot} duration_ms={int((completed_at-started_at).total_seconds()*1000)} "
+                f"source_watermark={watermark if watermark is not None else 'unavailable'}",
+                s.NODE_NAME, force=True,
+            )
+            _hourly_seen_slot = slot
+        finally:
+            try:
+                _fcntl.flock(lock_fd, _fcntl.LOCK_UN)
+            finally:
+                os.close(lock_fd)
 
     async def _bg_reload():
+        last_reload_mono = _time.monotonic()
+        reload_every = max(1, int(s.RELOAD_INTERVAL or 3600))
         while True:
-            await asyncio.sleep(s.RELOAD_INTERVAL)
             try:
-                await _refresh_simple_rates(s)
-                for table in _RATES_TABLES:
-                    await _refresh_rates(table, s)
-                _has_any_rebuild = (
-                    s.index_builder_fn or s.weight_builder_fn  # старый стиль
-                    or s.enrich_fn or s.ENRICHED_TABLE          # новый стиль
-                )
-                if (s.REBUILD_INTERVAL > 0
-                        and _has_any_rebuild
-                        and (s.last_rebuild is None or
-                             (datetime.now() - s.last_rebuild).total_seconds()
-                             >= s.REBUILD_INTERVAL)):
-                    async with _model_state_gate.write():
-                        await _do_rebuild()
-                s.last_reload = datetime.now()
+                now = datetime.now()
+                target_minute = _hourly_rebuild_target_minute(_hourly_identity)
+                slot, slot_target = _hourly_rebuild_slot(now, target_minute)
+                if now.strftime("%Y-%m-%dT%H") == slot and now >= slot_target:
+                    await _run_hourly_rebuild(slot, slot_target)
+
+                if _time.monotonic() - last_reload_mono >= reload_every:
+                    await _refresh_simple_rates(s)
+                    for table in _RATES_TABLES:
+                        await _refresh_rates(table, s)
+                    s.last_reload = datetime.now()
+                    last_reload_mono = _time.monotonic()
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 log(f" bg_reload: {e}", s.NODE_NAME, level="error", force=True)
                 send_error_trace(e, s.NODE_NAME, "bg_reload")
+
+            now = datetime.now()
+            target_minute = _hourly_rebuild_target_minute(_hourly_identity)
+            next_target = now.replace(minute=target_minute, second=0, microsecond=0)
+            if next_target <= now:
+                next_target += timedelta(hours=1)
+            until_rebuild = max(0.5, (next_target - now).total_seconds())
+            until_reload = max(0.5, reload_every - (_time.monotonic() - last_reload_mono))
+            await asyncio.sleep(min(60.0, until_rebuild, until_reload))
 
     # ── fill_cache helpers ────────────────────────────────────────────────────
 
@@ -4561,9 +4850,9 @@ def build_app(model_module) -> FastAPI:
                 "cache_upstream":     s.cache_upstream_url if not s.compute_worker else None,
                 "last_reload":        s.last_reload.isoformat() if s.last_reload else None,
                 "last_rebuild":       s.last_rebuild.isoformat() if s.last_rebuild else None,
-                "rebuild_auto":       s.REBUILD_INTERVAL > 0 and bool(
-                    s.index_builder_fn or s.weight_builder_fn
-                    or s.enrich_fn or s.ENRICHED_TABLE),
+                "rebuild_auto":       _rebuild_supported(),
+                "hourly_rebuild_default": _rebuild_supported(),
+                "hourly_rebuild_target_minute": _hourly_rebuild_target_minute(_hourly_identity),
                 "rebuild_interval_s": s.REBUILD_INTERVAL,
                 "enriched_table":     s.ENRICHED_TABLE,
                 "ml_mode": ({
@@ -5385,8 +5674,9 @@ def build_app(model_module) -> FastAPI:
     @app.get("/reload")
     async def ep_reload():
         try:
-            async with _model_state_gate.write():
-                await _preload()
+            async with _rebuild_lock:
+                async with _model_state_gate.write():
+                    await _preload()
             return ok_response({"reloaded_at": s.last_reload.isoformat()})
         except Exception as e:
             send_error_trace(e, s.NODE_NAME, "reload")
@@ -5394,14 +5684,12 @@ def build_app(model_module) -> FastAPI:
 
     @app.get("/rebuild_index")
     async def ep_rebuild_index():
-        if (not s.index_builder_fn and not s.weight_builder_fn
-                and not s.enrich_fn and not s.ENRICHED_TABLE):
+        if not _rebuild_supported():
             return err_response(
                 "Rebuild не настроен. "
                 "Добавь context_idx.py + weights.py (старый стиль) "
                 "или enrich_dataset() + ENRICHED_TABLE в model.py (новый стиль).")
-        async with _model_state_gate.write():
-            result = await _do_rebuild()
+        result = await _do_rebuild()
         if "error" in result:
             return err_response(result["error"])
         return ok_response(result)
@@ -5753,10 +6041,7 @@ def build_app(model_module) -> FastAPI:
                     "error": f"[Тест 3 — Покрытие] {' | '.join(_failures3)}"}
 
         # ── Тест 4: rebuild_index ─────────────────────────────────────────────
-        _has_any_rebuild4 = (
-                s.index_builder_fn is not None or s.weight_builder_fn is not None
-                or s.enrich_fn is not None or bool(s.ENRICHED_TABLE)
-        )
+        _has_any_rebuild4 = _rebuild_supported()
         if _has_any_rebuild4:
             log("  [Тест 4] проверяем rebuild_index...", s.NODE_NAME, force=True)
             try:

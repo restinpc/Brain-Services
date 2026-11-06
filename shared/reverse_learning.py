@@ -1174,10 +1174,8 @@ async def train_at_date(
     else:
         pre_codes: list[list[str]] = []
         for ext_date, _ in seq:
-            try:
-                codes = await active_codes_at(ext_date)
-            except Exception:
-                codes = []
+            # Do not cache an exceptional provider as empty training data.
+            codes = await active_codes_at(ext_date)
             pre_codes.append(sorted(set(codes)))
 
         codes_key = tuple(tuple(c) for c in pre_codes)
@@ -1752,7 +1750,7 @@ class ReverseStore:
                 )
                 if loaded:
                     return loaded
-                return {}, 0.0
+                raise RuntimeError("ML_TRAINING_PENDING: reserved job has no durable universe")
 
         try:
             universe, pr, iters, ext_cnt, _from_train_cache = await train_at_date(
@@ -1849,7 +1847,7 @@ class ReverseStore:
             if log_fn:
                 log_fn(f"  ❌ ml-train {control_date}: {e}")
 
-            return {}, 0.0
+            raise
 
     async def maybe_retrain(
         self,
@@ -1903,10 +1901,8 @@ class ReverseStore:
         else:
             pre_codes: list[list[str]] = []
             for ext_date, _ in seq:
-                try:
-                    codes = await active_codes_at(ext_date)
-                except Exception:
-                    codes = []
+                # Do not cache an exceptional provider as empty training data.
+                codes = await active_codes_at(ext_date)
                 pre_codes.append(sorted(set(codes)))
             codes_key = tuple(tuple(c) for c in pre_codes)
             _seq_codes_cache[seq_cache_key] = (pre_codes, codes_key)
@@ -1988,7 +1984,7 @@ class ReverseStore:
                     )
                     if loaded_after_wait:
                         return loaded_after_wait
-                    return {}, 0.0
+                    raise RuntimeError("ML_TRAINING_PENDING: reserved job has no durable universe")
 
             try:
                 universe, pr, iters, ext_cnt, from_train_cache = await train_prebuilt_records(
@@ -2080,4 +2076,4 @@ class ReverseStore:
                 if log_fn:
                     log_fn(f"  ❌ ml-train {control_date}: {e}")
 
-                return {}, 0.0
+                raise
