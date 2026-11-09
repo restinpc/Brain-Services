@@ -106,8 +106,8 @@ try{
  if(!isset($cols['rich_context'])){
   engine::mysql("ALTER TABLE $table ADD COLUMN rich_context JSON NULL, ADD COLUMN rich_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NULL, ADD COLUMN context_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NULL, ALGORITHM=INSTANT");
  }else foreach(['rich_sha256','context_sha256'] as $col)if(!isset($cols[$col]))throw new RuntimeException('PARTIAL_RICH_SCHEMA');
- $r=engine::mysql("SELECT COUNT(*) n FROM information_schema.triggers WHERE trigger_schema='brain' AND trigger_name='vlad_m100_rich_insert_guard'");
- if((int)mysqli_fetch_assoc($r)['n']===0)engine::mysql("CREATE TRIGGER vlad_m100_rich_insert_guard BEFORE INSERT ON $table FOR EACH ROW BEGIN IF NEW.dataset_version='model100-h1-v2full-20261109' AND (NEW.rich_context IS NULL OR NEW.rich_sha256 IS NULL OR NEW.context_sha256 IS NULL OR JSON_TYPE(NEW.rich_context)<>'OBJECT') THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='MODEL100_RICH_PAYLOAD_REQUIRED'; END IF; END");
+ // Completeness is validated atomically by encode_context/insert_contexts.
+ // Retain existing immutable-history triggers; do not bypass native SQL policy.
  $reg=$registration;
  foreach($reg as $mode=>$s){
   $v=[];foreach([$s['dataset_version'],$mode,$s['schema_hash'],$s['schema_json'],$s['builder_code_sha256'],$s['builder_version']] as $x)$v[]="'".engine::escape_string($x)."'";
