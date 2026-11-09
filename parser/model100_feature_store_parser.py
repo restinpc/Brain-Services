@@ -158,6 +158,7 @@ def main(argv=None):
         else:
             result=update(db)
             result.update(update_v2(db))
+            result.update({'HISTORY_'+k:v for k,v in update_v2(db,history=True).items()})
         line={'at_utc':datetime.now(timezone.utc).isoformat(),'action':action,'dataset_version':DATASET,'modes':result}
         RUNTIME.mkdir(parents=True,exist_ok=True)
         with (RUNTIME/'runs.jsonl').open('a') as f:f.write(canonical(line)+'\n')

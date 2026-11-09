@@ -10,7 +10,9 @@ V1 is neither updated nor deleted. Add nullable `rich_context JSON`, `rich_sha25
 falling back to a rebuild. Root migration holds the existing registered writer lease and first streams
 every old V1 field, including formation time, to a compressed backup and manifest outside Git.
 Rollback means retaining additive columns and immutable rows while disabling the V2 extension;
-never deleting V1, reverting source data or recreating the table.
+never deleting V1, reverting source data or recreating the table. Root controls `disable-v2` and
+`enable-v2` update only V2 registry metadata under the same writer lease, with a prior backup.
+Disabled V2 does not stop V1 and does not require source snapshots.
 
 The fixed 489 values/masks reuse the V1 implementation and IEEE754 hex codec. The V2 schema embeds
 the rich contract. The registry schema hash therefore differs intentionally from V1 even though fixed
@@ -31,7 +33,7 @@ never an UPDATE. Payload limit: 512 KiB of canonical rich JSON.
 - **news:** latest 64 admissible article events in the preceding 24 hours, selected and sorted by
   availability and stable provider/article id. Actual `event_type`/`cluster_id` attach only when the NLP
   row version clock matches the frozen snapshot. Topic, novelty, quality, confirmations, similarity,
-  publication/receipt/text/NLP clocks and existing artifact SHA are retained. Article identity does not
+  publication/receipt/text/NLP clocks, original feed category and existing artifact SHA are retained. Article identity does not
   assert cross-provider identity. No embedding is invented: the inspected event table has no persisted
   per-event embedding/NMF/SVD vector. Window statistics use 1/3/6/12/24 hours, include topic activity
   changes, total/omitted counts and omitted-topic distribution. No full article/HTML is copied.
@@ -42,16 +44,27 @@ never an UPDATE. Payload limit: 512 KiB of canonical rich JSON.
   nowcast errors require identical target original SHA, reference period, official publication clock,
   a strictly earlier forecast availability, and verified GDP annualized/CPI monthly unit semantics.
   Latest forecasts are retained separately per provider. These errors exist only after the actual
-  release becomes admissible; they never relax conservative forward forecast expiry. There is no
+  release becomes admissible. There is no
   retrospective price-response feature and no copied `pct_change`/`t1` from Model80 analogues.
   Existing
-  forecast expiry policy is reused; no future release calendar extends expired forecasts. Historical
+  fixed numeric forecast expiry policy is reused. Additional rich pre-release vintages preserve
+  real forecasts after a quarter/month ends only when an original first-actual clock proves that
+  the actual had not yet been published at the cutoff. Unknown target clocks keep the conservative
+  period-end policy. Forecast sequences stop at actual publication. Future target-document SHA and
+  retrospectively discovered target clocks are not exposed as input features; time-to-target stays
+  null without contemporaneous calendar evidence. Up to32 records/45days, latest per series then
+  two preceding vintages, with explicit omitted counts. Historical
   backfill receipt after cutoff is masked and explicitly labelled, not called original Brain receipt.
 - **price:** one Yahoo EUR/USD series from `brain.sasha_rates_eur_usd`; last 72 calendar hours, no
   synthetic candles, explicit gaps and 24/48/72-hour summaries. OHLC, shadows, true range, close
   position, log return, prior volatility, momentum, ATR, range position, acceleration and directional
   streak use only admitted closed candles. Session labels are fixed UTC activity buckets, explicitly
   not exchange/DST session clocks. Weekend gaps are not trading-hour substitutions.
+  True range uses the previous actual source bar close across weekends, only if that version is
+  available at cutoff and the gap is at most96hours; missing ranges remain null with counts.
+  H1 log returns require the immediately preceding calendar-hour bar. The24h HIGH_VOLATILITY
+  heuristic requires realized volatility above1.5times the previous24h, with12 valid returns in
+  each window. It is a descriptive input, not a trained trading signal.
 - **gdelt:** geo country/category counts over all source rows; bounded GKG samples with actual themes,
   locations/country codes, tone, provider and source ids. Sampling retains hourly total counts and is
   labelled; sample distributions are separate from full geo distributions. No inferred causal links.
@@ -76,9 +89,17 @@ source publication hour. Later article text is not newly admitted to strict hist
 
 Same registered parser ID168 and PHP `parser_run_registered_row()` / `BrainParserWriterFence`.
 V1 commits first. V2 failures have separate status and cannot undo successful V1 work. At most 256
-missing market cutoffs per mode per call; subsequent calls resume from missing keys. Historical
+missing market cutoffs per mode and lane per call; subsequent calls resume from missing keys. Live
+updates precede one bounded archive recovery wave. Live/history status is independent; archive success
+cannot hide failed live. Recovery uses the last actual progress, so outages beyond seven days do not
+silently abandon earlier missing hours. The bootstrap boundary is stored in the existing schema
+registry. Completed-history checks and current updates do not depend on historical snapshot files.
+Historical
 captures are pinned/hash checked; new hours use bounded source reads and retained snapshots.
 No second cron, no writers or admission changes on B2–B4.
+
+DDL reference: [MySQL8.4 online column operations](https://dev.mysql.com/doc/refman/8.4/en/innodb-online-ddl-operations.html).
+The target is verified InnoDB/DYNAMIC without FULLTEXT; explicit INSTANT rejects unsupported cases.
 
 Python async interfaces, using the existing Brain engine:
 

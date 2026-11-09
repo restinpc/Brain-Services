@@ -17,7 +17,7 @@ async def enrich(brain_engine, vlad_engine, snapshot, start, end):
     async with vlad_engine.connect() as c:
         await c.exec_driver_sql("SET time_zone='+00:00'")
         await c.rollback();await c.exec_driver_sql('SET TRANSACTION READ ONLY')
-        sql='SELECT press,source_id,event_type,cluster_id,updated_at AS nlp_updated_at FROM vlad_news_algo_events WHERE date_dt>=:start AND date_dt<=:end ORDER BY date_dt,id'
+        sql='SELECT press,source_id,feed,event_type,cluster_id,cluster_similarity,updated_at AS nlp_updated_at FROM vlad_news_algo_events WHERE date_dt>=:start AND date_dt<=:end ORDER BY date_dt,id'
         async for row in stream_rows(c,sql,params):
             r=serial(row)
             if wanted.get((r['press'],int(r['source_id'])))==r['nlp_updated_at']:
@@ -43,21 +43,30 @@ async def enrich(brain_engine, vlad_engine, snapshot, start, end):
                 FROM vlad_gdelt_geo_events WHERE snapshot_at>=:start AND snapshot_at<:end
                 AND {pub}<=:cutoff GROUP BY epoch,country,category ORDER BY epoch,country,category'''
         buckets={}
+        def add_geo(rows):
+            for r in rows:
+                epoch=int(r['epoch'])
+                if datetime.fromtimestamp(epoch,timezone.utc)>clock(end):continue
+                b=buckets.setdefault(epoch,dict(countries=Counter(),categories=Counter(),count=0,
+                    tone_sum=0.,tone_count=0,first_id=int(r['min_id']),last_id=int(r['max_id'])))
+                b['countries'][r['country'] or 'UNKNOWN']+=int(r['n'])
+                b['categories'][r['category'] or 'UNKNOWN']+=int(r['n'])
+                b['count']+=int(r['n']);b['tone_sum']+=float(r['tone_sum'] or 0);b['tone_count']+=int(r['tone_count'])
+                b['first_id']=min(b['first_id'],int(r['min_id']));b['last_id']=max(b['last_id'],int(r['max_id']))
         try:
             chunk=params['start']
             while chunk<params['end']:
                 stop=min(chunk+timedelta(days=14),params['end'])
-                args=dict(start=chunk,end=stop,cutoff=params['end'])
-                for r in (await c.execute(text(sql),args)).mappings():
-                        epoch=int(r['epoch'])
-                        if datetime.fromtimestamp(epoch,timezone.utc)>clock(end):continue
-                        b=buckets.setdefault(epoch,dict(countries=Counter(),categories=Counter(),count=0,
-                            tone_sum=0.,tone_count=0,first_id=int(r['min_id']),last_id=int(r['max_id'])))
-                        b['countries'][r['country'] or 'UNKNOWN']+=int(r['n'])
-                        b['categories'][r['category'] or 'UNKNOWN']+=int(r['n'])
-                        b['count']+=int(r['n']);b['tone_sum']+=float(r['tone_sum'] or 0);b['tone_count']+=int(r['tone_count'])
-                        b['first_id']=min(b['first_id'],int(r['min_id']));b['last_id']=max(b['last_id'],int(r['max_id']))
+                inclusive_stop=stop+timedelta(microseconds=1) if stop==params['end'] else stop
+                args=dict(start=chunk,end=inclusive_stop,cutoff=params['end'])
+                add_geo((await c.execute(text(sql),args)).mappings())
                 chunk=stop
+            if snapshot['capture_mode']=='STRICT_ASOF':
+                # Disjoint from publication-window rows: late receipt of an old
+                # snapshot must appear now, not be silently lost during recovery.
+                late=sql.replace('snapshot_at>=:start AND snapshot_at<:end',
+                                 'snapshot_at<:start AND loaded_at>=:start AND loaded_at<=:end')
+                add_geo((await c.execute(text(late),dict(params,cutoff=params['end']))).mappings())
             for epoch,b in sorted(buckets.items()):
                 countries=sorted(b.pop('countries').items(),key=lambda kv:(-kv[1],kv[0]))
                 b['countries']=dict(countries[:32]);b['omitted_country_mentions']=sum(v for _,v in countries[32:])
@@ -72,13 +81,16 @@ async def enrich(brain_engine, vlad_engine, snapshot, start, end):
         # availability hour, with the complete hourly count retained.
         pub='GREATEST(available_at,loaded_at)' if snapshot['capture_mode']=='STRICT_ASOF' else 'available_at'
         outer_pub='GREATEST(n.available_at,n.loaded_at)' if snapshot['capture_mode']=='STRICT_ASOF' else 'n.available_at'
+        where=f'available_at>=:start AND available_at<=:end AND {pub}<=:end'
+        if snapshot['capture_mode']=='STRICT_ASOF':
+            where='('+where+') OR (available_at<:start AND loaded_at>=:start AND loaded_at<=:end)'
         sql=f'''SELECT n.id,n.record_key,n.event_id,n.story_id,n.source,
                 n.v2_themes,n.v2_locations,n.v2_tone,{outer_pub} AS effective_available,
                 ranked.epoch,ranked.rn,ranked.total FROM (SELECT id,
                 CEIL(UNIX_TIMESTAMP({pub})/3600)*3600 AS epoch,
                 ROW_NUMBER() OVER(PARTITION BY CEIL(UNIX_TIMESTAMP({pub})/3600) ORDER BY id) rn,
                 COUNT(*) OVER(PARTITION BY CEIL(UNIX_TIMESTAMP({pub})/3600)) total
-                FROM sasha_gdelt_news WHERE available_at>=:start AND available_at<=:end AND {pub}<=:end
+                FROM sasha_gdelt_news WHERE {where}
                 ) ranked JOIN sasha_gdelt_news n ON n.id=ranked.id WHERE ranked.rn<=4 ORDER BY ranked.epoch,n.id'''
         try:
             for r in (await c.execute(text(sql),params)).mappings():

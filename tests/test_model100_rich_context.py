@@ -73,8 +73,10 @@ class RichTests(unittest.TestCase):
         self.assertEqual((len(c['events']),c['omitted_count'],c['total_24h']),(64,16,80))
 
     def test_later_semantic_row_rejected(self):
-        r=RichContextBuilder(self.news_base(1),{'news':[dict(press='cnn',source_id=0,nlp_updated_at='2026-02-01',event_type='future')]})
-        self.assertIsNone(r.build_at('2026-01-01T15:00:00Z')['groups']['news']['events'][0]['event_type'])
+        b=self.news_base(1);b.news['cnn'].rows[0]['cluster_similarity']=.9
+        r=RichContextBuilder(b,{'news':[dict(press='cnn',source_id=0,nlp_updated_at='2026-02-01',event_type='future',cluster_similarity=.8)]})
+        e=r.build_at('2026-01-01T15:00:00Z')['groups']['news']['events'][0]
+        self.assertIsNone(e['event_type']);self.assertIsNone(e['cluster_similarity'])
 
     def test_gdelt_future(self):
         r=RichContextBuilder(self.base(),{'gdelt':[dict(available_at='2026-01-01T16:00:00Z',row_id='future')]})
@@ -140,6 +142,62 @@ class RichTests(unittest.TestCase):
         self.assertEqual(RichContextBuilder(b)._nowcast_comparisons(actual),[])
         b.forecast_vintages[0]['_at']=clock('2025-04-29T12:00:00Z');actual['original_sha256']='different_document'
         self.assertEqual(RichContextBuilder(b)._nowcast_comparisons(actual),[])
+
+    def test_forecast_after_quarter_end_before_actual_is_preserved(self):
+        from shared.model100_h1_features import clock
+        b=self.base();b.raw_forecast_vintages=[dict(source='GDP_NOW_ATL',indicator='GDP_NOWCAST',role='GDP_FORECAST',unit='PERCENT_SAAR',
+            reference_period='2024-10-01',_at=clock('2025-01-29T12:00:00Z'),_id='f',target_publication_at_audit='2025-01-30T13:30:00Z',
+            target_original_sha256='target',target_clock_status='VERIFIED_ORIGINAL_RELEASE',original_sha256='forecast',event_identity='f',value='2.3',eligible_feature=False)]
+        r=RichContextBuilder(b)
+        self.assertEqual(r._pre_release_forecasts(clock('2025-01-29T11:00:00Z'))['events'],[])
+        x=r._pre_release_forecasts(clock('2025-01-29T13:00:00Z'))['events']
+        self.assertEqual(len(x),1);self.assertTrue(x[0]['forward_usable'])
+        self.assertIsNone(x[0]['target_release_at']);self.assertNotIn('target_original_sha256',x[0])
+        self.assertEqual(r._pre_release_forecasts(clock('2025-01-30T14:00:00Z'))['events'],[])
+
+    def test_future_modified_metadata_not_even_a_future_flag(self):
+        from shared.model100_rich_context import public,clock
+        a=dict(_at=clock('2025-01-01'),modified_at_utc='2026-01-01')
+        b=dict(_at=clock('2025-01-01'),modified_at_utc=None)
+        self.assertEqual(public(a,clock('2025-02-01'),('modified_at_utc',)),public(b,clock('2025-02-01'),('modified_at_utc',)))
+
+    def test_open_proxy_not_in_rich_sequence(self):
+        data=dict(prices=[],macro=[],news=[],gdelt=[],proxy=[dict(event_time_utc='2026-01-01T15:00:00Z',
+            window_end_utc='2026-01-01T16:00:00Z',feature_ready_at_utc='2026-01-01T15:00:00Z',brain_first_received_at_utc='2026-01-01T15:00:00Z')])
+        r=RichContextBuilder(FeatureBuilder(data))
+        self.assertEqual(r.build_at('2026-01-01T15:00:00Z')['groups']['binance']['h1_sequence'],[])
+
+    def test_cftc_delayed_receipt_not_in_context(self):
+        r=RichContextBuilder(self.base(),{'cftc':[dict(source_available_at_utc='2026-01-01T12:00:00Z',brain_first_received_at_utc='2026-01-01T16:00:00Z')]})
+        self.assertIsNone(r.build_at('2026-01-01T15:00:00Z')['groups']['cftc']['state'])
+
+    def test_atr_uses_friday_close_across_weekend_without_synthetic_bars(self):
+        from shared.model100_h1_features import clock
+        b=self.base();b.price_by_open={clock('2026-01-02T20:00:00Z'):dict(_at=clock('2026-01-02T21:00:00Z'),open=1.,high=1.01,low=.99,close=1.),
+            clock('2026-01-05T00:00:00Z'):dict(_at=clock('2026-01-05T01:00:00Z'),open=1.02,high=1.03,low=1.02,close=1.025)}
+        x=unpack(RichContextBuilder(b).build_at('2026-01-05T01:00:00Z'))['groups']['price']
+        bar=x['h1_sequence'][-1]
+        self.assertAlmostEqual(bar['true_range'],.03);self.assertEqual(bar['previous_source_bar_gap_hours'],52.)
+        self.assertIsNone(bar['log_return']);self.assertGreater(len(x['missing_calendar_hours']),0)
+
+    def test_high_volatility_regime_uses_only_prior_closed_returns(self):
+        from shared.model100_h1_features import clock,HOUR
+        t=clock('2026-01-04T00:00:00Z');b=self.base();b.price_by_open={};c=1.
+        for i in range(72):
+            at=t-HOUR*(72-i);o=c;c=o*math.exp(.001 if i>=48 else .0001)
+            b.price_by_open[at]=dict(_at=at+HOUR,open=o,close=c,high=max(o,c)+.00001,low=min(o,c)-.00001)
+        x=RichContextBuilder(b)._price(t)
+        self.assertEqual(x['windows']['24']['regime'],'HIGH_VOLATILITY')
+        self.assertGreater(x['windows']['24']['volatility_ratio_previous_24h'],1.5)
+
+    def test_atr_long_gap_is_unknown_for_full_and_bounded_inputs(self):
+        from shared.model100_h1_features import clock
+        t=clock('2026-01-01T01:00:00Z');a=self.base();b=self.base()
+        current=dict(_at=t,open=1.02,high=1.03,low=1.02,close=1.025)
+        a.price_by_open={clock('2025-12-01'):dict(_at=clock('2025-12-02'),open=1.,high=1.01,low=.99,close=1.),clock('2026-01-01'):current}
+        b.price_by_open={clock('2026-01-01'):current}
+        x=RichContextBuilder(a)._price(t);y=RichContextBuilder(b)._price(t)
+        self.assertEqual(x,y);self.assertIsNone(x['h1_sequence'][-1]['true_range'])
 
 
 if __name__=='__main__':unittest.main()

@@ -56,10 +56,13 @@ async def get_context_range(engine,start,end,mode,version=DATASET,groups=GROUPS,
     async with engine.connect() as c:
         schema=parsed((await c.execute(text(f'SELECT schema_json FROM {SETS} WHERE dataset_version=:v AND mode=:m'),
                                              dict(v=version,m=mode))).scalar_one())
+        has_rich=bool(schema.get('rich_contract'))
+        if has_rich and schema['rich_contract'].get('version')!=VERSION:raise ValueError('UNSUPPORTED_RICH_CONTRACT')
         columns=FIXED_COLUMNS if numeric else 'cutoff_utc,mode,row_hash,payload_sha256,rich_sha256,context_sha256'
         if numeric:columns+=',rich_sha256,context_sha256'
         full=set(groups)==set(GROUPS)
-        if full:columns+=',rich_context'
+        if not has_rich:columns=FIXED_COLUMNS if numeric else 'cutoff_utc,mode'
+        elif full:columns+=',rich_context'
         elif groups:
             columns+=",JSON_EXTRACT(rich_context,'$.group_sha256') AS group_sha256"
             columns+=''.join(",JSON_EXTRACT(rich_context,'$.groups."+g+"') AS rich_"+g for g in groups)
@@ -68,11 +71,13 @@ async def get_context_range(engine,start,end,mode,version=DATASET,groups=GROUPS,
                               execution_options={'yield_per':16})
         try:
             async for r in result.mappings():
-                if digest(dict(row_hash=r['row_hash'],payload_sha256=r['payload_sha256'],rich_sha256=r['rich_sha256']))!=r['context_sha256']:
+                if has_rich and digest(dict(row_hash=r['row_hash'],payload_sha256=r['payload_sha256'],rich_sha256=r['rich_sha256']))!=r['context_sha256']:
                     raise ValueError('CONTEXT_SHA_MISMATCH')
                 out={'timestamp':clock(r['cutoff_utc']).isoformat(),'mode':r['mode'],'dataset_version':version}
                 if numeric:out['numeric']=decode_row(r,schema)
-                if full:
+                if not has_rich:
+                    out['rich_context']=None;out['rich_missing_reason']='V1_HAS_NO_RICH_CONTEXT'
+                elif full:
                     rich=parsed(r['rich_context'])
                     if digest(rich)!=r['rich_sha256']:raise ValueError('RICH_SHA_MISMATCH')
                     out['rich_context']=unpack(rich)

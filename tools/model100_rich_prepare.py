@@ -40,7 +40,8 @@ async def prepare():
                 capture=dict(base=retain(data,mode+'-base'),extra=dict(path=str(extra_path),sha256=meta['extras_sha256']),end=end)
                 (RUNTIME/(mode+'-capture.json')).write_text(canonical(capture))
                 reg[mode]=dict(dataset_version=DATASET,schema_hash=digest(schema),schema_json=canonical(schema),
-                               builder_code_sha256=code_hash(),builder_version=VERSION)
+                               builder_code_sha256=code_hash(),builder_version=VERSION,
+                               bootstrap_end_utc=end,bootstrap_rows=len(builder.cutoffs('2025-01-01',end)))
         (RUNTIME/'registration.json').write_text(canonical(reg));print(canonical({m:dict(schema_hash=r['schema_hash'],code_sha256=r['builder_code_sha256']) for m,r in reg.items()}))
     finally:
         for e in (v,b,s):await e.dispose()

@@ -80,6 +80,27 @@ def prepared_rows(mode,schema,due):
     if found!=wanted:raise ValueError('V2_SHARD_CUTOFF_MISSING')
 
 
+def write_status(db,mode,history,result):
+    c=db.cursor(dictionary=True)
+    c.execute(f'SELECT status_json FROM {SETS} WHERE dataset_version=%s AND mode=%s',(DATASET,mode))
+    row=c.fetchone();previous=parsed(row['status_json']) if row and row.get('status_json') else {}
+    lanes=previous.get('lanes',{});lane='history' if history else 'live';old=lanes.get(lane,{})
+    record={**result,'last_run_at_utc':datetime.now(timezone.utc).isoformat()}
+    if result.get('inserted',0)>0:record['last_new_data_at_utc']=record['last_run_at_utc']
+    elif old.get('last_new_data_at_utc'):record['last_new_data_at_utc']=old['last_new_data_at_utc']
+    if 'capture' not in record and old.get('capture'):record['capture']=old['capture']
+    lanes={**lanes,lane:record}
+    state='FAILED_RETRY_NEXT_NATIVE_TICK' if any(v.get('status','').startswith('FAILED') for v in lanes.values()) else result['status']
+    state_json={**previous,'lanes':lanes,'last_lane':lane}
+    c.execute(f'UPDATE {SETS} SET last_run_at_utc=UTC_TIMESTAMP(6),last_status=%s,status_json=%s WHERE dataset_version=%s AND mode=%s',
+              (state,canonical(state_json),DATASET,mode));db.commit();c.close()
+
+
+def live_lower_bound(bootstrap,last):
+    boundary=clock(bootstrap)+timedelta(hours=1)
+    return max(boundary,clock(last)-timedelta(days=7)) if last else boundary
+
+
 def update_v2(db,history=False):
     out={};now=datetime.now(timezone.utc).replace(minute=0,second=0,microsecond=0)
     for mode in ('RESEARCH','STRICT_ASOF'):
@@ -90,12 +111,20 @@ def update_v2(db,history=False):
             if not reg:
                 c.close();out[key]=dict(status='SUCCESS_UNCHANGED',detail='V2_NOT_REGISTERED');continue
             schema=parsed(reg['schema_json'])
+            state=parsed(reg.get('status_json')) or {}
+            if state.get('enabled') is False:
+                c.close();out[key]=dict(status='SUCCESS_UNCHANGED',detail='V2_DISABLED_BY_ROOT');continue
             if reg['builder_code_sha256']!=code_hash() or schema.get('rich_contract')!=contract():raise ValueError('V2_NEW_VERSION_REQUIRED')
-            lower=datetime(2025,1,1,tzinfo=timezone.utc) if history else now-timedelta(days=7)
+            bootstrap=clock(state.get('bootstrap_end_utc'))
+            if not bootstrap:raise ValueError('BOOTSTRAP_BOUNDARY_REQUIRED')
+            lower=datetime(2025,1,1,tzinfo=timezone.utc)
             upper=now
             if history:
-                manifest=json.loads((RUNTIME/(mode+'-verified-manifest.json')).read_text())
-                upper=min(now,clock(manifest['shards'][-1]['last_cutoff']))
+                upper=min(now,bootstrap)
+            else:
+                c.execute(f'SELECT MAX(cutoff_utc) AS last_cutoff FROM {TABLE} WHERE dataset_version=%s AND mode=%s',(DATASET,mode))
+                last=clock(c.fetchone()['last_cutoff'])
+                lower=live_lower_bound(bootstrap,last)
             c.execute(f'''SELECT v.cutoff_utc FROM {TABLE} v WHERE v.dataset_version=%s AND v.mode=%s
                          AND v.cutoff_utc>=%s
                          AND v.cutoff_utc<=%s AND NOT EXISTS(SELECT 1 FROM {TABLE} r
@@ -109,12 +138,12 @@ def update_v2(db,history=False):
                 result=dict(status='SUCCESS_NEW_DATA' if counts['inserted'] else 'SUCCESS_UNCHANGED',
                             **counts,first_cutoff=due[0],last_cutoff=due[-1],input='VERIFIED_IMMUTABLE_V2_SHARDS',batch_limit=256)
             else:
-                meta=json.loads((RUNTIME/(mode+'-capture.json')).read_text())
+                meta=None
                 latest=RUNTIME/(mode+'-latest-capture.json')
-                if clock(due[-1])>clock(meta['end']) and latest.is_file():
+                if latest.is_file():
                     cached=json.loads(latest.read_text())
                     if clock(cached['end'])>=clock(due[-1]) and clock(cached.get('start')) and clock(cached['start'])<=clock(due[0]):meta=cached
-                if clock(due[-1])<=clock(meta['end']):
+                if meta:
                     data=read_input(meta['base']);extra=read_input(meta['extra'])
                 else:
                     start=clock(due[0])-timedelta(days=4)
@@ -132,10 +161,8 @@ def update_v2(db,history=False):
                 result=dict(status='SUCCESS_NEW_DATA' if counts['inserted'] else 'SUCCESS_UNCHANGED',
                             **counts,first_cutoff=due[0],last_cutoff=due[-1],capture=meta,
                             rich_source_diagnostics=extra.get('diagnostics',{}),batch_limit=256)
-            c=db.cursor();c.execute(f'UPDATE {SETS} SET last_run_at_utc=UTC_TIMESTAMP(6),last_status=%s,status_json=%s WHERE dataset_version=%s AND mode=%s',
-                                   (result['status'],canonical(result),DATASET,mode));db.commit();c.close();out[key]=result
+            write_status(db,mode,history,result);out[key]=result
         except Exception as e:
             db.rollback();out[key]=dict(status='FAILED_RETRY_NEXT_NATIVE_TICK',error_type=type(e).__name__,reason=str(e)[:160])
-            c=db.cursor();c.execute(f'UPDATE {SETS} SET last_run_at_utc=UTC_TIMESTAMP(6),last_status=%s,status_json=%s WHERE dataset_version=%s AND mode=%s',
-                                   (out[key]['status'],canonical(out[key]),DATASET,mode));db.commit();c.close()
+            write_status(db,mode,history,out[key])
     return out

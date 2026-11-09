@@ -21,9 +21,14 @@ def contract():
                 max_bytes=MAX_BYTES,news_limit=64,macro_history_per_series=6,
                 macro_releases_limit=64,macro_revisions_limit=32,
                 price_calendar_hours=72,gdelt_limit=32,binance_limit=72,
-                cftc_limit=8,fxcm_limit=24,availability='V1_INDEX_ADMISSION_UNCHANGED',
+                cftc_limit=8,fxcm_limit=24,availability='V1_SOURCE_CLOCKS_PLUS_DOCUMENTED_TARGET_EVENT_EXPIRY',
                 numeric_aggregation_policy='WINDOW_MATH_FSUM_V2',
-                nowcast_join_policy='EXACT_TARGET_SHA_PERIOD_PUBLICATION_CLOCK_INDICATOR_UNIT_V1')
+                nowcast_join_policy='EXACT_TARGET_SHA_PERIOD_PUBLICATION_CLOCK_INDICATOR_UNIT_V1',
+                forecast_context_policy='SOURCE_CLOCK_PLUS_DOCUMENTED_ACTUAL_EVENT_EXPIRY',
+                pre_release_forecasts_limit=32,pre_release_forecasts_window_days=45,
+                raw_forecast_history_per_series=3,
+                true_range_policy='PREVIOUS_SOURCE_BAR_AVAILABLE_AT_CUTOFF_MAX96H_GAP',
+                high_volatility_policy='24H_RV_GT1P5_PREVIOUS24H_MIN12_VALID_RETURNS_EACH')
 
 
 class StableWindowIndex(EventIndex):
@@ -48,13 +53,17 @@ class V2FeatureBuilder(FeatureBuilder):
         self.news={k:StableWindowIndex(v) for k,v in self.news.items()}
         self.gdelt={k:StableWindowIndex(v) for k,v in self.gdelt.items()}
         snapshot=args[0] if args else kwargs['snapshot']
-        # These are used only to measure a nowcast error AFTER its actual
-        # release. They do not relax V1's conservative forward-state expiry.
-        self.forecast_vintages=[]
+        # Target-joined vintages measure errors only AFTER the actual release.
+        # Raw sequences have separate documented expiry; V1 fixed state stays intact.
+        self.forecast_vintages=[];self.raw_forecast_vintages=[]
         for r in snapshot.get('macro',[]):
             if r.get('source') not in ('GDP_NOW_ATL','NYFED_NOW','ALFRED','CLEVELAND_NOW'):continue
             at=clock(r.get('available_at'));target=clock(r.get('target_publication_at_audit'))
-            if not at or not target or at>=target or not r.get('target_original_sha256'):continue
+            if not at or number(r.get('value')) is None:continue
+            if not (r.get('role','').startswith('GDP_FORECAST') or r.get('role')=='INFLATION_FORECAST'):continue
+            r={**r,'_at':at,'_id':r['event_identity'],'_uncertain':r.get('temporal_status')!='H1_DOCUMENTED'}
+            self.raw_forecast_vintages.append(r)
+            if not target or at>=target or not r.get('target_original_sha256'):continue
             if r.get('target_clock_status')!='VERIFIED_ORIGINAL_RELEASE' or number(r.get('value')) is None:continue
             self.forecast_vintages.append({**r,'_at':at})
 
@@ -101,12 +110,12 @@ def public(row, t, keys):
          'age_hours': age(t, row)}
     # An archive fetched years later does not expose a future ingestion clock
     # as an input at a historical cutoff. Source ids/SHA retain audit linkage.
-    if out.get('first_received_at') and clock(out['first_received_at'])>t:
+    if 'first_received_at' in out and (not out['first_received_at'] or clock(out['first_received_at'])>t):
         out['first_received_at']=None
-        out['receipt_missing_reason']='BACKFILL_RECEIPT_AFTER_CUTOFF_NOT_HISTORICAL_BRAIN_RECEIPT'
+        out['receipt_missing_reason']='UNPROVEN_AT_CUTOFF'
     for field in ('modified_at_utc','ingested_at_utc'):
-        if out.get(field) and clock(out[field])>t:
-            out[field]=None;out[field+'_missing_reason']='METADATA_VERSION_AFTER_CUTOFF'
+        if field in out and (not out[field] or clock(out[field])>t):
+            out[field]=None;out[field+'_missing_reason']='UNPROVEN_AT_CUTOFF'
     return out
 
 
@@ -123,6 +132,7 @@ class RichContextBuilder:
         self.forecasts_by_target=defaultdict(list)
         for r in getattr(base,'forecast_vintages',[]):
             self.forecasts_by_target[(r['target_original_sha256'],str(r.get('reference_period'))[:10])].append(r)
+        self.raw_forecasts=EventIndex(getattr(base,'raw_forecast_vintages',[]))
         self.geo = sorted(self.extras.get('gdelt', []), key=lambda r: (r['available_at'], r['row_id']))
         self.geo_times = [clock(r['available_at']) for r in self.geo]
         # Preserve revision events separately. Never substitute them into first values.
@@ -137,7 +147,7 @@ class RichContextBuilder:
                    'gdelt': self._gdelt, 'binance': self._binance,
                    'cftc': self._cftc, 'fxcm': self._fxcm}
         context = {'version': VERSION, 'mode': self.base.config.mode, 'cutoff_utc': t.isoformat(),
-                   'availability_contract': 'V1_INDEX_ADMISSION_UNCHANGED',
+                   'availability_contract': contract()['availability'],
                    'groups': {k: methods[k](t) for k in self.groups}}
         encoded = pack(context)
         encoded['group_sha256']={k:digest(v) for k,v in encoded['groups'].items()}
@@ -158,7 +168,7 @@ class RichContextBuilder:
                 'quality_score', 'novelty', 'confirmation_count', 'date_dt',
                 'published_at_utc', 'first_seen_at_utc', 'text_observed_at',
                 'nlp_updated_at', 'text_sha', 'nlp_artifact_sha', 'publication_precision',
-                'modified_at_utc','ingested_at_utc')
+                'modified_at_utc','ingested_at_utc','source_day')
         for r in chosen:
             extra = self.news_extra.get((r['press'], int(r['source_id'])), {})
             # Metadata of a later NLP row must not decorate an older snapshot.
@@ -166,12 +176,12 @@ class RichContextBuilder:
             e = public(r, t, keys)
             e.update(event_id=r['_id'], event_type=extra.get('event_type') if same_version else None,
                      cluster_id=extra.get('cluster_id') if same_version else None,
+                     cluster_similarity=extra.get('cluster_similarity') if same_version else None,
+                     feed=extra.get('feed') if same_version else None,region=None,currency=None,
                      semantic_metadata_status='MATCHED_ROW_VERSION' if same_version else 'VERSION_UNAVAILABLE',
                      independent_source_count=None, embedding=None,
-                     embedding_missing_reason='NO_PERSISTED_PER_EVENT_VECTOR',
                      temporal_uncertainty=bool(r['_uncertain']))
-            e['event_version_sha256']=digest(select(e,('event_id','event_type','cluster_id','topic_id','quality_score','novelty','confirmation_count','text_sha','nlp_artifact_sha','nlp_updated_at')))
-            e['version_history_status']='CURRENT_PERSISTED_NLP_VERSION_ONLY'
+            e['event_version_sha256']=digest(select(e,('event_id','event_type','cluster_id','cluster_similarity','feed','topic_id','quality_score','novelty','confirmation_count','text_sha','nlp_artifact_sha','nlp_updated_at')))
             out.append(e)
         windows = {}
         for h in (1, 3, 6, 12, 24):
@@ -189,6 +199,11 @@ class RichContextBuilder:
                 'omitted_count': max(0, len(rows)-len(out)),
                 'omitted_topics': dict(sorted(Counter(str(r.get('topic_id')) for r in rows[:-64]).items())),
                 'selection': 'LAST_64_AVAILABLE_AT_THEN_SOURCE_ID',
+                'coverage':dict(embedding_status='NO_PERSISTED_PER_EVENT_VECTOR',
+                    version_history_status='CURRENT_PERSISTED_NLP_VERSION_ONLY',
+                    classification_status='REGION_CURRENCY_NOT_PERSISTED;ORIGINAL_FEED_CATEGORY_RETAINED',
+                    independent_source_status='NO_PROVEN_CROSS_PROVIDER_EVENT_IDENTITY',
+                    unknown_clock_reason='UNPROVEN_AT_CUTOFF'),
                 'event_identity': 'ARTICLE_ID_NOT_PROVEN_CROSS_PROVIDER_EVENT_CLUSTER'}
 
     def _macro(self, t):
@@ -230,7 +245,45 @@ class RichContextBuilder:
                 'omitted_release_count': max(0, len(releases)-64),
                 'known_revisions': [public({**r,'_at':clock(r['available_at'])},t,keys) for r in revisions[-32:]],
                 'omitted_revision_count': max(0,len(revisions)-32),
+                'pre_release_forecasts':self._pre_release_forecasts(t),
                 'revision_policy': 'KNOWN_ONLY_SEPARATE_FROM_ORIGINAL_STATE'}
+
+    def _pre_release_forecasts(self,t):
+        lo,hi=self.raw_forecasts.bounds(t,45*24);groups=defaultdict(list)
+        for r in self.raw_forecasts.rows[lo:hi]:
+            target=clock(r.get('target_publication_at_audit'))
+            verified=r.get('target_clock_status')=='VERIFIED_ORIGINAL_RELEASE' and bool(r.get('target_original_sha256'))
+            if verified:
+                if target is None or target<=t:continue
+            else:
+                # Without an original target release clock, keep the existing
+                # conservative period-end expiry; never invent a future target.
+                if not r.get('eligible_feature'):continue
+                if not r.get('reference_period'):continue
+                period=clock(str(r.get('reference_period'))[:10])
+                if not period:continue
+                import calendar
+                month=period.month+2 if r.get('role','').startswith('GDP_FORECAST') else period.month
+                end=period.replace(month=month,day=calendar.monthrange(period.year,month)[1])+timedelta(days=1)
+                if t>=end:continue
+            key=tuple(str(r.get(k)) for k in ('source','indicator','reference_period','target_horizon'))
+            groups[key].append(r)
+        selected=[rows[-1] for _,rows in sorted(groups.items())]
+        more=sorted((r for rows in groups.values() for r in rows[-3:-1]),key=lambda r:(r['_at'],r['_id']),reverse=True)
+        selected=(selected+more)[:32];selected.sort(key=lambda r:(r['_at'],r['_id']))
+        keys=('source','indicator','region','reference_period','target_horizon','role','value','unit',
+              'event_identity','original_sha256','source_url','source_published_at','temporal_status','availability_policy',
+              'forecast_vintage_day','release_version','first_received_at')
+        # Do not expose a subsequently discovered actual-release timestamp or
+        # target-document SHA as a feature before that actual publication.
+        events=[public(r,t,keys)|dict(is_consensus=False,forward_usable=True,
+                expiry_policy='DOCUMENTED_TARGET_ACTUAL_EVENT_OR_CONSERVATIVE_PERIOD_END',
+                target_release_at=None,time_to_target_hours=None,
+                target_calendar_missing_reason='NO_CONTEMPORANEOUS_CALENDAR_EVIDENCE') for r in selected]
+        return dict(events=events,total_eligible_vintages=sum(len(v) for v in groups.values()),
+                    selected_vintages=len(events),omitted_count=sum(len(v) for v in groups.values())-len(events),
+                    eligible_series=len(groups),window_days=45,
+                    selection='LATEST_PER_SERIES_THEN_TWO_PRECEDING_VINTAGES_LIMIT32')
 
     def _nowcast_comparisons(self,actual):
         pub=clock(actual.get('source_published_at'))
@@ -258,6 +311,7 @@ class RichContextBuilder:
 
     def _price(self, t):
         rows=[]; gaps=[]
+        source_opens=sorted(self.base.price_by_open)
         for n in range(72, 0, -1):
             start=t-HOUR*n; r=self.base.price_by_open.get(start)
             if not r or r['_at'] > t:
@@ -265,12 +319,19 @@ class RichContextBuilder:
             o,h,l,c=(r[k] for k in ('open','high','low','close')); span=h-l
             prior=self.base.price_by_open.get(start-HOUR)
             pc=prior['close'] if prior and prior['_at']<=t else None
-            tr=max(span,abs(h-pc),abs(l-pc)) if pc else span
+            pos=bisect.bisect_left(source_opens,start)
+            previous_open=source_opens[pos-1] if pos else None
+            previous=self.base.price_by_open.get(previous_open)
+            gap=(start-previous_open).total_seconds()/3600 if previous and previous['_at']<=t else None
+            if gap is not None and gap>96:gap=None
+            previous_close=previous['close'] if gap is not None and gap<=96 else None
+            tr=max(span,abs(h-previous_close),abs(l-previous_close)) if previous_close is not None else None
             hour=start.hour
             rows.append({'bar_open_utc':start.isoformat(),'bar_close_utc':(start+HOUR).isoformat(),
                          'available_at':r['_at'].isoformat(),'open':o,'high':h,'low':l,'close':c,
                          'change':c-o,'range':span,'upper_shadow':h-max(o,c),'lower_shadow':min(o,c)-l,
                          'close_position':(c-l)/span if span else None,'true_range':tr,
+                         'previous_source_bar_gap_hours':gap,
                          'log_return':math.log(c/pc) if pc else None,
                          'session_utc': 'ASIA' if hour<7 else 'EUROPE' if hour<13 else 'EUROPE_US' if hour<17 else 'US' if hour<22 else 'ROLLOVER',
                          'session_policy':'FIXED_UTC_ACTIVITY_BUCKET_NOT_EXCHANGE_DST_CLOCK'})
@@ -278,18 +339,29 @@ class RichContextBuilder:
         for w in (24,48,72):
             rr=[r for r in rows if clock(r['bar_open_utc'])>=t-HOUR*w]
             ret=[r['log_return'] for r in rr if r['log_return'] is not None]
+            ranges=[r['true_range'] for r in rr if r['true_range'] is not None]
             derived[str(w)]={'bars':len(rr),'calendar_hours':w,'missing_hours':w-len(rr),
                              'momentum':math.log(rr[-1]['close']/rr[0]['open']) if rr else None,
                              'realized_volatility':math.sqrt(sum(x*x for x in ret)) if ret else None,
-                             'atr':sum(r['true_range'] for r in rr)/len(rr) if rr else None,
+                             'atr':math.fsum(ranges)/len(ranges) if ranges else None,
+                             'atr_missing_ranges':len(rr)-len(ranges),
                              'high':max((r['high'] for r in rr),default=None),'low':min((r['low'] for r in rr),default=None)}
             if rr:
                 move=rr[-1]['close']-rr[0]['open'];atr=derived[str(w)]['atr']
                 derived[str(w)]['movement_atr_ratio']=move/atr if atr else None
-                derived[str(w)]['regime']='TREND' if atr and abs(move)>3*atr else 'RANGE'
+                derived[str(w)]['regime']=None if atr is None or len(rr)<12 else 'TREND' if atr and abs(move)>3*atr else 'RANGE'
         for i,r in enumerate(rows):
             prev=[x['log_return'] for x in rows[max(0,i-24):i] if x['log_return'] is not None]
             r['preceding_realized_volatility']=math.sqrt(sum(x*x for x in prev)) if prev else None
+            r['preceding_return_count']=len(prev)
+        current=[r['log_return'] for r in rows if clock(r['bar_open_utc'])>=t-HOUR*24 and r['log_return'] is not None]
+        previous=[r['log_return'] for r in rows if t-HOUR*48<=clock(r['bar_open_utc'])<t-HOUR*24 and r['log_return'] is not None]
+        current_vol=math.sqrt(math.fsum(v*v for v in current)) if current else None
+        previous_vol=math.sqrt(math.fsum(v*v for v in previous)) if previous else None
+        ratio=current_vol/previous_vol if current_vol is not None and previous_vol else None
+        derived['24']['volatility_ratio_previous_24h']=ratio
+        if ratio is not None and ratio>1.5 and len(current)>=12 and len(previous)>=12:
+            derived['24']['regime']='HIGH_VOLATILITY'
         if rows:
             direction=1 if rows[-1]['change']>0 else -1 if rows[-1]['change']<0 else 0
             streak=0

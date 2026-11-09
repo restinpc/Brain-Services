@@ -45,9 +45,10 @@ def worker_shard(task):
         groups=x['groups']
         comparison_hours+=int(any(r.get('nowcast_comparisons') for r in groups['macro']['series_state'].values()))
         for k in counts:
-            g=groups[k];counts[k]+=int(bool(g.get('events') or g.get('series_state') or g.get('h1_sequence') or g.get('state')))
+            g=groups[k];counts[k]+=int(bool(g.get('events') or g.get('series_state') or g.get('h1_sequence') or g.get('state') or g.get('pre_release_forecasts',{}).get('events')))
         news_ids.update(e['event_id'] for e in groups['news']['events'])
         macro_ids.update(e['event_identity'] for e in groups['macro']['releases'])
+        macro_ids.update(e['event_identity'] for e in groups['macro']['pre_release_forecasts']['events'])
         checks.append(dict(cutoff=t.isoformat(),context_sha256=p['context_sha256'],rich_sha256=p['rich_sha256'],bytes=size))
     raw=('\n'.join(lines)+'\n').encode();compressed=gzip.compress(raw,compresslevel=6,mtime=0)
     dest=RUNTIME/(_MODE+'-verified-shards');dest.mkdir(exist_ok=True)

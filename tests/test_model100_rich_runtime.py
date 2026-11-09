@@ -48,5 +48,45 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaises(ValueError):insert_contexts(db,[(row,rich)],schema)
         db.commit.assert_not_called();db.rollback.assert_called_once()
 
+    def test_recovery_starts_from_last_progress_not_current_day(self):
+        from shared.model100_h1_features import clock
+        self.assertEqual(runtime.live_lower_bound('2026-01-01','2026-03-01'),clock('2026-02-22'))
+        self.assertEqual(runtime.live_lower_bound('2026-01-01',None),clock('2026-01-01T01:00:00Z'))
+
+    def test_successful_history_does_not_hide_failed_live(self):
+        from unittest.mock import MagicMock
+        db=MagicMock();c=db.cursor.return_value
+        c.fetchone.return_value=dict(status_json=canonical(dict(bootstrap_end_utc='2026-01-01',lanes=dict(live=dict(status='FAILED_RETRY_NEXT_NATIVE_TICK')))))
+        runtime.write_status(db,'RESEARCH',True,dict(status='SUCCESS_UNCHANGED',inserted=0))
+        args=c.execute.call_args.args[1];state=json.loads(args[1])
+        self.assertEqual(args[0],'FAILED_RETRY_NEXT_NATIVE_TICK')
+        self.assertEqual(state['lanes']['history']['status'],'SUCCESS_UNCHANGED')
+        self.assertEqual(state['bootstrap_end_utc'],'2026-01-01')
+
+    def no_pending_without_files(self,history):
+        from unittest.mock import MagicMock
+        state=dict(bootstrap_end_utc='2026-01-01',lanes={})
+        reg=dict(schema_json=canonical(dict(rich_contract=contract())),builder_code_sha256='code',status_json=canonical(state))
+        cursors=[]
+        for _ in range(2):
+            main=MagicMock();main.fetchone.side_effect=[reg] if history else [reg,dict(last_cutoff=None)];main.fetchall.return_value=[]
+            status=MagicMock();status.fetchone.return_value=dict(status_json=canonical(state));cursors.extend([main,status])
+        db=MagicMock();db.cursor.side_effect=cursors
+        with patch.object(runtime,'code_hash',return_value='code'),patch.object(Path,'read_text',side_effect=AssertionError('FILE_DEPENDENCY')):
+            result=runtime.update_v2(db,history=history)
+        self.assertTrue(all(r['status']=='SUCCESS_UNCHANGED' for r in result.values()))
+
+    def test_live_no_pending_needs_no_snapshot(self):self.no_pending_without_files(False)
+
+    def test_history_no_pending_needs_no_manifest(self):self.no_pending_without_files(True)
+
+    def test_root_disabled_v2_does_not_block_v1_or_require_files(self):
+        from unittest.mock import MagicMock
+        db=MagicMock();db.cursor.return_value.fetchone.return_value=dict(schema_json='{}',status_json='{"enabled":false}')
+        with patch.object(runtime,'code_hash',side_effect=AssertionError('CODE_NOT_NEEDED')):
+            result=runtime.update_v2(db)
+        self.assertTrue(all(v.get('detail')=='V2_DISABLED_BY_ROOT' for v in result.values()))
+        db.commit.assert_not_called()
+
 
 if __name__=='__main__':unittest.main()
