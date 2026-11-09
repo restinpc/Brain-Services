@@ -17,3 +17,21 @@ __pycache__
 
 
 counter.json
+
+# Host-local credentials, runtime state and deployment evidence
+.env
+.env.*
+*.pyc
+*.session
+*.session-*
+*.log.gz
+*.bak*
+*.pre-*
+*.before-*
+*.stability-backup*
+*.b2-*-backup*
+.backup*/
+.brain-storage-proof*/
+parser/counter_*.json
+future_leak_audit*.json
+parser/ForWhaleAlert/ms-playwright/

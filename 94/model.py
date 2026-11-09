@@ -526,15 +526,20 @@ async def _prepare_map_table(engine, map_table: str, markets: list[dict]) -> dic
 
 async def _source_max_ts(engine, prices_table: str, parser_table: str) -> datetime | None:
     from sqlalchemy import text
-    table = prices_table if await _table_exists(engine, prices_table) else parser_table
+    table = await _first_existing_table(engine, prices_table, parser_table)
+    if table is None:
+        return None
     async with engine.connect() as conn:
         return (await conn.execute(text(f"SELECT MAX(price_timestamp) FROM `{table}`"))).scalar()
 
 
 async def _load_price_chunk(engine, prices_table: str, parser_table: str, mapped_markets: dict,
                             start: datetime, end: datetime) -> list[dict]:
-    from sqlalchemy import text
-    table = prices_table if await _table_exists(engine, prices_table) else parser_table
+    from sqlalchemy import bindparam, text
+    table = await _first_existing_table(engine, prices_table, parser_table)
+    if table is None or not mapped_markets:
+        return []
+    condition_ids = list(mapped_markets)
     sql = text(f"""
         SELECT p.condition_id, p.price_timestamp, p.price
         FROM `{table}` p
@@ -601,7 +606,28 @@ async def enrich_dataset(engine_vlad, engine_brain) -> dict:
     state_table = ds["state_table"]
 
     await _ensure_enriched_tables(engine_vlad, enriched, state_table)
-    markets = await _load_market_meta(engine_vlad, markets_table, parser_table)
+    canonical_split_configured = "markets_table" in ds or "prices_table" in ds
+    if canonical_split_configured:
+        if not ds.get("markets_table") or not ds.get("prices_table"):
+            market_source = price_source = None
+        else:
+            market_source = markets_table if await _table_exists(source_engine, markets_table) else None
+            price_source = prices_table if await _table_exists(source_engine, prices_table) else None
+    else:
+        market_source = await _first_existing_table(source_engine, markets_table, parser_table)
+        price_source = await _first_existing_table(source_engine, prices_table, parser_table)
+    if market_source is None or price_source is None:
+        # Explicit canonical sources are mandatory. Fail before touching the
+        # published derived state; the framework retains its last good snapshot.
+        missing_tables = [
+            name for name, source in (
+                (markets_table, market_source), (prices_table, price_source)
+            ) if source is None
+        ]
+        raise RuntimeError(
+            "canonical_parser_source_missing:" + ",".join(missing_tables)
+        )
+    markets = await _load_market_meta(source_engine, market_source, market_source)
     map_stats = await _prepare_map_table(engine_vlad, map_table, markets)
     async with engine_vlad.connect() as conn:
         map_rows = (await conn.execute(text(

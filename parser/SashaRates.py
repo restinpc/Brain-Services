@@ -596,6 +596,24 @@ def _yahoo_daily_bars(timestamps, opens, highs, lows, closes, gmt_offset, cutoff
     return rows
 
 
+def _eurusd_recovery_params(params, symbol, day, latest, now=None):
+    """Recover a genuine EURUSD outage window, not only the latest ten days."""
+    from datetime import timezone
+    result = dict(params)
+    if symbol != 'EURUSD=X' or day or latest is None:
+        return result
+    now = now or datetime.utcnow()
+    now = now.replace(tzinfo=timezone.utc) if now.tzinfo is None else now.astimezone(timezone.utc)
+    latest = latest.replace(tzinfo=timezone.utc) if latest.tzinfo is None else latest.astimezone(timezone.utc)
+    if now - latest <= timedelta(days=8):
+        return result
+    # Yahoo's existing H1 limit is 730 days; retain one day of overlap.
+    begin = max(latest-timedelta(days=1), now-timedelta(days=729))
+    result.pop('range', None)
+    result.update(period1=int(begin.timestamp()), period2=int(now.timestamp()))
+    return result
+
+
 def fetch_yahoo(symbol: str, day: bool, latest) -> list:
     interval = "1d" if day else "1h"
     params = {"interval": interval, "includePrePost": "false"}
@@ -608,6 +626,7 @@ def fetch_yahoo(symbol: str, day: bool, latest) -> list:
             params["range"] = "2y"  # часовые Yahoo не отдаёт глубже 730 дней
     else:
         params["range"] = "3mo" if day else "10d"
+    params = _eurusd_recovery_params(params, symbol, day, latest)
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
     response = _http_get(url, params=params)
     if response.status_code != 200:
