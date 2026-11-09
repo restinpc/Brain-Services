@@ -24,7 +24,13 @@ if($action==='deploy'){
  $changed=trim(shell_exec('git -C '.escapeshellarg($repo).' diff --name-only '.escapeshellarg($head).' '.escapeshellarg($target)));
  foreach(explode("\n",$changed) as $path)if($path!==''&&!preg_match('~^(shared/model100_|parser/model100_|tests/test_model100|migrations/model100_|tools/model100_|docs/)~D',$path))throw new RuntimeException('UNEXPECTED_PRODUCTION_DIFF:'.$path);
  $configBefore=hash_file('sha256',$repo.'/94/config.toml');$entry=$repo.'/parser/'.$script;
- if(str_contains($changed,'parser/'.$script)===false&&$head!==$target)throw new RuntimeException('ENTRYPOINT_NOT_IN_COMMIT');
+ if(str_contains($changed,'parser/'.$script)===false&&$head!==$target){
+  // Library-only fixes are safe when the existing tracked entrypoint is exactly
+  // the target Git blob. Never accept a stale symlink or local replacement.
+  $expected=trim(shell_exec('git -C '.escapeshellarg($repo).' rev-parse '.escapeshellarg($target.':parser/'.$script)));
+  $actual=trim(shell_exec('git -C '.escapeshellarg($repo).' hash-object '.escapeshellarg($entry)));
+  if(is_link($entry)||!preg_match('/^[0-9a-f]{40}$/D',$expected)||!hash_equals($expected,$actual))throw new RuntimeException('ENTRYPOINT_SOURCE_MISMATCH');
+ }
  $backup=$base.'/entrypoint-before-deploy.symlink';
  if(is_link($entry)){if(file_exists($backup)||is_link($backup))throw new RuntimeException('DEPLOY_BACKUP_EXISTS');rename($entry,$backup);}
  exec('git -C '.escapeshellarg($repo).' merge --ff-only '.escapeshellarg($target).' 2>&1',$output,$rc);
