@@ -37,12 +37,13 @@ def worker_init(mode):
 
 def worker_shard(task):
     index,hours=task;start=time.monotonic();lines=[];checks=[];counts={k:0 for k in _RICH.groups}
-    news_ids=set();macro_ids=set();sizes=[]
+    news_ids=set();macro_ids=set();sizes=[];comparison_hours=0
     for at in hours:
         t=clock(at);x=_RICH.build_at(t);check_clocks(x,t)
         p=encode_context(_BASE.build_at(t),x,_SCHEMA)
         lines.append(canonical(p));size=len(p['rich_context'].encode());sizes.append(size)
         groups=x['groups']
+        comparison_hours+=int(any(r.get('nowcast_comparisons') for r in groups['macro']['series_state'].values()))
         for k in counts:
             g=groups[k];counts[k]+=int(bool(g.get('events') or g.get('series_state') or g.get('h1_sequence') or g.get('state')))
         news_ids.update(e['event_id'] for e in groups['news']['events'])
@@ -57,7 +58,7 @@ def worker_shard(task):
                sha256=hashlib.sha256(raw).hexdigest(),file_sha256=hashlib.sha256(compressed).hexdigest())
     return dict(shard=shard,checks=checks,counts=counts,news_ids=sorted(news_ids),macro_ids=sorted(macro_ids),
                 total_bytes=sum(sizes),max_bytes=max(sizes),seconds=time.monotonic()-start,
-                peak_rss_kb=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+                peak_rss_kb=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,nowcast_comparison_hours=comparison_hours)
 
 
 async def run():
@@ -77,7 +78,7 @@ async def run():
             hours=[clock(r[0]).isoformat() for r in rows]
             tasks=[(i//256,hours[i:i+256]) for i in range(0,len(hours),256)]
             counts={k:0 for k in ('news','macro','price','gdelt','binance','cftc','fxcm')}
-            news_ids=set();macro_ids=set();shards=[];total_bytes=maximum=peak=0;n=0
+            news_ids=set();macro_ids=set();shards=[];total_bytes=maximum=peak=0;n=0;comparison_hours=0
             with (RUNTIME/(mode+'-dryrun-sha.jsonl')).open('w') as f:
                 # Four low-priority processes on the verified 112-CPU B1.
                 # Workers read pinned files only; none has a DB writer/engine.
@@ -87,11 +88,12 @@ async def run():
                         for k in counts:counts[k]+=item['counts'][k]
                         news_ids.update(item['news_ids']);macro_ids.update(item['macro_ids'])
                         total_bytes+=item['total_bytes'];maximum=max(maximum,item['max_bytes']);peak=max(peak,item['peak_rss_kb'])
+                        comparison_hours+=item['nowcast_comparison_hours']
                         for check in item['checks']:f.write(canonical(check)+'\n')
                         print(canonical(dict(mode=mode,rows=n,seconds=time.monotonic()-start)),flush=True)
             result=dict(rows=n,hours_with_group=counts,distinct_selected_news=len(news_ids),distinct_selected_macro=len(macro_ids),
                         average_rich_bytes=total_bytes/n,maximum_rich_bytes=maximum,total_rich_bytes=total_bytes,
-                        seconds=time.monotonic()-start,peak_worker_rss_kb=peak,workers=4,capture_sha256=digest(meta),clock_checks='ALL_ROWS_PASSED')
+                        seconds=time.monotonic()-start,peak_worker_rss_kb=peak,workers=4,capture_sha256=digest(meta),clock_checks='ALL_ROWS_PASSED',nowcast_comparison_hours=comparison_hours)
             (RUNTIME/(mode+'-verified-manifest.json')).write_text(canonical(dict(schema_hash=digest(schema),capture=meta,rows=n,shards=shards)))
             (RUNTIME/(mode+'-full-dryrun.json')).write_text(canonical(result));results[mode]=result;print(canonical(result),flush=True)
         (RUNTIME/'full-dryrun.json').write_text(canonical(results))

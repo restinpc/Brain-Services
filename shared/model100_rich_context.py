@@ -22,7 +22,8 @@ def contract():
                 macro_releases_limit=64,macro_revisions_limit=32,
                 price_calendar_hours=72,gdelt_limit=32,binance_limit=72,
                 cftc_limit=8,fxcm_limit=24,availability='V1_INDEX_ADMISSION_UNCHANGED',
-                numeric_aggregation_policy='WINDOW_MATH_FSUM_V2')
+                numeric_aggregation_policy='WINDOW_MATH_FSUM_V2',
+                nowcast_join_policy='EXACT_TARGET_SHA_PERIOD_PUBLICATION_CLOCK_INDICATOR_UNIT_V1')
 
 
 class StableWindowIndex(EventIndex):
@@ -46,6 +47,16 @@ class V2FeatureBuilder(FeatureBuilder):
         super().__init__(*args,**kwargs)
         self.news={k:StableWindowIndex(v) for k,v in self.news.items()}
         self.gdelt={k:StableWindowIndex(v) for k,v in self.gdelt.items()}
+        snapshot=args[0] if args else kwargs['snapshot']
+        # These are used only to measure a nowcast error AFTER its actual
+        # release. They do not relax V1's conservative forward-state expiry.
+        self.forecast_vintages=[]
+        for r in snapshot.get('macro',[]):
+            if r.get('source') not in ('GDP_NOW_ATL','NYFED_NOW','ALFRED','CLEVELAND_NOW'):continue
+            at=clock(r.get('available_at'));target=clock(r.get('target_publication_at_audit'))
+            if not at or not target or at>=target or not r.get('target_original_sha256'):continue
+            if r.get('target_clock_status')!='VERIFIED_ORIGINAL_RELEASE' or number(r.get('value')) is None:continue
+            self.forecast_vintages.append({**r,'_at':at})
 
 
 def pack(value):
@@ -93,6 +104,9 @@ def public(row, t, keys):
     if out.get('first_received_at') and clock(out['first_received_at'])>t:
         out['first_received_at']=None
         out['receipt_missing_reason']='BACKFILL_RECEIPT_AFTER_CUTOFF_NOT_HISTORICAL_BRAIN_RECEIPT'
+    for field in ('modified_at_utc','ingested_at_utc'):
+        if out.get(field) and clock(out[field])>t:
+            out[field]=None;out[field+'_missing_reason']='METADATA_VERSION_AFTER_CUTOFF'
     return out
 
 
@@ -106,6 +120,9 @@ class RichContextBuilder:
         self.groups = tuple(groups)
         self.news_extra = {(r['press'], int(r['source_id'])): r for r in self.extras.get('news', [])}
         self.proxy_extra={r['event_time_utc']:r for r in self.extras.get('proxy',[])}
+        self.forecasts_by_target=defaultdict(list)
+        for r in getattr(base,'forecast_vintages',[]):
+            self.forecasts_by_target[(r['target_original_sha256'],str(r.get('reference_period'))[:10])].append(r)
         self.geo = sorted(self.extras.get('gdelt', []), key=lambda r: (r['available_at'], r['row_id']))
         self.geo_times = [clock(r['available_at']) for r in self.geo]
         # Preserve revision events separately. Never substitute them into first values.
@@ -140,7 +157,8 @@ class RichContextBuilder:
         keys = ('press', 'source_id', 'topic_id', 'topic_focus', 'cluster_similarity',
                 'quality_score', 'novelty', 'confirmation_count', 'date_dt',
                 'published_at_utc', 'first_seen_at_utc', 'text_observed_at',
-                'nlp_updated_at', 'text_sha', 'nlp_artifact_sha', 'publication_precision')
+                'nlp_updated_at', 'text_sha', 'nlp_artifact_sha', 'publication_precision',
+                'modified_at_utc','ingested_at_utc')
         for r in chosen:
             extra = self.news_extra.get((r['press'], int(r['source_id'])), {})
             # Metadata of a later NLP row must not decorate an older snapshot.
@@ -152,6 +170,8 @@ class RichContextBuilder:
                      independent_source_count=None, embedding=None,
                      embedding_missing_reason='NO_PERSISTED_PER_EVENT_VECTOR',
                      temporal_uncertainty=bool(r['_uncertain']))
+            e['event_version_sha256']=digest(select(e,('event_id','event_type','cluster_id','topic_id','quality_score','novelty','confirmation_count','text_sha','nlp_artifact_sha','nlp_updated_at')))
+            e['version_history_status']='CURRENT_PERSISTED_NLP_VERSION_ONLY'
             out.append(e)
         windows = {}
         for h in (1, 3, 6, 12, 24):
@@ -192,6 +212,13 @@ class RichContextBuilder:
                      delta_previous=number(current['value'])-number(prev['value']) if prev else None,
                      consensus=None, actual_minus_consensus=None, actual_minus_nowcast=None,
                      surprise_missing_reason='NO_VERIFIED_PRE_RELEASE_MATCHED_CONSENSUS_OR_NOWCAST')
+            c['independent_nowcast']=current['value'] if current.get('feature_kind')=='FORECAST_OF_TARGET' else None
+            c['nowcast_comparisons']=self._nowcast_comparisons(current)
+            if c['nowcast_comparisons']:
+                chosen=max(c['nowcast_comparisons'],key=lambda r:(r['available_at'],r['source'],r['event_identity']))
+                c.update(actual_minus_nowcast=chosen['actual_minus_nowcast'],nowcast_source=chosen['source'],
+                         nowcast_value=chosen['value'],nowcast_available_at=chosen['available_at'],
+                         surprise_missing_reason='CONSENSUS_NOT_AVAILABLE;INDEPENDENT_NOWCAST_ERROR_ONLY')
             # Previous release sequence is deliberately bounded per indicator.
             history_keys=('event_identity','reference_period','edition','release_version','value','original_sha256')
             c['history'] = [public(r, t, history_keys) for r in known[-6:]]
@@ -204,6 +231,30 @@ class RichContextBuilder:
                 'known_revisions': [public({**r,'_at':clock(r['available_at'])},t,keys) for r in revisions[-32:]],
                 'omitted_revision_count': max(0,len(revisions)-32),
                 'revision_policy': 'KNOWN_ONLY_SEPARATE_FROM_ORIGINAL_STATE'}
+
+    def _nowcast_comparisons(self,actual):
+        pub=clock(actual.get('source_published_at'))
+        if not pub:return []
+        target=(actual.get('original_sha256'),str(actual.get('reference_period'))[:10])
+        candidates={};indicator=actual.get('indicator')
+        for r in self.forecasts_by_target.get(target,[]):
+            if r['_at']>=pub or clock(r['target_publication_at_audit'])!=pub:continue
+            unit=str(r.get('unit') or '').upper();au=str(actual.get('unit') or '').upper()
+            gdp=(indicator=='BEA_GDP_REAL_QOQ_ANNUALIZED' and r.get('role','').startswith('GDP_FORECAST') and
+                 unit in ('PERCENT_SAAR','PERCENT_QOQ_SAAR','PERCENT_ANNUALIZED') and au=='PERCENT_ANNUALIZED')
+            cpi=(indicator=={'CPI_INFLATION':'CPI_HEADLINE_MOM','CORE_CPI_INFLATION':'CPI_CORE_MOM'}.get(r.get('indicator')) and
+                 unit=='PERCENT_MOM_SA' and au=='PERCENT')
+            if not (gdp or cpi):continue
+            key='ATLANTA_GDPNOW' if gdp and r['source'] in ('GDP_NOW_ATL','ALFRED') else r['source']
+            old=candidates.get(key)
+            rank=lambda x:(x['_at'],x['source']=='GDP_NOW_ATL',x['event_identity'])
+            if old is None or rank(r)>rank(old):candidates[key]=r
+        return [dict(source=r['source'],origin_provider=origin,event_identity=r['event_identity'],value=r['value'],
+                     actual_minus_nowcast=Decimal(str(actual['value']))-Decimal(str(r['value'])),
+                     available_at=r['_at'].isoformat(),original_sha256=r['original_sha256'],
+                     target_original_sha256=r['target_original_sha256'],is_consensus=False,
+                     unit_relation='MATCHED_TARGET_INDICATOR_MONTHLY_OR_ANNUALIZED_PERCENT')
+                for origin,r in sorted(candidates.items())]
 
     def _price(self, t):
         rows=[]; gaps=[]

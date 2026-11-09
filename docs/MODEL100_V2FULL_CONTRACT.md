@@ -39,6 +39,12 @@ never an UPDATE. Payload limit: 512 KiB of canonical rich JSON.
   events in seven days, and 32 separately retained known revisions. First values are never replaced
   with later revisions. Consensus/surprises remain null with a reason unless a genuine pre-release
   matched value exists. Independent nowcasts keep their role and are not called consensus. Existing
+  nowcast errors require identical target original SHA, reference period, official publication clock,
+  a strictly earlier forecast availability, and verified GDP annualized/CPI monthly unit semantics.
+  Latest forecasts are retained separately per provider. These errors exist only after the actual
+  release becomes admissible; they never relax conservative forward forecast expiry. There is no
+  retrospective price-response feature and no copied `pct_change`/`t1` from Model80 analogues.
+  Existing
   forecast expiry policy is reused; no future release calendar extends expired forecasts. Historical
   backfill receipt after cutoff is masked and explicitly labelled, not called original Brain receipt.
 - **price:** one Yahoo EUR/USD series from `brain.sasha_rates_eur_usd`; last 72 calendar hours, no

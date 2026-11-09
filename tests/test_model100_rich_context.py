@@ -120,5 +120,26 @@ class RichTests(unittest.TestCase):
         self.assertEqual(full.mean('v',1,2),short.mean('v',0,1))
         self.assertEqual(full.total('v',1,2),.5)
 
+    def test_nowcast_error_only_from_pre_release_matched_original(self):
+        from shared.model100_h1_features import clock
+        b=self.base();b.forecast_vintages=[dict(source='GDP_NOW_ATL',indicator='GDP_NOWCAST',role='GDP_FORECAST',unit='PERCENT_SAAR',
+            reference_period='2025-01-01',_at=clock('2025-04-29T12:00:00Z'),target_publication_at_audit='2025-04-30T12:30:00Z',
+            target_original_sha256='target',original_sha256='forecast',event_identity='f1',value='2.3')]
+        actual=dict(indicator='BEA_GDP_REAL_QOQ_ANNUALIZED',unit='PERCENT_ANNUALIZED',value='2.1',
+                    source_published_at='2025-04-30T12:30:00Z',reference_period='2025-01-01',original_sha256='target')
+        r=RichContextBuilder(b);x=r._nowcast_comparisons(actual)
+        from decimal import Decimal
+        self.assertEqual(x[0]['actual_minus_nowcast'],Decimal('-.2'));self.assertFalse(x[0]['is_consensus'])
+        from shared.model100_h1_features import EventIndex
+        b.macro={'gdp':EventIndex([{**actual,'_at':clock(actual['source_published_at']),'_until':None,'_id':'actual',
+                                   'event_identity':'actual','source':'BEA_RELEASES','edition':'FIRST_ESTIMATE'}])}
+        r=RichContextBuilder(b)
+        self.assertEqual(r.build_at('2025-04-30T12:00:00Z')['groups']['macro']['series_state'],{})
+        self.assertEqual(unpack(r.build_at('2025-04-30T13:00:00Z'))['groups']['macro']['series_state']['gdp']['actual_minus_nowcast'],Decimal('-.2'))
+        b.forecast_vintages[0]['_at']=clock('2025-04-30T13:00:00Z')
+        self.assertEqual(RichContextBuilder(b)._nowcast_comparisons(actual),[])
+        b.forecast_vintages[0]['_at']=clock('2025-04-29T12:00:00Z');actual['original_sha256']='different_document'
+        self.assertEqual(RichContextBuilder(b)._nowcast_comparisons(actual),[])
+
 
 if __name__=='__main__':unittest.main()

@@ -5,7 +5,7 @@ from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1];sys.path[:0]=[str(ROOT),str(ROOT/'shared')]
 from shared.model100_rich_context import V2FeatureBuilder as FeatureBuilder
 from shared.model100_h1_features import Config,clock,digest,canonical
-from shared.model100_rich_context import RichContextBuilder
+from shared.model100_rich_context import RichContextBuilder,contract
 from shared.model100_rich_runtime import RUNTIME,read_input
 
 
@@ -15,6 +15,7 @@ def run():
         start=time.monotonic();meta=json.loads((RUNTIME/(mode+'-capture.json')).read_text())
         data=read_input(meta['base']);extra=read_input(meta['extra'])
         schema=json.loads(json.loads((RUNTIME/'registration.json').read_text())[mode]['schema_json'])
+        if schema.get('rich_contract')!=contract():raise ValueError('FINAL_RICH_SCHEMA_REQUIRED')
         full=FeatureBuilder(data,Config(mode=mode),schema);rich=RichContextBuilder(full,extra)
         hours=full.cutoffs('2025-01-01',meta['end']);selected=[hours[i*(len(hours)-1)//11] for i in range(12)]
         checks=[]
@@ -30,7 +31,8 @@ def run():
             x=rich.build_at(t);y=rr.build_at(t)
             if x!=y:raise ValueError('RICH_FULL_INCREMENTAL_MISMATCH:'+at)
             checks.append(dict(cutoff=at,fixed_sha256=a['row_hash'],rich_sha256=digest(x)))
-        results[mode]=dict(real_bounded_snapshot_checks=checks,seconds=time.monotonic()-start)
+        if json.loads((RUNTIME/(mode+'-capture.json')).read_text())!=meta:raise ValueError('CAPTURE_CHANGED_DURING_AUDIT')
+        results[mode]=dict(schema_hash=digest(schema),capture_sha256=digest(meta),real_bounded_snapshot_checks=checks,seconds=time.monotonic()-start)
         print(canonical({mode:results[mode]}),flush=True)
     (RUNTIME/'incremental-equivalence.json').write_text(canonical(results))
 
