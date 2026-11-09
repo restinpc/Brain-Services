@@ -40,13 +40,13 @@ if($action==='history'){
 if(in_array($action,['disable-v2','enable-v2'],true)){
  $lease=BrainParserWriterFence::acquireForRegisteredTable($table,true);if($lease===false)throw new RuntimeException('WRITER_BUSY');
  try{
-  $r=engine::mysql("SELECT mode,status_json,last_status FROM vlad_model100_h1_feature_sets WHERE dataset_version='model100-h1-v2full-20261109'");
+  $r=engine::mysql("SELECT mode,status_json,last_status FROM vlad_model100_h1_feature_sets WHERE dataset_version='model100-h1-v2full-20261109b'");
   $before=[];while($row=mysqli_fetch_assoc($r))$before[]=$row;
   if(count($before)!==2)throw new RuntimeException('BOTH_V2_MODES_REQUIRED');
   $path=$base.'/control-'.gmdate('Ymd-His').'-'.bin2hex(random_bytes(4)).'.json';
   if(file_put_contents($path,json_encode(['action'=>$action,'before'=>$before],JSON_PRETTY_PRINT|JSON_THROW_ON_ERROR))===false)throw new RuntimeException('CONTROL_BACKUP_FAILED');chmod($path,0600);
   $enabled=$action==='enable-v2'?'true':'false';$status=$action==='enable-v2'?'V2_ENABLED_AWAITING_NATIVE_TICK':'V2_DISABLED_BY_ROOT';
-  engine::mysql("UPDATE vlad_model100_h1_feature_sets SET status_json=JSON_SET(COALESCE(status_json,JSON_OBJECT()),'$.enabled',JSON_EXTRACT('$enabled','$')),last_status='$status' WHERE dataset_version='model100-h1-v2full-20261109'");
+  engine::mysql("UPDATE vlad_model100_h1_feature_sets SET status_json=JSON_SET(COALESCE(status_json,JSON_OBJECT()),'$.enabled',JSON_EXTRACT('$enabled','$')),last_status='$status' WHERE dataset_version='model100-h1-v2full-20261109b'");
   echo json_encode(['action'=>$action,'v1_unchanged'=>true,'backup'=>$path]).PHP_EOL;
  }finally{BrainParserWriterFence::release($lease);}exit;
 }

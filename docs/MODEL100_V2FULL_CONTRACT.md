@@ -1,6 +1,6 @@
 # Model100 V2-Full input contract
 
-Dataset: `model100-h1-v2full-20261109`. No neural network, targets, weights or trading signals.
+Dataset: `model100-h1-v2full-20261109b`. No neural network, targets, weights or trading signals.
 
 ## Storage and immutability
 
@@ -128,3 +128,10 @@ full texts, credentials and runtime snapshots are never committed to Git.
 
 Runtime counts, benchmarks, V1 backup equality and native cron evidence are reported separately.
 This contract is not a claim that pending deployment/history/cron checks have passed.
+
+## Auxiliary-clock correction
+
+Version b masks NLP update, text-observation and first-seen clocks above cutoff, as well as
+receipt/modification/ingestion clocks. Null clocks use the group UNPROVEN_AT_CUTOFF reason.
+Current NLP values remain explicitly research-only when historical NLP availability is unproven.
+The superseded initial V2 partial dataset is disabled and retained unchanged for audit; not the default reader dataset.

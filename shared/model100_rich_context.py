@@ -10,8 +10,8 @@ from datetime import timedelta, datetime
 from decimal import Decimal
 from .model100_h1_features import canonical, digest, clock, number, HOUR, EventIndex, FeatureBuilder
 
-VERSION = 'model100-rich-v2full-1'
-DATASET = 'model100-h1-v2full-20261109'
+VERSION = 'model100-rich-v2full-2'
+DATASET = 'model100-h1-v2full-20261109b'
 GROUPS = ('news', 'macro', 'price', 'gdelt', 'binance', 'cftc', 'fxcm')
 MAX_BYTES = 524288
 
@@ -23,6 +23,7 @@ def contract():
                 price_calendar_hours=72,gdelt_limit=32,binance_limit=72,
                 cftc_limit=8,fxcm_limit=24,availability='V1_SOURCE_CLOCKS_PLUS_DOCUMENTED_TARGET_EVENT_EXPIRY',
                 numeric_aggregation_policy='WINDOW_MATH_FSUM_V2',
+                auxiliary_clock_policy='MASK_UNPROVEN_OR_AFTER_CUTOFF_V2',
                 nowcast_join_policy='EXACT_TARGET_SHA_PERIOD_PUBLICATION_CLOCK_INDICATOR_UNIT_V1',
                 forecast_context_policy='SOURCE_CLOCK_PLUS_DOCUMENTED_ACTUAL_EVENT_EXPIRY',
                 pre_release_forecasts_limit=32,pre_release_forecasts_window_days=45,
@@ -113,9 +114,10 @@ def public(row, t, keys):
     if 'first_received_at' in out and (not out['first_received_at'] or clock(out['first_received_at'])>t):
         out['first_received_at']=None
         out['receipt_missing_reason']='UNPROVEN_AT_CUTOFF'
-    for field in ('modified_at_utc','ingested_at_utc'):
+    for field in ('modified_at_utc','ingested_at_utc','nlp_updated_at','first_seen_at_utc','text_observed_at'):
         if field in out and (not out[field] or clock(out[field])>t):
-            out[field]=None;out[field+'_missing_reason']='UNPROVEN_AT_CUTOFF'
+            out[field]=None
+            if field in ('modified_at_utc','ingested_at_utc'):out[field+'_missing_reason']='UNPROVEN_AT_CUTOFF'
     return out
 
 

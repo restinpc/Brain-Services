@@ -161,6 +161,16 @@ class RichTests(unittest.TestCase):
         b=dict(_at=clock('2025-01-01'),modified_at_utc=None)
         self.assertEqual(public(a,clock('2025-02-01'),('modified_at_utc',)),public(b,clock('2025-02-01'),('modified_at_utc',)))
 
+    def test_future_auxiliary_news_clocks_are_not_feature_values(self):
+        from shared.model100_rich_context import public,clock
+        fields=('nlp_updated_at','first_seen_at_utc','text_observed_at')
+        future=dict(_at=clock('2025-01-01'),**dict.fromkeys(fields,'2026-01-01'))
+        unknown=dict(_at=clock('2025-01-01'),**dict.fromkeys(fields,None))
+        self.assertEqual(public(future,clock('2025-02-01'),fields),public(unknown,clock('2025-02-01'),fields))
+        known=dict(_at=clock('2025-01-01'),**dict.fromkeys(fields,'2025-01-02'))
+        result=public(known,clock('2025-02-01'),fields)
+        self.assertTrue(all(result[k]=='2025-01-02' for k in fields))
+
     def test_open_proxy_not_in_rich_sequence(self):
         data=dict(prices=[],macro=[],news=[],gdelt=[],proxy=[dict(event_time_utc='2026-01-01T15:00:00Z',
             window_end_utc='2026-01-01T16:00:00Z',feature_ready_at_utc='2026-01-01T15:00:00Z',brain_first_received_at_utc='2026-01-01T15:00:00Z')])
