@@ -149,13 +149,20 @@ def main(argv=None):
         if c.fetchone()[0]!=1:raise RuntimeError('WRITER_BUSY')
         c.close()
         action=args[6] if len(args)>6 else 'normal'
-        if action not in ('normal','import'):raise ValueError('INVALID_RUN_MODE')
-        result=import_history(db) if action=='import' else update(db)
+        if action not in ('normal','import','v2-history'):raise ValueError('INVALID_RUN_MODE')
+        from shared.model100_rich_runtime import update_v2
+        if action=='v2-history':
+            result=update(db)
+            result.update(update_v2(db,history=True))
+        elif action=='import':result=import_history(db)
+        else:
+            result=update(db)
+            result.update(update_v2(db))
         line={'at_utc':datetime.now(timezone.utc).isoformat(),'action':action,'dataset_version':DATASET,'modes':result}
         RUNTIME.mkdir(parents=True,exist_ok=True)
         with (RUNTIME/'runs.jsonl').open('a') as f:f.write(canonical(line)+'\n')
         print(canonical(line))
-        if action=='normal' and any(v.get('status') not in ('SUCCESS_NEW_DATA','SUCCESS_UNCHANGED') for v in result.values()):raise SystemExit(1)
+        if action in ('normal','v2-history') and any(v.get('status') not in ('SUCCESS_NEW_DATA','SUCCESS_UNCHANGED') for v in result.values()):raise SystemExit(1)
     finally:db.close()
 
 

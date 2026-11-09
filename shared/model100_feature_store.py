@@ -122,7 +122,7 @@ async def read_features(engine,version,mode,start,end=None,limit=None):
         # Do not change a pooled Framework connection's session timezone.
         s=(await c.execute(text(f'SELECT schema_json FROM {SETS} WHERE dataset_version=:v AND mode=:m'),dict(v=version,m=mode))).scalar_one()
         schema=parsed(s)
-        sql=f'SELECT * FROM {TABLE} WHERE dataset_version=:v AND mode=:m AND cutoff_utc>=:a AND cutoff_utc<=:b ORDER BY cutoff_utc'
+        sql=f'SELECT dataset_version,mode,cutoff_utc,schema_hash,feature_values,missing_masks,provenance,row_hash,payload_sha256,builder_version,value_encoding FROM {TABLE} WHERE dataset_version=:v AND mode=:m AND cutoff_utc>=:a AND cutoff_utc<=:b ORDER BY cutoff_utc'
         if limit is not None:
             if not isinstance(limit,int) or limit<1:raise ValueError('INVALID_LIMIT')
             sql+=' LIMIT '+str(limit)
