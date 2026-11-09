@@ -163,7 +163,7 @@ class RichTests(unittest.TestCase):
 
     def test_future_auxiliary_news_clocks_are_not_feature_values(self):
         from shared.model100_rich_context import public,clock
-        fields=('nlp_updated_at','first_seen_at_utc','text_observed_at')
+        fields=('nlp_updated_at','first_seen_at_utc','text_observed_at','brain_first_received_at_utc','published_at_utc','source_published_at','loaded_at_utc','feature_ready_at_utc')
         future=dict(_at=clock('2025-01-01'),**dict.fromkeys(fields,'2026-01-01'))
         unknown=dict(_at=clock('2025-01-01'),**dict.fromkeys(fields,None))
         self.assertEqual(public(future,clock('2025-02-01'),fields),public(unknown,clock('2025-02-01'),fields))

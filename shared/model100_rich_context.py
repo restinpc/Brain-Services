@@ -114,7 +114,8 @@ def public(row, t, keys):
     if 'first_received_at' in out and (not out['first_received_at'] or clock(out['first_received_at'])>t):
         out['first_received_at']=None
         out['receipt_missing_reason']='UNPROVEN_AT_CUTOFF'
-    for field in ('modified_at_utc','ingested_at_utc','nlp_updated_at','first_seen_at_utc','text_observed_at'):
+    for field in ('modified_at_utc','ingested_at_utc','nlp_updated_at','first_seen_at_utc','text_observed_at',
+                  'brain_first_received_at_utc','published_at_utc','source_published_at','loaded_at_utc','feature_ready_at_utc'):
         if field in out and (not out[field] or clock(out[field])>t):
             out[field]=None
             if field in ('modified_at_utc','ingested_at_utc'):out[field+'_missing_reason']='UNPROVEN_AT_CUTOFF'
