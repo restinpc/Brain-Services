@@ -88,5 +88,16 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue(all(v.get('detail')=='V2_DISABLED_BY_ROOT' for v in result.values()))
         db.commit.assert_not_called()
 
+    def test_single_context_closes_stream_before_return(self):
+        import asyncio
+        from shared import model100_rich_store as store
+        closed=[]
+        async def rows(*args,**kwargs):
+            try:yield {'ok':True}
+            finally:closed.append(True)
+        with patch.object(store,'get_context_range',rows):
+            value=asyncio.run(store.get_context(None,'2026-01-01','RESEARCH'))
+        self.assertEqual(value,{'ok':True});self.assertEqual(closed,[True])
+
 
 if __name__=='__main__':unittest.main()

@@ -90,5 +90,7 @@ async def get_context_range(engine,start,end,mode,version=DATASET,groups=GROUPS,
 
 
 async def get_context(engine,T,mode,version=DATASET,groups=GROUPS,numeric=True):
-    async for r in get_context_range(engine,T,T,mode,version,groups,numeric):return r
+    from contextlib import aclosing
+    async with aclosing(get_context_range(engine,T,T,mode,version,groups,numeric)) as rows:
+        async for r in rows:return r
     return None
