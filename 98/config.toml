@@ -4,7 +4,7 @@
 
 [service]
 id = 98
-port = 8960
+port = 8961
 name = "brain-candle-vision-patterns-s98"
 text = "Monolith CV candle-index patterns (brain_index 0-6) with next-candle T1 sums"
 
