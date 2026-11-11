@@ -1,6 +1,6 @@
 [service]
 id = 99
-port = 8961
+port = 8962
 name = "brain-earthquake-regimes-ml-s99"
 text = "USGS earthquake magnitude/depth/location, local sequences and causal activity regimes with ML/reverse-learning"
 
