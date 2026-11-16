@@ -16,8 +16,9 @@ shift_window = 48
 reload_interval = 3600
 rebuild_interval = 7200
 ml_workers = 2
-ml_batch_size = 2000
-batch_model_size = 1000
+# Commit and report progress in smaller chunks; arithmetic is unchanged.
+ml_batch_size = 300
+batch_model_size = 300
 
 [dataset]
 # На сервере исходная таблица называется vlad_polymarket_direct.
@@ -35,6 +36,8 @@ engine = "vlad"
 filter_by_date = true
 key_field = "event_type"
 model_can_filter = true
+# Prices and outcomes are read from dataset_index.np_rates.
+model_uses_rates = false
 
 [model]
 # Historical price itself is causal.  Other columns in the legacy price table

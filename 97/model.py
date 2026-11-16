@@ -25,9 +25,13 @@ dataset_index["np_rates"] и переиспользуются между выз�
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 from datetime import datetime
+
+import numpy as np
+from sqlalchemy import text
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
@@ -53,6 +57,40 @@ def _is_daily(index: dict) -> bool:
     if "is_daily" in index:
         return bool(index["is_daily"])
     return str(index.get("rates_table") or "").endswith("_day")
+
+
+async def enrich_dataset(engine_vlad, engine_brain) -> dict:
+    """Framework rebuild hook: refresh all six in-memory pattern indexes.
+
+    There is no enriched SQL dataset for candle patterns. Read the same stored
+    T1 candles used by np_rates and replace the model's indexes after building
+    all of them successfully. Source tables are read-only.
+    """
+    del engine_vlad
+    series = {}
+    async with engine_brain.connect() as conn:
+        for pair in ("eur_usd", "btc_usd", "eth_usd"):
+            for suffix in ("", "_day"):
+                table = f"brain_rates_{pair}{suffix}"
+                result = await conn.execute(text(
+                    f"SELECT `date`, `open`, `close`, `t1` FROM `{table}` "
+                    "WHERE `t1` IS NOT NULL ORDER BY `date`"
+                ))
+                rows = result.mappings().all()
+                if len(rows) < 2:
+                    raise ValueError(
+                        f"Model 97 rebuild requires at least two candles with stored T1 in {table}"
+                    )
+                series[table] = {
+                    "dates_ns": np.array([int(r["date"].timestamp()) for r in rows], dtype=np.int64),
+                    "open": np.array([float(r["open"] or 0) for r in rows], dtype=np.float64),
+                    "close": np.array([float(r["close"] or 0) for r in rows], dtype=np.float64),
+                    "t1": np.array([float(r["t1"]) for r in rows], dtype=np.float64),
+                }
+
+    global _MAX_LENGTH
+    _MAX_LENGTH = None
+    return await asyncio.to_thread(cc.rebuild_histories, series, max_length=_max_length())
 
 
 def model(rates, dataset, date, *, type=0, var=0, param="", dataset_index=None):

@@ -65,6 +65,18 @@ def _to_result(pairs: list[tuple[str, float]], var: int) -> dict[str, float]:
     return out
 
 
+def _history(index: dict, algorithm: int):
+    rates_table = str(index.get("rates_table") or "")
+    if not rates_table:
+        raise ValueError("Model 98 requires dataset_index['rates_table'] to select brain_index tables")
+    return vc.history_for(
+        index.get("np_rates"),
+        algorithm=algorithm,
+        rates_table=rates_table,
+        max_depth=_max_depth(),
+    )
+
+
 async def enrich_dataset(engine_vlad, engine_brain) -> dict:
     """Индексы считает монолит; здесь только диагностика и сброс локального кеша."""
     del engine_vlad, engine_brain
@@ -86,12 +98,7 @@ def model(rates, dataset, date, *, type=0, var=0, param="", dataset_index=None):
         return {}
 
     index = dataset_index or {}
-    history = vc.history_for(
-        index.get("np_rates"),
-        algorithm=algorithm,
-        rates_table=str(index.get("rates_table") or ""),
-        max_depth=_max_depth(),
-    )
+    history = _history(index, algorithm)
     if history is None:
         return {}
 
@@ -103,29 +110,6 @@ def model(rates, dataset, date, *, type=0, var=0, param="", dataset_index=None):
     return _to_result(pairs, var)
 
 
-def batch_model(rates, dataset, dates, *, type=0, var=0, param="", dataset_index=None):
-    del rates, dataset, param
-    algorithm = _algorithm(type)
-    if algorithm is None or not dates:
-        return {date: {} for date in dates}
-
-    index = dataset_index or {}
-    history = vc.history_for(
-        index.get("np_rates"),
-        algorithm=algorithm,
-        rates_table=str(index.get("rates_table") or ""),
-        max_depth=_max_depth(),
-    )
-    if history is None:
-        return {date: {} for date in dates}
-
-    is_daily = _is_daily(index)
-    depth = _max_depth()
-    return {
-        date: _to_result(
-            history.codes_at(date, is_daily=is_daily, max_depth=depth),
-            var,
-        )
-        if isinstance(date, datetime) else {}
-        for date in dates
-    }
+# Expose only model(): deployed framework versions may omit rates_table in the
+# optional batch path. Scalar fill uses the same instrument metadata as /values.
+# The prepared VisionHistory is reused across scalar calls, types and vars.
