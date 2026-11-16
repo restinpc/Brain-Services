@@ -256,9 +256,10 @@ def fetch_dune_data(sql: str) -> list:
         resp.raise_for_status()
         execution_id = resp.json()["execution_id"]
     except Exception as e:
-        print(f" Ошибка запуска Dune query: {e}")
-        return []
+        print(f" Ошибка запуска Dune query: HTTP={getattr(getattr(e, 'response', None), 'status_code', 'n/a')} type={type(e).__name__}")
+        raise RuntimeError(f"DUNE_EXECUTE_FAILED:{type(e).__name__}") from e
 
+    completed = False
     for _ in range(120):
         try:
             status_resp = requests.get(
@@ -284,14 +285,20 @@ def fetch_dune_data(sql: str) -> list:
                 continue
 
             if state == "QUERY_STATE_COMPLETED":
+                completed = True
                 break
             if state in ("QUERY_STATE_FAILED", "QUERY_STATE_CANCELLED"):
                 print(f" Dune query failed: {state}")
-                return []
+                raise RuntimeError(f"DUNE_QUERY_{state}")
         except Exception as e:
-            print(f" Ошибка статуса: {e}")
-            return []
+            if isinstance(e, RuntimeError) and str(e).startswith("DUNE_QUERY_"):
+                raise
+            print(f" Ошибка статуса Dune: HTTP={getattr(getattr(e, 'response', None), 'status_code', 'n/a')} type={type(e).__name__}")
+            raise RuntimeError(f"DUNE_STATUS_FAILED:{type(e).__name__}") from e
         time.sleep(2)
+
+    if not completed:
+        raise TimeoutError("DUNE_STATUS_TIMEOUT")
 
     try:
         result_resp = requests.get(
@@ -301,10 +308,15 @@ def fetch_dune_data(sql: str) -> list:
         )
         result_resp.raise_for_status()
         data = result_resp.json()
-        return data.get("result", {}).get("rows", [])
+        rows = data.get("result", {}).get("rows")
+        if not isinstance(rows, list):
+            raise RuntimeError("DUNE_RESULTS_MALFORMED")
+        return rows
     except Exception as e:
-        print(f" Ошибка получения результатов: {e}")
-        return []
+        if isinstance(e, RuntimeError) and str(e) == "DUNE_RESULTS_MALFORMED":
+            raise
+        print(f" Ошибка получения результатов Dune: HTTP={getattr(getattr(e, 'response', None), 'status_code', 'n/a')} type={type(e).__name__}")
+        raise RuntimeError(f"DUNE_RESULTS_FAILED:{type(e).__name__}") from e
 
 #  9. ЗАПИСЬ В БД 
 def save_rows(table_name: str, rows: list):
