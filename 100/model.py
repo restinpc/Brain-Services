@@ -204,8 +204,13 @@ class NewsEnricher:
         self.bucket = None
         self.latest = {}
         self.last_time = None
+        self.first_time = None
         self.baselines = {s: deque() for s in STREAMS.values()}
         self.contexts = set()
+        self.context_hours = Counter()
+        self.context_days = Counter()
+        self.context_last_day = {}
+        self.last_finished_day = None
 
     def add(self, row):
         observation = _observation(row, self.cfg, self.stats)
@@ -215,6 +220,8 @@ class NewsEnricher:
         available = observation["available"]
         if self.last_time is not None and available < self.last_time:
             raise ValueError("GDELT observations must be ordered by effective availability")
+        if self.first_time is None:
+            self.first_time = available
         self.last_time = available
         bucket = available.replace(minute=0, second=0, microsecond=0)
         output = self.finish() if self.bucket is not None and bucket != self.bucket else []
@@ -265,14 +272,46 @@ class NewsEnricher:
             baseline.append((self.bucket, count))
         rows = [features[key] for key in sorted(features)]
         self.contexts.update(features)
+        self.context_hours.update(features.keys())
+        day = self.bucket.date()
+        for name in features:
+            if self.context_last_day.get(name) != day:
+                self.context_days[name] += 1
+                self.context_last_day[name] = day
+        if self.last_finished_day != day:
+            self.stats["observed_days"] += 1
+            self.last_finished_day = day
         self.stats.update(enriched_rows=len(rows), observed_hours=1,
                           unique_observations=sum(counts.values()))
         self.latest.clear()
         return rows
 
     def summary(self):
+        minimum = self.cfg["min_analogs"]
+        required = minimum + 1  # Prior analogs plus a distinct current observation.
+        coverage, warnings = {}, []
+        for frame, counts, observed in (
+            ("hour", self.context_hours, self.stats["observed_hours"]),
+            ("day", self.context_days, self.stats["observed_days"]),
+        ):
+            repeated = sum(count >= required for count in counts.values())
+            coverage[frame] = {
+                "observed_frames": observed,
+                "max_context_observations": max(counts.values(), default=0),
+                "contexts_with_min_observations": repeated,
+            }
+            if not repeated:
+                warnings.append(
+                    f"Insufficient {frame} history: no context has {required} distinct {frame} observations "
+                    f"({minimum} prior analogs + current)."
+                )
         return {**self.stats, "contexts": len(self.contexts),
-                "availability_mode": self.cfg["availability_mode"]}
+                "availability_mode": self.cfg["availability_mode"],
+                "source_time_from": self.first_time.isoformat(sep=" ") if self.first_time else None,
+                "source_time_to": self.last_time.isoformat(sep=" ") if self.last_time else None,
+                "history_coverage": {"min_prior_analogs": minimum,
+                                     "required_context_observations": required, **coverage},
+                "warnings": warnings}
 
 
 def build_enriched_rows(source, *, cfg=None):
@@ -365,7 +404,7 @@ async def enrich_dataset(engine_vlad, engine_brain):
         finally:
             await dest.execute(text(f"DROP TEMPORARY TABLE IF EXISTS `{stage}`"))
     invalidate()
-    return builder.summary()
+    return {**builder.summary(), "source_table": source, "source_engine": source_engine}
 
 
 def _runtime(dataset, dataset_index):

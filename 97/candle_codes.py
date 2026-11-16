@@ -213,3 +213,38 @@ def history_for(
                 _CACHE.clear()
             _CACHE[key] = cached
     return cached
+
+
+def rebuild_histories(
+    series: dict[str, dict],
+    *,
+    max_length: int = MAX_PATTERN_LENGTH,
+) -> dict:
+    """Build fresh indexes, then publish them together after all builds succeed."""
+    if not series or len(series) > _CACHE_LIMIT:
+        raise ValueError("Model 97 rebuild requires 1 to 6 rate histories")
+    max_length = max(1, min(MAX_PATTERN_LENGTH, int(max_length)))
+    rebuilt: dict[tuple, CodeHistory] = {}
+    stats = {}
+    for table, np_rates in series.items():
+        dates = np_rates["dates_ns"]
+        if len(dates) < 2:
+            raise ValueError(f"Model 97 rebuild requires at least two candles with stored T1 in {table}")
+        history = _build(np_rates, max_length)
+        key = (str(table), max_length, len(dates), int(dates[0]), int(dates[-1]))
+        rebuilt[key] = history
+        stats[table] = {
+            "candles": len(dates),
+            "levels": len(history.levels),
+            "last_date": datetime.fromtimestamp(int(dates[-1])).isoformat(sep=" "),
+        }
+
+    with _CACHE_LOCK:
+        _CACHE.clear()
+        _CACHE.update(rebuilt)
+    return {
+        "mode": "memory_rebuild",
+        "max_pattern_length": max_length,
+        "tables_rebuilt": len(rebuilt),
+        "tables": stats,
+    }

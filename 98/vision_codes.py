@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import re
 import threading
+import time
+from dataclasses import dataclass
 from datetime import date as date_cls, datetime
 from urllib.parse import quote_plus
 
@@ -40,7 +42,19 @@ _FNV_PRIME = np.uint64(1099511628211)
 
 # До 7 алгоритмов на текущий инструмент; чужие пары вытесняются первыми.
 _CACHE_LIMIT = 8
-_CACHE: dict[tuple, "VisionHistory"] = {}
+_HISTORY_CHECK_SECONDS = 60.0
+
+
+@dataclass
+class _CachedHistory:
+    dates: np.ndarray
+    t1: np.ndarray
+    fingerprint: tuple[int, int]
+    checked_at: float
+    history: "VisionHistory"
+
+
+_CACHE: dict[tuple, _CachedHistory] = {}
 _CACHE_LOCK = threading.Lock()
 _ENGINE = None
 _ENGINE_LOCK = threading.Lock()
@@ -273,8 +287,8 @@ def _list_index_tables() -> set[str]:
         with engine().connect() as conn:
             rows = conn.execute(text(f"SHOW TABLES LIKE '{prefix}%'")).fetchall()
         found = {row[0] for row in rows}
-    except Exception:
-        found = set()
+    except Exception as exc:
+        raise RuntimeError("Model 98 could not discover brain_index tables") from exc
     with _TABLES_LOCK:
         _TABLES = found
     return found
@@ -476,11 +490,13 @@ def _load_history(index_table: str, rates_table: str, np_rates: dict, max_depth:
     try:
         with engine().connect() as conn:
             idx_dates, idx_cells, pairs = _load_cells(conn, index_table, rates_table)
-    except Exception:
-        return None
+    except Exception as exc:
+        raise RuntimeError(f"Model 98 could not read {index_table}") from exc
     if not pairs:
-        return None
+        raise ValueError(f"Model 98 found no CV cell columns in {index_table}")
     dates_ns, cells, valid = _align_to_rates(np_rates, idx_dates, idx_cells)
+    if not np.any(valid):
+        raise ValueError(f"Model 98 found no matching candle dates in {index_table} / {rates_table}")
     return build_from_arrays(
         dates_ns,
         cells,
@@ -500,52 +516,52 @@ def history_for(
 ) -> VisionHistory | None:
     """Индекс CV-таблицы с кешем между вызовами model()."""
     if not np_rates:
-        return None
+        raise ValueError(f"Model 98 requires np_rates for {rates_table}")
     dates_ns = np_rates.get("dates_ns")
-    if dates_ns is None or len(dates_ns) < 2:
+    t1 = np_rates.get("t1")
+    if dates_ns is None or t1 is None or len(dates_ns) != len(t1):
+        raise ValueError(f"Model 98 requires aligned dates_ns and stored t1 for {rates_table}")
+    if len(dates_ns) < 2:
         return None
     table = index_table_name(int(algorithm), rates_table)
     if not table:
-        return None
+        raise ValueError(f"Model 98 found no index table for algorithm={algorithm}, rates_table={rates_table}")
 
-    fingerprint = (0, 0)
-    try:
-        with engine().connect() as conn:
-            fingerprint = _fingerprint(conn, table)
-    except Exception:
-        return None
-    if fingerprint[0] <= 0:
-        return None
-
-    key = (
-        str(table),
-        int(algorithm),
-        int(max_depth),
-        int(len(dates_ns)),
-        int(dates_ns[0]),
-        int(dates_ns[-1]),
-        int(fingerprint[0]),
-        int(fingerprint[1]),
-    )
-    cached = _CACHE.get(key)
-    if cached is not None:
-        return cached
-
+    key = (str(table), int(algorithm), int(max_depth))
+    # Hold the source arrays, not only their ids: appends replace arrays and a
+    # reload may replace T1 without changing the timeline's size/endpoints.
+    # Serialize the cold load so concurrent type/var workers share one index.
     with _CACHE_LOCK:
         cached = _CACHE.get(key)
-        if cached is None:
-            cached = _load_history(table, rates_table, np_rates, max_depth)
-            if cached is None:
-                return None
-            suffix = rates_suffix(rates_table)
-            for item in [k for k in _CACHE if k[0] == table]:
+        same_rates = cached is not None and cached.dates is dates_ns and cached.t1 is t1
+        now = time.monotonic()
+        if same_rates and now - cached.checked_at < _HISTORY_CHECK_SECONDS:
+            return cached.history
+
+        try:
+            with engine().connect() as conn:
+                fingerprint = _fingerprint(conn, table)
+        except Exception as exc:
+            raise RuntimeError(f"Model 98 could not inspect {table}") from exc
+        if fingerprint[0] <= 0:
+            raise ValueError(f"Model 98 index table {table} is empty")
+
+        if same_rates and cached.fingerprint == fingerprint:
+            cached.checked_at = now
+            return cached.history
+
+        history = _load_history(table, rates_table, np_rates, max_depth)
+        if history is None:
+            raise RuntimeError(f"Model 98 could not build history for {table}")
+        suffix = rates_suffix(rates_table)
+        for item in [k for k in _CACHE if k[0] == table]:
+            del _CACHE[item]
+        if len(_CACHE) >= _CACHE_LIMIT:
+            for item in [k for k in _CACHE if suffix not in str(k[0])]:
                 del _CACHE[item]
-            if len(_CACHE) >= _CACHE_LIMIT:
-                for item in [k for k in _CACHE if suffix not in str(k[0])]:
-                    del _CACHE[item]
-                    if len(_CACHE) < _CACHE_LIMIT:
-                        break
-            while len(_CACHE) >= _CACHE_LIMIT:
-                _CACHE.pop(next(iter(_CACHE)))
-            _CACHE[key] = cached
-    return cached
+                if len(_CACHE) < _CACHE_LIMIT:
+                    break
+        while len(_CACHE) >= _CACHE_LIMIT:
+            _CACHE.pop(next(iter(_CACHE)))
+        _CACHE[key] = _CachedHistory(dates_ns, t1, fingerprint, now, history)
+        return history
