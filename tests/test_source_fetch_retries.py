@@ -25,6 +25,13 @@ class SourceFetchRetryTests(unittest.TestCase):
             rows = ns['fetch_data'](ns['DATASETS']['sasha_oilpriceapi_brent'])
         self.assertEqual(rows, [('2026-11-18', 'BRENT_CRUDE_USD', 70.0)])
         self.assertEqual(get.call_count, 2)
+        self.assertEqual(get.call_args_list[0].kwargs['proxies']['https'], 'http://10.10.11.1:3128')
+
+    def test_oilprice_all_endpoint_timeouts_are_a_fetch_failure(self):
+        ns = load_script('OilPriceAPI.py', 'sasha_oilpriceapi_brent', {'OILPRICE_API_KEY': 'test-key'})
+        with patch.object(ns['requests'], 'get', side_effect=ns['requests'].ReadTimeout('slow')):
+            with self.assertRaisesRegex(RuntimeError, 'OILPRICE_API_ENDPOINTS_UNREACHABLE'):
+                ns['fetch_data'](ns['DATASETS']['sasha_oilpriceapi_brent'])
 
     def test_aisstream_retries_transient_handshake_error(self):
         ns = load_script('WorldMonitor_ais_maritime.py', 'vlad_wm_ais_snapshot')
