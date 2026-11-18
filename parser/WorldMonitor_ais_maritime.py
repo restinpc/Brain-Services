@@ -654,7 +654,7 @@ class AISCollector:
         data = self.fetch_snapshot()
         if not data:
             print("    Нет данных AIS snapshot")
-            return
+            raise SystemExit(2)
 
         now = datetime.now(timezone.utc)
         snapshot_at = now.replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")

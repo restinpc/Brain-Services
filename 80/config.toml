@@ -65,3 +65,7 @@ step = 0.10
 extremum_limit = 50
 active_tail = 0
 precision_metric = "mean"
+
+# Recovery capacity guard; throughput canary remains in progress.
+[runtime]
+model_compute_concurrency = 2
