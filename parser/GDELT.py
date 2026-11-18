@@ -635,7 +635,7 @@ def main():
         def budget_expired(signum, frame):
             raise TimeoutError("GDELT recent stage budget exceeded; partial state retained")
         signal.signal(signal.SIGALRM, budget_expired)
-        signal.alarm(180)
+        signal.alarm(600)
         # GDELT posts 15-minute batches a few minutes after each interval.
         # Keep a 30-minute publication buffer so the live lane never requests
         # a manifest-listed file before it is available; the rolling window
