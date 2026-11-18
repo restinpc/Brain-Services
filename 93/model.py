@@ -277,8 +277,3 @@ def _pair_from_index(index: dict) -> int:
     if "eth" in table:
         return 4
     return mom.DEFAULT_TARGET
-
-
-def dataset_snapshot_factory(gate):
-    _ensure_configured()
-    return mom.dataset_snapshot_factory(gate)

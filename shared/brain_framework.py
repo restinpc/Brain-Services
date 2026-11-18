@@ -1,10 +1,5 @@
 """
-brain_framework.py v21.5 — autonomous dataset synchronization over v21.4.
-
-Read-only SQL snapshots are compared with the current RAM state. Unchanged
-rows and indexes are retained; changed snapshots publish atomically. Large
-direct sources compare SHA-256 blocks before transferring changed rows.
-Original compatibility and test/reverse-learning contracts below are retained.
+brain_framework.py v21.2 — param-aware tests + runtime/version diagnostics over v21.1.
 
 
 Исправление v21.1 — PARAM/TEST-COMPAT:
@@ -57,7 +52,7 @@ Original compatibility and test/reverse-learning contracts below are retained.
 
 from __future__ import annotations
 
-FRAMEWORK_VERSION = "21.6-unified-causal-incremental-rc1+snapshot-v6"
+FRAMEWORK_VERSION = "21.4-shared-parallel-runtime"
 
 import asyncio
 import bisect
@@ -86,630 +81,6 @@ import numpy as np
 from fastapi import FastAPI, Query
 from sqlalchemy import text
 from dotenv import load_dotenv
-from dataclasses import dataclass
-from datetime import date
-from typing import Any
-import re
-
-# BEGIN embedded dynamic synchronization (single-file deployment)
-_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z_0-9]*$")
-
-
-def safe_identifier(value: str) -> str:
-    if not isinstance(value, str) or not _IDENTIFIER.fullmatch(value):
-        raise ValueError(f"Unsafe SQL identifier: {value!r}")
-    return f"`{value}`"
-
-
-def normalize_row(row: dict) -> dict:
-    return {key: datetime(value.year, value.month, value.day)
-            if type(value) is date else value for key, value in dict(row).items()}
-
-
-@dataclass(frozen=True)
-class TableContract:
-    table: str
-    primary_key: str
-    updated_at: str
-    date_alias: str | None = None
-
-    def select_columns(self) -> str:
-        suffix = (f", {safe_identifier(self.date_alias)} AS `date`"
-                  if self.date_alias and self.date_alias != "date" else "")
-        return "*" + suffix
-
-
-async def discover_contract(engine, *, table: str, date_alias: str | None = None,
-                            updated_column: str = "updated_at",
-                            primary_key: str | None = None,
-                            explicit_contract: bool = False) -> TableContract:
-    """Validate read-only schema: column-level ON UPDATE or explicit writer contract.
-
-    A SELECT with joins/custom transformations cannot be safely patched using
-    table-level changes. Caller must only invoke this for a direct table source.
-    """
-    safe_identifier(table)
-    safe_identifier(updated_column)
-    if date_alias:
-        safe_identifier(date_alias)
-    if primary_key:
-        safe_identifier(primary_key)
-    async with engine.connect() as conn:
-        result = await conn.execute(text("""
-            SELECT COLUMN_NAME, EXTRA
-            FROM information_schema.COLUMNS
-            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :tbl
-        """), {"tbl": table})
-        cols = {str(row[0]): str(row[1] or "").lower() for row in result.fetchall()}
-        result = await conn.execute(text("""
-            SELECT COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE
-            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :tbl
-              AND CONSTRAINT_NAME = 'PRIMARY'
-            ORDER BY ORDINAL_POSITION
-        """), {"tbl": table})
-        primary = [str(row[0]) for row in result.fetchall()]
-        result = await conn.execute(text("""
-            SELECT INDEX_NAME, COLUMN_NAME FROM information_schema.STATISTICS
-            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :tbl
-              AND SEQ_IN_INDEX = 1
-        """), {"tbl": table})
-        leading_indexed = {str(row[1]) for row in result.fetchall()}
-    if updated_column not in leading_indexed:
-        raise ValueError(f"{table}.{updated_column} lacks a leading index; 10s polling would scan the whole table")
-    if len(primary) != 1:
-        raise ValueError("A single-column PRIMARY KEY is required for delta replay")
-    pk = primary[0]
-    if primary_key and primary_key != pk:
-        raise ValueError(f"Configured primary key {primary_key!r} differs from {pk!r}")
-    if updated_column not in cols:
-        raise ValueError(f"No {updated_column!r} column in {table}; reliable delta unavailable")
-    if not explicit_contract and "on update" not in cols[updated_column]:
-        raise ValueError(f"{table}.{updated_column} lacks ON UPDATE; cannot trust edits")
-    if date_alias and date_alias not in cols:
-        raise ValueError(f"Date alias source {date_alias!r} not present in {table}")
-    return TableContract(table, pk, updated_column, date_alias)
-
-
-def _normalized_date(row):
-    value = row.get("date")
-    if not isinstance(value, datetime):
-        raise ValueError("Delta row lacks datetime 'date'; refusing to publish")
-    return value
-
-
-def apply_delta_snapshot(old_rows: list[dict], changes: dict[Any, dict | None],
-                         *, pk: str, key_field: str,
-                         old_by_key: dict | None = None,
-                         old_key_dates: dict | None = None,
-                         key_fn=None) -> dict:
-    """Build new state without DB re-SELECT; reuse unaffected per-key indexes.
-
-    Dataset/dates/timestamps must have new list identity for atomic publication;
-    per-key groups are rebuilt only for affected keys when old_by_key exists.
-    """
-    if not changes:
-        return {}
-    changed_ids = set(changes)
-    row_key = key_fn or (lambda row: row.get(pk))
-    additions = [(row if key_fn else normalize_row(row)) for row in changes.values() if row is not None]
-    for row in additions:
-        if not key_fn and (pk not in row or row[pk] is None):
-            raise ValueError(f"Delta missing PK {pk}")
-        _normalized_date(row)
-    survivors = [row for row in old_rows if row_key(row) not in changed_ids]
-    additions.sort(key=lambda row: row["date"])
-    out = _merge_sorted(survivors, additions)
-    dates = [row["date"] for row in out]
-    if old_by_key is None:
-        by_key = {}
-        for row in out:
-            key = row.get(key_field)
-            if key is not None:
-                by_key.setdefault(key, []).append(row)
-        key_dates = {key: [row["date"] for row in group]
-                     for key, group in by_key.items()}
-    else:
-        by_key = dict(old_by_key)
-        key_dates = dict(old_key_dates or {})
-        changed_old_rows = (row for row in old_rows if row_key(row) in changed_ids)
-        affected = {row[key_field] for row in changed_old_rows
-                    if row.get(key_field) is not None}
-        affected.update(row[key_field] for row in additions
-                        if row.get(key_field) is not None)
-        for key in affected:
-            remaining = [row for row in old_by_key.get(key, ())
-                         if row_key(row) not in changed_ids]
-            new_group = [row for row in additions if row.get(key_field) == key]
-            group = _merge_sorted(remaining, new_group)
-            if group:
-                by_key[key] = group
-                key_dates[key] = [row["date"] for row in group]
-            else:
-                by_key.pop(key, None)
-                key_dates.pop(key, None)
-    timestamps = np.fromiter((int(value.timestamp()) for value in dates),
-                             dtype=np.int64, count=len(dates))
-    return {"dataset": out, "dataset_dates": dates,
-            "dataset_by_key": by_key, "dataset_key_dates": key_dates,
-            "_dataset_ts_arr": timestamps}
-
-
-def _merge_sorted(left: list[dict], right: list[dict]) -> list[dict]:
-    out = []
-    i = j = 0
-    while i < len(left) and j < len(right):
-        if _normalized_date(left[i]) <= _normalized_date(right[j]):
-            out.append(left[i]); i += 1
-        else:
-            out.append(right[j]); j += 1
-    out.extend(left[i:])
-    out.extend(right[j:])
-    return out
-
-
-class NamespaceSnapshot:
-    """Stage existing standalone loaders; retain unchanged published objects.
-
-    This is a compatibility adapter for services predating build_app. It reads
-    their original SQL and does not add source tables, schedulers or triggers.
-    """
-    def __init__(self, namespace, names, *, poll_seconds=60, gate=None, loader=None, describe=None):
-        self.namespace = namespace
-        self.names = tuple(sorted(names))
-        self.gate = gate if gate is not None else _AsyncRWGate()
-        self.loader, self.describe = loader, describe
-        self.on_publish = None
-        self.check_lock = asyncio.Lock()
-        self.poll_seconds = float(poll_seconds)
-        self.revision = ''
-        self.metrics = {'mode': 'initializing', 'strategy': 'namespace-snapshot',
-                        'checks': 0, 'unchanged_checks': 0, 'changed_elements_total': 0,
-                        'full_mysql_scan': True, 'hourly_dataset_ram_reload': False}
-
-    def staging(self):
-        from collections import defaultdict
-        result = {}
-        for name in self.names:
-            old = self.namespace[name]
-            if isinstance(old, defaultdict):
-                result[name] = defaultdict(old.default_factory)
-            elif isinstance(old, (dict, list, set)):
-                result[name] = type(old)()
-            elif isinstance(old, bool):
-                result[name] = False
-            else:
-                result[name] = old
-        return result
-
-    @classmethod
-    def _reuse(cls, old, new):
-        if type(old) is not type(new):
-            return new, 1
-        if isinstance(new, np.ndarray):
-            same = (old.dtype == new.dtype and old.shape == new.shape and
-                    np.array_equal(old, new, equal_nan=True))
-            return (old, 0) if same else (new, int(new.size))
-        if isinstance(new, dict):
-            changes = len(old.keys() - new.keys())
-            for key, value in list(new.items()):
-                if key in old:
-                    new[key], count = cls._reuse(old[key], value)
-                    changes += count
-                else:
-                    changes += 1
-            return (old, 0) if not changes else (new, changes)
-        if isinstance(new, tuple):
-            changes = abs(len(old) - len(new))
-            items = list(new)
-            for index in range(min(len(old), len(new))):
-                items[index], count = cls._reuse(old[index], new[index])
-                changes += count
-            return (old, 0) if not changes else (tuple(items), changes)
-        if isinstance(new, list):
-            changes = abs(len(old)-len(new))
-            for index in range(min(len(old), len(new))):
-                new[index], count = cls._reuse(old[index], new[index])
-                changes += count
-            return (old, 0) if not changes else (new, changes)
-        return (old, 0) if old == new else (new, 1)
-
-    async def publish(self, staged, started):
-        import pickle
-        # Serialization failures cannot partially change live state or cache keys.
-        revision = hashlib.sha256(pickle.dumps(
-            tuple((name, staged[name]) for name in self.names), protocol=5)).hexdigest()
-        async with self.gate.write():
-            updated = {}
-            changes = 0
-            for name in self.names:
-                updated[name], count = self._reuse(self.namespace[name], staged[name])
-                changes += count
-            next_revision = revision if changes or not self.revision else self.revision
-            if self.on_publish is not None:
-                self.on_publish(next_revision, changes)
-            self.namespace.update(updated)
-            if changes or not self.revision:
-                self.revision = revision
-        elapsed = _time.monotonic()-started
-        if elapsed > 3:
-            self.poll_seconds = max(300.0, self.poll_seconds)
-        self.metrics.update(mode='active', last_error=None, poll_seconds=self.poll_seconds,
-            last_check_seconds=round(elapsed,4), last_checked_at=datetime.now().isoformat(),
-            last_changed_elements=changes, snapshot_revision=self.revision)
-        self.metrics['checks'] += 1
-        self.metrics['unchanged_checks'] += int(changes == 0)
-        self.metrics['changed_elements_total'] += changes
-        return bool(changes)
-
-    async def refresh(self):
-        async with self.check_lock:
-            started = _time.monotonic()
-            if self.loader is None:
-                raise RuntimeError('Snapshot provider has no loader')
-            staged = await asyncio.to_thread(self.loader)
-            changed = await self.publish(staged, started)
-            if self.describe is not None:
-                self.metrics.update(self.describe())
-            return changed
-
-    def params(self, params):
-        return {**params, '__dataset_snapshot': self.revision}
-
-    def owns_read_lease(self):
-        task = asyncio.current_task()
-        return self.gate._writer is task or self.gate._reader_depths.get(task, 0) > 0
-
-    async def cached_values(self, callback, refresh, **kwargs):
-        # cache_helper singleflight starts a child task. Do not hold the parent's
-        # read lease while waiting for that child to acquire its own lease.
-        if not self.owns_read_lease():
-            await refresh(kwargs.get('pair', 1), kwargs.get('day', 1))
-        compute = kwargs.get('compute_fn')
-        params = kwargs.get('extra_params') or {}
-        class Changed(RuntimeError):
-            pass
-        for _ in range(3):
-            revision = self.revision
-            async def guarded_compute():
-                async with self.gate.read():
-                    if revision != self.revision:
-                        raise Changed('Snapshot changed before calculation')
-                    result = compute()
-                    return await result if asyncio.iscoroutine(result) else result
-            call = {**kwargs, 'extra_params': self.params(params)}
-            if compute is not None:
-                call['compute_fn'] = guarded_compute
-            try:
-                result = await callback(**call)
-            except Changed:
-                continue
-            if revision == self.revision:
-                return result
-        raise RuntimeError('Snapshot changed repeatedly during cached request; retry')
-
-
-
-class SnapshotDatasetPoller:
-    """Read existing SQL, preserve unchanged RAM rows, publish a delta.
-
-    No source columns, triggers or replication changes. Small/custom SQL uses
-    a streamed content comparison, including duplicate rows. Large direct
-    integer-PK sources use 256-bit server block hashes and fetch changed blocks.
-    Full MySQL scans and rows transferred are deliberately separate metrics.
-    """
-    needs_reconcile = False
-
-    def __init__(self, engine, query, *, table=None, date_alias=None,
-                 threshold=100000, block_size=10000, poll_seconds=60):
-        from types import SimpleNamespace
-        self.engine, self.query = engine, query
-        self.table, self.date_alias = table, date_alias
-        self.threshold, self.block_size = threshold, block_size
-        self.poll_seconds = float(poll_seconds)
-        self.contract = SimpleNamespace(primary_key=None)
-        self.watermark = 0
-        self._rows = {}
-        self._groups = {}
-        self._blocks = {}
-        self._hash_sql = None
-        self._pending = None
-        self.metrics = {'strategy': 'streamed-snapshot', 'checks': 0,
-                        'unchanged_checks': 0, 'rows_applied_total': 0,
-                        'inserted_total': 0, 'updated_total': 0, 'deleted_total': 0}
-
-    @staticmethod
-    def _digest(row):
-        import pickle
-        return hashlib.sha256(pickle.dumps(tuple(row.items()), protocol=5)).digest()
-
-    def identity(self, row):
-        pk = self.contract.primary_key
-        return row[pk] if pk else id(row)
-
-    @classmethod
-    def _groups_for(cls, rows):
-        groups = {}
-        for row in rows:
-            digest = cls._digest(row)
-            bucket = groups.get(digest)
-            if bucket is None:
-                groups[digest] = row
-            elif isinstance(bucket, list):
-                bucket.append(row)
-            else:
-                groups[digest] = [bucket, row]
-        return groups
-
-    async def _stream(self, conn, query, params=None):
-        result = await conn.stream(text(query), params or {},
-                                   execution_options={'yield_per': 4096})
-        keys = tuple(result.keys())
-        try:
-            async for part in result.partitions(4096):
-                for values in part:
-                    yield normalize_row(dict(zip(keys, values)))
-        finally:
-            await result.close()
-
-    async def _enable_blocks(self, conn):
-        if not self.table:
-            return
-        safe_identifier(self.table)
-        columns = (await conn.execute(text('''SELECT COLUMN_NAME,DATA_TYPE,COLUMN_KEY
-            FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE()
-            AND TABLE_NAME=:table ORDER BY ORDINAL_POSITION'''),
-            {'table': self.table})).mappings().all()
-        primary = [c for c in columns if c['COLUMN_KEY'] == 'PRI']
-        if len(primary) != 1 or primary[0]['DATA_TYPE'] not in {'tinyint','smallint','mediumint','int','bigint'}:
-            return
-        pk = primary[0]['COLUMN_NAME']
-        self.contract.primary_key = pk
-        expressions = []
-        binary = {'binary','varbinary','blob','tinyblob','mediumblob','longblob','bit'}
-        for column in columns:
-            name = safe_identifier(column['COLUMN_NAME'])
-            expressions.append(f'HEX({name})' if column['DATA_TYPE'] in binary else name)
-        self._hash_sql = f'''SELECT FLOOR({safe_identifier(pk)} / {int(self.block_size)}) AS block_id,
-            COUNT(*) AS n, BIT_XOR(UNHEX(SHA2(CAST(JSON_ARRAY({','.join(expressions)}) AS CHAR),256))) AS digest
-            FROM {safe_identifier(self.table)} GROUP BY FLOOR({safe_identifier(pk)} / {int(self.block_size)})'''
-        self.metrics['strategy'] = 'snapshot-sha256-blocks'
-
-    async def _read_blocks(self, conn):
-        result = (await conn.execute(text(self._hash_sql))).all()
-        if any(not isinstance(r[2], bytes) or len(r[2]) != 32 for r in result):
-            raise ValueError('MySQL did not return binary 256-bit block hashes')
-        return {int(r[0]): (int(r[1]), r[2]) for r in result}
-
-    async def bootstrap(self):
-        async with self.engine.connect() as conn:
-            await conn.execution_options(isolation_level='REPEATABLE READ')
-            async with conn.begin():
-                rows = [row async for row in self._stream(conn, self.query)]
-                if len(rows) >= self.threshold:
-                    self.poll_seconds = max(300.0, self.poll_seconds)
-                await self._enable_blocks(conn)
-                if self._hash_sql:
-                    self._blocks = await self._read_blocks(conn)
-        self._rows = {self.identity(row): row for row in rows}
-        if len(self._rows) != len(rows):
-            raise ValueError('Snapshot primary key is not unique')
-        if not self._hash_sql:
-            self._groups = self._groups_for(rows)
-        self.metrics.update({'rows': len(rows), 'poll_seconds': self.poll_seconds})
-        return rows
-
-    async def changes(self, current):
-        import time
-        started = time.monotonic()
-        if current.keys() != self._rows.keys():
-            raise RuntimeError('Concurrent snapshot replacement; rebootstrap required')
-        old, groups = self._rows, self._groups
-        seen, duplicate_offsets, changes = set(), {}, {}
-        transferred = 0
-        blocks = self._blocks
-        async with self.engine.connect() as conn:
-            await conn.execution_options(isolation_level='REPEATABLE READ')
-            async with conn.begin():
-                if self._hash_sql:
-                    blocks = await self._read_blocks(conn)
-                    dirty = {k for k in self._blocks.keys() | blocks.keys()
-                             if self._blocks.get(k) != blocks.get(k)}
-                    old = {k:r for k,r in self._rows.items()
-                           if int(k) // self.block_size in dirty}
-                    pk = safe_identifier(self.contract.primary_key)
-                    alias = f', {safe_identifier(self.date_alias)} AS date' if self.date_alias else ''
-                    streams = [(f'SELECT *{alias} FROM {safe_identifier(self.table)} '
-                                f'WHERE {pk}>=:lo AND {pk}<:hi',
-                                {'lo': k*self.block_size, 'hi': (k+1)*self.block_size})
-                               for k in sorted(dirty) if k in blocks]
-                else:
-                    streams = [(self.query, {})]
-                for query, params in streams:
-                    async for row in self._stream(conn, query, params):
-                        transferred += 1
-                        if self._hash_sql:
-                            ident = self.identity(row)
-                            seen.add(ident)
-                            if ident not in old or row != old[ident]:
-                                changes[ident] = row
-                        else:
-                            digest = self._digest(row)
-                            bucket = groups.get(digest)
-                            match = None
-                            if isinstance(bucket, list):
-                                offset = duplicate_offsets.get(digest, 0)
-                                if offset < len(bucket):
-                                    match = bucket[offset]
-                                duplicate_offsets[digest] = offset + 1
-                            elif bucket is not None and id(bucket) not in seen:
-                                match = bucket
-                            if match is not None:
-                                seen.add(id(match))
-                            else:
-                                changes[id(row)] = row
-                for ident in old.keys() - seen:
-                    changes[ident] = None
-        # Caller commits this index only after all staged RAM structures publish.
-        next_rows = self._rows
-        next_groups = self._groups
-        if changes:
-            next_rows = dict(self._rows)
-            for ident, row in changes.items():
-                if row is None:
-                    next_rows.pop(ident, None)
-                else:
-                    next_rows[ident] = row
-            if not self._hash_sql:
-                next_groups = self._groups_for(next_rows.values())
-        elapsed = time.monotonic() - started
-        self._pending = (next_rows, next_groups, blocks, {
-            'last_check_seconds': round(elapsed, 4), 'rows_received_sql': transferred,
-            'rows_scanned_sql': sum(n for n,_ in blocks.values()) if self._hash_sql else transferred,
-            'full_mysql_scan': True, 'rows': len(next_rows),
-            'inserted': sum(k not in self._rows and v is not None for k,v in changes.items()),
-            'updated': sum(k in self._rows and v is not None for k,v in changes.items()),
-            'deleted': sum(v is None for v in changes.values()),
-            'applied': len(changes), 'last_checked_at': datetime.now().isoformat(),
-        })
-        return changes
-
-    def commit(self):
-        if self._pending is None:
-            return
-        self._rows, self._groups, self._blocks, stats = self._pending
-        self._pending = None
-        self.watermark += 1
-        self.metrics['checks'] += 1
-        self.metrics['unchanged_checks'] += int(stats['applied'] == 0)
-        for name in ['inserted','updated','deleted']:
-            self.metrics[name + '_total'] += stats[name]
-        self.metrics['rows_applied_total'] += stats['applied']
-        self.metrics.update(stats)
-
-    def discard(self):
-        self._pending = None
-
-    def cache_token(self, *, pending=False):
-        rows, groups, blocks = self._rows, self._groups, self._blocks
-        if pending and self._pending is not None:
-            rows, groups, blocks, _ = self._pending
-        if self._hash_sql:
-            return hashlib.sha256(b''.join(str(k).encode() + str(n).encode() + digest
-                for k, (n, digest) in sorted(blocks.items()))).hexdigest()
-        total = sum(int.from_bytes(digest, 'big') * (len(rows) if isinstance(rows, list) else 1)
-                    for digest, rows in groups.items()) % (1 << 256)
-        return f'{len(rows)}:{total:064x}'
-
-
-class DatasetPoller:
-    """Read-only CDC-by-updated_at with periodic complete PK/version reconciliation.
-
-    Each poll uses timestamp overlap, keyset pagination, and a bounded staging
-    batch. Every fetched record is compared to RAM. A separate PK inventory
-    detects hard deletes and backfilled/late commits missed by the timestamp
-    cursor. Does not claim deterministic binlog-level consistency.
-    """
-
-    def __init__(self, engine, contract: TableContract, *, overlap_seconds: int = 120,
-                 page_size: int = 2048, max_poll_rows: int = 100000):
-        self.engine = engine
-        self.contract = contract
-        self.overlap_seconds = max(1, int(overlap_seconds))
-        self.page_size = max(10, min(10000, int(page_size)))
-        self.max_poll_rows = max(self.page_size, int(max_poll_rows))
-        self.watermark: datetime | None = None
-
-    async def server_time(self) -> datetime:
-        async with self.engine.connect() as conn:
-            return (await conn.execute(text("SELECT NOW(6)"))).scalar_one()
-
-    def seed(self, started_at: datetime):
-        self.watermark = started_at
-
-    async def changes(self, current: dict[Any, dict]) -> dict[Any, dict]:
-        if self.watermark is None:
-            raise RuntimeError("Poller was not seeded before snapshot preload")
-        c = self.contract
-        sql = text(
-            f"SELECT {c.select_columns()} FROM {safe_identifier(c.table)} "
-            f"WHERE ({safe_identifier(c.updated_at)} > :ts "
-            f"OR ({safe_identifier(c.updated_at)} = :ts AND {safe_identifier(c.primary_key)} > :pk)) "
-            f"AND {safe_identifier(c.updated_at)} >= :begin "
-            f"ORDER BY {safe_identifier(c.updated_at)}, {safe_identifier(c.primary_key)} "
-            "LIMIT :lim"
-        )
-        begin = self.watermark - timedelta(seconds=self.overlap_seconds)
-        ts = begin
-        # MySQL identifiers can be strings; a safe first page has no PK tie break
-        # restriction because its comparison uses > :ts, where ts = begin - 1us.
-        ts -= timedelta(microseconds=1)
-        last_pk = 0
-        observed_max = self.watermark
-        changed: dict[Any, dict] = {}
-        count = 0
-        async with self.engine.connect() as conn:
-            while True:
-                result = await conn.execute(sql, {"ts": ts, "pk": last_pk,
-                                                   "begin": begin, "lim": self.page_size})
-                rows = result.mappings().all()
-                if not rows:
-                    break
-                for raw in rows:
-                    row = normalize_row(raw)
-                    ident = row[c.primary_key]
-                    stamp = row[c.updated_at]
-                    if stamp is None or not isinstance(stamp, datetime):
-                        raise ValueError("updated_at must be non-null DATETIME/TIMESTAMP")
-                    ts, last_pk = stamp, ident
-                    observed_max = max(observed_max, stamp)
-                    if current.get(ident) != row:
-                        changed[ident] = row
-                count += len(rows)
-                if len(rows) < self.page_size:
-                    break
-                if count >= self.max_poll_rows:
-                    # Do not advance past an unconsumed suffix; retry with a
-                    # larger budget/shorter overlap rather than falsely finishing.
-                    raise RuntimeError("Delta poll exceeded max_poll_rows; watermark unchanged")
-        self.watermark = observed_max
-        return changed
-
-    async def reconcile(self, current: dict[Any, dict]) -> dict[Any, dict | None]:
-        """Full PK/updated_at inventory (NOT a full-width table reload).
-
-        Detects deletions, replacement keys, and older timestamp corrections.
-        Row content changes whose updated_at did not change violate contract.
-        """
-        c = self.contract
-        sql = text(f"SELECT {safe_identifier(c.primary_key)}, {safe_identifier(c.updated_at)} "
-                   f"FROM {safe_identifier(c.table)} ORDER BY {safe_identifier(c.primary_key)}")
-        db_versions = {}
-        async with self.engine.connect() as conn:
-            result = await conn.stream(sql, execution_options={"yield_per": self.page_size})
-            try:
-                async for part in result.partitions(self.page_size):
-                    for record in part:
-                        db_versions[record[0]] = record[1]
-            finally:
-                await result.close()
-        removals = {ident: None for ident in current.keys() - db_versions.keys()}
-        fetch_ids = [ident for ident, stamp in db_versions.items()
-                     if ident not in current or current[ident].get(c.updated_at) != stamp]
-        fetch_size = 500
-        for offset in range(0, len(fetch_ids), fetch_size):
-            chunk = fetch_ids[offset: offset + fetch_size]
-            params = {f"p{i}": value for i, value in enumerate(chunk)}
-            placeholders = ",".join(f":p{i}" for i in range(len(chunk)))
-            sql = text(f"SELECT {c.select_columns()} FROM {safe_identifier(c.table)} "
-                       f"WHERE {safe_identifier(c.primary_key)} IN ({placeholders})")
-            async with self.engine.connect() as conn:
-                result = await conn.execute(sql, params)
-                for raw in result.mappings().all():
-                    row = normalize_row(raw)
-                    removals[row[c.primary_key]] = row
-        return removals
-
-# END embedded dynamic synchronization
 
 load_dotenv()
 
@@ -725,35 +96,10 @@ def _framework_file_sha256(path: str) -> str:
         return "unavailable"
 
 
-def _hourly_rebuild_target_minute(
-    service_identity: str, configured_minute: int | None = None,
-) -> int:
-    """Choose the hourly rebuild minute; keep 21.4's :30..:34 default.
-
-    Operators may move a service's rebuild out of a forecasting window (for
-    example :40).  Explicitly disabling the scheduler is a separate setting.
-    """
-    if configured_minute is not None:
-        value = int(configured_minute)
-        if not 0 <= value <= 59:
-            raise ValueError("HOURLY_REBUILD_MINUTE must be in [0, 59]")
-        return value
+def _hourly_rebuild_target_minute(service_identity: str) -> int:
+    """Stable per-service minute in the framework's :30..:34 rebuild window."""
     digest = hashlib.sha256(str(service_identity).encode("utf-8")).digest()
     return 30 + (digest[0] % 5)
-
-
-def _config_bool(value: object, *, name: str) -> bool:
-    """Do not interpret the string 'false' as Python's truthy bool('false')."""
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)) and value in (0, 1):
-        return bool(value)
-    normalized = str(value).strip().lower()
-    if normalized in {"true", "1", "yes", "on"}:
-        return True
-    if normalized in {"false", "0", "no", "off"}:
-        return False
-    raise ValueError(f"{name} must be a boolean, got {value!r}")
 
 
 def _hourly_rebuild_slot(now: datetime, target_minute: int) -> tuple[str, datetime]:
@@ -986,7 +332,6 @@ class _AsyncRWGate:
     def __init__(self):
         self._cond = asyncio.Condition()
         self._readers = 0
-        self._reader_depths = {}
         self._writer = None
         self._write_depth = 0
         self._waiting_writers = 0
@@ -997,13 +342,9 @@ class _AsyncRWGate:
             # A task already holding the write lease may read its own state.
             if self._writer is task:
                 return ("writer", task)
-            if self._reader_depths.get(task, 0):
-                self._reader_depths[task] += 1
-                return ("reader", task)
             while self._writer is not None or self._waiting_writers > 0:
                 await self._cond.wait()
             self._readers += 1
-            self._reader_depths[task] = 1
             return ("reader", task)
 
     async def release_read(self, token):
@@ -1011,11 +352,6 @@ class _AsyncRWGate:
         if kind == "writer":
             return
         async with self._cond:
-            depth = self._reader_depths.get(_task, 0)
-            if depth > 1:
-                self._reader_depths[_task] = depth-1
-                return
-            self._reader_depths.pop(_task, None)
             self._readers = max(0, self._readers - 1)
             if self._readers == 0:
                 self._cond.notify_all()
@@ -1574,8 +910,7 @@ def _select_current_events(
 
         dates = [item[0] for item in values]
         lo = bisect.bisect_left(dates, left)
-        # Never let future dataset rows become an input to a past forecast.
-        hi = bisect.bisect_right(dates, min(right, target_date))
+        hi = bisect.bisect_right(dates, right)
 
         for event_time, pct, _row in values[lo:hi]:
             if _is_zero_interval_event(event_time, target_date, is_daily):
@@ -1643,8 +978,6 @@ def _lookup_historical_outcome(
 def _previous_completed_candle_direction(
     np_rates,
     target_date: datetime,
-    *,
-    is_daily: bool = False,
 ) -> tuple[bool, int | None]:
     """True = предыдущая свеча бычья, значит прогнозируется max."""
     if np_rates is None:
@@ -1653,10 +986,8 @@ def _previous_completed_candle_direction(
     if dates_ns is None or len(dates_ns) == 0:
         return False, None
 
-    # A start-time < target is insufficient when target falls within a candle.
-    latest_completed_start = target_date - _timeframe_delta(is_daily)
     cut = int(np.searchsorted(
-        dates_ns, int(latest_completed_start.timestamp()), side="right"
+        dates_ns, int(target_date.timestamp()), side="left"
     ))
     if cut <= 0:
         return False, None
@@ -1709,13 +1040,12 @@ def _aggregate_event_history(
 
     # Направление extremum из предыдущей завершённой свечи target_date.
     predict_max, _prev_idx = _previous_completed_candle_direction(
-        np_rates, target_date, is_daily=is_daily
+        np_rates, target_date
     )
 
     t1_sum = 0.0
     outcomes = 0
     extremum_hits = 0
-    extremum_eligible = 0
 
     unit = _timeframe_delta(is_daily)
     ext_array_name = "ext_max" if predict_max else "ext_min"
@@ -1742,25 +1072,17 @@ def _aggregate_event_history(
         t1_sum += weighted
         outcomes += 1
 
-        # Extrema require the RIGHT neighbor to be completed as well.
-        # The precomputed ext_* array may include future candles; never read it
-        # until the next candle's close was causally available at target_date.
         ext_arr = np_rates.get(ext_array_name)
-        if (frame_end + unit <= target_date and ext_arr is not None
-                and idx < len(ext_arr)):
-            extremum_eligible += 1
-            if bool(ext_arr[idx]):
-                extremum_hits += 1
+        if ext_arr is not None and bool(ext_arr[idx]):
+            extremum_hits += 1
 
     if outcomes < int(min_occurrence):
         return 0.0, 0.0, outcomes, extremum_hits
 
-    extremum_score = 0.0
-    if extremum_eligible >= int(min_occurrence):
-        probability = extremum_hits / extremum_eligible
-        extremum_score = (probability * 2.0) - 1.0
-        if predict_max:
-            extremum_score = -extremum_score
+    probability = extremum_hits / outcomes
+    extremum_score = (probability * 2.0) - 1.0
+    if predict_max:
+        extremum_score = -extremum_score
 
     return t1_sum, extremum_score, outcomes, extremum_hits
 
@@ -2246,17 +1568,7 @@ class _State:
     FILTER_DATASET_BY_DATE: bool    = False
     SHIFT_WINDOW:        int        = 12
     RELOAD_INTERVAL:     int        = 3600
-    REBUILD_INTERVAL:    int        = 0  # historical config, not scheduler control
-    DYNAMIC_SYNC_ENABLED: bool = True
-    DYNAMIC_POLL_SECONDS: float = 60.0
-    DYNAMIC_RECONCILE_SECONDS: float = 600.0
-    DYNAMIC_AUX_SECONDS: float = 120.0
-    DYNAMIC_MAX_STALE_SECONDS: float = 90.0
-    DYNAMIC_UPDATED_COLUMN: str = "updated_at"
-    DYNAMIC_PRIMARY_KEY: str | None = None
-    DYNAMIC_EXPLICIT_CONTRACT: bool = False
-    HOURLY_REBUILD_ENABLED: bool    = True
-    HOURLY_REBUILD_MINUTE: int | None = None
+    REBUILD_INTERVAL:    int        = 0
     VAR_RANGE:           list       = None
     TYPES_RANGE:         list       = None
     PARAM_RANGE:         list       = None
@@ -2329,14 +1641,6 @@ class _State:
         self.dataset_key_dates: dict = {}
         self.dataset_key_field: str  = "ctx_id"
         self._dataset_ts_arr:   np.ndarray | None = None  # для быстрого searchsorted
-        self._standard_events_by_type: dict | None = None
-        self.dynamic_poller: DatasetPoller | SnapshotDatasetPoller | None = None
-        self.snapshot_cache_revision = ""
-        self.dynamic_status: dict = {"mode": "initializing"}
-        self.dynamic_last_ok: datetime | None = None
-        self.dynamic_cache_stale: bool = False
-        self._dynamic_rows_by_pk: dict = {}
-        self._dataset_bootstrap_db_time: datetime | None = None
 
         self.rates:         dict = {}
         self.extremums:     dict = {}
@@ -2702,165 +2006,48 @@ async def _load_rates(s: _State):
         log(f"   NP_RATES build failed: {e}", s.NODE_NAME, level="error")
 
 
-def _patch_np_rates_delta(table: str, s: _State, affected: set[datetime]) -> None:
-    """Patch only changed T1/OHLC/extrema cells; fallback for old-row insertion."""
-    if not affected or not s.np_built:
-        return
-    candle_map = {row["date"]: row for row in s.global_rates.get(table, ())
-                  if row["date"] in affected}
-    np_r = s.np_rates.get(table)
-    need_rebuild = np_r is None
-    if not need_rebuild:
-        timestamps = np_r["dates_ns"]
-        for dt in sorted(affected):
-            ts = _dt_to_ts(dt)
-            index = int(np.searchsorted(timestamps, ts, side="left"))
-            present = index < len(timestamps) and int(timestamps[index]) == ts
-            has_t1 = dt in s.rates[table]
-            if (has_t1 and not present and index != len(timestamps)) or (present and not has_t1):
-                need_rebuild = True
-                break
-    if need_rebuild:
-        np_r = _build_np_rates_for_table(
-            s.rates.get(table, {}), s.candle_ranges.get(table, {}),
-            s.extremums.get(table, {}), s.global_rates.get(table, [])
-        )
-        s.np_rates[table] = np_r
-    else:
-        for dt in sorted(affected):
-            if dt not in s.rates[table]:
-                continue
-            row = candle_map[dt]
-            ts = _dt_to_ts(dt)
-            index = int(np.searchsorted(np_r["dates_ns"], ts, side="left"))
-            if index == len(np_r["dates_ns"]):
-                _append_np_rates_row(
-                    table, dt, s.rates[table][dt], s.candle_ranges[table][dt], s,
-                    close=row["close"], open_=row["open"],
-                    max_=row["max"], min_=row["min"]
-                )
-            else:
-                np_r["t1"][index] = s.rates[table][dt]
-                np_r["ranges"][index] = s.candle_ranges[table][dt]
-                for field in ("open", "close", "min", "max"):
-                    if field in np_r:
-                        np_r[field][index] = row[field]
-        # Extrema of the new/updated bar and its immediate neighbors may change.
-        delta = timedelta(days=1) if table.endswith("_day") else timedelta(hours=1)
-        for dt in affected:
-            for candidate in (dt - delta, dt, dt + delta):
-                ts = _dt_to_ts(candidate)
-                idx = int(np.searchsorted(np_r["dates_ns"], ts, side="left"))
-                if idx < len(np_r["dates_ns"]) and int(np_r["dates_ns"][idx]) == ts:
-                    np_r["ext_min"][idx] = candidate in s.extremums[table]["min"]
-                    np_r["ext_max"][idx] = candidate in s.extremums[table]["max"]
-    if np_r is not None:
-        np_r["avg_range"] = s.avg_range.get(table, 0.0)
-
-
 async def _refresh_rates_unlocked(table: str, s: _State):
-    """Idempotent upsert of new/recent corrected candles and their extrema."""
-    now = datetime.now()
+    now  = datetime.now()
     last = s.last_rates_refresh.get(table)
-    throttle = max(2.0, float(getattr(s, "DYNAMIC_POLL_SECONDS", 60)))
-    if last and (now - last).total_seconds() < throttle:
+    if last and (now - last).total_seconds() < 30:
         return
-    # Use the full candle history; t1 may be NULL for the newest row.
-    dates = s.global_rates_dates.get(table, [])
-    if not dates:
+    s.last_rates_refresh[table] = now
+    ram = s.rates.get(table)
+    if not ram:
         return
-    lookback = timedelta(days=50) if table.endswith("_day") else timedelta(hours=72)
-    cutoff = dates[-1] - lookback
+    max_dt = max(ram.keys())
     try:
         async with s.engine_brain.connect() as conn:
             res = await conn.execute(text(
                 f"SELECT date, open, close, `max`, `min`, t1 "
-                f"FROM `{table}` WHERE date >= :cutoff ORDER BY date"
-            ), {"cutoff": cutoff})
-            changes = list(res.mappings().all())
-        staged = _copy.copy(s)
-        staged.global_rates = dict(s.global_rates)
-        staged.global_rates_dates = dict(s.global_rates_dates)
-        staged.rates = dict(s.rates)
-        staged.candle_ranges = dict(s.candle_ranges)
-        staged.last_candles = dict(s.last_candles)
-        staged.extremums = dict(s.extremums)
-        staged.avg_range = dict(s.avg_range)
-        staged.np_rates = dict(s.np_rates)
-        staged.global_rates[table] = list(s.global_rates.get(table, ()))
-        staged.global_rates_dates[table] = list(s.global_rates_dates.get(table, ()))
-        staged.rates[table] = dict(s.rates.get(table, {}))
-        staged.candle_ranges[table] = dict(s.candle_ranges.get(table, {}))
-        staged.last_candles[table] = list(s.last_candles.get(table, ()))
-        old_ext = s.extremums.get(table, {"min": set(), "max": set()})
-        staged.extremums[table] = {"min": set(old_ext["min"]), "max": set(old_ext["max"])}
-        old_np = s.np_rates.get(table)
-        staged.np_rates[table] = (
-            {key: (value.copy() if isinstance(value, np.ndarray) else value)
-             for key, value in old_np.items()} if old_np is not None else None
-        )
-        by_date = staged.global_rates[table]
-        dates = staged.global_rates_dates[table]
-        t1_map = staged.rates[table]
-        ranges = staged.candle_ranges[table]
-        last_candles = staged.last_candles[table]
-        affected = set()
-        for record in changes:
-            dt = record["date"]
-            candle = {"date": dt, "open": float(record["open"] or 0),
-                      "close": float(record["close"] or 0),
-                      "max": float(record["max"] or 0),
-                      "min": float(record["min"] or 0)}
-            t1 = float(record["t1"]) if record["t1"] is not None else None
-            pos = bisect.bisect_left(dates, dt)
-            found = pos < len(dates) and dates[pos] == dt
-            if found and by_date[pos] == candle and t1_map.get(dt) == t1:
-                continue
-            if found:
-                by_date[pos] = candle
-                last_candles[pos] = (dt, candle["close"] > candle["open"])
-            else:
-                dates.insert(pos, dt)
-                by_date.insert(pos, candle)
-                last_candles.insert(pos, (dt, candle["close"] > candle["open"]))
-            if t1 is None:
-                t1_map.pop(dt, None)
-            else:
-                t1_map[dt] = t1
-            ranges[dt] = candle["max"] - candle["min"]
-            affected.add(dt)
-        if affected:
-            interval = timedelta(days=1) if table.endswith("_day") else timedelta(hours=1)
-            extrema = staged.extremums[table]
-            for dt in affected:
-                for candidate in (dt - interval, dt, dt + interval):
-                    extrema["min"].discard(candidate)
-                    extrema["max"].discard(candidate)
-                    pos = bisect.bisect_left(dates, candidate)
-                    if not (0 < pos < len(dates) - 1) or dates[pos] != candidate:
-                        continue
-                    if dates[pos - 1] != candidate - interval or dates[pos + 1] != candidate + interval:
-                        continue
-                    prior, value, following = by_date[pos - 1], by_date[pos], by_date[pos + 1]
-                    if value["max"] > prior["max"] and value["max"] > following["max"]:
-                        extrema["max"].add(candidate)
-                    if value["min"] < prior["min"] and value["min"] < following["min"]:
-                        extrema["min"].add(candidate)
-            staged.avg_range[table] = sum(ranges.values()) / len(ranges) if ranges else 0.0
-            _patch_np_rates_delta(table, staged, affected)
-            # All table-visible references switch together under state_gate.write.
-            s.global_rates[table] = staged.global_rates[table]
-            s.global_rates_dates[table] = staged.global_rates_dates[table]
-            s.rates[table] = staged.rates[table]
-            s.candle_ranges[table] = staged.candle_ranges[table]
-            s.last_candles[table] = staged.last_candles[table]
-            s.extremums[table] = staged.extremums[table]
-            s.avg_range[table] = staged.avg_range[table]
-            s.np_rates[table] = staged.np_rates[table]
-            log(f" dynamic rates: {len(affected)} changed candle(s) {table}", s.NODE_NAME)
-        s.last_rates_refresh[table] = now
-    except Exception as exc:
-        log(f" dynamic refresh rates {table}: {exc}", s.NODE_NAME, level="warning")
+                f"FROM `{table}` WHERE date > :dt ORDER BY date"), {"dt": max_dt})
+            n = 0
+            for r in res.mappings().all():
+                dt  = r["date"]
+                t1  = float(r["t1"]) if r["t1"] is not None else None
+                rng = float(r["max"] or 0) - float(r["min"] or 0)
+                if t1 is not None:
+                    ram[dt] = t1
+                s.last_candles.setdefault(table, []).append(
+                    (dt, (r["close"] or 0) > (r["open"] or 0)))
+                s.candle_ranges.setdefault(table, {})[dt] = rng
+                s.global_rates.setdefault(table, []).append({
+                    "date":  dt, "open":  float(r["open"]  or 0),
+                    "close": float(r["close"] or 0),
+                    "min":   float(r["min"]   or 0), "max": float(r["max"] or 0),
+                })
+                s.global_rates_dates.setdefault(table, []).append(dt)
+                if s.np_built:
+                    _append_np_rates_row(table, dt, t1, rng, s,
+                                         close=float(r["close"] or 0),
+                                         open_=float(r["open"]  or 0),
+                                         max_=float(r["max"] or 0),
+                                         min_=float(r["min"] or 0))
+                n += 1
+            if n > 0:
+                log(f"   +{n} candle(s) {table}", s.NODE_NAME)
+    except Exception as e:
+        log(f"   refresh {table}: {e}", s.NODE_NAME, level="warning")
 
 
 async def _refresh_rates(table: str, s: _State):
@@ -2933,45 +2120,25 @@ async def _refresh_simple_rates_unlocked(s: _State) -> None:
     if not s.last_simple_rate_dt:
         return
     table = s.RATES_TABLE
-    cutoff = (s.last_simple_rate_dt -
-              (timedelta(days=50) if table.endswith("_day") else timedelta(hours=72)))
     try:
         async with s.engine_brain.connect() as conn:
             res = await conn.execute(text(
                 f"SELECT date, open, close, `min`, `max` "
-                f"FROM `{table}` WHERE date >= :dt ORDER BY date"
-            ), {"dt": cutoff})
-            incoming = res.mappings().all()
-        rows = list(s.simple_rates)
-        dates = list(s.simple_rates_dates)
-        changed = 0
-        for record in incoming:
-            row = {"date": record["date"], "open": float(record["open"] or 0),
-                   "close": float(record["close"] or 0),
-                   "min": float(record["min"] or 0),
-                   "max": float(record["max"] or 0)}
-            pos = bisect.bisect_left(dates, row["date"])
-            if pos < len(dates) and dates[pos] == row["date"]:
-                if rows[pos] != row:
-                    rows[pos] = row
-                    changed += 1
-            else:
-                dates.insert(pos, row["date"])
-                rows.insert(pos, row)
-                changed += 1
-        if changed:
-            staged = _copy.copy(s)
-            staged.simple_rates = rows
-            staged.simple_rates_dates = dates
-            staged.last_simple_rate_dt = dates[-1]
-            _build_np_simple_rates(staged)
-            s.simple_rates = staged.simple_rates
-            s.simple_rates_dates = staged.simple_rates_dates
-            s.last_simple_rate_dt = staged.last_simple_rate_dt
-            s.np_simple_rates = staged.np_simple_rates
-            log(f" dynamic simple_rates: {changed} candle(s)", s.NODE_NAME)
-    except Exception as exc:
-        log(f" dynamic simple_rates: {exc}", s.NODE_NAME, level="warning")
+                f"FROM `{table}` WHERE date > :dt ORDER BY date"),
+                {"dt": s.last_simple_rate_dt})
+            new_rows = res.mappings().all()
+        for r in new_rows:
+            row = {"date":  r["date"], "open":  float(r["open"]  or 0),
+                   "close": float(r["close"] or 0), "min": float(r["min"] or 0),
+                   "max":   float(r["max"]   or 0)}
+            s.simple_rates.append(row)
+            s.simple_rates_dates.append(row["date"])
+        if new_rows:
+            s.last_simple_rate_dt = s.simple_rates_dates[-1]
+            _build_np_simple_rates(s)
+            log(f"   +{len(new_rows)} candle(s) {table}", s.NODE_NAME)
+    except Exception as e:
+        log(f"   refresh simple_rates: {e}", s.NODE_NAME, level="warning")
 
 
 async def _refresh_simple_rates(s: _State) -> None:
@@ -3080,25 +2247,7 @@ async def _load_dataset(s: _State, *, strict: bool = False):
         s.dataset = []
         return
     query = s.DATASET_QUERY or f"SELECT * FROM `{s.DATASET_TABLE}`"
-    s._dataset_load_ok = False
     try:
-        if s.DYNAMIC_SYNC_ENABLED:
-            direct = bool(s.DATASET_TABLE and not s.DATASET_QUERY)
-            expected = (f"SELECT *, `{s.DATASET_DATE_FIELD}` AS date FROM `{s.ENRICHED_TABLE}` ORDER BY `{s.DATASET_DATE_FIELD}`"
-                        if s.ENRICHED_TABLE else "")
-            enriched = bool(expected and " ".join(query.split()).lower() == expected.lower())
-            poller = SnapshotDatasetPoller(
-                _engine_for(s.DATASET_ENGINE, s), query,
-                table=(s.DATASET_TABLE if direct else s.ENRICHED_TABLE if enriched else None),
-                date_alias=(s.DATASET_DATE_FIELD if enriched else None),
-                poll_seconds=s.DYNAMIC_POLL_SECONDS,
-            )
-            s.dataset = await poller.bootstrap()
-            s.dynamic_poller = poller
-            _build_dataset_index(s)
-            s._dataset_load_ok = True
-            log(f"  initial snapshot: {len(s.dataset)} rows", s.NODE_NAME)
-            return
         from datetime import date as _date
         chunk_size = max(1, int(os.getenv("DATASET_STREAM_CHUNK", "4096")))
         async with _engine_for(s.DATASET_ENGINE, s).connect() as conn:
@@ -3129,7 +2278,6 @@ async def _load_dataset(s: _State, *, strict: bool = False):
                 await res.close()
             s.dataset = rows
         _build_dataset_index(s)
-        s._dataset_load_ok = True
         log(f"  dataset: {len(s.dataset)} rows", s.NODE_NAME)
     except Exception as e:
         s.dataset = []
@@ -3175,13 +2323,12 @@ def _build_dataset_index(s: _State) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 _DDL_BT_RESULTS = """
-CREATE TABLE IF NOT EXISTS vlad_backtest_results_fw216snapshot1 (
+CREATE TABLE IF NOT EXISTS vlad_backtest_results (
     id BIGINT NOT NULL AUTO_INCREMENT,
     service_url VARCHAR(255) NOT NULL,
     model_id INT NOT NULL DEFAULT 0,
     pair TINYINT NOT NULL, day_flag TINYINT NOT NULL, tier TINYINT NOT NULL,
     params_hash CHAR(32) NOT NULL, params_json TEXT NOT NULL,
-    snapshot_revision CHAR(64) NOT NULL DEFAULT '',
     date_from DATETIME NOT NULL, date_to DATETIME NOT NULL,
     balance_final DECIMAL(18,4) NOT NULL DEFAULT 0,
     total_result DECIMAL(18,4) NOT NULL DEFAULT 0,
@@ -3197,10 +2344,9 @@ CREATE TABLE IF NOT EXISTS vlad_backtest_results_fw216snapshot1 (
 """
 
 _DDL_BT_SUMMARY = """
-CREATE TABLE IF NOT EXISTS vlad_backtest_summary_fw216snapshot1 (
+CREATE TABLE IF NOT EXISTS vlad_backtest_summary (
     id INT NOT NULL AUTO_INCREMENT,
     model_id INT NOT NULL, service_url VARCHAR(255) NOT NULL,
-    snapshot_revision CHAR(64) NOT NULL DEFAULT '',
     pair TINYINT NOT NULL, day_flag TINYINT NOT NULL, tier TINYINT NOT NULL,
     date_from DATETIME NOT NULL, date_to DATETIME NOT NULL,
     total_combinations INT NOT NULL DEFAULT 0,
@@ -3211,7 +2357,7 @@ CREATE TABLE IF NOT EXISTS vlad_backtest_summary_fw216snapshot1 (
     best_params_json TEXT,
     computed_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     PRIMARY KEY (id),
-    UNIQUE KEY uq_sum (model_id, pair, day_flag, tier, date_from, date_to, snapshot_revision)
+    UNIQUE KEY uq_sum (model_id, pair, day_flag, tier, date_from, date_to)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 """
 
@@ -3382,42 +2528,6 @@ def build_app(model_module) -> FastAPI:
     s.SHIFT_WINDOW     = int( _get("cache", "shift_window",     "SHIFT_WINDOW",     "", 12))
     s.REBUILD_INTERVAL = int(_get("cache", "rebuild_interval", "REBUILD_INTERVAL", "", 0))
     s.RELOAD_INTERVAL = int(_get("cache", "reload_interval", "RELOAD_INTERVAL", "", 3600))
-    s.DYNAMIC_SYNC_ENABLED = _config_bool(
-        _get("dataset", "dynamic_sync", "DYNAMIC_SYNC_ENABLED", "DYNAMIC_SYNC_ENABLED", "true"),
-        name="DYNAMIC_SYNC_ENABLED",
-    )
-    s.DYNAMIC_POLL_SECONDS = max(2.0, float(_get(
-        "dataset", "dynamic_poll_seconds", "DYNAMIC_POLL_SECONDS", "DYNAMIC_POLL_SECONDS", 60)))
-    s.DYNAMIC_RECONCILE_SECONDS = max(60.0, float(_get(
-        "dataset", "dynamic_reconcile_seconds", "DYNAMIC_RECONCILE_SECONDS",
-        "DYNAMIC_RECONCILE_SECONDS", 600)))
-    s.DYNAMIC_AUX_SECONDS = max(20.0, float(_get(
-        "dataset", "dynamic_aux_seconds", "DYNAMIC_AUX_SECONDS", "DYNAMIC_AUX_SECONDS", 120)))
-    s.DYNAMIC_MAX_STALE_SECONDS = max(10.0, float(_get(
-        "dataset", "dynamic_max_stale_seconds", "DYNAMIC_MAX_STALE_SECONDS",
-        "DYNAMIC_MAX_STALE_SECONDS", 90)))
-    s.DYNAMIC_UPDATED_COLUMN = str(_get(
-        "dataset", "dynamic_updated_column", "DYNAMIC_UPDATED_COLUMN",
-        "DYNAMIC_UPDATED_COLUMN", "updated_at"))
-    s.DYNAMIC_PRIMARY_KEY = _get(
-        "dataset", "dynamic_primary_key", "DYNAMIC_PRIMARY_KEY", "DYNAMIC_PRIMARY_KEY", None)
-    s.DYNAMIC_EXPLICIT_CONTRACT = _config_bool(_get(
-        "dataset", "dynamic_explicit_contract", "DYNAMIC_EXPLICIT_CONTRACT",
-        "DYNAMIC_EXPLICIT_CONTRACT", "false"), name="DYNAMIC_EXPLICIT_CONTRACT")
-    # Separate scheduler switches, opt-in: defaults are identical to v21.4.
-    s.HOURLY_REBUILD_ENABLED = _config_bool(
-        _get("cache", "hourly_rebuild_enabled", "HOURLY_REBUILD_ENABLED",
-             "HOURLY_REBUILD_ENABLED", True),
-        name="HOURLY_REBUILD_ENABLED",
-    )
-    _configured_rebuild_minute = _get(
-        "cache", "hourly_rebuild_minute", "HOURLY_REBUILD_MINUTE",
-        "HOURLY_REBUILD_MINUTE", None,
-    )
-    if _configured_rebuild_minute is not None and str(_configured_rebuild_minute).strip() != "":
-        s.HOURLY_REBUILD_MINUTE = int(_configured_rebuild_minute)
-        if not 0 <= s.HOURLY_REBUILD_MINUTE <= 59:
-            raise ValueError("HOURLY_REBUILD_MINUTE must be in [0, 59]")
 
     # ── Датасет (новый способ — через enriched_table) ─────────────────────────
     s.PARSER_TABLE         = _get("dataset", "parser_table",   "PARSER_TABLE",         "", None)
@@ -3544,7 +2654,6 @@ def build_app(model_module) -> FastAPI:
     # Model calls are concurrent readers; refresh/reload/rebuild are exclusive
     # writers. Strict chronological models are still forced to model_limit=1 by
     # _resolve_model_compute_limit().
-    _framework_state = s
     _model_state_gate = s.state_gate
 
     async def _run_model_offloop(fn, *args, **kwargs):
@@ -3573,7 +2682,6 @@ def build_app(model_module) -> FastAPI:
         target_date = _parse_date(date_str)
         if not target_date:
             return None
-        _check_dynamic_freshness(target_date)
         table = _rates_table(pair, day)
         if not _skip_refresh:
             await _refresh_rates(table, s)
@@ -3604,7 +2712,6 @@ def build_app(model_module) -> FastAPI:
                 "rates_table": table,
                 "execution_scope": "diagnostic_raw",
                 "full_dataset": s.dataset,
-                "_standard_events_by_type": s._standard_events_by_type,
             }
         result = await _run_model_offloop(
             s.model_fn,
@@ -3628,8 +2735,7 @@ def build_app(model_module) -> FastAPI:
             )
 
     async def _call_model_impl(pair, day, date_str, calc_type=0, calc_var=0, param="",
-                          _skip_refresh: bool = False, _state=None):
-        s = _state if _state is not None else _framework_state
+                          _skip_refresh: bool = False):
         if s.compute_worker is False:
             raise RuntimeError(
                 "Local model() is disabled on this proxy-only node; cache MISS must "
@@ -3638,7 +2744,6 @@ def build_app(model_module) -> FastAPI:
         target_date = _parse_date(date_str)
         if not target_date:
             return None
-        _check_dynamic_freshness(target_date)
         table = _rates_table(pair, day)
 
         # Non-ML live calls share the read-only state snapshot and execute through
@@ -3679,7 +2784,6 @@ def build_app(model_module) -> FastAPI:
                     "rates_table": table,
                     "execution_scope": "live",
                     "full_dataset": s.dataset,
-                "_standard_events_by_type": s._standard_events_by_type,
                 }
 
             def _invoke_non_ml():
@@ -3785,333 +2889,16 @@ def build_app(model_module) -> FastAPI:
             raise
 
     async def _call_model(pair, day, date_str, calc_type=0, calc_var=0, param="",
-                          _skip_refresh: bool = False, _snapshot_revision=None, _state=None):
+                          _skip_refresh: bool = False):
         if not _skip_refresh:
             target_date = _parse_date(date_str)
             if target_date is not None:
                 await _refresh_rates(_rates_table(pair, day), s)
         async with _model_state_gate.read():
-            if _snapshot_revision is not None and _snapshot_revision != s.snapshot_cache_revision:
-                raise _SnapshotChanged("Dataset changed before prediction acquired its read lease")
             return await _call_model_impl(
                 pair, day, date_str, calc_type=calc_type, calc_var=calc_var,
-                param=param, _skip_refresh=True, _state=_state,
+                param=param, _skip_refresh=True,
             )
-
-    # ── Autonomous dataset delta / reconciliation ────────────────────────────
-
-    def _standard_events_snapshot(changes: dict):
-        """Update event cache only for changed event types; no full event scan."""
-        previous = s._standard_events_by_type
-        if previous is None:
-            return None
-        pk = s.dynamic_poller.contract.primary_key
-        row_key = getattr(s.dynamic_poller, "identity", lambda row: row.get(pk))
-        updated = dict(previous)
-        dirty = set()
-        for ident, row in changes.items():
-            old = s._dynamic_rows_by_pk.get(ident)
-            for candidate in (old, row):
-                if candidate is not None:
-                    parsed = _std_get_event(candidate)
-                    if parsed is not None:
-                        dirty.add(str(parsed[2]).strip().lower())
-        for kind in dirty:
-            group = [entry for entry in previous.get(kind, ())
-                     if row_key(entry[2]) not in changes]
-            for row in changes.values():
-                if row is None:
-                    continue
-                parsed = _std_get_event(row)
-                if parsed and str(parsed[2]).strip().lower() == kind:
-                    group.append((parsed[0], float(parsed[1]), row))
-            group.sort(key=lambda item: item[0])
-            if group:
-                updated[kind] = group
-            else:
-                updated.pop(kind, None)
-        return updated
-
-    custom_snapshot = None
-
-    def _publish_custom_revision(revision, changes):
-        if changes:
-            if s.reverse_store is not None:
-                s.reverse_store.clear_universe_cache()
-            s._ml_active_cache.clear()
-        s.snapshot_cache_revision = revision
-        s.dynamic_cache_stale = False
-
-    async def _refresh_custom_snapshot_once():
-        if custom_snapshot is None:
-            return
-        try:
-            await custom_snapshot.refresh()
-            s.dynamic_status = {**custom_snapshot.metrics, 'mode': 'active'}
-            s.dynamic_last_ok = datetime.now()
-            s.dynamic_status['last_success'] = s.dynamic_last_ok.isoformat()
-            return dict(s.dynamic_status)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            s.dynamic_status.update(mode='degraded', last_error=str(exc)[:300])
-            log(f' CUSTOM_SNAPSHOT failure: {exc}', s.NODE_NAME, level='error', force=True)
-            return {'error': str(exc)[:300]}
-
-    def _calculate_snapshot_cache_revision(state, *, pending=False):
-        import pickle
-        poller = state.dynamic_poller
-        if not isinstance(poller, SnapshotDatasetPoller):
-            return custom_snapshot.revision if custom_snapshot is not None else None
-        # Values/backtest namespaces only; ReverseStore training hashes and weights
-        # keep their established identities. Existing result rows are preserved.
-        payload = (poller.cache_token(pending=pending), state.ctx_index, state.weight_codes, state.url_map, state._label_cache)
-        model_cache_version = getattr(model_module, 'MODEL_CACHE_VERSION', None)
-        if model_cache_version:
-            payload = (str(model_cache_version), payload)
-        return hashlib.sha256(pickle.dumps(payload, protocol=5)).hexdigest()
-
-    def _refresh_snapshot_cache_revision():
-        s.snapshot_cache_revision = _calculate_snapshot_cache_revision(s) or ""
-
-    def _values_params(params, state=None):
-        revision = (state or s).snapshot_cache_revision
-        if not revision:
-            return dict(params)
-        return {**params, "__dataset_snapshot": revision}
-
-    def _values_hash(params):
-        return _params_hash(_values_params(params))
-
-    async def _init_dynamic_dataset():
-        nonlocal custom_snapshot
-        if not s.DYNAMIC_SYNC_ENABLED:
-            s.dynamic_status = {"mode": "disabled"}
-            return
-        poller = s.dynamic_poller
-        if poller is None:
-            factory = getattr(model_module, 'dataset_snapshot_factory', None)
-            if callable(factory):
-                custom_snapshot = factory(_model_state_gate)
-                if not isinstance(custom_snapshot, NamespaceSnapshot):
-                    raise TypeError('dataset_snapshot_factory must return NamespaceSnapshot')
-                custom_snapshot.on_publish = _publish_custom_revision
-                initial = await _refresh_custom_snapshot_once()
-                if initial and 'error' in initial:
-                    raise RuntimeError('Initial custom snapshot load failed: '+initial['error'])
-            else:
-                s.dynamic_status = {"mode": "model-managed", "reason": "No Framework dataset SQL"}
-            return
-        s._dynamic_rows_by_pk = {poller.identity(row): row for row in s.dataset}
-        s.dynamic_last_ok = datetime.now()
-        s.dynamic_status = {"mode": "active", **poller.metrics}
-        if s.model_needs_index and "run_standard_model" in (
-            getattr(getattr(s.model_fn, "__code__", None), "co_names", ())
-        ):
-            s._standard_events_by_type = _dataset_event_index(
-                s.dataset, {"full_dataset": s.dataset}, _std_get_event)
-
-    async def _legacy_dynamic_refresh_once(*, reconcile: bool = False):
-        poller = s.dynamic_poller
-        if poller is None:
-            return
-        starting_watermark = poller.watermark
-        try:
-            base_data = s.dataset
-            base_map = s._dynamic_rows_by_pk
-            changes = await (poller.reconcile(base_map) if reconcile
-                             else poller.changes(base_map))
-            if changes:
-                updated_state = apply_delta_snapshot(
-                    base_data, changes, pk=poller.contract.primary_key,
-                    key_field=s.dataset_key_field,
-                    old_by_key=s.dataset_by_key,
-                    old_key_dates=s.dataset_key_dates,
-                )
-                # Load related values from MySQL before publishing a new version.
-                # Derived ctx queries (enriched aggregations) are recalculated
-                # only when data changes, not on every periodic poll.
-                staged = _copy.copy(s)
-                await _load_ctx_index(staged, strict=True)
-                await _load_weight_codes(staged, strict=True)
-                await _load_url_map(staged, strict=True)
-                await _load_label_cache(staged, strict=True)
-                next_events = _standard_events_snapshot(changes)
-                next_map = dict(base_map)
-                for ident, value in changes.items():
-                    if value is None:
-                        next_map.pop(ident, None)
-                    else:
-                        next_map[ident] = value
-                async with _model_state_gate.write():
-                    if s.dataset is not base_data:
-                        raise RuntimeError("Concurrent rebuild: delta snapshot changed; retry")
-                    for name, value in updated_state.items():
-                        setattr(s, name, value)
-                    for name in ("ctx_index", "ctx_row_count", "weight_codes",
-                                 "weights_row_count", "url_map", "_label_cache"):
-                        setattr(s, name, getattr(staged, name))
-                    s._dynamic_rows_by_pk = next_map
-                    s._standard_events_by_type = next_events
-                    s.last_reload = datetime.now()
-                    if s.reverse_store is not None:
-                        s.reverse_store.clear_universe_cache()
-                    # Cached historical values may depend on revised events.
-                    # Do not silently serve a known-stale historical cache.
-                    cutoff = datetime.now() - timedelta(days=s.CACHE_FRESH_LAG_DAYS)
-                    if any((r or base_map.get(k) or {}).get("date", datetime.max) <= cutoff
-                           for k, r in changes.items()):
-                        s.dynamic_cache_stale = True
-                log(f" DYNAMIC_SYNC applied {len(changes)} row delta(s)",
-                    s.NODE_NAME, force=True)
-            s.dynamic_last_ok = datetime.now()
-            s.dynamic_status.update({"mode": "active", "last_delta_rows": len(changes),
-                                     "last_success": s.dynamic_last_ok.isoformat(),
-                                     "watermark": str(poller.watermark), "last_error": None})
-            if reconcile:
-                s.dynamic_status["last_reconcile"] = s.dynamic_last_ok.isoformat()
-        except asyncio.CancelledError:
-            poller.watermark = starting_watermark
-            raise
-        except Exception as exc:
-            poller.watermark = starting_watermark
-            s.dynamic_status.update({"mode": "degraded", "last_error": str(exc)[:300]})
-            log(f" DYNAMIC_SYNC failure: {exc}", s.NODE_NAME, level="error", force=True)
-
-    _snapshot_check_lock = asyncio.Lock()
-
-    async def _dynamic_refresh_once(*, reconcile=False, force_aux=False, check_dataset=True):
-        async with _snapshot_check_lock:
-            if s.dynamic_poller is not None and not isinstance(s.dynamic_poller, SnapshotDatasetPoller):
-                return await _legacy_dynamic_refresh_once(reconcile=reconcile)
-            return await _dynamic_refresh_once_unlocked(
-                reconcile=reconcile, force_aux=force_aux, check_dataset=check_dataset)
-
-    async def _dynamic_refresh_once_unlocked(*, reconcile=False, force_aux=False, check_dataset=True):
-        poller = s.dynamic_poller
-        if poller is None:
-            return
-        base_data, base_map = s.dataset, s._dynamic_rows_by_pk
-        started = _time.monotonic()
-        try:
-            changes = await poller.changes(base_map) if check_dataset else {}
-            staged = _copy.copy(s)
-            names = ('ctx_index', 'ctx_row_count', 'weight_codes',
-                     'weights_row_count', 'url_map', '_label_cache')
-            if changes or force_aux:
-                await _load_ctx_index(staged, strict=True)
-                await _load_weight_codes(staged, strict=True)
-                await _load_url_map(staged, strict=True)
-                await _load_label_cache(staged, strict=True)
-            aux_changed = any(getattr(staged, name) != getattr(s, name) for name in names)
-            if changes or aux_changed:
-                updated = apply_delta_snapshot(
-                    base_data, changes, pk=poller.contract.primary_key,
-                    key_field=s.dataset_key_field, old_by_key=s.dataset_by_key,
-                    old_key_dates=s.dataset_key_dates, key_fn=poller.identity,
-                ) if changes else {}
-                next_events = _standard_events_snapshot(changes) if changes else s._standard_events_by_type
-                next_map = dict(base_map) if changes else base_map
-                for ident, row in changes.items():
-                    if row is None:
-                        next_map.pop(ident, None)
-                    else:
-                        next_map[ident] = row
-                # All fallible staging precedes publication, including cache hashing.
-                revision = _calculate_snapshot_cache_revision(staged, pending=check_dataset)
-                publication_wait = _time.monotonic()
-                async with _model_state_gate.write():
-                    if s.dataset is not base_data or s.dynamic_poller is not poller:
-                        raise RuntimeError('Concurrent dataset replacement; retry')
-                    if s.reverse_store is not None:
-                        s.reverse_store.clear_universe_cache()
-                    for name, value in updated.items():
-                        setattr(s, name, value)
-                    for name in names:
-                        setattr(s, name, getattr(staged, name))
-                    s._dynamic_rows_by_pk = next_map
-                    s._standard_events_by_type = next_events
-                    s.snapshot_cache_revision = revision
-                    s.dynamic_cache_stale = False
-                    s.last_reload = datetime.now()
-                    s._ml_active_cache.clear()
-                    if check_dataset:
-                        poller.commit()
-                    s.dynamic_status.update(last_applied_at=datetime.now().isoformat(),
-                        last_publish_wait_seconds=round(_time.monotonic()-publication_wait, 4))
-                log(f' SNAPSHOT_SYNC applied {len(changes)} row delta(s); aux={aux_changed}',
-                    s.NODE_NAME, force=True)
-            elif check_dataset:
-                poller.commit()
-            s.dynamic_status.update(poller.metrics)
-            s.dynamic_status.update(snapshot_revision=s.snapshot_cache_revision,
-                last_sync_seconds=round(_time.monotonic()-started, 4),
-                hourly_dataset_ram_reload=False)
-            if check_dataset:
-                s.dynamic_last_ok = datetime.now()
-                s.dynamic_status.update(mode='active', last_delta_rows=len(changes),
-                    last_success=s.dynamic_last_ok.isoformat(), last_error=None)
-            if changes or force_aux:
-                s.dynamic_status.update(aux_last_success=datetime.now().isoformat(), aux_last_error=None)
-            return {'changed_rows': len(changes), 'aux_changed': aux_changed}
-        except asyncio.CancelledError:
-            poller.discard()
-            raise
-        except Exception as exc:
-            poller.discard()
-            error = str(exc)[:300]
-            if check_dataset:
-                s.dynamic_status.update(mode='degraded', last_error=error)
-            else:
-                s.dynamic_status['aux_last_error'] = error
-            log(f' SNAPSHOT_SYNC failure: {exc}', s.NODE_NAME, level='error', force=True)
-            return {'error': error}
-
-    async def _bg_dynamic_dataset():
-        if custom_snapshot is not None:
-            while True:
-                await asyncio.sleep(custom_snapshot.poll_seconds)
-                await _refresh_custom_snapshot_once()
-        if s.dynamic_poller is None:
-            return
-        while True:
-            await asyncio.sleep(s.dynamic_poller.poll_seconds)
-            await _dynamic_refresh_once()
-
-    async def _bg_dynamic_aux():
-        # Serialize auxiliary publication with the dataset path without another
-        # expensive scan of the main source.
-        while True:
-            await asyncio.sleep(s.DYNAMIC_AUX_SECONDS)
-            await _dynamic_refresh_once(force_aux=True, check_dataset=False)
-
-
-    async def _bg_dynamic_rates():
-        while True:
-            try:
-                await _refresh_simple_rates(s)
-                for table in _RATES_TABLES:
-                    await _refresh_rates(table, s)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                log(f" DYNAMIC_RATES background failure: {exc}", s.NODE_NAME, level="error")
-            await asyncio.sleep(max(10.0, s.DYNAMIC_POLL_SECONDS))
-
-    def _check_dynamic_freshness(target_date: datetime):
-        if s.dynamic_poller is None and custom_snapshot is None:
-            return
-        if custom_snapshot is not None and not custom_snapshot.metrics.get("checks"):
-            raise RuntimeError("CUSTOM_DATASET_NOT_READY")
-        # The historic/backtest paths are allowed to use frozen snapshots.
-        # Live/near-live calculations must not silently use an outdated dataset.
-        if abs((datetime.now() - target_date).total_seconds()) > 7200:
-            return
-        age = ((datetime.now() - s.dynamic_last_ok).total_seconds()
-               if s.dynamic_last_ok is not None else float("inf"))
-        max_age = max(s.DYNAMIC_MAX_STALE_SECONDS, getattr(s.dynamic_poller or custom_snapshot, "poll_seconds", 0) * 3)
-        if age > max_age:
-            raise RuntimeError(f"DYNAMIC_DATASET_STALE: last successful poll {age:.0f}s ago")
 
     # ── _preload ──────────────────────────────────────────────────────────────
 
@@ -4130,29 +2917,14 @@ def build_app(model_module) -> FastAPI:
 
         await _load_simple_rates(s)
         await _load_rates(s)
-        s._dataset_bootstrap_db_time = None
-        if s.DYNAMIC_SYNC_ENABLED and (s.DATASET_TABLE or s.ENRICHED_TABLE):
-            try:
-                s._dataset_bootstrap_db_time = await DatasetPoller(
-                    _engine_for(s.DATASET_ENGINE, s),
-                    # Placeholder contract is used only for NOW(6), before discovery.
-                    TableContract(
-                        s.DATASET_TABLE or s.ENRICHED_TABLE, "id", s.DYNAMIC_UPDATED_COLUMN
-                    ),
-            ).server_time()
-            except Exception as exc:
-                log(f" dynamic bootstrap time unavailable: {exc}", s.NODE_NAME,
-                    level="warning")
         await _load_dataset(s)
-        await _init_dynamic_dataset()
         await _load_weight_codes(s)
         await _load_ctx_index(s)
         await _load_url_map(s)
         await _load_label_cache(s)
-        _refresh_snapshot_cache_revision()
 
         s.service_url  = f"http://localhost:{s.PORT}"
-        s._cache_table = f"vlad_values_cache_svc{s.PORT}_fw216rc1"
+        s._cache_table = f"vlad_values_cache_svc{s.PORT}"
 
         if s.cache_writer or s.compute_worker:
             # CREATE TABLE IF NOT EXISTS is idempotent. A remote compute worker
@@ -4298,19 +3070,8 @@ def build_app(model_module) -> FastAPI:
             str(_enrich_result.get("mode") or "").lower()
             if isinstance(_enrich_result, dict) else ""
         )
-        if custom_snapshot is not None:
-            stats['snapshot_sync'] = await _refresh_custom_snapshot_once()
-            s.last_rebuild = datetime.now()
-            return stats
-        if isinstance(s.dynamic_poller, SnapshotDatasetPoller):
-            sync = await _dynamic_refresh_once_unlocked(force_aux=True)
-            stats["snapshot_sync"] = sync
-            if sync and "error" in sync:
-                return {"error": sync["error"], **stats}
-            s.last_rebuild = datetime.now()
-            return stats
         staged = _copy.copy(s)
-        if s.enrich_fn is not None and _enrich_mode not in ("noop", "locked") and not isinstance(s.dynamic_poller, SnapshotDatasetPoller):
+        if s.enrich_fn is not None and _enrich_mode not in ("noop", "locked"):
             await _load_dataset(staged, strict=True)
             stats["dataset_reload"] = {"rows": len(staged.dataset), "mode": _enrich_mode or "changed"}
             log(
@@ -4335,26 +3096,6 @@ def build_app(model_module) -> FastAPI:
             ):
                 if hasattr(staged, name):
                     setattr(s, name, getattr(staged, name))
-        if s.dynamic_poller is not None:
-            try:
-                async with _model_state_gate.write():
-                    pk = s.dynamic_poller.contract.primary_key
-                    row_key = getattr(s.dynamic_poller, "identity", lambda row: row[pk])
-                    s._dynamic_rows_by_pk = {row_key(r): r for r in s.dataset}
-                    s._standard_events_by_type = (
-                        _dataset_event_index(s.dataset, {"full_dataset": s.dataset}, _std_get_event)
-                        if s.model_needs_index and "run_standard_model" in (
-                            getattr(getattr(s.model_fn, "__code__", None), "co_names", ()))
-                        else None
-                    )
-                # Poll's overlap window covers concurrent writes. Reconciliation
-                # additionally catches prior changes/deletions after a rebuild.
-            except Exception as exc:
-                s.dynamic_status["mode"] = "degraded"
-                s.dynamic_status["last_error"] = f"post_rebuild: {exc}"
-        if isinstance(s.dynamic_poller, SnapshotDatasetPoller):
-            await _dynamic_refresh_once()
-            _refresh_snapshot_cache_revision()
         log(
             f" rebuild done: weights={len(s.weight_codes)} ctx={len(s.ctx_index)}",
             s.NODE_NAME, force=True,
@@ -4368,8 +3109,7 @@ def build_app(model_module) -> FastAPI:
 
     async def _do_rebuild() -> dict:
         async with _rebuild_lock:
-            async with _snapshot_check_lock:
-                return await _do_rebuild_locked()
+            return await _do_rebuild_locked()
 
     async def _auto_build_weights() -> dict:
         """
@@ -4438,10 +3178,6 @@ def build_app(model_module) -> FastAPI:
     # ── _bg_reload + framework-default hourly rebuild ────────────────────────
 
     _hourly_identity = f"{s.NODE_NAME}:{int(s.SERVICE_ID)}:{int(s.PORT)}"
-    _hourly_target_minute = _hourly_rebuild_target_minute(
-        _hourly_identity, (s.HOURLY_REBUILD_MINUTE if s.HOURLY_REBUILD_MINUTE is not None
-                           else (40 if s.DYNAMIC_SYNC_ENABLED else None))
-    )
     _hourly_marker = _hourly_rebuild_marker_path(_hourly_identity)
     _hourly_lock_path = _hourly_rebuild_lock_path(_hourly_identity)
     _hourly_seen_slot = None
@@ -4638,19 +3374,12 @@ def build_app(model_module) -> FastAPI:
         last_reload_mono = _time.monotonic()
         reload_every = max(1, int(s.RELOAD_INTERVAL or 3600))
         while True:
-            hourly_needed = s.HOURLY_REBUILD_ENABLED
             try:
                 now = datetime.now()
-                requires_builders = bool(
-                    s.index_builder_fn or s.weight_builder_fn or s.enrich_fn or
-                    (s.ENRICHED_TABLE and s.DATASET_INDEX_FIELDS)
-                )
-                hourly_needed = (s.HOURLY_REBUILD_ENABLED and
-                                 (s.dynamic_poller is None or requires_builders))
-                if hourly_needed:
-                    slot, slot_target = _hourly_rebuild_slot(now, _hourly_target_minute)
-                    if now.strftime("%Y-%m-%dT%H") == slot and now >= slot_target:
-                        await _run_hourly_rebuild(slot, slot_target)
+                target_minute = _hourly_rebuild_target_minute(_hourly_identity)
+                slot, slot_target = _hourly_rebuild_slot(now, target_minute)
+                if now.strftime("%Y-%m-%dT%H") == slot and now >= slot_target:
+                    await _run_hourly_rebuild(slot, slot_target)
 
                 if _time.monotonic() - last_reload_mono >= reload_every:
                     await _refresh_simple_rates(s)
@@ -4665,15 +3394,13 @@ def build_app(model_module) -> FastAPI:
                 send_error_trace(e, s.NODE_NAME, "bg_reload")
 
             now = datetime.now()
+            target_minute = _hourly_rebuild_target_minute(_hourly_identity)
+            next_target = now.replace(minute=target_minute, second=0, microsecond=0)
+            if next_target <= now:
+                next_target += timedelta(hours=1)
+            until_rebuild = max(0.5, (next_target - now).total_seconds())
             until_reload = max(0.5, reload_every - (_time.monotonic() - last_reload_mono))
-            if hourly_needed:
-                next_target = now.replace(minute=_hourly_target_minute, second=0, microsecond=0)
-                if next_target <= now:
-                    next_target += timedelta(hours=1)
-                until_rebuild = max(0.5, (next_target - now).total_seconds())
-                await asyncio.sleep(min(60.0, until_rebuild, until_reload))
-            else:
-                await asyncio.sleep(min(60.0, until_reload))
+            await asyncio.sleep(min(60.0, until_rebuild, until_reload))
 
     # ── fill_cache helpers ────────────────────────────────────────────────────
 
@@ -4743,7 +3470,6 @@ def build_app(model_module) -> FastAPI:
             }
             # Safe internal accelerator for run_standard_model(); no model flag required.
             dataset_index_dict["full_dataset"] = s_state.dataset
-            dataset_index_dict["_standard_events_by_type"] = s_state._standard_events_by_type
 
         try:
             res = s_state.model_fn(
@@ -4837,7 +3563,6 @@ def build_app(model_module) -> FastAPI:
             "is_daily": bool(str(rates_tbl or s_state.RATES_TABLE or "").endswith("_day")),
             "rates_table": rates_tbl or s_state.RATES_TABLE,
             "full_dataset": s_state.dataset,
-            "_standard_events_by_type": s_state._standard_events_by_type,
             "execution_scope": "fill_cache",
         }
 
@@ -4921,11 +3646,8 @@ def build_app(model_module) -> FastAPI:
         np_rates_pd,
         rates_tbl,
         batch_size,
-        _state=None,
     ):
         """Automatic fused fill for standard services; returns handled + counters."""
-        s = _state if _state is not None else _framework_state
-        _values_hash = lambda params: _params_hash(_values_params(params, s))
         if not type_var_slots:
             return False, 0, 0, 0
         _ordered_model, _ = _ordered_fill_control(s)
@@ -4938,7 +3660,7 @@ def build_app(model_module) -> FastAPI:
         slot_meta = []
         for calc_type, var in type_var_slots:
             extra = {"type": calc_type, "var": var, "param": ""}
-            p_hash = _values_hash(extra)
+            p_hash = _params_hash(extra)
             slot_meta.append((
                 (calc_type, var),
                 p_hash,
@@ -5112,7 +3834,6 @@ def build_app(model_module) -> FastAPI:
         type_var_slots: list,
         dt_from: datetime | None = None,
         dt_to: datetime | None = None,
-        _state=None,
     ) -> int:
         """
         Прогревает _ml_active_cache для всех экстремумов пары/таймфрейма.
@@ -5129,7 +3850,6 @@ def build_app(model_module) -> FastAPI:
         _ml_active_cache (574k для pair1/h) и вызывая OOM → glibc heap corruption.
         Теперь фильтруем ext_dates по окну fill_cache + 90-дневный lookback-буфер.
         """
-        s = _state if _state is not None else _framework_state
         if s.batch_model_fn is None:
             return 0
 
@@ -5155,7 +3875,6 @@ def build_app(model_module) -> FastAPI:
                 "rates_table": tbl,
             }
             dataset_index_dict["full_dataset"] = s.dataset
-            dataset_index_dict["_standard_events_by_type"] = s._standard_events_by_type
 
         # Группируем слоты по calc_var — один batch_model call на интервал
         # (train_mode не влияет на набор дат экстремумов, только на обучение).
@@ -5281,20 +4000,15 @@ def build_app(model_module) -> FastAPI:
     # ── _fill_worker ──────────────────────────────────────────────────────────
 
     async def _fill_worker(pairs, days, date_from_str, date_to_str, types, params, batch_size):
-        s = _copy.copy(_framework_state)
-        s._ml_active_cache = dict(_framework_state._ml_active_cache)
-        for name in ('rates', 'np_rates', 'global_rates', 'global_rates_dates', 'last_rates_refresh'):
-            setattr(s, name, dict(getattr(s, name)))
-        _values_hash = lambda params: _params_hash(_values_params(params, s))
         if not s.cache_writer:
-            _framework_state.fill_status = s.fill_status = {
+            s.fill_status = {
                 "state": "error",
                 "error": "fill_cache разрешён только на Brain 1",
                 "cache_role": s.cache_role,
             }
             return
         s.fill_cancel.clear()
-        _framework_state._fill_cache_active = s._fill_cache_active = True   # skip vlad_reverse_universe writes for speed
+        s._fill_cache_active = True   # skip vlad_reverse_universe writes for speed
         # Preparation also needs cleanup protection.  Failures here happen
         # before the main processing loop (for example while refreshing rates),
         # so the loop's finally block cannot reset _fill_cache_active for us.
@@ -5322,7 +4036,7 @@ def build_app(model_module) -> FastAPI:
             total  = total_candles * len(type_var_slots)
             done   = skipped = errors = 0
             completed_slots = 0
-            _framework_state.fill_status = s.fill_status = {
+            s.fill_status = {
                 "state": "running", "phase": "preparing",
                 "total": total, "done": 0,
                 "skipped": 0, "errors": 0,
@@ -5333,7 +4047,7 @@ def build_app(model_module) -> FastAPI:
             log(f" fill_cache: {len(pd_slots)} инструментов × "
                 f"{len(type_var_slots)} type/var/param слотов", s.NODE_NAME, force=True)
         except Exception:
-            _framework_state._fill_cache_active = s._fill_cache_active = False
+            s._fill_cache_active = False
             raise
 
         try:
@@ -5371,7 +4085,7 @@ def build_app(model_module) -> FastAPI:
                 cached_by_hash: dict[str, set] = {}
                 try:
                     _wanted_hashes = [
-                        _values_hash({"type": ct, "var": vv, "param": prm})
+                        _params_hash({"type": ct, "var": vv, "param": prm})
                         for ct, vv, prm in type_var_slots
                     ]
                     _where_ch = ["service_url=:url", "pair=:pair", "day_flag=:day"]
@@ -5420,7 +4134,7 @@ def build_app(model_module) -> FastAPI:
                 _fast_handled, _fast_done, _fast_skipped, _fast_errors = (
                     await _try_fill_standard_fast(
                         pair_id, day_flag, candles, _fast_slots, cached_by_hash,
-                        all_rows, all_dates_pd, np_rates_pd, tbl, batch_size, _state=s,
+                        all_rows, all_dates_pd, np_rates_pd, tbl, batch_size,
                     )
                 )
                 if _fast_handled:
@@ -5444,7 +4158,7 @@ def build_app(model_module) -> FastAPI:
                     nonlocal done, skipped, errors, completed_slots
 
                     extra       = {"type": calc_type, "var": var, "param": calc_param}
-                    p_hash      = _values_hash(extra)
+                    p_hash      = _params_hash(extra)
                     params_json = _json.dumps(extra, ensure_ascii=False)
 
                     # OPT-1: используем prefetch вместо отдельного SELECT
@@ -5506,7 +4220,7 @@ def build_app(model_module) -> FastAPI:
                         })
                         warmed = await _prewarm_ml_active_cache(
                             pair_id, day_flag, [(calc_type, var, calc_param)],
-                            dt_from=dt_from, dt_to=dt_to, _state=s,
+                            dt_from=dt_from, dt_to=dt_to,
                         )
                         if warmed:
                             log(
@@ -5572,7 +4286,7 @@ def build_app(model_module) -> FastAPI:
                                                 pair_id, day_flag,
                                                 _rep["date"].strftime("%Y-%m-%d %H:%M:%S"),
                                                 calc_type=calc_type, calc_var=var, param=calc_param,
-                                                _skip_refresh=True, _state=s,
+                                                _skip_refresh=True,
                                             )
                                         except Exception as _e:
                                             import traceback as _tb
@@ -5608,7 +4322,7 @@ def build_app(model_module) -> FastAPI:
                                             pair_id, day_flag,
                                             candle["date"].strftime("%Y-%m-%d %H:%M:%S"),
                                             calc_type=calc_type, calc_var=var, param=calc_param,
-                                            _skip_refresh=True, _state=s,
+                                            _skip_refresh=True,
                                         )
                                     except Exception as _e2:
                                         import traceback as _tb2
@@ -5765,7 +4479,7 @@ def build_app(model_module) -> FastAPI:
             # Guaranteed cleanup — runs even if an exception aborts the loop.
             # Without this, _fill_cache_active stays True forever after a crash,
             # causing all subsequent /values calls to also use skip_db_writes=True.
-            _framework_state._fill_cache_active = s._fill_cache_active = False
+            s._fill_cache_active = False
 
         state = "stopped" if s.fill_cancel.is_set() else "done"
         s.fill_status.update({
@@ -5835,15 +4549,11 @@ def build_app(model_module) -> FastAPI:
 
     # ── _backtest ─────────────────────────────────────────────────────────────
 
-    async def _backtest(pair, day, tier, extra_params, df, dt):
-        async with _model_state_gate.read():
-            return await _backtest_snapshot_locked(pair, day, tier, extra_params, df, dt)
-
-    async def _backtest_snapshot_locked(pair, day, tier, extra_params, df, dt) -> dict:
-        p_hash = _values_hash(extra_params)
+    async def _backtest(pair, day, tier, extra_params, df, dt) -> dict:
+        p_hash = _params_hash(extra_params)
         async with s.engine_vlad.connect() as conn:
             ex = (await conn.execute(text("""
-                SELECT value_score, accuracy, trade_count FROM vlad_backtest_results_fw216snapshot1
+                SELECT value_score, accuracy, trade_count FROM vlad_backtest_results
                 WHERE service_url=:url AND pair=:pair AND day_flag=:day
                   AND tier=:tier AND params_hash=:ph AND date_from=:df AND date_to=:dt
                 LIMIT 1
@@ -5953,12 +4663,12 @@ def build_app(model_module) -> FastAPI:
         try:
             async with s.engine_vlad.begin() as conn:
                 await conn.execute(text("""
-                    INSERT INTO vlad_backtest_results_fw216snapshot1
+                    INSERT INTO vlad_backtest_results
                         (service_url, model_id, pair, day_flag, tier,
-                         params_hash, params_json, snapshot_revision, date_from, date_to,
+                         params_hash, params_json, date_from, date_to,
                          balance_final, total_result, summary_lost,
                          value_score, trade_count, win_count, accuracy)
-                    VALUES (:url,:mid,:pair,:day,:tier,:ph,:pj,:revision,:df,:dt,
+                    VALUES (:url,:mid,:pair,:day,:tier,:ph,:pj,:df,:dt,
                             :bf,:tr,:sl,:vs,:tc,:wc,:acc)
                     ON DUPLICATE KEY UPDATE
                         balance_final=VALUES(balance_final),
@@ -5972,7 +4682,7 @@ def build_app(model_module) -> FastAPI:
                 """), {
                     "url": s.service_url, "mid": s.SERVICE_ID,
                     "pair": pair, "day": day, "tier": tier,
-                    "ph": p_hash, "pj": _json.dumps(_values_params(extra_params), ensure_ascii=False), "revision": s.snapshot_cache_revision,
+                    "ph": p_hash, "pj": _json.dumps(extra_params, ensure_ascii=False),
                     "df": df, "dt": dt,
                     "bf": result["balance_final"], "tr": result["total_result"],
                     "sl": result["summary_lost"],  "vs": result["value_score"],
@@ -5983,34 +4693,30 @@ def build_app(model_module) -> FastAPI:
         return result
 
     async def _upsert_summary(pair, day, tier, df, dt):
-        async with _model_state_gate.read():
-            return await _upsert_summary_snapshot_locked(pair, day, tier, df, dt)
-
-    async def _upsert_summary_snapshot_locked(pair, day, tier, df, dt):
         async with s.engine_vlad.connect() as conn:
             row = (await conn.execute(text("""
                 SELECT COUNT(*), MAX(value_score), AVG(value_score),
                        MAX(accuracy), AVG(accuracy),
                        MAX(CASE WHEN value_score=(
-                           SELECT MAX(value_score) FROM vlad_backtest_results_fw216snapshot1 r2
+                           SELECT MAX(value_score) FROM vlad_backtest_results r2
                            WHERE r2.service_url=:url AND r2.pair=:pair
                              AND r2.day_flag=:day AND r2.tier=:tier
-                             AND r2.date_from=:df AND r2.date_to=:dt AND r2.snapshot_revision=:revision)
+                             AND r2.date_from=:df AND r2.date_to=:dt)
                        THEN params_json END)
-                FROM vlad_backtest_results_fw216snapshot1
+                FROM vlad_backtest_results
                 WHERE service_url=:url AND pair=:pair AND day_flag=:day
-                  AND tier=:tier AND date_from=:df AND date_to=:dt AND snapshot_revision=:revision
+                  AND tier=:tier AND date_from=:df AND date_to=:dt
             """), {"url": s.service_url, "pair": pair, "day": day,
-                   "tier": tier, "df": df, "dt": dt, "revision": s.snapshot_cache_revision})).fetchone()
+                   "tier": tier, "df": df, "dt": dt})).fetchone()
         if not row or not row[0]:
             return
         async with s.engine_vlad.begin() as conn:
             await conn.execute(text("""
-                INSERT INTO vlad_backtest_summary_fw216snapshot1
-                    (model_id,service_url,pair,day_flag,tier,date_from,date_to,snapshot_revision,
+                INSERT INTO vlad_backtest_summary
+                    (model_id,service_url,pair,day_flag,tier,date_from,date_to,
                      total_combinations,best_score,avg_score,
                      best_accuracy,avg_accuracy,best_params_json)
-                VALUES (:mid,:url,:pair,:day,:tier,:df,:dt,:revision,
+                VALUES (:mid,:url,:pair,:day,:tier,:df,:dt,
                         :cnt,:bs,:as_,:ba,:aa,:bpj)
                 ON DUPLICATE KEY UPDATE
                     total_combinations=VALUES(total_combinations),
@@ -6021,7 +4727,7 @@ def build_app(model_module) -> FastAPI:
             """), {
                 "mid": s.SERVICE_ID, "url": s.service_url,
                 "pair": pair, "day": day, "tier": tier, "df": df, "dt": dt,
-                "revision": s.snapshot_cache_revision, "cnt": row[0], "bs": float(row[1] or 0), "as_": float(row[2] or 0),
+                "cnt": row[0], "bs": float(row[1] or 0), "as_": float(row[2] or 0),
                 "ba": float(row[3] or 0), "aa": float(row[4] or 0), "bpj": row[5],
             })
 
@@ -6083,32 +4789,8 @@ def build_app(model_module) -> FastAPI:
             log(f" initial load: {e}", s.NODE_NAME, level="error", force=True)
         _write_capacity_file()
         task = asyncio.create_task(_bg_reload())
-        dynamic_task = (asyncio.create_task(_bg_dynamic_dataset())
-                        if s.dynamic_poller is not None or custom_snapshot is not None else None)
-        rate_task = (asyncio.create_task(_bg_dynamic_rates())
-                     if s.DYNAMIC_SYNC_ENABLED else None)
-        aux_task = (asyncio.create_task(_bg_dynamic_aux())
-                    if s.DYNAMIC_SYNC_ENABLED else None)
         yield
         task.cancel()
-        if aux_task is not None:
-            aux_task.cancel()
-            try:
-                await aux_task
-            except asyncio.CancelledError:
-                pass
-        if rate_task is not None:
-            rate_task.cancel()
-            try:
-                await rate_task
-            except asyncio.CancelledError:
-                pass
-        if dynamic_task is not None:
-            dynamic_task.cancel()
-            try:
-                await dynamic_task
-            except asyncio.CancelledError:
-                pass
         s.fill_cancel.set()
         _remove_capacity_file()
         if s.runtime_coordinator is not None:
@@ -6168,16 +4850,9 @@ def build_app(model_module) -> FastAPI:
                 "cache_upstream":     s.cache_upstream_url if not s.compute_worker else None,
                 "last_reload":        s.last_reload.isoformat() if s.last_reload else None,
                 "last_rebuild":       s.last_rebuild.isoformat() if s.last_rebuild else None,
-                "dynamic_dataset":      dict(s.dynamic_status),
-                "dynamic_historical_cache_stale": s.dynamic_cache_stale,
                 "rebuild_auto":       _rebuild_supported(),
-                "hourly_rebuild_default": _rebuild_supported() and s.HOURLY_REBUILD_ENABLED,
-                "hourly_rebuild_enabled": s.HOURLY_REBUILD_ENABLED,
-                "hourly_rebuild_effective": (s.HOURLY_REBUILD_ENABLED and
-                    (s.dynamic_poller is None or bool(s.index_builder_fn or
-                     s.weight_builder_fn or s.enrich_fn or
-                     (s.ENRICHED_TABLE and s.DATASET_INDEX_FIELDS)))),
-                "hourly_rebuild_target_minute": _hourly_target_minute,
+                "hourly_rebuild_default": _rebuild_supported(),
+                "hourly_rebuild_target_minute": _hourly_rebuild_target_minute(_hourly_identity),
                 "rebuild_interval_s": s.REBUILD_INTERVAL,
                 "enriched_table":     s.ENRICHED_TABLE,
                 "ml_mode": ({
@@ -6311,33 +4986,6 @@ def build_app(model_module) -> FastAPI:
 
     # ── /values ───────────────────────────────────────────────────────────────
 
-    class _SnapshotChanged(RuntimeError):
-        pass
-
-    async def _cached_snapshot_values(pair, day, date, calc_type, calc_var, param):
-        for attempt in range(3):
-            revision = s.snapshot_cache_revision
-            async def compute():
-                return await _call_model(pair, day, date, calc_type=calc_type,
-                    calc_var=calc_var, param=param, _snapshot_revision=revision)
-            try:
-                response = await cached_values(
-                    engine_vlad=s.engine_cache, service_url=s.service_url,
-                    pair=pair, day=day, date=date,
-                    extra_params=_values_params({'type': calc_type, 'var': calc_var, 'param': param}),
-                    compute_fn=compute, node=s.NODE_NAME, table_name=s.cache_table,
-                    compute_on_miss=bool(s.compute_worker),
-                    miss_fn=(None if s.compute_worker else lambda: _proxy_values_to_brain1(
-                        s, pair=pair, day=day, date=date, calc_type=calc_type,
-                        calc_var=calc_var, param=param)),
-                )
-            except _SnapshotChanged:
-                continue
-            if revision == s.snapshot_cache_revision:
-                return response
-        raise RuntimeError('Dataset changed repeatedly during cached prediction; retry request')
-
-
     @app.get("/values")
     async def ep_values(
         pair: int = Query(1), day: int = Query(1),
@@ -6387,13 +5035,19 @@ def build_app(model_module) -> FastAPI:
                 )
                 return resp
 
-            if s.dynamic_cache_stale:
-                return err_response(
-                    "HISTORICAL_CACHE_STALE: dataset changed in a cached period. "
-                    "Invalidate service historical cache through the existing "
-                    "cache administration path before serving cached /values."
-                )
-            resp = await _cached_snapshot_values(pair, day, date, type, var, param)
+            resp = await cached_values(
+                engine_vlad=s.engine_cache, service_url=s.service_url,
+                pair=pair, day=day, date=date,
+                extra_params={"type": type, "var": var, "param": param},
+                compute_fn=lambda: _call_model(pair, day, date,
+                                               calc_type=type, calc_var=var, param=param),
+                node=s.NODE_NAME, table_name=s.cache_table,
+                compute_on_miss=bool(s.compute_worker),
+                miss_fn=(None if s.compute_worker else lambda: _proxy_values_to_brain1(
+                    s, pair=pair, day=day, date=date, calc_type=type,
+                    calc_var=var, param=param,
+                )),
+            )
             payload = resp.get("payLoad") or {}
             resp["details"] = _build_narrative(payload, date, 1 if day == 1 else 0, type)
             return resp
@@ -6845,7 +5499,7 @@ def build_app(model_module) -> FastAPI:
         types:        str  = Query("", description="type через запятую — пусто = все"),
         vars_:        str  = Query("", alias="vars", description="var через запятую — пусто = все"),
         params_:      str  = Query("", alias="params", description="param через запятую — пусто = все PARAM_RANGE"),
-        also_backtest: bool = Query(False, description="Также очистить vlad_backtest_results_fw216snapshot1"),
+        also_backtest: bool = Query(False, description="Также очистить vlad_backtest_results"),
         stop_fill:    bool  = Query(True,  description="Остановить fill_cache если запущен"),
     ):
         """
@@ -6857,7 +5511,7 @@ def build_app(model_module) -> FastAPI:
             /clear_cache?date_from=2025-01-01   — с определённой даты
             /clear_cache?types=0&vars=0,1       — конкретные type/var слоты
             /clear_cache?params=currcir,wm2ns   — конкретные param
-            /clear_cache?also_backtest=true     — + vlad_backtest_results_fw216snapshot1
+            /clear_cache?also_backtest=true     — + vlad_backtest_results
         """
         if not s.cache_writer:
             return err_response(
@@ -6915,7 +5569,7 @@ def build_app(model_module) -> FastAPI:
                 v_range = var_list  or list(s.VAR_RANGE or [0])
                 p_range = param_list or list(s.PARAM_RANGE or [""])
                 hashes  = [
-                    _values_hash({"type": t, "var": v, "param": prm})
+                    _params_hash({"type": t, "var": v, "param": prm})
                     for t in t_range for v in v_range for prm in p_range
                 ]
                 placeholders = ", ".join(f":ph{i}" for i in range(len(hashes)))
@@ -6937,9 +5591,6 @@ def build_app(model_module) -> FastAPI:
                     text(f"DELETE FROM `{s.cache_table}` WHERE {where}"), params
                 )
                 deleted_cache = res.rowcount
-            if not (pair_list or day_list or dt_from or dt_to or
-                    type_list or var_list or param_list):
-                s.dynamic_cache_stale = False
         except Exception as e:
             errors.append(f"cache: {e}")
             log(f"   clear_cache error: {e}", s.NODE_NAME, level="error")
@@ -6947,7 +5598,7 @@ def build_app(model_module) -> FastAPI:
         # ── Опционально — backtest results ────────────────────────────────────
         if also_backtest:
             try:
-                # vlad_backtest_results_fw216snapshot1 фильтруется аналогично, без date_val
+                # vlad_backtest_results фильтруется аналогично, без date_val
                 clauses = ["service_url = :svc_url"]
                 params2: dict = {"svc_url": s.service_url}
                 if pair_list:
@@ -6965,7 +5616,7 @@ def build_app(model_module) -> FastAPI:
                     v_range = var_list  or list(s.VAR_RANGE or [0])
                     p_range = param_list or list(s.PARAM_RANGE or [""])
                     hashes  = [
-                        _values_hash({"type": t, "var": v, "param": prm})
+                        _params_hash({"type": t, "var": v, "param": prm})
                         for t in t_range for v in v_range for prm in p_range
                     ]
                     pls = ", ".join(f":ph{i}" for i in range(len(hashes)))
@@ -6975,7 +5626,7 @@ def build_app(model_module) -> FastAPI:
                 where2 = " AND ".join(clauses)
                 async with s.engine_vlad.begin() as conn:
                     res = await conn.execute(
-                        text(f"DELETE FROM vlad_backtest_results_fw216snapshot1 WHERE {where2}"), params2
+                        text(f"DELETE FROM vlad_backtest_results WHERE {where2}"), params2
                     )
                     deleted_backtest = res.rowcount
             except Exception as e:
@@ -7024,9 +5675,8 @@ def build_app(model_module) -> FastAPI:
     async def ep_reload():
         try:
             async with _rebuild_lock:
-                async with _snapshot_check_lock:
-                    async with _model_state_gate.write():
-                        await _preload()
+                async with _model_state_gate.write():
+                    await _preload()
             return ok_response({"reloaded_at": s.last_reload.isoformat()})
         except Exception as e:
             send_error_trace(e, s.NODE_NAME, "reload")
@@ -7116,7 +5766,7 @@ def build_app(model_module) -> FastAPI:
             "requested_slots": [
                 {
                     "type": int(type), "var": int(v), "param": str(prm),
-                    "params_hash": _values_hash({"type": int(type), "var": int(v), "param": str(prm)}),
+                    "params_hash": _params_hash({"type": int(type), "var": int(v), "param": str(prm)}),
                 }
                 for v in vars_to_run for prm in params_to_run
             ],
@@ -7126,8 +5776,8 @@ def build_app(model_module) -> FastAPI:
     @app.get("/summary")
     async def ep_summary(pair: int = Query(-1), day: int = Query(-1),
                          tier: int = Query(-1)):
-        conds  = ["service_url=:url", "snapshot_revision=:revision"]
-        params = {"url": s.service_url, "revision": s.snapshot_cache_revision}
+        conds  = ["service_url=:url"]
+        params = {"url": s.service_url}
         if pair >= 0: conds.append("pair=:pair");    params["pair"] = pair
         if day  >= 0: conds.append("day_flag=:day"); params["day"]  = day
         if tier >= 0: conds.append("tier=:tier");    params["tier"] = tier
@@ -7137,7 +5787,7 @@ def build_app(model_module) -> FastAPI:
                     f"SELECT model_id,pair,day_flag,tier,date_from,date_to,"
                     f"total_combinations,best_score,avg_score,"
                     f"best_accuracy,avg_accuracy,best_params_json,computed_at "
-                    f"FROM vlad_backtest_summary_fw216snapshot1 WHERE {' AND '.join(conds)} "
+                    f"FROM vlad_backtest_summary WHERE {' AND '.join(conds)} "
                     f"ORDER BY computed_at DESC"), params)
                 rows = []
                 for r in res.mappings().all():
@@ -7208,7 +5858,6 @@ def build_app(model_module) -> FastAPI:
                 "url_map": s.url_map,
                 "dataset_timestamps": getattr(s, "_dataset_ts_arr", None),
                 "full_dataset": s.dataset,
-                "_standard_events_by_type": s._standard_events_by_type,
                 "rates_table": s.RATES_TABLE,
                 "execution_scope": "pretest",
             }
@@ -7333,7 +5982,6 @@ def build_app(model_module) -> FastAPI:
                             "url_map": s.url_map,
                             "dataset_timestamps": getattr(s, "_dataset_ts_arr", None),
                             "full_dataset": s.dataset,
-                "_standard_events_by_type": s._standard_events_by_type,
                             "rates_table": _tbl3,
                         }
 
@@ -7479,7 +6127,7 @@ def build_app(model_module) -> FastAPI:
                 extra = {"type": int(type), "var": int(v), "param": str(prm)}
                 slot_specs.append({
                     "type": int(type), "var": int(v), "param": str(prm),
-                    "hash": _values_hash(extra),
+                    "hash": _params_hash(extra),
                     "key": f"type={int(type)} var={int(v)} param={str(prm)!r}",
                 })
 
@@ -7757,7 +6405,7 @@ def build_app(model_module) -> FastAPI:
         rows = [r for r in s.global_rates.get(table, [])
                 if (dt_from is None or r["date"] >= dt_from)
                 and (dt_to is None or r["date"] <= dt_to)]
-        p_hash = _values_hash(extra_params)
+        p_hash = _params_hash(extra_params)
 
         cache_signals: dict[datetime, float] = {}
         try:
@@ -7868,12 +6516,12 @@ def build_app(model_module) -> FastAPI:
                 async with s.engine_vlad.connect() as conn:
                     res = await conn.execute(text("""
                         SELECT value_score, accuracy, trade_count, params_json
-                        FROM vlad_backtest_results_fw216snapshot1
+                        FROM vlad_backtest_results
                         WHERE service_url=:url AND pair=:pair AND day_flag=:day
-                          AND tier=:tier AND date_from=:df AND date_to=:dt AND snapshot_revision=:revision
+                          AND tier=:tier AND date_from=:df AND date_to=:dt
                         ORDER BY value_score DESC
                     """), {"url": s.service_url, "pair": pair_id, "day": day_flag,
-                           "tier": tier, "df": df, "dt": dt, "revision": s.snapshot_cache_revision})
+                           "tier": tier, "df": df, "dt": dt})
                     for r in res.mappings().all():
                         params = _json.loads(r["params_json"]) if r["params_json"] else {}
                         if vars_to_run and params.get("var") not in vars_to_run:

@@ -56,7 +56,6 @@ _ORIENTATION: dict[tuple[int, int], tuple[str, int, int]] = {}
 _PAIRS_BY_ASSET: dict[int, list[tuple[int, int]]] = {}
 _SERIES: dict[tuple[tuple[int, int], bool], tuple[np.ndarray, np.ndarray]] = {}
 _DISCOVERED_AT = 0.0
-_SNAPSHOT_ACTIVE = False
 _HISTORY_FROM: datetime | None = None
 
 
@@ -178,8 +177,6 @@ def mask(key: tuple[int, int]) -> str:
 def discover(force: bool = False) -> dict:
     """Читает доступные пары только из таблицы ключей, включая пары лишь с D1."""
     global _DISCOVERED_AT
-    if _SNAPSHOT_ACTIVE:
-        return {'pairs': len(_ORIENTATION), 'cached': True, 'source': keys_table()}
     with _LOCK:
         if not force and (_ORIENTATION or time.time() - _DISCOVERED_AT < 60):
             return {"pairs": len(_ORIENTATION), "cached": True, "source": keys_table()}
@@ -261,10 +258,6 @@ def _load_series(key: tuple[int, int], day: bool) -> tuple[np.ndarray, np.ndarra
     with engine().connect() as conn:
         rows = conn.execute(text(query), params).fetchall()
 
-    return _series_arrays(rows)
-
-
-def _series_arrays(rows):
     stamps = np.empty(len(rows), dtype=np.int64)
     values = np.empty(len(rows), dtype=np.float64)
     count = 0
@@ -288,8 +281,6 @@ def series(key: tuple[int, int], day: bool) -> tuple[np.ndarray, np.ndarray]:
     if cached is not None:
         return cached
 
-    if _SNAPSHOT_ACTIVE:
-        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float64)
     loaded = _load_series(key, bool(day))
     with _LOCK:
         _SERIES[cache_key] = loaded
@@ -299,8 +290,6 @@ def series(key: tuple[int, int], day: bool) -> tuple[np.ndarray, np.ndarray]:
 def invalidate_series() -> int:
     """Сбрасывает серии и список ключей после подкачки новых котировок."""
     global _DISCOVERED_AT
-    if _SNAPSHOT_ACTIVE:
-        return 0
     with _LOCK:
         dropped = len(_SERIES)
         _SERIES.clear()
@@ -443,77 +432,3 @@ def quotes_stale(day: bool, slack_minutes: float) -> bool:
     if age is None:
         return True
     return age > (1440.0 if day else 60.0) + slack_minutes
-
-
-def dataset_snapshot_factory(gate):
-    """Use the Framework snapshot loop for the existing numpy provider."""
-    from brain_framework import NamespaceSnapshot
-    global _SNAPSHOT_ACTIVE
-    pending = {}
-    totals = {'inserted_total': 0, 'updated_total': 0, 'deleted_total': 0,
-              'rows_applied_total': 0}
-    first = True
-
-    def load():
-        query = (f'SELECT `key`, timeframe, `date`, momentum_bp FROM `{keys_table()}` '
-                 "WHERE timeframe IN ('hour','day')")
-        params = {}
-        if _HISTORY_FROM is not None:
-            query += ' AND `date` >= :history_from'
-            params['history_from'] = _HISTORY_FROM
-        query += ' ORDER BY `key`, timeframe, `date`'
-        with engine().connect() as conn:
-            rows = conn.execute(text(query), params).fetchall()
-        grouped = {}
-        for raw_key, timeframe, date_value, value in rows:
-            parts = str(raw_key).split('_')
-            if len(parts) != 2 or not all(part.isdigit() for part in parts):
-                continue
-            key = tuple(map(int, parts))
-            if key[0] not in ASSET_CODES or key[1] not in ASSET_CODES or key[0] >= key[1]:
-                continue
-            if str(raw_key) != mask(key):
-                continue
-            grouped.setdefault((key, timeframe == 'day'), []).append((date_value, value))
-        series_next = {key: _series_arrays(values) for key, values in grouped.items()}
-        keys = sorted({key for key, day in series_next})
-        orientation_next = {key: (mask(key), key[0], key[1]) for key in keys}
-        by_asset = {asset: [] for asset in ASSET_CODES}
-        for key in keys:
-            by_asset[key[0]].append(key)
-            by_asset[key[1]].append(key)
-        with _LOCK:
-            previous = dict(_SERIES)
-        inserted = updated = deleted = 0
-        for key in previous.keys() | series_next.keys():
-            old_dates, old_values = previous.get(key, (np.empty(0,dtype=np.int64), np.empty(0)))
-            new_dates, new_values = series_next.get(key, (np.empty(0,dtype=np.int64), np.empty(0)))
-            _, old_index, new_index = np.intersect1d(old_dates,new_dates,assume_unique=True,return_indices=True)
-            inserted += len(new_dates)-len(new_index)
-            deleted += len(old_dates)-len(old_index)
-            updated += int(np.count_nonzero(old_values[old_index] != new_values[new_index]))
-        pending.update(inserted=inserted,updated=updated,deleted=deleted,
-                       rows_received_sql=len(rows),rows_scanned_sql=len(rows),
-                       rows=sum(len(dates) for dates, values in series_next.values()),
-                       pairs=len(keys),series=len(series_next))
-        return {'_ORIENTATION': orientation_next, '_PAIRS_BY_ASSET': by_asset, '_SERIES': series_next}
-
-    def describe():
-        nonlocal first
-        stats = dict(pending)
-        if first:
-            stats['initial_loaded_rows'] = stats['rows']
-            totals['initial_loaded_rows'] = stats['rows']
-            first = False
-        else:
-            for name in ('inserted','updated','deleted'):
-                totals[name+'_total'] += stats[name]
-            totals['rows_applied_total'] += sum(stats[n] for n in ('inserted','updated','deleted'))
-        return {**stats, **totals, 'source': keys_table(), 'strategy': 'numpy-snapshot'}
-
-    provider = NamespaceSnapshot(globals(), ['_ORIENTATION','_PAIRS_BY_ASSET','_SERIES'],
-                                 gate=gate, loader=load, describe=describe)
-    # All available series are staged together. Foreground calls must use these
-    # immutable arrays instead of fetching a later SQL version lazily.
-    _SNAPSHOT_ACTIVE = True
-    return provider

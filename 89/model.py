@@ -8,9 +8,6 @@ reweights the active codes on historical extrema.
 """
 from __future__ import annotations
 
-import asyncio
-
-MODEL_CACHE_VERSION = "snapshot-identity-v1"
 import bisect
 from datetime import datetime
 import os
@@ -98,7 +95,7 @@ async def enrich_dataset(engine_vlad, engine_brain) -> dict:
         closes = [float(row[2]) for row in source]
         highs = [float(row[3]) for row in source]
         lows = [float(row[4]) for row in source]
-        detected = await asyncio.to_thread(scan_ohlc, dates, opens, highs, lows, closes)
+        detected = scan_ohlc(dates, opens, highs, lows, closes)
         for row in detected:
             row["source_name"] = source_name
             figure_counts[row["event_type"]] = figure_counts.get(row["event_type"], 0) + 1
@@ -184,13 +181,13 @@ def _select_source(
             int((row.get("date") or row["date_dt"]).timestamp())
             for row in selected
         ]
-        cached = [selected, timestamps, None, source]
+        cached = [selected, timestamps, None]
         if len(_SELECTED_CACHE) >= 12:
             _SELECTED_CACHE.clear()
             _RESULT_CACHE.clear()
         _SELECTED_CACHE[cache_key] = cached
 
-    selected, timestamps, events = cached[:3]
+    selected, timestamps, events = cached
     index["full_dataset"] = selected
     index["dataset_timestamps"] = timestamps
     if events is not None:
@@ -219,7 +216,7 @@ def _run_source_model(
     shift_window: int,
 ) -> dict:
     if ml_enabled:
-        cache_key = (id(selected_index.get("_selected_cache_entry", selected_dataset)), date, source_name)
+        cache_key = (id(selected_dataset), date, source_name)
         cached = _RESULT_CACHE.get(cache_key)
         if cached is not None:
             return cached
