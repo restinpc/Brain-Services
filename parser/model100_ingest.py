@@ -12,6 +12,7 @@ import io
 import json
 import lzma
 import math
+import re
 import statistics
 import struct
 import zipfile
@@ -177,6 +178,64 @@ def aggregate_quote_ticks(ticks: Iterable[QuoteTick], *, provider: str,
             "ASOF_STATUS": asof, "quality_status": "VALIDATED",
             "parser_version": PARSER_VERSION, "schema_version": SCHEMA_VERSION,
             "source_batch_sha256": batch_sha256,
+        })
+    return out
+
+
+def aggregate_bid_ask_h1(ticks: Iterable[QuoteTick], *, provider: str,
+                         source_archive_uri: str | None = None,
+                         source_archive_sha256: str | None = None) -> list[dict]:
+    """Build provider-labelled bid/ask OHLC rows from ticks grouped by UTC hour.
+
+    Quote-size fields are intentionally not interpreted as executed volume.
+    The source hash and URI refer to the exact raw tick archive used to build
+    each candle.
+    """
+    provider = str(provider).strip().upper()
+    if not provider or len(provider) > 24:
+        raise ValueError("provider must contain 1..24 characters")
+    grouped: dict[datetime, list[QuoteTick]] = defaultdict(list)
+    for tick in ticks:
+        start = tick.event_at.replace(minute=0, second=0, microsecond=0)
+        grouped[start].append(tick)
+    if not grouped:
+        return []
+    if not source_archive_uri:
+        raise ValueError("source archive URI is required")
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", str(source_archive_sha256 or "")):
+        raise ValueError("source archive SHA-256 must contain 64 hexadecimal characters")
+
+    out = []
+    for start, items in sorted(grouped.items()):
+        items.sort(key=lambda item: item.event_at)
+        end = start + timedelta(hours=1)
+        if any(item.event_at < start or item.event_at >= end for item in items):
+            raise ValueError("tick timestamp falls outside its UTC H1 window")
+        bid = [item.bid for item in items]
+        ask = [item.ask for item in items]
+        out.append({
+            "provider": provider,
+            "instrument": "EURUSD",
+            "market_type": "SPOT_BID_ASK_H1",
+            "event_time_utc": start.replace(tzinfo=None),
+            "window_end_utc": end.replace(tzinfo=None),
+            "feature_ready_at_utc": None,
+            "bid_open": bid[0], "bid_high": max(bid),
+            "bid_low": min(bid), "bid_close": bid[-1],
+            "ask_open": ask[0], "ask_high": max(ask),
+            "ask_low": min(ask), "ask_close": ask[-1],
+            "spread_open": ask[0] - bid[0],
+            "spread_close": ask[-1] - bid[-1],
+            "quote_tick_count": len(items),
+            "executed_volume": None,
+            "volume_type": "NONE",
+            "source_archive_uri": source_archive_uri,
+            "source_archive_sha256": str(source_archive_sha256).lower(),
+            "source_archive_available_at_utc": None,
+            "parser_version": "dukascopy-h1-brain-v1",
+            "schema_version": "model100-fx-bidask-h1-v1",
+            "quality_status": "VALIDATED",
+            "asof_status": "HISTORICAL_REPLAY",
         })
     return out
 

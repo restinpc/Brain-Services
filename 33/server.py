@@ -27,7 +27,7 @@ from common import (
     resolve_workers,
     build_engines,
 )
-from cache_helper import ensure_cache_table, load_service_url, cached_values
+from cache_helper import ensure_cache_table, load_service_url, cached_values as _base_cached_values
 
 SERVICE_ID = 33
 NODE_NAME  = os.getenv("NODE_NAME", "brain-calendar-weights-microservice")
@@ -343,30 +343,45 @@ def compute_extremum_value(t_dates, calc_var, ext_set, candle_ranges, avg_range,
 
 # ── Загрузка данных при старте ────────────────────────────────────────────────
 
-async def preload_all_data():
-    global SERVICE_URL, LAST_RELOAD_TIME, _CAL_SORTED_DATES, _CAL_SORTED_DATA
-    log("🔄 CALENDAR FULL DATA RELOAD STARTED", NODE_NAME, force=True)
+from brain_framework import NamespaceSnapshot, FRAMEWORK_VERSION
+import time as _snapshot_time
+_namespace_snapshot = NamespaceSnapshot(globals(), ['GLOBAL_AVG_RANGE', 'GLOBAL_CAL_BY_DT', 'GLOBAL_CAL_CTX_HIST', 'GLOBAL_CAL_CTX_INDEX', 'GLOBAL_CANDLE_RANGES', 'GLOBAL_EVENT_NAMES', 'GLOBAL_EXTREMUMS', 'GLOBAL_LAST_CANDLES', 'GLOBAL_RATES', 'GLOBAL_WEIGHT_CODES', 'SERVICE_URL', '_CAL_SORTED_DATA', '_CAL_SORTED_DATES'])
 
-    GLOBAL_WEIGHT_CODES.clear()
-    GLOBAL_CAL_CTX_INDEX.clear()
-    GLOBAL_CAL_CTX_HIST.clear()
-    GLOBAL_CAL_BY_DT.clear()
-    GLOBAL_RATES.clear()
-    GLOBAL_EXTREMUMS.clear()
-    GLOBAL_CANDLE_RANGES.clear()
-    GLOBAL_AVG_RANGE.clear()
-    GLOBAL_LAST_CANDLES.clear()
-    GLOBAL_EVENT_NAMES.clear()
-    _CAL_SORTED_DATES.clear()
-    _CAL_SORTED_DATA.clear()
+async def preload_all_data():
+    async with _namespace_snapshot.check_lock:
+        try:
+            return await _stage_and_publish()
+        except Exception as exc:
+            _namespace_snapshot.metrics.update(mode="degraded", last_error=str(exc)[:300])
+            raise
+
+async def _stage_and_publish():
+    staged = _namespace_snapshot.staging()
+    started = _snapshot_time.monotonic()
+    global SERVICE_URL, LAST_RELOAD_TIME, _CAL_SORTED_DATES, _CAL_SORTED_DATA
+    log("🔄 CALENDAR SNAPSHOT CHECK STARTED", NODE_NAME, force=True)
+
+    staged['GLOBAL_WEIGHT_CODES'].clear()
+    staged['GLOBAL_CAL_CTX_INDEX'].clear()
+    staged['GLOBAL_CAL_CTX_HIST'].clear()
+    staged['GLOBAL_CAL_BY_DT'].clear()
+    staged['GLOBAL_RATES'].clear()
+    staged['GLOBAL_EXTREMUMS'].clear()
+    staged['GLOBAL_CANDLE_RANGES'].clear()
+    staged['GLOBAL_AVG_RANGE'].clear()
+    staged['GLOBAL_LAST_CANDLES'].clear()
+    staged['GLOBAL_EVENT_NAMES'].clear()
+    staged['_CAL_SORTED_DATES'].clear()
+    staged['_CAL_SORTED_DATA'].clear()
 
     async with engine_vlad.connect() as conn:
         try:
             res = await conn.execute(text("SELECT weight_code FROM brain_calendar_weights"))
-            GLOBAL_WEIGHT_CODES.extend(r[0] for r in res.fetchall())
-            log(f"  weight_codes: {len(GLOBAL_WEIGHT_CODES)}", NODE_NAME)
+            staged['GLOBAL_WEIGHT_CODES'].extend(r[0] for r in res.fetchall())
+            log(f"  weight_codes: {len(staged['GLOBAL_WEIGHT_CODES'])}", NODE_NAME)
         except Exception as e:
             log(f"❌ weight_codes error: {e}", NODE_NAME, level="error")
+            raise
 
         try:
             res = await conn.execute(text("""
@@ -377,10 +392,11 @@ async def preload_all_data():
             for r in res.mappings().all():
                 key = (r["event_id"], r["currency_code"], r["importance"],
                        r["forecast_dir"], r["surprise_dir"], r["revision_dir"])
-                GLOBAL_CAL_CTX_INDEX[key] = {"occurrence_count": r["occurrence_count"] or 0}
-            log(f"  ctx_index: {len(GLOBAL_CAL_CTX_INDEX)}", NODE_NAME)
+                staged['GLOBAL_CAL_CTX_INDEX'][key] = {"occurrence_count": r["occurrence_count"] or 0}
+            log(f"  ctx_index: {len(staged['GLOBAL_CAL_CTX_INDEX'])}", NODE_NAME)
         except Exception as e:
             log(f"❌ ctx_index error: {e}", NODE_NAME, level="error")
+            raise
 
     # url → event_id — используем engine_vlad (там есть колонка EventId)
     url_to_event_id = {}
@@ -397,6 +413,7 @@ async def preload_all_data():
         log(f"  url→event_id map: {len(url_to_event_id)} entries", NODE_NAME)
     except Exception as e:
         log(f"❌ url→event_id map error: {e}", NODE_NAME, level="error")
+        raise
 
     # event_names — используем engine_vlad (там есть EventId и EventName)
     try:
@@ -408,10 +425,11 @@ async def preload_all_data():
                 GROUP BY EventId, EventName
             """))
             for r in res.fetchall():
-                GLOBAL_EVENT_NAMES[r[0]] = r[1]
-        log(f"  event_names: {len(GLOBAL_EVENT_NAMES)} entries", NODE_NAME)
+                staged['GLOBAL_EVENT_NAMES'][r[0]] = r[1]
+        log(f"  event_names: {len(staged['GLOBAL_EVENT_NAMES'])} entries", NODE_NAME)
     except Exception as e:
         log(f"⚠️  event_names load error: {e}", NODE_NAME, level="warning")
+        raise
 
     # Загрузка календарных событий из engine_brain
     try:
@@ -459,8 +477,8 @@ async def preload_all_data():
                     continue
 
                 # Заполняем GLOBAL_EVENT_NAMES из engine_brain (там всегда есть EventName)
-                if event_name and event_id not in GLOBAL_EVENT_NAMES:
-                    GLOBAL_EVENT_NAMES[event_id] = event_name
+                if event_name and event_id not in staged['GLOBAL_EVENT_NAMES']:
+                    staged['GLOBAL_EVENT_NAMES'][event_id] = event_name
 
                 fcd, scd, rcd = classify_event(
                     forecast, previous, old_prev, actual, DIRECTION_THRESHOLD
@@ -468,33 +486,34 @@ async def preload_all_data():
                 imp = (importance or "none").lower()
                 key = (event_id, currency, imp, fcd, scd, rcd)
 
-                if key not in GLOBAL_CAL_CTX_INDEX:
+                if key not in staged['GLOBAL_CAL_CTX_INDEX']:
                     skipped_no_index += 1
                     continue
 
-                GLOBAL_CAL_CTX_HIST.setdefault(key, []).append(full_date)
-                GLOBAL_CAL_BY_DT.setdefault(full_date, []).append(key)
+                staged['GLOBAL_CAL_CTX_HIST'].setdefault(key, []).append(full_date)
+                staged['GLOBAL_CAL_BY_DT'].setdefault(full_date, []).append(key)
 
-            for key in GLOBAL_CAL_CTX_HIST:
-                GLOBAL_CAL_CTX_HIST[key].sort()
+            for key in staged['GLOBAL_CAL_CTX_HIST']:
+                staged['GLOBAL_CAL_CTX_HIST'][key].sort()
 
-            total_obs = sum(len(v) for v in GLOBAL_CAL_CTX_HIST.values())
-            log(f"  contexts: {len(GLOBAL_CAL_CTX_HIST)}, observations: {total_obs}", NODE_NAME)
+            total_obs = sum(len(v) for v in staged['GLOBAL_CAL_CTX_HIST'].values())
+            log(f"  contexts: {len(staged['GLOBAL_CAL_CTX_HIST'])}, observations: {total_obs}", NODE_NAME)
             log(f"  skipped (no event_id via url): {skipped_no_event_id}", NODE_NAME)
             log(f"  skipped (not in ctx_index): {skipped_no_index}", NODE_NAME)
 
     except Exception as e:
         log(f"❌ brain_calendar (from engine_brain) error: {e}", NODE_NAME, level="error")
+        raise
 
     # Построение отсортированных структур для поиска по интервалу
-    if GLOBAL_CAL_BY_DT:
-        sorted_items = sorted(GLOBAL_CAL_BY_DT.items())
+    if staged['GLOBAL_CAL_BY_DT']:
+        sorted_items = sorted(staged['GLOBAL_CAL_BY_DT'].items())
         _sorted_dts, _sorted_vals = zip(*sorted_items)
-        _CAL_SORTED_DATES[:] = list(_sorted_dts)
-        _CAL_SORTED_DATA[:]  = list(_sorted_vals)
+        staged['_CAL_SORTED_DATES'][:] = list(_sorted_dts)
+        staged['_CAL_SORTED_DATA'][:]  = list(_sorted_vals)
     else:
-        _CAL_SORTED_DATES.clear()
-        _CAL_SORTED_DATA.clear()
+        staged['_CAL_SORTED_DATES'].clear()
+        staged['_CAL_SORTED_DATA'].clear()
 
     # Загрузка рыночных данных из engine_brain
     for table in [
@@ -502,11 +521,11 @@ async def preload_all_data():
         "brain_rates_btc_usd", "brain_rates_btc_usd_day",
         "brain_rates_eth_usd", "brain_rates_eth_usd_day",
     ]:
-        GLOBAL_RATES[table]         = {}
-        GLOBAL_LAST_CANDLES[table]  = []
-        GLOBAL_CANDLE_RANGES[table] = {}
-        GLOBAL_AVG_RANGE[table]     = 0.0
-        GLOBAL_EXTREMUMS[table]     = {"min": set(), "max": set()}
+        staged['GLOBAL_RATES'][table]         = {}
+        staged['GLOBAL_LAST_CANDLES'][table]  = []
+        staged['GLOBAL_CANDLE_RANGES'][table] = {}
+        staged['GLOBAL_AVG_RANGE'][table]     = 0.0
+        staged['GLOBAL_EXTREMUMS'][table]     = {"min": set(), "max": set()}
         try:
             async with engine_brain.connect() as conn:
                 res    = await conn.execute(text(
@@ -516,12 +535,12 @@ async def preload_all_data():
                 for r in rows_b:
                     dt = r["date"]
                     if r["t1"] is not None:
-                        GLOBAL_RATES[table][dt] = float(r["t1"])
-                    GLOBAL_LAST_CANDLES[table].append((dt, r["close"] > r["open"]))
+                        staged['GLOBAL_RATES'][table][dt] = float(r["t1"])
+                    staged['GLOBAL_LAST_CANDLES'][table].append((dt, r["close"] > r["open"]))
                     rng = float(r["max"] or 0) - float(r["min"] or 0)
-                    GLOBAL_CANDLE_RANGES[table][dt] = rng
+                    staged['GLOBAL_CANDLE_RANGES'][table][dt] = rng
                     ranges.append(rng)
-                GLOBAL_AVG_RANGE[table] = (
+                staged['GLOBAL_AVG_RANGE'][table] = (
                     sum(ranges) / len(ranges) if ranges else 0.0
                 )
                 interval = "1 DAY" if table.endswith("_day") else "1 HOUR"
@@ -534,37 +553,44 @@ async def preload_all_data():
                         WHERE t1.`{typ}` {op} t_prev.`{typ}` AND t1.`{typ}` {op} t_next.`{typ}`
                     """
                     res_ext = await conn.execute(text(q))
-                    GLOBAL_EXTREMUMS[table][typ] = {
+                    staged['GLOBAL_EXTREMUMS'][table][typ] = {
                         r["date"] for r in res_ext.mappings().all()
                     }
-            log(f"  {table}: {len(GLOBAL_RATES[table])} candles", NODE_NAME)
+            log(f"  {table}: {len(staged['GLOBAL_RATES'][table])} candles", NODE_NAME)
         except Exception as e:
             log(f"❌ {table}: {e}", NODE_NAME, level="error")
+            raise
 
     # Загрузка SERVICE_URL
     try:
-        SERVICE_URL = await load_service_url(engine_super, SERVICE_ID)
-        log(f"  SERVICE_URL loaded: {SERVICE_URL}", NODE_NAME)
+        staged['SERVICE_URL'] = await load_service_url(engine_super, SERVICE_ID)
+        log(f"  SERVICE_URL loaded: {staged['SERVICE_URL']}", NODE_NAME)
     except OperationalError as e:
         log(f"❌ Failed to load service URL (OperationalError): {e}",
             NODE_NAME, level="error", force=True)
-        SERVICE_URL = ""
+        staged['SERVICE_URL'] = ""
+        raise
     except Exception as e:
         log(f"❌ Failed to load service URL: {e}", NODE_NAME, level="error", force=True)
-        SERVICE_URL = ""
+        staged['SERVICE_URL'] = ""
+        raise
 
     try:
         await ensure_cache_table(engine_vlad)
     except Exception as e:
         log(f"❌ Failed to ensure cache table: {e}", NODE_NAME, level="error")
+        raise
 
-    LAST_RELOAD_TIME = datetime.now()
-    log("✅ CALENDAR FULL DATA RELOAD COMPLETED", NODE_NAME, force=True)
+    changed = await _namespace_snapshot.publish(staged, started)
+    if changed:
+        LAST_RELOAD_TIME = datetime.now()
+    log("✅ CALENDAR SNAPSHOT CHECK COMPLETED", NODE_NAME, force=True)
+
 
 
 async def background_reload_data():
     while True:
-        await asyncio.sleep(3600)
+        await asyncio.sleep(_namespace_snapshot.poll_seconds)
         try:
             await preload_all_data()
         except Exception as e:
@@ -603,7 +629,7 @@ app = FastAPI(lifespan=lifespan)
 _LAST_RATES_REFRESH: dict[str, datetime] = {}
 
 
-async def _refresh_rates_if_needed(rates_table: str):
+async def _refresh_rates_snapshot_unlocked(rates_table: str):
     """Если в RAM нет свечи за последний час — подгрузить из БД. Не чаще раза в 30 сек."""
     now  = datetime.now()
     last = _LAST_RATES_REFRESH.get(rates_table)
@@ -637,7 +663,7 @@ async def _refresh_rates_if_needed(rates_table: str):
         log(f"  ⚠️ Rates refresh error ({rates_table}): {e}", NODE_NAME, level="warning")
 
 
-async def calculate_pure_memory(
+async def _calculate_memory_snapshot(
     pair: int, day: int, date_str: str,
     calc_type: int = 0, calc_var: int = 0,
 ) -> dict | None:
@@ -646,7 +672,6 @@ async def calculate_pure_memory(
         return None
 
     rates_table  = get_rates_table_name(pair, day)
-    await _refresh_rates_if_needed(rates_table)
     modification = get_modification_factor(pair)
     delta_unit   = timedelta(days=1) if day == 1 else timedelta(hours=1)
     check_dts    = [target_date + delta_unit * s
@@ -717,6 +742,25 @@ async def calculate_pure_memory(
 
 # ── Роуты ─────────────────────────────────────────────────────────────────────
 
+
+async def _refresh_rates_if_needed(rates_table):
+    if _namespace_snapshot.owns_read_lease():
+        return
+    async with _namespace_snapshot.gate.write():
+        return await _refresh_rates_snapshot_unlocked(rates_table)
+
+async def calculate_pure_memory(pair, day, date_str, calc_type=0, calc_var=0):
+    if not _namespace_snapshot.owns_read_lease():
+        await _refresh_rates_if_needed(get_rates_table_name(pair, day))
+    async with _namespace_snapshot.gate.read():
+        return await _calculate_memory_snapshot(pair, day, date_str, calc_type=calc_type, calc_var=calc_var)
+
+async def _refresh_cache_rates(pair, day):
+    await _refresh_rates_if_needed(get_rates_table_name(pair, day))
+
+async def cached_values(**kwargs):
+    return await _namespace_snapshot.cached_values(_base_cached_values, _refresh_cache_rates, **kwargs)
+
 @app.get("/")
 async def get_metadata():
     db_status = {}
@@ -753,6 +797,8 @@ async def get_metadata():
             "E{event_id}_{currency}_{imp}_{fcd}_{scd}_{rcd}_{mode}[_{hour_shift}]"
         ),
         "metadata": {
+            "framework_version": FRAMEWORK_VERSION,
+            "dynamic_dataset": dict(_namespace_snapshot.metrics),
             "ctx_index_rows":    len(GLOBAL_CAL_CTX_INDEX),
             "weight_codes":      len(GLOBAL_WEIGHT_CODES),
             "calendar_contexts": len(GLOBAL_CAL_CTX_HIST),

@@ -21,7 +21,7 @@ from common import (
     resolve_workers,
     build_engines,
 )
-from cache_helper import ensure_cache_table, load_service_url, cached_values
+from cache_helper import ensure_cache_table, load_service_url, cached_values as _base_cached_values
 
 SERVICE_ID = 28
 NODE_NAME = os.getenv("NODE_NAME", "brain-investing-context-weights-microservice")
@@ -165,67 +165,81 @@ def compute_extremum_value(t_dates, calc_var, ext_set, candle_ranges, avg_range,
     return val if val != 0 else None
 
 
+from brain_framework import NamespaceSnapshot, FRAMEWORK_VERSION
+import time as _snapshot_time
+_namespace_snapshot = NamespaceSnapshot(globals(), ['GLOBAL_AVG_RANGE', 'GLOBAL_CALENDAR', 'GLOBAL_CANDLE_RANGES', 'GLOBAL_CTX_INDEX', 'GLOBAL_EXTREMUMS', 'GLOBAL_HISTORY', 'GLOBAL_LAST_CANDLES', 'GLOBAL_RATES', 'GLOBAL_WEIGHT_CODES', 'SERVICE_URL', '_CAL_SORTED_DATA', '_CAL_SORTED_DATES'])
+
 async def preload_all_data():
+    async with _namespace_snapshot.check_lock:
+        try:
+            return await _stage_and_publish()
+        except Exception as exc:
+            _namespace_snapshot.metrics.update(mode="degraded", last_error=str(exc)[:300])
+            raise
+
+async def _stage_and_publish():
+    staged = _namespace_snapshot.staging()
+    started = _snapshot_time.monotonic()
     global SERVICE_URL, LAST_RELOAD_TIME
-    log(" FULL DATA RELOAD STARTED", NODE_NAME, force=True)
+    log(" SNAPSHOT CHECK STARTED", NODE_NAME, force=True)
 
     async with engine_vlad.connect() as conn:
         res = await conn.execute(text("SELECT weight_code FROM vlad_investing_weights"))
-        GLOBAL_WEIGHT_CODES[:] = [r["weight_code"] for r in res.mappings().all()]
-        log(f"  weight_codes: {len(GLOBAL_WEIGHT_CODES)}", NODE_NAME)
+        staged['GLOBAL_WEIGHT_CODES'][:] = [r["weight_code"] for r in res.mappings().all()]
+        log(f"  weight_codes: {len(staged['GLOBAL_WEIGHT_CODES'])}", NODE_NAME)
 
         res = await conn.execute(text("""
             SELECT event_id, forecast_direction, surprise_direction, actual_direction,
                    occurrence_count, importance, currency
             FROM vlad_investing_event_context_idx
         """))
-        GLOBAL_CTX_INDEX.clear()
+        staged['GLOBAL_CTX_INDEX'].clear()
         for r in res.mappings().all():
             key = (r["event_id"], r["forecast_direction"],
                    r["surprise_direction"], r["actual_direction"])
-            GLOBAL_CTX_INDEX[key] = {
+            staged['GLOBAL_CTX_INDEX'][key] = {
                 "occurrence_count": r["occurrence_count"] or 0,
                 "importance": r["importance"], "currency": r["currency"],
             }
-        log(f"  ctx_index: {len(GLOBAL_CTX_INDEX)}", NODE_NAME)
+        log(f"  ctx_index: {len(staged['GLOBAL_CTX_INDEX'])}", NODE_NAME)
 
     async with engine_brain.connect() as conn:
         res = await conn.execute(text("""
             SELECT event_id, occurrence_time_utc, importance, actual, forecast, previous
             FROM vlad_investing_calendar WHERE event_id IS NOT NULL
         """))
-        GLOBAL_CALENDAR.clear();
-        GLOBAL_HISTORY.clear()
+        staged['GLOBAL_CALENDAR'].clear();
+        staged['GLOBAL_HISTORY'].clear()
         for r in res.mappings().all():
             dt, eid = r["occurrence_time_utc"], r["event_id"]
-            GLOBAL_HISTORY.setdefault(eid, []).append(dt)
-            GLOBAL_CALENDAR.setdefault(dt, []).append({
+            staged['GLOBAL_HISTORY'].setdefault(eid, []).append(dt)
+            staged['GLOBAL_CALENDAR'].setdefault(dt, []).append({
                 "EventId": eid, "Importance": r["importance"], "event_date": dt,
                 "actual": try_float(r["actual"]),
                 "forecast": try_float(r["forecast"]),
                 "previous": try_float(r["previous"]),
             })
-        for eid in GLOBAL_HISTORY:
-            GLOBAL_HISTORY[eid].sort()
-        log(f"  calendar: {sum(len(v) for v in GLOBAL_CALENDAR.values())} events", NODE_NAME)
+        for eid in staged['GLOBAL_HISTORY']:
+            staged['GLOBAL_HISTORY'][eid].sort()
+        log(f"  calendar: {sum(len(v) for v in staged['GLOBAL_CALENDAR'].values())} events", NODE_NAME)
 
     #  bisect: перестройка отсортированных списков 
-    if GLOBAL_CALENDAR:
-        _si = sorted(GLOBAL_CALENDAR.items())
-        _CAL_SORTED_DATES[:] = [x[0] for x in _si]
-        _CAL_SORTED_DATA[:] = [x[1] for x in _si]
+    if staged['GLOBAL_CALENDAR']:
+        _si = sorted(staged['GLOBAL_CALENDAR'].items())
+        staged['_CAL_SORTED_DATES'][:] = [x[0] for x in _si]
+        staged['_CAL_SORTED_DATA'][:] = [x[1] for x in _si]
     else:
-        _CAL_SORTED_DATES.clear()
-        _CAL_SORTED_DATA.clear()
+        staged['_CAL_SORTED_DATES'].clear()
+        staged['_CAL_SORTED_DATA'].clear()
 
     for table in ["brain_rates_eur_usd", "brain_rates_eur_usd_day",
                   "brain_rates_btc_usd", "brain_rates_btc_usd_day",
                   "brain_rates_eth_usd", "brain_rates_eth_usd_day"]:
-        GLOBAL_RATES[table] = {};
-        GLOBAL_LAST_CANDLES[table] = []
-        GLOBAL_CANDLE_RANGES[table] = {};
-        GLOBAL_AVG_RANGE[table] = 0.0
-        GLOBAL_EXTREMUMS[table] = {"min": set(), "max": set()}
+        staged['GLOBAL_RATES'][table] = {};
+        staged['GLOBAL_LAST_CANDLES'][table] = []
+        staged['GLOBAL_CANDLE_RANGES'][table] = {};
+        staged['GLOBAL_AVG_RANGE'][table] = 0.0
+        staged['GLOBAL_EXTREMUMS'][table] = {"min": set(), "max": set()}
         async with engine_brain.connect() as conn:
             res = await conn.execute(text(
                 f"SELECT date, open, close, `max`, `min`, t1 FROM {table}"))
@@ -234,12 +248,12 @@ async def preload_all_data():
             for r in rows:
                 dt = r["date"]
                 if r["t1"] is not None:
-                    GLOBAL_RATES[table][dt] = float(r["t1"])
-                GLOBAL_LAST_CANDLES[table].append((dt, r["close"] > r["open"]))
+                    staged['GLOBAL_RATES'][table][dt] = float(r["t1"])
+                staged['GLOBAL_LAST_CANDLES'][table].append((dt, r["close"] > r["open"]))
                 rng = float(r["max"] or 0) - float(r["min"] or 0)
-                GLOBAL_CANDLE_RANGES[table][dt] = rng
+                staged['GLOBAL_CANDLE_RANGES'][table][dt] = rng
                 ranges.append(rng)
-            GLOBAL_AVG_RANGE[table] = sum(ranges) / len(ranges) if ranges else 0.0
+            staged['GLOBAL_AVG_RANGE'][table] = sum(ranges) / len(ranges) if ranges else 0.0
             interval = "1 DAY" if table.endswith("_day") else "1 HOUR"
             for typ in ("min", "max"):
                 op = ">" if typ == "max" else "<"
@@ -249,26 +263,31 @@ async def preload_all_data():
                     JOIN {table} t_next ON t_next.date = t1.date + INTERVAL {interval}
                     WHERE t1.{col} {op} t_prev.{col} AND t1.{col} {op} t_next.{col}"""
                 res_ext = await conn.execute(text(q))
-                GLOBAL_EXTREMUMS[table][typ] = {r["date"] for r in res_ext.mappings().all()}
-        log(f"  {table}: {len(GLOBAL_RATES[table])} candles", NODE_NAME)
+                staged['GLOBAL_EXTREMUMS'][table][typ] = {r["date"] for r in res_ext.mappings().all()}
+        log(f"  {table}: {len(staged['GLOBAL_RATES'][table])} candles", NODE_NAME)
 
     try:
-        SERVICE_URL = await load_service_url(engine_super, SERVICE_ID)
+        staged['SERVICE_URL'] = await load_service_url(engine_super, SERVICE_ID)
         log(f"  SERVICE_URL loaded", NODE_NAME)
     except (OperationalError, Exception) as e:
         log(f" load_service_url failed: {e}", NODE_NAME, level="error", force=True)
-        SERVICE_URL = ""
+        staged['SERVICE_URL'] = ""
+        raise
     try:
         await ensure_cache_table(engine_vlad)
     except Exception as e:
         log(f" ensure_cache_table failed: {e}", NODE_NAME, level="error")
-    LAST_RELOAD_TIME = datetime.now()
-    log(" FULL DATA RELOAD COMPLETED", NODE_NAME, force=True)
+        raise
+    changed = await _namespace_snapshot.publish(staged, started)
+    if changed:
+        LAST_RELOAD_TIME = datetime.now()
+    log(" SNAPSHOT CHECK COMPLETED", NODE_NAME, force=True)
+
 
 
 async def background_reload_data():
     while True:
-        await asyncio.sleep(3600)
+        await asyncio.sleep(_namespace_snapshot.poll_seconds)
         try:
             await preload_all_data()
         except Exception as e:
@@ -301,7 +320,7 @@ app = FastAPI(lifespan=lifespan)
 _LAST_RATES_REFRESH = {}
 
 
-async def _refresh_rates_if_needed(rates_table):
+async def _refresh_rates_snapshot_unlocked(rates_table):
     """Если в RAM нет свечи за последний час — подгрузить из БД. Не чаще раз в 30 сек."""
     now = datetime.now()
     last = _LAST_RATES_REFRESH.get(rates_table)
@@ -334,7 +353,7 @@ async def _refresh_rates_if_needed(rates_table):
         log(f"   Rates refresh error ({rates_table}): {e}", NODE_NAME, level="warning")
 
 
-async def calculate_pure_memory(pair, day, date_str, calc_type=0, calc_var=0):
+async def _calculate_memory_snapshot(pair, day, date_str, calc_type=0, calc_var=0):
     target_date = parse_date_string(date_str)
     if not target_date:
         log(f" calculate_pure_memory: date parse failed | "
@@ -343,7 +362,6 @@ async def calculate_pure_memory(pair, day, date_str, calc_type=0, calc_var=0):
         return None
 
     rates_table = get_rates_table_name(pair, day)
-    await _refresh_rates_if_needed(rates_table)
     modification = get_modification_factor(pair)
     window = 12
     check_dates = (
@@ -417,6 +435,25 @@ async def calculate_pure_memory(pair, day, date_str, calc_type=0, calc_var=0):
     return {k: round(v, 6) for k, v in result.items() if v != 0}
 
 
+
+async def _refresh_rates_if_needed(rates_table):
+    if _namespace_snapshot.owns_read_lease():
+        return
+    async with _namespace_snapshot.gate.write():
+        return await _refresh_rates_snapshot_unlocked(rates_table)
+
+async def calculate_pure_memory(pair, day, date_str, calc_type=0, calc_var=0):
+    if not _namespace_snapshot.owns_read_lease():
+        await _refresh_rates_if_needed(get_rates_table_name(pair, day))
+    async with _namespace_snapshot.gate.read():
+        return await _calculate_memory_snapshot(pair, day, date_str, calc_type=calc_type, calc_var=calc_var)
+
+async def _refresh_cache_rates(pair, day):
+    await _refresh_rates_if_needed(get_rates_table_name(pair, day))
+
+async def cached_values(**kwargs):
+    return await _namespace_snapshot.cached_values(_base_cached_values, _refresh_cache_rates, **kwargs)
+
 @app.get("/")
 async def get_metadata():
     for t in ["vlad_investing_weights", "vlad_investing_event_context_idx",
@@ -443,6 +480,8 @@ async def get_metadata():
         "name": NODE_NAME, "text": "Event context weights (fdir/sdir/adir)",
         "weight_code_format": "{event_id}__{fdir}__{sdir}__{adir}__{mode}[__{hour}]",
         "metadata": {
+            "framework_version": FRAMEWORK_VERSION,
+            "dynamic_dataset": dict(_namespace_snapshot.metrics),
             "ctx_index_rows": len(GLOBAL_CTX_INDEX),
             "weight_codes": len(GLOBAL_WEIGHT_CODES),
             "last_reload": LAST_RELOAD_TIME.isoformat() if LAST_RELOAD_TIME else None,
