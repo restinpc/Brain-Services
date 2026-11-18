@@ -104,6 +104,7 @@ MAX_RETRIES = 3
 # rows/updates from an already-seen date. Re-read a small tail and replace it
 # transactionally in MySQL.
 AUCTIONS_TABLE = "vlad_tr_auctions_query"
+BUYBACKS_TABLE = "vlad_tr_buybacks_security_details"
 AUCTIONS_OVERLAP_DAYS = 7
 
 # Колонки с датами — для определения поля фильтрации
@@ -130,7 +131,8 @@ class TreasuryCollector:
                 cursor.execute("SHOW TABLES LIKE %s", (self.table_name,))
                 if not cursor.fetchone():
                     return None, None
-                for date_col in DATE_COLUMNS:
+                date_columns = (['operation_date'] + DATE_COLUMNS) if self.table_name == BUYBACKS_TABLE else DATE_COLUMNS
+                for date_col in date_columns:
                     try:
                         cursor.execute(f"SELECT MAX(`{date_col}`) FROM `{self.table_name}`")
                         row = cursor.fetchone()
@@ -152,7 +154,8 @@ class TreasuryCollector:
             data = resp.json()
             rows = data.get('data', [])
             if rows:
-                for col in DATE_COLUMNS:
+                date_columns = (['operation_date'] + DATE_COLUMNS) if self.table_name == BUYBACKS_TABLE else DATE_COLUMNS
+                for col in date_columns:
                     if col in rows[0]:
                         return col
         except Exception:
@@ -316,7 +319,7 @@ class TreasuryCollector:
             print(f"    Ошибка загрузки: {e}")
             return
         if not all_data:
-            if self.table_name == "vlad_tr_daily_treasury_statement_all" and last_date:
+            if self.table_name in ("vlad_tr_daily_treasury_statement_all", BUYBACKS_TABLE) and last_date:
                 print(f"    Последняя запись: {last_date}")
             print("    Нет новых данных")
             return
@@ -330,6 +333,9 @@ class TreasuryCollector:
         print(f"    Вставлено новых записей: {inserted}")
         if self.table_name == "vlad_tr_daily_treasury_statement_all":
             committed_latest = max(str(row["record_date"]) for row in all_data)
+            print(f"    Последняя запись: {committed_latest}")
+        elif self.table_name == BUYBACKS_TABLE:
+            committed_latest = max(str(row["operation_date"]) for row in all_data)
             print(f"    Последняя запись: {committed_latest}")
 
 
