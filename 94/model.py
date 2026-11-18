@@ -617,6 +617,7 @@ async def enrich_dataset(engine_vlad, engine_brain) -> dict:
     enriched = ds["enriched_table"]
     map_table = ds["map_table"]
     state_table = ds["state_table"]
+    source_engine = engine_vlad
 
     await _ensure_enriched_tables(engine_vlad, enriched, state_table)
     canonical_split_configured = "markets_table" in ds or "prices_table" in ds
