@@ -79,6 +79,9 @@ IMPORTANCE_MAP = {"low": 1, "medium": 2, "high": 3}
 START_FALLBACK = date(1970, 1, 1)
 END_DATE_UTC = datetime.now(timezone.utc).date()
 LOOKBACK_DAYS = 7
+HTTP_PROXY_HOST = os.getenv("HTTP_PROXY_HOST", "10.10.11.1").strip()
+HTTP_PROXY_PORT = os.getenv("HTTP_PROXY_PORT", "3128").strip()
+HTTP_PROXY_URL = f"http://{HTTP_PROXY_HOST}:{HTTP_PROXY_PORT}" if HTTP_PROXY_HOST else None
 
 
 def log(msg: str) -> None:
@@ -399,7 +402,8 @@ def main() -> int:
 
     processed_total = 0
     seen_total = 0
-    with curl_requests.Session(impersonate="chrome") as session:
+    proxies = {"http": HTTP_PROXY_URL, "https": HTTP_PROXY_URL} if HTTP_PROXY_URL else None
+    with curl_requests.Session(impersonate="chrome", proxies=proxies) as session:
         ranges = month_ranges(start_d, end_d)
         log(f"Month chunks: {len(ranges)}")
         event_map: Dict[int, Dict[str, Any]] = {}
