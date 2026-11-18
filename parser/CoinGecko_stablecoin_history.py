@@ -21,6 +21,9 @@ NODE_NAME = os.getenv("NODE_NAME", "coingecko_stablecoin")
 EMAIL = os.getenv("ALERT_EMAIL", "vladyurjevitch@yandex.ru")
 CG_API_KEY = os.getenv("COINGECKO_API_KEY", "")
 CG_BASE = "https://api.coingecko.com/api/v3"
+HTTP_PROXY_HOST = os.getenv("HTTP_PROXY_HOST", "10.10.11.1")
+HTTP_PROXY_PORT = int(os.getenv("HTTP_PROXY_PORT", "3128"))
+HTTP_PROXY_URL = f"http://{HTTP_PROXY_HOST}:{HTTP_PROXY_PORT}" if HTTP_PROXY_HOST else None
 
 STABLECOINS = {
     "tether":       "USDT",
@@ -56,6 +59,9 @@ class CoinGeckoCollector:
     def __init__(self, table_name):
         self.table_name = table_name
         self.session = requests.Session()
+        self.session.trust_env = False
+        if HTTP_PROXY_URL:
+            self.session.proxies.update({"http": HTTP_PROXY_URL, "https": HTTP_PROXY_URL})
         retry = Retry(total=3, backoff_factor=3, status_forcelist=[429, 500, 502, 503, 504], allowed_methods=["GET"])
         self.session.mount("https://", HTTPAdapter(max_retries=retry))
         headers = {"Accept": "application/json"}

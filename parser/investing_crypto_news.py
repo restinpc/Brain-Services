@@ -17,6 +17,8 @@ from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 import tempfile
 import shutil
+import xml.etree.ElementTree as ET
+from urllib.parse import urlparse, urlunparse
 
 # Playwright temp dir
 TEMP_DIR = os.path.join(os.path.expanduser("~"), ".playwright-tmp")
@@ -34,6 +36,10 @@ NODE_NAME = os.getenv("NODE_NAME", "vlad_investing_crypto_news")
 ALERT_EMAIL = os.getenv("ALERT_EMAIL", "vladyurjevitch@yandex.ru")
 
 BASE_URL = "https://ru.investing.com/news/cryptocurrency-news"
+INVESTING_CRYPTO_RSS = "https://www.investing.com/rss/news_301.rss"
+HTTP_PROXY_HOST = os.getenv("HTTP_PROXY_HOST", "10.10.11.1")
+HTTP_PROXY_PORT = int(os.getenv("HTTP_PROXY_PORT", "3128"))
+HTTP_PROXY_URL = f"http://{HTTP_PROXY_HOST}:{HTTP_PROXY_PORT}" if HTTP_PROXY_HOST else None
 MAX_PAGES = 999
 MAX_CONSECUTIVE_FAILURES = 15  # Больше попыток — Cloudflare иногда пропускает
 CONTEXT_REFRESH_EVERY = 5  # Чаще обновляем context
@@ -143,6 +149,38 @@ async def create_context(browser):
     return context, page
 
 
+def canonical_investing_link(link):
+    parts = urlparse(link)
+    if parts.netloc.lower() in ("www.investing.com", "investing.com"):
+        parts = parts._replace(netloc="ru.investing.com")
+    return urlunparse(parts)
+
+
+def fetch_crypto_rss():
+    proxies = {"http": HTTP_PROXY_URL, "https": HTTP_PROXY_URL} if HTTP_PROXY_URL else None
+    response = requests.get(INVESTING_CRYPTO_RSS, proxies=proxies, timeout=(10, 30),
+                            headers={"User-Agent": USER_AGENTS[0], "Accept": "application/rss+xml, application/xml;q=0.9, */*"})
+    response.raise_for_status()
+    root = ET.fromstring(response.content)
+    items = []
+    for item in root.findall("./channel/item"):
+        title = (item.findtext("title") or "").strip()
+        link = (item.findtext("link") or "").strip()
+        if not title or not link:
+            continue
+        if not link.startswith("http"):
+            link = "https://www.investing.com" + (link if link.startswith("/") else "/" + link)
+        items.append({
+            "datetime": datetime.datetime.now(),
+            "title": title,
+            "source": (item.findtext("source") or "Investing.com").strip(),
+            "description": (item.findtext("description") or "").strip(),
+            "link": canonical_investing_link(link),
+            "published_at": (item.findtext("pubDate") or "").strip(),
+        })
+    return items
+
+
 async def parse_and_save_incrementally(table_name, max_pages=None):
     print("[*] Запуск парсера Investing.com (v2 — anti-detect)...")
     ensure_table_exists(table_name)
@@ -156,6 +194,24 @@ async def parse_and_save_incrementally(table_name, max_pages=None):
         print(f"    В БД уже есть {len(existing_links)} новостей")
     except:
         existing_links = set()
+
+    print(f"[*] Получение официальной RSS-ленты Investing.com: {INVESTING_CRYPTO_RSS}")
+    rss_news = fetch_crypto_rss()
+    rss_frame = pd.DataFrame(rss_news)
+    if not rss_frame.empty:
+        rss_frame = rss_frame.drop_duplicates(subset=["link"])
+        new_frame = rss_frame[~rss_frame["link"].isin(existing_links)]
+        if not new_frame.empty:
+            new_frame.to_sql(name=table_name, con=engine, if_exists="append", index=False, chunksize=100, method="multi")
+        total_added = len(new_frame)
+    else:
+        total_added = 0
+    print(f" Получено из RSS: {len(rss_news)}")
+    print(" Обработано страниц: 1")
+    print(f" Спарсено новостей: {len(rss_news)}")
+    print(f" Добавлено в БД: {total_added}")
+    print(" Загрузка завершена")
+    return total_added
 
     async with async_playwright() as p:
         browser_args = [
