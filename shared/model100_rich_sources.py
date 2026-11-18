@@ -29,7 +29,7 @@ async def enrich(brain_engine, vlad_engine, snapshot, start, end):
         await c.exec_driver_sql('SET SESSION MAX_EXECUTION_TIME=120000')
         for key,table in [('cftc','vlad_model100_cftc_tff_euro_fx'),('fxcm','vlad_model100_fxcm_h1')]:
             sql=f'SELECT * FROM {table}'
-            if key=='fxcm':sql+=' WHERE event_time_utc>=:start AND event_time_utc<:end ORDER BY event_time_utc'
+            if key=='fxcm':sql+=" WHERE provider='FXCM' AND event_time_utc>=:start AND event_time_utc<:end ORDER BY event_time_utc"
             else:sql+=' ORDER BY report_date'
             async for r in stream_rows(c,sql,params):
                 out[key].append(serial(r))

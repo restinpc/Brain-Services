@@ -103,6 +103,10 @@ DATASETS = {
         "series_id": "CURRCIR",
         "description": "Currency in Circulation — Объем денежных средств в обращении (эмиссия)"
     },
+    "sasha_fred_wcurcir": {
+        "series_id": "WCURCIR",
+        "description": "Currency in Circulation — Week average, weekly ending Wednesday (millions of USD, NSA)"
+    },
     "sasha_fred_wm2ns": {
         "series_id": "WM2NS",
         "description": "M2 Money Stock — Недельный M2"

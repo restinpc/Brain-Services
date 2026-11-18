@@ -304,7 +304,8 @@ class TreasuryCollector:
             except ValueError:
                 request_from = last_date
         elif last_date:
-            print(f"    Последняя запись: {last_date} (колонка: {date_col}) → загружаем только новее")
+            label = "Последняя запись до загрузки" if self.table_name == "vlad_tr_daily_treasury_statement_all" else "Последняя запись"
+            print(f"    {label}: {last_date} (колонка: {date_col}) → загружаем только новее")
             print(f"    Серверный фильтр: filter={date_col}:gt:{last_date}")
         else:
             print(f"    Таблица пуста или нет колонки даты — полная загрузка")
@@ -315,6 +316,8 @@ class TreasuryCollector:
             print(f"    Ошибка загрузки: {e}")
             return
         if not all_data:
+            if self.table_name == "vlad_tr_daily_treasury_statement_all" and last_date:
+                print(f"    Последняя запись: {last_date}")
             print("    Нет новых данных")
             return
         print(f"    Получено {len(all_data)} новых строк")
@@ -325,6 +328,9 @@ class TreasuryCollector:
             replace_from=replace_from,
         )
         print(f"    Вставлено новых записей: {inserted}")
+        if self.table_name == "vlad_tr_daily_treasury_statement_all":
+            committed_latest = max(str(row["record_date"]) for row in all_data)
+            print(f"    Последняя запись: {committed_latest}")
 
 
 def main():

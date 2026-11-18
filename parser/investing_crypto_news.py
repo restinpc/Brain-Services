@@ -16,6 +16,7 @@ import requests
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 import tempfile
+import shutil
 
 # Playwright temp dir
 TEMP_DIR = os.path.join(os.path.expanduser("~"), ".playwright-tmp")
@@ -53,6 +54,11 @@ def send_error_trace(exc: Exception, script_name: str = "investing_crypto_news_l
         requests.post(TRACE_URL, data={"url": "cli_script", "node": NODE_NAME, "email": ALERT_EMAIL, "logs": logs}, timeout=10)
     except:
         pass
+
+
+def should_stop_on_http_status(status: int) -> bool:
+    """Do not retry access-denied or rate-limited responses in the same run."""
+    return status in (403, 429, 503)
 
 
 parser = argparse.ArgumentParser(description="Investing.com crypto news → MySQL")
@@ -152,18 +158,27 @@ async def parse_and_save_incrementally(table_name, max_pages=None):
         existing_links = set()
 
     async with async_playwright() as p:
-        # Chromium (уже установлен на сервере)
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                '--disable-blink-features=AutomationControlled',
-                '--disable-dev-shm-usage',
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-infobars',
-                '--disable-background-timer-throttling',
-            ],
-        )
+        browser_args = [
+            '--disable-blink-features=AutomationControlled',
+            '--disable-dev-shm-usage',
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-infobars',
+            '--disable-background-timer-throttling',
+        ]
+        try:
+            browser = await p.chromium.launch(headless=True, args=browser_args)
+        except Exception as launch_error:
+            if 'Executable doesn\'t exist' not in str(launch_error):
+                raise
+            system_chromium = (shutil.which('chromium-browser')
+                               or shutil.which('chromium')
+                               or shutil.which('google-chrome'))
+            if not system_chromium:
+                raise
+            print(f'[WARN] Playwright browser bundle missing; using system Chromium: {system_chromium}')
+            browser = await p.chromium.launch(
+                headless=True, executable_path=system_chromium, args=browser_args)
 
         context, page = await create_context(browser)
 
@@ -193,24 +208,16 @@ async def parse_and_save_incrementally(table_name, max_pages=None):
                 # новости уже в DOM, JS-трекеры нам не нужны.
                 response = await page.goto(url, timeout=30000, wait_until='domcontentloaded')
 
-                # Проверяем что не 403/429/503
+                # Do not retry access-denied or rate-limited responses by
+                # rotating browser contexts. Let the next scheduled run retry.
                 if response and response.status >= 400:
                     consecutive_failures += 1
                     status = response.status
                     print(f"    HTTP {status} (неудача {consecutive_failures}/{MAX_CONSECUTIVE_FAILURES})")
 
-                    # При 403 — это Cloudflare блокировка. Новый context + retry ту же страницу
-                    if status == 403 or status == 429 or status == 503:
-                        try:
-                            await context.close()
-                        except:
-                            pass
-                        wait = random.uniform(15, 30) if status == 403 else random.uniform(30, 60)
-                        print(f"    Cloudflare блок — новый context, пауза {wait:.0f}с...")
-                        await asyncio.sleep(wait)
-                        context, page = await create_context(browser)
-                        # НЕ увеличиваем page_num — retry ту же страницу
-                        continue
+                    if should_stop_on_http_status(status):
+                        print(f"    SOURCE_FETCH_STOPPED_HTTP_{status}; повтор будет в следующем штатном запуске")
+                        break
                     else:
                         page_num += 1
                         await asyncio.sleep(random.uniform(5, 10))
