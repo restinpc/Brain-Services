@@ -57,12 +57,12 @@ confirmation_hours = 12
 confirmation_similarity = 0.78
 
 [ml]
-enabled = true
+enabled = false
 init_mode = "constant"
 target_precision = 0.95
 max_iter = 20
 step = 0.10
-extremum_limit = 50
+extremum_limit = 8
 active_tail = 0
 precision_metric = "mean"
 
