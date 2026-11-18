@@ -66,7 +66,7 @@ async def get_context_range(engine,start,end,mode,version=DATASET,groups=GROUPS,
         elif groups:
             columns+=",JSON_EXTRACT(rich_context,'$.group_sha256') AS group_sha256"
             columns+=''.join(",JSON_EXTRACT(rich_context,'$.groups."+g+"') AS rich_"+g for g in groups)
-        result=await c.stream(text(f'SELECT {columns} FROM {TABLE} WHERE dataset_version=:v AND mode=:m AND cutoff_utc>=:a AND cutoff_utc<=:b ORDER BY cutoff_utc'),
+        result=await c.stream(text(f'SELECT {columns} FROM {TABLE} FORCE INDEX (PRIMARY) WHERE dataset_version=:v AND mode=:m AND cutoff_utc>=:a AND cutoff_utc<=:b ORDER BY cutoff_utc'),
                               dict(v=version,m=mode,a=clock(start).replace(tzinfo=None),b=clock(end).replace(tzinfo=None)),
                               execution_options={'yield_per':16})
         try:

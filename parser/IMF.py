@@ -72,8 +72,8 @@ DB_CONFIG = {
 DATASETS = {
     "sasha_imf_international_reserves": {
         "description": "IRFCL - Международные резервы и ликвидность иностранной валюты",
-        "dataflow": "IRFCL",
-        "key": "...",
+        "dataflow": "IMF.STA,IRFCL",
+        "key": "...D",
         "require_daily_frequency": True,
         "usd_eur_filter_columns": ["CURRENCY", "INDICATOR", "FULL_DESCRIPTION", "SERIES_NAME"],
         "default_start_date": "2015-01-01",
@@ -161,7 +161,7 @@ def fetch_data(config: dict, start_date: str = None) -> list:
     Возвращает список кортежей: (date_iso, series_key, value)
     """
     try:
-        base_url = "https://api.imf.org/external/sdmx/2.1/Data"
+        base_url = "https://api.imf.org/external/sdmx/2.1/data"
         dataflow_candidates = [config["dataflow"], *config.get("fallback_dataflows", [])]
 
         params = {}
@@ -172,7 +172,7 @@ def fetch_data(config: dict, start_date: str = None) -> list:
         response = None
 
         for dataflow in dataflow_candidates:
-            url = f"{base_url}/{dataflow}/{config.get('key', '...')}"
+            url = f"{base_url}/{dataflow}/{config.get('key', '...')}/all/"
             print(f" Запрос: {url} | params={params}")
 
             # IMF API иногда отдает chunked-ошибки; ретраим с небольшим backoff
@@ -191,6 +191,12 @@ def fetch_data(config: dict, start_date: str = None) -> list:
             if response is None:
                 continue
 
+            print(f" IMF HTTP {response.status_code}")
+
+            if response.status_code == 204:
+                print(" Получено строк: 0 (HTTP 204)")
+                return []
+
             if response.status_code == 403:
                 print(f" HTTP 403 для dataflow={dataflow}, пробуем следующий candidate...")
                 continue
@@ -202,13 +208,16 @@ def fetch_data(config: dict, start_date: str = None) -> list:
             break
 
         if response is None or response.status_code != 200:
-            return []
+            status = response.status_code if response is not None else "NETWORK"
+            raise RuntimeError(f"IMF_SOURCE_FETCH_FAILED:HTTP_{status}")
 
         # Читаем CSV прямо в pandas
         df = pd.read_csv(io.StringIO(response.text), low_memory=False)
 
-        if df.empty or 'TIME_PERIOD' not in df.columns or 'OBS_VALUE' not in df.columns:
-            print("  Нет колонок TIME_PERIOD / OBS_VALUE")
+        if 'TIME_PERIOD' not in df.columns or 'OBS_VALUE' not in df.columns:
+            raise ValueError("IMF_RESPONSE_SCHEMA_MISSING_TIME_OR_VALUE")
+        if df.empty:
+            print(" Получено строк: 0")
             return []
 
         # Приводим данные
@@ -219,8 +228,7 @@ def fetch_data(config: dict, start_date: str = None) -> list:
         # Оставляем только данные с частотой до 24 часов (daily)
         if config.get("require_daily_frequency", False):
             if "FREQUENCY" not in df.columns:
-                print("  В ответе нет колонки FREQUENCY, daily-фильтр не может быть применен")
-                return []
+                raise ValueError("IMF_RESPONSE_SCHEMA_MISSING_FREQUENCY")
             before_daily = len(df)
             df = df[df["FREQUENCY"].astype(str).str.upper() == "D"]
             print(f"⏱ Фильтр daily (FREQUENCY=D): {before_daily} → {len(df)}")
@@ -229,8 +237,7 @@ def fetch_data(config: dict, start_date: str = None) -> list:
         filter_cols = config.get("usd_eur_filter_columns", [])
         existing_filter_cols = [c for c in filter_cols if c in df.columns]
         if not existing_filter_cols:
-            print("  Не найдены колонки для USD/EUR фильтрации")
-            return []
+            raise ValueError("IMF_RESPONSE_SCHEMA_MISSING_CURRENCY_FILTER")
 
         usd_eur_mask = pd.Series(False, index=df.index)
         for col in existing_filter_cols:
@@ -239,6 +246,9 @@ def fetch_data(config: dict, start_date: str = None) -> list:
         before_fx = len(df)
         df = df[usd_eur_mask]
         print(f" Фильтр USD/EUR: {before_fx} → {len(df)}")
+        if df.empty:
+            print(" Получено строк: 0")
+            return []
 
         # Формируем series_key из ключевых измерений; не включаем справочные текстовые поля
         ignored_cols = {
@@ -280,10 +290,39 @@ def fetch_data(config: dict, start_date: str = None) -> list:
         return result
 
     except Exception as e:
-        print(f" Ошибка запроса: {e}")
-        return []
+        print(f" Ошибка запроса: {type(e).__name__}")
+        raise
 
 #  9. ЗАПИСЬ В БД 
+def preserve_registered_series_keys(table_name: str, rows: list) -> list:
+    # IMF now leaves optional display attributes empty. Keep the existing key
+    # for the same dataflow version, four SDMX dimensions and native scale.
+    def identity(key):
+        match = re.match(r"^(.+\.D\.-?\d+)(?:\.|$)", str(key))
+        if not match:
+            raise ValueError("IMF_SERIES_IDENTITY_UNRECOGNIZED")
+        return match.group(1)
+
+    if table_name not in DATASETS:
+        raise ValueError("IMF_TABLE_NOT_REGISTERED")
+    with mysql.connector.connect(**DB_CONFIG) as conn:
+        cur = conn.cursor()
+        try:
+            cur.execute(f"SELECT DISTINCT series_key FROM `{table_name}` ORDER BY series_key LIMIT 2001")
+            keys = cur.fetchall()
+        finally:
+            cur.close()
+    if len(keys) > 2000:
+        raise RuntimeError("IMF_SERIES_IDENTITY_BOUND_EXCEEDED")
+    aliases = {}
+    for (key,) in keys:
+        sig = identity(key)
+        if sig in aliases and aliases[sig] != key:
+            raise RuntimeError("IMF_SERIES_IDENTITY_AMBIGUOUS")
+        aliases[sig] = key
+    return [(day, aliases.get(identity(key), key), value) for day, key, value in rows]
+
+
 def save_rows(table_name: str, rows: list):
     if not rows:
         print("  Нет данных для записи")
@@ -293,6 +332,7 @@ def save_rows(table_name: str, rows: list):
         INSERT IGNORE INTO `{table_name}` (date_iso, series_key, value)
         VALUES (%s, %s, %s)
     """
+    rows = preserve_registered_series_keys(table_name, rows)
     chunk_size = 5000
     total_inserted = 0
     total_chunks = (len(rows) + chunk_size - 1) // chunk_size
@@ -330,8 +370,7 @@ def save_rows(table_name: str, rows: list):
                     pass
 
         if not saved:
-            # Продолжаем со следующими батчами, чтобы сохранить максимум возможного.
-            continue
+            raise RuntimeError(f"IMF_SAVE_FAILED:batch={chunk_no}")
 
     print(f" Записано {total_inserted} новых строк из {len(rows)} total")
 

@@ -9,12 +9,15 @@ from .model100_h1_features import Config,canonical,digest,clock,_atomic
 from .model100_feature_store import TABLE,SETS,parsed
 from .model100_feature_cli import capture
 from .model100_rich_context import V2FeatureBuilder as FeatureBuilder
-from .model100_rich_context import RichContextBuilder,VERSION,DATASET,GROUPS,MAX_BYTES,contract
+from .model100_rich_context import RichContextBuilder,VERSION,GROUPS,MAX_BYTES,contract
 from .model100_rich_store import insert_contexts
 
 ROOT=Path(__file__).resolve().parents[1]
 RUNTIME=Path('/brain/model100-featurebuilder-20261109/v2-runtime')
 V1='model100-h1-v1hex-20261109'
+# New writer generation. Reader defaults in model100_rich_context/store remain
+# pinned to the existing dataset until a separately approved consumer switch.
+DATASET='model100-h1-v2full-20261117'
 
 
 def code_hash():
@@ -117,6 +120,11 @@ def update_v2(db,history=False):
             if reg['builder_code_sha256']!=code_hash() or schema.get('rich_contract')!=contract():raise ValueError('V2_NEW_VERSION_REQUIRED')
             bootstrap=clock(state.get('bootstrap_end_utc'))
             if not bootstrap:raise ValueError('BOOTSTRAP_BOUNDARY_REQUIRED')
+            if history and state.get('history_policy')=='LIVE_ONLY_CUTOVER':
+                result=dict(status='SUCCESS_UNCHANGED',inserted=0,
+                            detail='HISTORICAL_V2_RETAINED_IN_PRIOR_DATASET_VERSION',
+                            cutover_utc=bootstrap.isoformat())
+                write_status(db,mode,history,result);out[key]=result;continue
             lower=datetime(2025,1,1,tzinfo=timezone.utc)
             upper=now
             if history:
@@ -134,7 +142,7 @@ def update_v2(db,history=False):
             if not due:
                 result=dict(status='SUCCESS_UNCHANGED',inserted=0)
             elif history:
-                counts=insert_contexts(db,prepared_rows(mode,schema,due),schema)
+                counts=insert_contexts(db,prepared_rows(mode,schema,due),schema,version=DATASET)
                 result=dict(status='SUCCESS_NEW_DATA' if counts['inserted'] else 'SUCCESS_UNCHANGED',
                             **counts,first_cutoff=due[0],last_cutoff=due[-1],input='VERIFIED_IMMUTABLE_V2_SHARDS',batch_limit=256)
             else:
@@ -157,7 +165,7 @@ def update_v2(db,history=False):
                 rich=RichContextBuilder(base,extra)
                 admitted=set(base.cutoffs(due[0],due[-1]))
                 if any(t not in admitted for t in due):raise ValueError('V2_MARKET_GRID_MISMATCH')
-                counts=insert_contexts(db,((base.build_at(t),rich.build_at(t)) for t in due),schema)
+                counts=insert_contexts(db,((base.build_at(t),rich.build_at(t)) for t in due),schema,version=DATASET)
                 result=dict(status='SUCCESS_NEW_DATA' if counts['inserted'] else 'SUCCESS_UNCHANGED',
                             **counts,first_cutoff=due[0],last_cutoff=due[-1],capture=meta,
                             rich_source_diagnostics=extra.get('diagnostics',{}),batch_limit=256)
