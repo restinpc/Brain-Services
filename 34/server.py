@@ -31,7 +31,7 @@ from common import (
     resolve_workers,
     build_engines,
 )
-from cache_helper import ensure_cache_table, load_service_url, cached_values
+from cache_helper import ensure_cache_table, load_service_url, cached_values as _base_cached_values
 
 SERVICE_ID = 34
 NODE_NAME  = os.getenv("NODE_NAME", "brain-market-tech-microservice")
@@ -256,7 +256,21 @@ def compute_extremum_value(t_dates, calc_var, ext_set, candle_ranges,
     return val if val != 0 else None
 
 
+from brain_framework import NamespaceSnapshot, FRAMEWORK_VERSION
+import time as _snapshot_time
+_namespace_snapshot = NamespaceSnapshot(globals(), ['GLOBAL_AVG_RANGE', 'GLOBAL_CANDLE_RANGES', 'GLOBAL_CTX_INDEX', 'GLOBAL_EXTREMUMS', 'GLOBAL_LAST_CANDLES', 'GLOBAL_MKT_BY_INSTR', 'GLOBAL_MKT_CONTEXT', 'GLOBAL_MKT_CTX_HIST', 'GLOBAL_MKT_OBS_DTS', 'GLOBAL_RATES', 'GLOBAL_WEIGHT_CODES', 'NP_CTX_HIST_BUILT', 'NP_RATES', 'SERVICE_URL', '_MKT_SORTED_DATES'])
+
 async def preload_all_data():
+    async with _namespace_snapshot.check_lock:
+        try:
+            return await _stage_and_publish()
+        except Exception as exc:
+            _namespace_snapshot.metrics.update(mode="degraded", last_error=str(exc)[:300])
+            raise
+
+async def _stage_and_publish():
+    staged = _namespace_snapshot.staging()
+    started = _snapshot_time.monotonic()
     """Инициализация всех глобальных структур."""
     global GLOBAL_MKT_BY_INSTR, GLOBAL_MKT_CONTEXT, GLOBAL_MKT_OBS_DTS
     global _MKT_SORTED_DATES, GLOBAL_MKT_CTX_HIST, GLOBAL_CTX_INDEX
@@ -264,18 +278,18 @@ async def preload_all_data():
     global GLOBAL_AVG_RANGE, GLOBAL_LAST_CANDLES, SERVICE_URL, LAST_RELOAD_TIME
     global NP_RATES, NP_CTX_HIST, NP_CTX_HIST_BUILT
 
-    log(" MARKET-TECH FULL DATA RELOAD START", NODE_NAME, force=True)
+    log(" MARKET-TECH SNAPSHOT CHECK START", NODE_NAME, force=True)
 
     # Очищаем старые данные
-    GLOBAL_MKT_BY_INSTR.clear()
-    GLOBAL_MKT_CONTEXT.clear()
-    GLOBAL_MKT_OBS_DTS.clear()
-    _MKT_SORTED_DATES[:] = []
-    GLOBAL_MKT_CTX_HIST.clear()
-    GLOBAL_CTX_INDEX.clear()
-    GLOBAL_WEIGHT_CODES.clear()
-    NP_RATES.clear()
-    NP_CTX_HIST_BUILT = False
+    staged['GLOBAL_MKT_BY_INSTR'].clear()
+    staged['GLOBAL_MKT_CONTEXT'].clear()
+    staged['GLOBAL_MKT_OBS_DTS'].clear()
+    staged['_MKT_SORTED_DATES'][:] = []
+    staged['GLOBAL_MKT_CTX_HIST'].clear()
+    staged['GLOBAL_CTX_INDEX'].clear()
+    staged['GLOBAL_WEIGHT_CODES'].clear()
+    staged['NP_RATES'].clear()
+    staged['NP_CTX_HIST_BUILT'] = False
 
     #  vlad DB: weights и context_idx 
     try:
@@ -285,36 +299,25 @@ async def preload_all_data():
                 SELECT weight_code FROM vlad_market_tech_weights
                 GROUP BY weight_code
             """))
-            GLOBAL_WEIGHT_CODES = [r[0] for r in res.fetchall()]
+            staged['GLOBAL_WEIGHT_CODES'] = [r[0] for r in res.fetchall()]
 
             # Индекс контекстов
             res = await conn.execute(text("""
-                SELECT weight_code, occurrence_count FROM vlad_market_tech_context_idx
+                SELECT instrument, rate_change_dir, trend_dir, momentum_dir,
+                       vol_zone, bb_zone, occurrence_count
+                FROM vlad_market_tech_context_idx
             """))
             for r in res.mappings().all():
-                weight_code = r["weight_code"]
-                parts = weight_code.split("_")
-                if len(parts) >= 6:
-                    try:
-                        instr_id = int(parts[0])
-                        instr_name = {v: k for k, v in INSTRUMENT_MAP.items()}.get(instr_id, "UNKNOWN")
-                        rcd = {v: k for k, v in RATE_CHANGE_MAP.items()}.get(int(parts[1]), "UNKNOWN")
-                        td = {v: k for k, v in TREND_MAP.items()}.get(int(parts[2]), "UNKNOWN")
-                        md = {v: k for k, v in MOMENTUM_MAP.items()}.get(int(parts[3]), "UNKNOWN")
-                        vol = {v: k for k, v in VOL_MAP.items()}.get(int(parts[4]), "UNKNOWN")
-                        bb = {v: k for k, v in BB_MAP.items()}.get(int(parts[5]), "UNKNOWN")
-                        ctx_key = (instr_name, rcd, td, md, vol, bb)
-                        GLOBAL_CTX_INDEX[ctx_key] = {
-                            "occurrence_count": int(r["occurrence_count"])
-                        }
-                    except (ValueError, IndexError):
-                        pass
-        log(f"  Market weights: {len(GLOBAL_WEIGHT_CODES)}, contexts: {len(GLOBAL_CTX_INDEX)}",
+                ctx_key = (r["instrument"], r["rate_change_dir"], r["trend_dir"],
+                           r["momentum_dir"], r["vol_zone"], r["bb_zone"])
+                staged['GLOBAL_CTX_INDEX'][ctx_key] = {"occurrence_count": int(r["occurrence_count"])}
+        log(f"  Market weights: {len(staged['GLOBAL_WEIGHT_CODES'])}, contexts: {len(staged['GLOBAL_CTX_INDEX'])}",
             NODE_NAME)
     except Exception as e:
         log(f" Market weights/contexts from vlad: {e}", NODE_NAME, level="error", force=True)
+        raise
 
-    #  brain DB: market_history 
+    #  brain DB: vlad_market_history 
     try:
         instruments = list(INSTRUMENT_COLUMNS.keys())
         if instruments:
@@ -326,9 +329,9 @@ async def preload_all_data():
             async with engine_brain.connect() as conn:
                 res  = await conn.execute(text(
                     f"SELECT `datetime`, {', '.join(col_parts)} "
-                    f"FROM market_history ORDER BY `datetime`"))
+                    f"FROM vlad_market_history ORDER BY `datetime`"))
                 rows = res.fetchall()
-                log(f"  market_history (from brain DB): {len(rows)} rows", NODE_NAME)
+                log(f"  vlad_market_history (from brain DB): {len(rows)} rows", NODE_NAME)
 
                 by_instr_close  = {instr: [] for instr in instruments}
                 by_instr_volume = {instr: [] for instr in instruments}
@@ -349,38 +352,39 @@ async def preload_all_data():
                     if not close_series:
                         continue
                     threshold = THRESHOLD_BY_INSTRUMENT.get(instr, DEFAULT_THRESHOLD)
-                    GLOBAL_MKT_BY_INSTR[instr] = close_series
+                    staged['GLOBAL_MKT_BY_INSTR'][instr] = close_series
 
                     for dt, rcd, td, md, vol_zone, bb_zone in classify_market_observations(
                             close_series, volume_series, threshold):
                         ctx_tuple = (rcd, td, md, vol_zone, bb_zone)
-                        GLOBAL_MKT_CONTEXT[(instr, dt)] = ctx_tuple
-                        GLOBAL_MKT_OBS_DTS[dt].add(instr)
+                        staged['GLOBAL_MKT_CONTEXT'][(instr, dt)] = ctx_tuple
+                        staged['GLOBAL_MKT_OBS_DTS'][dt].add(instr)
                         key = (instr, rcd, td, md, vol_zone, bb_zone)
-                        GLOBAL_MKT_CTX_HIST.setdefault(key, []).append(dt)
+                        staged['GLOBAL_MKT_CTX_HIST'].setdefault(key, []).append(dt)
 
-                for key in GLOBAL_MKT_CTX_HIST:
-                    GLOBAL_MKT_CTX_HIST[key].sort()
+                for key in staged['GLOBAL_MKT_CTX_HIST']:
+                    staged['GLOBAL_MKT_CTX_HIST'][key].sort()
 
-                total_obs = sum(len(v) for v in GLOBAL_MKT_CTX_HIST.values())
-                log(f"  instruments: {len(GLOBAL_MKT_BY_INSTR)}, "
-                    f"contexts: {len(GLOBAL_MKT_CONTEXT)}, obs: {total_obs}", NODE_NAME)
+                total_obs = sum(len(v) for v in staged['GLOBAL_MKT_CTX_HIST'].values())
+                log(f"  instruments: {len(staged['GLOBAL_MKT_BY_INSTR'])}, "
+                    f"contexts: {len(staged['GLOBAL_MKT_CONTEXT'])}, obs: {total_obs}", NODE_NAME)
     except Exception as e:
-        log(f" market_history (brain): {e}", NODE_NAME, level="error")
+        log(f" vlad_market_history (brain): {e}", NODE_NAME, level="error")
+        raise
 
     #  bisect: отсортированный список дат market 
-    _MKT_SORTED_DATES[:] = sorted(GLOBAL_MKT_OBS_DTS.keys())
+    staged['_MKT_SORTED_DATES'][:] = sorted(staged['GLOBAL_MKT_OBS_DTS'].keys())
 
     #  brain DB: brain_rates_* (остается без изменений) 
     async with engine_brain.connect() as conn:
         for table in ["brain_rates_eur_usd", "brain_rates_eur_usd_day",
                       "brain_rates_btc_usd", "brain_rates_btc_usd_day",
                       "brain_rates_eth_usd", "brain_rates_eth_usd_day"]:
-            GLOBAL_RATES[table]         = {}
-            GLOBAL_LAST_CANDLES[table]  = []
-            GLOBAL_CANDLE_RANGES[table] = {}
-            GLOBAL_AVG_RANGE[table]     = 0.0
-            GLOBAL_EXTREMUMS[table]     = {"min": set(), "max": set()}
+            staged['GLOBAL_RATES'][table]         = {}
+            staged['GLOBAL_LAST_CANDLES'][table]  = []
+            staged['GLOBAL_CANDLE_RANGES'][table] = {}
+            staged['GLOBAL_AVG_RANGE'][table]     = 0.0
+            staged['GLOBAL_EXTREMUMS'][table]     = {"min": set(), "max": set()}
             try:
                 res    = await conn.execute(text(
                     f"SELECT date, open, close, `max`, `min`, t1 FROM `{table}`"))
@@ -389,12 +393,12 @@ async def preload_all_data():
                 for r in rows_b:
                     dt = r["date"]
                     if r["t1"] is not None:
-                        GLOBAL_RATES[table][dt] = float(r["t1"])
-                    GLOBAL_LAST_CANDLES[table].append((dt, r["close"] > r["open"]))
+                        staged['GLOBAL_RATES'][table][dt] = float(r["t1"])
+                    staged['GLOBAL_LAST_CANDLES'][table].append((dt, r["close"] > r["open"]))
                     rng = float(r["max"] or 0) - float(r["min"] or 0)
-                    GLOBAL_CANDLE_RANGES[table][dt] = rng
+                    staged['GLOBAL_CANDLE_RANGES'][table][dt] = rng
                     ranges.append(rng)
-                GLOBAL_AVG_RANGE[table] = sum(ranges) / len(ranges) if ranges else 0.0
+                staged['GLOBAL_AVG_RANGE'][table] = sum(ranges) / len(ranges) if ranges else 0.0
 
                 interval = "1 DAY" if table.endswith("_day") else "1 HOUR"
                 for typ in ("min", "max"):
@@ -406,31 +410,37 @@ async def preload_all_data():
                         WHERE t1.`{typ}` {op} t_prev.`{typ}`
                           AND t1.`{typ}` {op} t_next.`{typ}`"""
                     res_ext = await conn.execute(text(q))
-                    GLOBAL_EXTREMUMS[table][typ] = {
+                    staged['GLOBAL_EXTREMUMS'][table][typ] = {
                         r["date"] for r in res_ext.mappings().all()}
 
-                log(f"  {table}: {len(GLOBAL_RATES[table])} candles", NODE_NAME)
+                log(f"  {table}: {len(staged['GLOBAL_RATES'][table])} candles", NODE_NAME)
             except Exception as e:
                 log(f" {table}: {e}", NODE_NAME, level="error")
+                raise
 
     try:
-        SERVICE_URL = await load_service_url(engine_super, SERVICE_ID)
+        staged['SERVICE_URL'] = await load_service_url(engine_super, SERVICE_ID)
         log(f"  SERVICE_URL loaded", NODE_NAME)
     except Exception as e:
         log(f"  load_service_url skipped: {e}", NODE_NAME, level="warn")
+        raise
 
     try:
         await ensure_cache_table(engine_vlad)
     except Exception as e:
         log(f"  ensure_cache_table skipped: {e}", NODE_NAME, level="warn")
+        raise
 
-    LAST_RELOAD_TIME = datetime.now()
-    log(" MARKET-TECH FULL DATA RELOAD COMPLETED", NODE_NAME, force=True)
+    changed = await _namespace_snapshot.publish(staged, started)
+    if changed:
+        LAST_RELOAD_TIME = datetime.now()
+    log(" MARKET-TECH SNAPSHOT CHECK COMPLETED", NODE_NAME, force=True)
+
 
 
 async def background_reload_data():
     while True:
-        await asyncio.sleep(3600)
+        await asyncio.sleep(_namespace_snapshot.poll_seconds)
         try:
             await preload_all_data()
         except Exception as e:
@@ -463,7 +473,7 @@ app = FastAPI(lifespan=lifespan)
 #  Подгрузка свежих свечей из БД 
 _LAST_RATES_REFRESH = {}
 
-async def _refresh_rates_if_needed(rates_table):
+async def _refresh_rates_snapshot_unlocked(rates_table):
     """Если в RAM нет свечи за последний час — подгрузить из БД. Не чаще раз в 30 сек."""
     now = datetime.now()
     last = _LAST_RATES_REFRESH.get(rates_table)
@@ -577,7 +587,7 @@ def _compute_cpu_only(pair: int, day: int, date_str: str,
     return {k: round(v, 6) for k, v in result.items() if v != 0}
 
 
-async def calculate_pure_memory(pair: int, day: int, date_str: str,
+async def _calculate_memory_snapshot(pair: int, day: int, date_str: str,
                                  calc_type: int = 0, calc_var: int = 0) -> dict | None:
     """Основной endpoint /values — использует кеш + вычисление."""
     target_date = parse_date_string(date_str)
@@ -585,7 +595,6 @@ async def calculate_pure_memory(pair: int, day: int, date_str: str,
         return None
 
     rates_table  = get_rates_table_name(pair, day)
-    await _refresh_rates_if_needed(rates_table)
     
     # CPU вычисление в thread pool чтобы не блокировать event loop
     result = await asyncio.to_thread(
@@ -597,11 +606,30 @@ async def calculate_pure_memory(pair: int, day: int, date_str: str,
 
 #  Endpoints 
 
+
+async def _refresh_rates_if_needed(rates_table):
+    if _namespace_snapshot.owns_read_lease():
+        return
+    async with _namespace_snapshot.gate.write():
+        return await _refresh_rates_snapshot_unlocked(rates_table)
+
+async def calculate_pure_memory(pair, day, date_str, calc_type=0, calc_var=0):
+    if not _namespace_snapshot.owns_read_lease():
+        await _refresh_rates_if_needed(get_rates_table_name(pair, day))
+    async with _namespace_snapshot.gate.read():
+        return await _calculate_memory_snapshot(pair, day, date_str, calc_type=calc_type, calc_var=calc_var)
+
+async def _refresh_cache_rates(pair, day):
+    await _refresh_rates_if_needed(get_rates_table_name(pair, day))
+
+async def cached_values(**kwargs):
+    return await _namespace_snapshot.cached_values(_base_cached_values, _refresh_cache_rates, **kwargs)
+
 @app.get("/")
 async def get_metadata():
     # Проверяем доступность таблиц:
     # - vlad: vlad_market_tech_weights, vlad_market_tech_context_idx, version_microservice
-    # - brain: market_history, brain_rates_*
+    # - brain: vlad_market_history, brain_rates_*
     for t in ["vlad_market_tech_weights", "vlad_market_tech_context_idx",
               "version_microservice"]:
         try:
@@ -609,10 +637,10 @@ async def get_metadata():
                 await conn.execute(text(f"SELECT 1 FROM `{t}` LIMIT 1"))
         except Exception as e:
             return {"status": "error", "error": f"vlad.{t} inaccessible: {e}"}
-    for t in ["market_history", "brain_rates_eur_usd",
+    for t in ["vlad_market_history", "brain_rates_eur_usd",
               "brain_rates_btc_usd", "brain_rates_eth_usd"]:
         try:
-            # market_history находится в brain, остальные тоже в brain
+            # vlad_market_history находится в brain, остальные тоже в brain
             async with engine_brain.connect() as conn:
                 await conn.execute(text(f"SELECT 1 FROM `{t}` LIMIT 1"))
         except Exception as e:
@@ -639,6 +667,8 @@ async def get_metadata():
             "mode":        "0=T1 1=Extremum",
         },
         "metadata": {
+            "framework_version": FRAMEWORK_VERSION,
+            "dynamic_dataset": dict(_namespace_snapshot.metrics),
             "ctx_index_rows":     len(GLOBAL_CTX_INDEX),
             "weight_codes":       len(GLOBAL_WEIGHT_CODES),
             "instruments_loaded": list(GLOBAL_MKT_BY_INSTR.keys()),
@@ -702,17 +732,18 @@ async def compute_values(
 
     Возвращает результат напрямую: {"key": float, ...} или {}
     """
-    try:
-        rates_table = get_rates_table_name(pair, day)
-        await _refresh_rates_if_needed(rates_table)
-        result = await asyncio.to_thread(
-            functools.partial(_compute_cpu_only, pair, day, date,
-                              calc_type=type, calc_var=var)
-        )
-        return result if result is not None else {}
-    except Exception as e:
-        send_error_trace(e, node=NODE_NAME, script="compute_values")
-        return {"error": str(e)}
+    await _refresh_cache_rates(pair, day)
+    async with _namespace_snapshot.gate.read():
+        try:
+            rates_table = get_rates_table_name(pair, day)
+            result = await asyncio.to_thread(
+                functools.partial(_compute_cpu_only, pair, day, date,
+                                  calc_type=type, calc_var=var)
+            )
+            return result if result is not None else {}
+        except Exception as e:
+            send_error_trace(e, node=NODE_NAME, script="compute_values")
+            return {"error": str(e)}
 
 
 @app.post("/compute_batch")
@@ -731,25 +762,26 @@ async def compute_batch(
     Каждая дата считается в thread pool через asyncio.to_thread +
     numpy-ускоренный _compute_cpu_only — event loop не блокируется.
     """
-    if not dates:
-        return {}
+    await _refresh_cache_rates(pair, day)
+    async with _namespace_snapshot.gate.read():
+        if not dates:
+            return {}
 
-    rates_table = get_rates_table_name(pair, day)
-    await _refresh_rates_if_needed(rates_table)
+        rates_table = get_rates_table_name(pair, day)
 
-    async def _one(date_str: str) -> tuple[str, dict]:
-        try:
-            result = await asyncio.to_thread(
-                functools.partial(_compute_cpu_only, pair, day, date_str,
-                                  calc_type=type, calc_var=var)
-            )
-            return date_str, (result if result is not None else {})
-        except Exception as e:
-            log(f"   compute_batch error {date_str}: {e}", NODE_NAME, level="warning")
-            return date_str, {}
+        async def _one(date_str: str) -> tuple[str, dict]:
+            try:
+                result = await asyncio.to_thread(
+                    functools.partial(_compute_cpu_only, pair, day, date_str,
+                                      calc_type=type, calc_var=var)
+                )
+                return date_str, (result if result is not None else {})
+            except Exception as e:
+                log(f"   compute_batch error {date_str}: {e}", NODE_NAME, level="warning")
+                return date_str, {}
 
-    results = await asyncio.gather(*[_one(d) for d in dates])
-    return dict(results)
+        results = await asyncio.gather(*[_one(d) for d in dates])
+        return dict(results)
 
 
 @app.post("/patch")
