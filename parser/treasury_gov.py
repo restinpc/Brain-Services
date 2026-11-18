@@ -268,6 +268,11 @@ class TreasuryCollector:
         total_inserted = 0
         with self.get_db_connection() as conn:
             cursor = conn.cursor()
+            if self.table_name == AUCTIONS_V2_TABLE:
+                cursor.execute(f"SELECT `cusip`, `issue_date` FROM `{self.table_name}`")
+                existing_keys = {(str(row[0]), str(row[1])) for row in cursor.fetchall()}
+                incoming_keys = {(str(row['cusip']), str(row['issue_date'])) for row in data}
+                total_inserted = len(incoming_keys - existing_keys)
             # For Auctions_Query we fetched a complete overlapping tail. Delete
             # that exact tail only after the HTTP fetch succeeded, then insert
             # the fresh API snapshot in the same DB transaction. This captures
@@ -293,7 +298,8 @@ class TreasuryCollector:
                         vals.append(v)
                     values.append(tuple(vals))
                 cursor.executemany(sql, values)
-                total_inserted += cursor.rowcount
+                if self.table_name != AUCTIONS_V2_TABLE:
+                    total_inserted += cursor.rowcount
             conn.commit()
         return total_inserted
 
@@ -336,11 +342,16 @@ class TreasuryCollector:
             print(f"    Ошибка загрузки: {e}")
             return
         if not all_data:
+            if self.table_name == AUCTIONS_V2_TABLE:
+                print("Получен пустой snapshot; новых данных нет")
             if self.table_name in ("vlad_tr_daily_treasury_statement_all", BUYBACKS_TABLE) and last_date:
                 print(f"    Последняя запись: {last_date}")
             print("    Нет новых данных")
             return
-        print(f"    Получено {len(all_data)} новых строк")
+        if self.table_name == AUCTIONS_V2_TABLE:
+            print(f"    Получено snapshot записей: {len(all_data)}")
+        else:
+            print(f"    Получено {len(all_data)} новых строк")
         self.create_table_from_sample(all_data[0])
         inserted = self.insert_batch(
             all_data,
@@ -348,7 +359,8 @@ class TreasuryCollector:
             replace_from=replace_from,
         )
         if self.table_name == AUCTIONS_V2_TABLE:
-            print(f"    Сохранено/обновлено по ключу Treasury (CUSIP + issue_date): {inserted}")
+            print(f"    Синхронизировано записей snapshot: {len(all_data)}")
+            print(f"    Новых ключей Treasury: {inserted}")
         else:
             print(f"    Вставлено новых записей: {inserted}")
         if self.table_name == "vlad_tr_daily_treasury_statement_all":

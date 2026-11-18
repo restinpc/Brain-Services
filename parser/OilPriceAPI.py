@@ -232,7 +232,11 @@ def _request_oilprice(endpoint: str, code: str):
     url = f"{OILPRICE_BASE_URL}{endpoint}"
     headers = {"Authorization": f"Token {OILPRICE_API_KEY}"}
     params = {"by_code": code}
-    response = requests.get(url, params=params, headers=headers, timeout=30)
+    try:
+        response = requests.get(url, params=params, headers=headers, timeout=(5, 20))
+    except requests.RequestException as e:
+        print(f"Тайм-аут/сетевая ошибка endpoint={endpoint} code={code}; пробуем следующий endpoint: {type(e).__name__}")
+        return None
 
     if response.status_code != 200:
         return None

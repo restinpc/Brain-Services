@@ -51,6 +51,26 @@ class TreasuryAuctionV2Tests(unittest.TestCase):
         collector.create_table_from_sample({'cusip': '123456789', 'issue_date': '2026-11-01', 'record_date': '2026-11-02'})
         self.assertIn('uq_treasury_cusip_issue_date', statements[0])
 
+    def test_v2_new_rows_count_excludes_existing_keys(self):
+        ns = self.load_parser()
+        collector = ns['TreasuryCollector']('vlad_tr_auctions_query_updated')
+        class Cursor:
+            rowcount = 3
+            def execute(self, sql, params=None): pass
+            def fetchall(self): return [('111111111', '2026-10-01')]
+            def executemany(self, sql, rows): pass
+        class Conn:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def cursor(self): return Cursor()
+            def commit(self): pass
+        collector.get_db_connection = lambda: Conn()
+        rows = [
+            {'cusip': '111111111', 'issue_date': '2026-10-01', 'record_date': '2026-11-02'},
+            {'cusip': '222222222', 'issue_date': '2026-11-01', 'record_date': '2026-11-03'},
+        ]
+        self.assertEqual(collector.insert_batch(rows), 1)
+
     def test_v2_upsert_preserves_history_and_uses_official_key(self):
         ns = self.load_parser()
         collector = ns['TreasuryCollector']('vlad_tr_auctions_query_updated')
@@ -59,6 +79,7 @@ class TreasuryAuctionV2Tests(unittest.TestCase):
         class Cursor:
             rowcount = 1
             def execute(self, sql, params=None): statements.append((sql, params))
+            def fetchall(self): return []
             def executemany(self, sql, rows): statements.append((sql, rows))
         class Conn:
             def __enter__(self): return self
