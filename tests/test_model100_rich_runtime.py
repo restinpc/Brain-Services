@@ -14,7 +14,7 @@ class RuntimeTests(unittest.TestCase):
         schema=FeatureBuilder(data,config).schema;schema['rich_contract']=contract()
         b=FeatureBuilder(data,config,schema=schema);at='2026-01-01T15:00:00+00:00'
         row=b.build_at(at);rich=RichContextBuilder(b).build_at(at)
-        return at,schema,row,rich,encode_context(row,rich,schema)
+        return at,schema,row,rich,encode_context(row,rich,schema,version=runtime.DATASET)
 
     def shard(self,p,schema,record):
         raw=(canonical(record)+'\n').encode();compressed=gzip.compress(raw,mtime=0)
@@ -22,6 +22,10 @@ class RuntimeTests(unittest.TestCase):
         manifest=dict(schema_hash=digest(schema),shards=[dict(path=str(q),sha256=hashlib.sha256(raw).hexdigest(),file_sha256=hashlib.sha256(compressed).hexdigest(),first_cutoff=record['cutoff_utc'].isoformat(),last_cutoff=record['cutoff_utc'].isoformat())])
         (p/'RESEARCH-verified-manifest.json').write_text(canonical(manifest))
         return q
+
+    def test_writer_uses_new_immutable_generation(self):
+        self.assertEqual(runtime.DATASET, 'model100-h1-v2full-20261118')
+        self.assertEqual(runtime.VERSION if hasattr(runtime, 'VERSION') else contract()['version'], 'model100-rich-v2full-2')
 
     def test_verified_shard_reconstructs(self):
         at,schema,row,rich,record=self.fixture()
