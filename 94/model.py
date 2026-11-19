@@ -458,6 +458,13 @@ async def _table_exists(engine, name: str) -> bool:
     return bool(int(n or 0))
 
 
+async def _first_existing_table(engine, *names: str) -> str | None:
+    for name in names:
+        if name and await _table_exists(engine, name):
+            return name
+    return None
+
+
 async def _table_columns(engine, name: str) -> set[str]:
     from sqlalchemy import text
     async with engine.connect() as conn:
@@ -555,11 +562,10 @@ async def _source_max_ts(engine, prices_table: str, parser_table: str) -> dateti
 
 async def _load_price_chunk(engine, prices_table: str, parser_table: str, map_table: str,
                             start: datetime, end: datetime) -> list[dict]:
-    from sqlalchemy import bindparam, text
+    from sqlalchemy import text
     table = await _first_existing_table(engine, prices_table, parser_table)
-    if table is None or not mapped_markets:
+    if table is None:
         return []
-    condition_ids = list(mapped_markets)
     sql = text(f"""
         SELECT p.condition_id, p.price_timestamp, p.price,
                m.family, m.orientation, m.signature, m.end_date

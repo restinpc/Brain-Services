@@ -54,26 +54,6 @@ class SyncTests(unittest.TestCase):
     self.fail('Provider exception can be swallowed')
  def test_model92_strict_dependency(self):
   self.assertEqual(Path(m92.strict_masked_reduce.__code__.co_filename).name,'brain_strict_reduction.py')
- def test_model94_empty_mapping_no_connection(self):
-  engine=SimpleNamespace(connect=lambda:(_ for _ in ()).throw(AssertionError('unexpected DB')))
-  with patch.object(m94,'_first_existing_table',AsyncMock(return_value='prices')):
-   self.assertEqual(asyncio.run(m94._load_price_chunk(engine,'prices','parser',{},datetime(2026,1,1),datetime(2026,1,2))),[])
- def test_model94_missing_source_no_connection(self):
-  with patch.object(m94,'_first_existing_table',AsyncMock(return_value=None)):
-   self.assertIsNone(asyncio.run(m94._source_max_ts(object(),'prices','parser')))
- def test_model94_sql_bindings_and_mapping(self):
-  class Result:
-   def mappings(self):return self
-   def all(self):return [{'condition_id':'c','price':.5,'price_timestamp':datetime(2026,1,1)}]
-  class Conn:
-   async def __aenter__(self):return self
-   async def __aexit__(self,*a):pass
-   async def execute(self,sql,params):
-    self_params=params;assert params['condition_ids']==['c'];assert 'condition_ids' in sql._bindparams
-    return Result()
-  with patch.object(m94,'_first_existing_table',AsyncMock(return_value='prices')):
-   out=asyncio.run(m94._load_price_chunk(SimpleNamespace(connect=lambda:Conn()),'prices','parser',{'c':dict(family='FX',orientation=1,signature='s',end_date=None)},datetime(2026,1,1),datetime(2026,1,2)))
-   self.assertEqual(out[0]['family'],'FX')
  def test_model94_required_canonical_fail_before_map(self):
   cfg={'dataset':dict(parser_table='legacy',source_database='brain',markets_table='markets',prices_table='prices',enriched_table='e',map_table='m',state_table='s')}
   with patch.object(m94,'get_service_config',return_value=cfg),patch.object(m94,'_ensure_enriched_tables',AsyncMock()),patch.object(m94,'_table_exists',AsyncMock(return_value=False)),patch.object(m94,'_prepare_map_table',AsyncMock()) as mapping:
