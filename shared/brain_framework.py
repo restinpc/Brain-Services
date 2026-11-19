@@ -5850,7 +5850,7 @@ def build_app(model_module) -> FastAPI:
         legacy_table = f"vlad_values_cache_svc{s.PORT}"
         legacy_hash = _params_hash(params)
         attempts = [(primary_table, primary_hash, "versioned")]
-        if (legacy_table, legacy_hash) != (primary_table, legacy_hash):
+        if (legacy_table, legacy_hash) != (primary_table, primary_hash):
             attempts.append((legacy_table, legacy_hash, "shared-legacy"))
 
         errors = []
