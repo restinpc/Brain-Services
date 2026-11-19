@@ -28,6 +28,11 @@ OILPRICE_API_KEY = (
     or os.getenv("OIL_PRICE_API_KEY")
 )
 OILPRICE_BASE_URL = os.getenv("OILPRICE_API_BASE_URL", "https://api.oilpriceapi.com/v1").rstrip("/")
+HTTP_PROXY_HOST = os.getenv("HTTP_PROXY_HOST", "10.10.11.1").strip()
+HTTP_PROXY_PORT = os.getenv("HTTP_PROXY_PORT", "3128").strip()
+OILPRICE_PROXIES = ({"http": f"http://{HTTP_PROXY_HOST}:{HTTP_PROXY_PORT}",
+                     "https": f"http://{HTTP_PROXY_HOST}:{HTTP_PROXY_PORT}"}
+                    if HTTP_PROXY_HOST else None)
 
 _HANDLER = os.getenv("HANDLER", "https://server.brain-project.online").rstrip("/")
 TRACE_URL = f"{_HANDLER}/trace.php"
@@ -232,15 +237,21 @@ def _request_oilprice(endpoint: str, code: str):
     url = f"{OILPRICE_BASE_URL}{endpoint}"
     headers = {"Authorization": f"Token {OILPRICE_API_KEY}"}
     params = {"by_code": code}
-    response = requests.get(url, params=params, headers=headers, timeout=30)
+    try:
+        response = requests.get(url, params=params, headers=headers, timeout=(5, 20), proxies=OILPRICE_PROXIES)
+    except requests.RequestException as e:
+        print(f"Тайм-аут/сетевая ошибка endpoint={endpoint} code={code}; пробуем следующий endpoint: {type(e).__name__}")
+        return None, False
 
     if response.status_code != 200:
-        return None
+        print(f"OilPriceAPI HTTP {response.status_code} endpoint={endpoint} code={code}")
+        return None, False
 
     try:
-        return response.json()
+        return response.json(), True
     except ValueError:
-        return None
+        print(f"OilPriceAPI вернул не JSON endpoint={endpoint} code={code}")
+        return None, False
 
 
 def fetch_data(config: dict) -> list:
@@ -250,9 +261,13 @@ def fetch_data(config: dict) -> list:
     """
     endpoints = ["/prices/past_month", "/prices/past_week", "/prices/latest"]
 
+    successful_responses = 0
+    attempts = 0
     for code in config.get("code_candidates", []):
         for endpoint in endpoints:
-            payload = _request_oilprice(endpoint, code)
+            attempts += 1
+            payload, request_ok = _request_oilprice(endpoint, code)
+            successful_responses += int(request_ok)
             if not payload:
                 continue
 
@@ -261,7 +276,9 @@ def fetch_data(config: dict) -> list:
                 print(f"Получено строк: {len(rows)} (code={code}, endpoint={endpoint})")
                 return rows
 
-    return []
+    if successful_responses == 0:
+        raise RuntimeError('OILPRICE_API_ENDPOINTS_UNREACHABLE')
+    raise RuntimeError('OILPRICE_API_RETURNED_NO_PRICE_ROWS')
 
 
 def save_rows(table_name: str, rows: list):

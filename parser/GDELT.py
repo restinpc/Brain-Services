@@ -119,7 +119,7 @@ def http_session():
 
 def download(session, url, target):
     """Скачиваем в файл, без хранения всего архива в RAM."""
-    from requests.exceptions import ChunkedEncodingError, ConnectionError, Timeout
+    from requests.exceptions import ChunkedEncodingError, ConnectionError, HTTPError, Timeout
     # Retry в HTTPAdapter не повторяет ошибки, возникшие ПОСЛЕ получения headers.
     for attempt in range(3):
         try:
@@ -129,6 +129,14 @@ def download(session, url, target):
                     for chunk in response.iter_content(1024 * 1024):
                         out.write(chunk)
             return
+        except HTTPError as error:
+            # Manifest-listed archives can be published a few minutes after
+            # their 15-minute interval. Retry only a transient 404; all other
+            # HTTP failures remain visible and fail the run.
+            if error.response is None or error.response.status_code != 404 or attempt == 2:
+                raise
+            print(f"GDELT archive not ready (HTTP 404), retry {attempt + 2}/3", flush=True)
+            time.sleep(2 ** attempt)
         except (ChunkedEncodingError, ConnectionError, Timeout):
             if attempt == 2:
                 raise
@@ -627,8 +635,12 @@ def main():
         def budget_expired(signum, frame):
             raise TimeoutError("GDELT recent stage budget exceeded; partial state retained")
         signal.signal(signal.SIGALRM, budget_expired)
-        signal.alarm(180)
-        end = utc_now()
+        signal.alarm(600)
+        # GDELT posts 15-minute batches a few minutes after each interval.
+        # Keep a 30-minute publication buffer so the live lane never requests
+        # a manifest-listed file before it is available; the rolling window
+        # and checkpoint preserve complete coverage.
+        end = utc_now() - timedelta(minutes=30)
         args.start = (end - timedelta(hours=args.recent_hours)).isoformat()
         args.end = end.isoformat()
         args.streams = "gkg"

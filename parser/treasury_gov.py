@@ -5,7 +5,7 @@ import requests
 import json
 import time
 from urllib.parse import urljoin
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import mysql.connector
 from mysql.connector import Error
 import traceback
@@ -73,6 +73,7 @@ RAW_DATASETS = {
     "TIPS_CPI_Data": "v1/accounting/od/tips_cpi_data",
     "Gold_Reserve": "v2/accounting/od/gold_reserve",
     "Auctions_Query": "v1/accounting/od/auctions_query",
+    "Auctions_Query_Updated": "v1/accounting/od/treasury_securities_auctions_v2",
     "Upcoming_Auctions": "v1/accounting/od/upcoming_auctions",
     "Record_Setting_Auction": "v2/accounting/od/record_setting_auction",
     "Buybacks_Operations": "v1/accounting/od/buybacks_operations",
@@ -104,6 +105,8 @@ MAX_RETRIES = 3
 # rows/updates from an already-seen date. Re-read a small tail and replace it
 # transactionally in MySQL.
 AUCTIONS_TABLE = "vlad_tr_auctions_query"
+AUCTIONS_V2_TABLE = "vlad_tr_auctions_query_updated"
+BUYBACKS_TABLE = "vlad_tr_buybacks_security_details"
 AUCTIONS_OVERLAP_DAYS = 7
 
 # Колонки с датами — для определения поля фильтрации
@@ -130,7 +133,8 @@ class TreasuryCollector:
                 cursor.execute("SHOW TABLES LIKE %s", (self.table_name,))
                 if not cursor.fetchone():
                     return None, None
-                for date_col in DATE_COLUMNS:
+                date_columns = (['operation_date'] + DATE_COLUMNS) if self.table_name == BUYBACKS_TABLE else DATE_COLUMNS
+                for date_col in date_columns:
                     try:
                         cursor.execute(f"SELECT MAX(`{date_col}`) FROM `{self.table_name}`")
                         row = cursor.fetchone()
@@ -152,7 +156,8 @@ class TreasuryCollector:
             data = resp.json()
             rows = data.get('data', [])
             if rows:
-                for col in DATE_COLUMNS:
+                date_columns = (['operation_date'] + DATE_COLUMNS) if self.table_name == BUYBACKS_TABLE else DATE_COLUMNS
+                for col in date_columns:
                     if col in rows[0]:
                         return col
         except Exception:
@@ -180,7 +185,10 @@ class TreasuryCollector:
             }
 
             # sort и filter добавляем ТОЛЬКО если колонка даты подтверждена
-            if date_col:
+            if self.table_name == AUCTIONS_V2_TABLE:
+                params['sort'] = '-record_date'
+                params['filter'] = f'record_date:lte:{datetime.now(timezone.utc).date().isoformat()}'
+            elif date_col:
                 params['sort'] = date_col
                 if last_date:
                     op = 'gte' if inclusive else 'gt'
@@ -225,10 +233,11 @@ class TreasuryCollector:
         for key in sample_row.keys():
             safe_key = self.sanitize_column_name(key)
             columns_def.append(f"`{safe_key}` TEXT NULL")
+        unique_def = ', UNIQUE KEY `uq_treasury_cusip_issue_date` (`cusip`(9), `issue_date`(10))' if self.table_name == AUCTIONS_V2_TABLE else ''
         sql = f"""
             CREATE TABLE IF NOT EXISTS `{self.table_name}` (
                 {', '.join(columns_def)},
-                `loaded_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                `loaded_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP{unique_def}
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         """
         with self.get_db_connection() as conn:
@@ -247,11 +256,23 @@ class TreasuryCollector:
         safe_keys = [self.sanitize_column_name(k) for k in keys]
         placeholders = ", ".join(["%s"] * len(keys))
         cols_str = ", ".join([f"`{k}`" for k in safe_keys])
-        sql = f"INSERT IGNORE INTO `{self.table_name}` ({cols_str}) VALUES ({placeholders})"
+        if self.table_name == AUCTIONS_V2_TABLE:
+            if any(not row.get('cusip') or not row.get('issue_date') for row in data):
+                raise ValueError('Treasury auctions v2 row missing official CUSIP + issue_date key')
+            updates = [f'`{k}`=VALUES(`{k}`)' for k in safe_keys if k not in ('cusip', 'issue_date')]
+            updates.append('`loaded_at`=UTC_TIMESTAMP()')
+            sql = f"INSERT INTO `{self.table_name}` ({cols_str}) VALUES ({placeholders}) ON DUPLICATE KEY UPDATE {', '.join(updates)}"
+        else:
+            sql = f"INSERT IGNORE INTO `{self.table_name}` ({cols_str}) VALUES ({placeholders})"
         batch_size = 1000
         total_inserted = 0
         with self.get_db_connection() as conn:
             cursor = conn.cursor()
+            if self.table_name == AUCTIONS_V2_TABLE:
+                cursor.execute(f"SELECT `cusip`, `issue_date` FROM `{self.table_name}`")
+                existing_keys = {(str(row[0]), str(row[1])) for row in cursor.fetchall()}
+                incoming_keys = {(str(row['cusip']), str(row['issue_date'])) for row in data}
+                total_inserted = len(incoming_keys - existing_keys)
             # For Auctions_Query we fetched a complete overlapping tail. Delete
             # that exact tail only after the HTTP fetch succeeded, then insert
             # the fresh API snapshot in the same DB transaction. This captures
@@ -277,13 +298,18 @@ class TreasuryCollector:
                         vals.append(v)
                     values.append(tuple(vals))
                 cursor.executemany(sql, values)
-                total_inserted += cursor.rowcount
+                if self.table_name != AUCTIONS_V2_TABLE:
+                    total_inserted += cursor.rowcount
             conn.commit()
         return total_inserted
 
     def process_dataset(self, endpoint: str):
         print(f"\n=== Обработка таблицы: {self.table_name} ===")
         last_date, date_col = self.get_last_record_date()
+        if self.table_name == AUCTIONS_V2_TABLE:
+            # Small, current official snapshot. Upsert by Treasury's documented key.
+            # The legacy table and its accumulated history remain untouched.
+            last_date, date_col = None, 'record_date'
         request_from = last_date
         inclusive = False
         replace_date_col = None
@@ -316,20 +342,32 @@ class TreasuryCollector:
             print(f"    Ошибка загрузки: {e}")
             return
         if not all_data:
-            if self.table_name == "vlad_tr_daily_treasury_statement_all" and last_date:
+            if self.table_name == AUCTIONS_V2_TABLE:
+                print("Получен пустой snapshot; новых данных нет")
+            if self.table_name in ("vlad_tr_daily_treasury_statement_all", BUYBACKS_TABLE) and last_date:
                 print(f"    Последняя запись: {last_date}")
             print("    Нет новых данных")
             return
-        print(f"    Получено {len(all_data)} новых строк")
+        if self.table_name == AUCTIONS_V2_TABLE:
+            print(f"    Получено snapshot записей: {len(all_data)}")
+        else:
+            print(f"    Получено {len(all_data)} новых строк")
         self.create_table_from_sample(all_data[0])
         inserted = self.insert_batch(
             all_data,
             replace_date_col=replace_date_col,
             replace_from=replace_from,
         )
-        print(f"    Вставлено новых записей: {inserted}")
+        if self.table_name == AUCTIONS_V2_TABLE:
+            print(f"    Синхронизировано записей snapshot: {len(all_data)}")
+            print(f"    Новых ключей Treasury: {inserted}")
+        else:
+            print(f"    Вставлено новых записей: {inserted}")
         if self.table_name == "vlad_tr_daily_treasury_statement_all":
             committed_latest = max(str(row["record_date"]) for row in all_data)
+            print(f"    Последняя запись: {committed_latest}")
+        elif self.table_name == BUYBACKS_TABLE:
+            committed_latest = max(str(row["operation_date"]) for row in all_data)
             print(f"    Последняя запись: {committed_latest}")
 
 

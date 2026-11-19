@@ -436,7 +436,15 @@ async def _fetch_aisstream_async():
 
 
 def _fetch_aisstream_vessels():
-    return asyncio.run(_fetch_aisstream_async())
+    result = None
+    for attempt in range(3):
+        result = asyncio.run(_fetch_aisstream_async())
+        if result[2] != 'error' or attempt == 2:
+            return result
+        delay = 2 * (attempt + 1)
+        print(f"    AISStream: повторное подключение после ошибки (попытка {attempt + 2}/3), пауза {delay}s")
+        time.sleep(delay)
+    return result
 
 
 def _vessel_lat(v):
