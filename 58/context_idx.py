@@ -94,6 +94,9 @@ async def build_index(engine_sasha, engine_brain):
         for attempt in range(3):
             try:
                 async with engine_sasha.begin() as conn:
+                    # Both services share this three-row index. Acquire primary
+                    # locks in the same order before secondary-key upserts.
+                    await conn.execute(text(f"SELECT id FROM `{CTX_TABLE}` ORDER BY id FOR UPDATE"))
                     # Context IDs are part of model weight codes. Update the
                     # three stable categories without resetting/reallocating IDs.
                     for event_type in EVENT_TYPES:
