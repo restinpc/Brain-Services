@@ -39,6 +39,27 @@ DEFAULTS = {
 }
 STREAMS = {"event": "event", "mention": "mention", "article_metadata": "gkg"}
 
+# _features() consumes only these raw GDELT fields. Projecting the JSON paths
+# server-side avoids sending the full multi-kilobyte provider payload per row.
+RAW_PAYLOAD_PROJECTION_SQL = """CASE record_type
+    WHEN 'event' THEN JSON_OBJECT(
+        'EventRootCode', JSON_EXTRACT(raw_payload, '$.EventRootCode'),
+        'GoldsteinScale', JSON_EXTRACT(raw_payload, '$.GoldsteinScale'),
+        'QuadClass', JSON_EXTRACT(raw_payload, '$.QuadClass'),
+        'AvgTone', JSON_EXTRACT(raw_payload, '$.AvgTone')
+    )
+    WHEN 'mention' THEN JSON_OBJECT(
+        'Confidence', JSON_EXTRACT(raw_payload, '$.Confidence'),
+        'MentionDocTone', JSON_EXTRACT(raw_payload, '$.MentionDocTone')
+    )
+    WHEN 'article_metadata' THEN JSON_OBJECT(
+        'V2Tone', JSON_EXTRACT(raw_payload, '$.V2Tone'),
+        'Themes', JSON_EXTRACT(raw_payload, '$.Themes'),
+        'V2Themes', JSON_EXTRACT(raw_payload, '$.V2Themes')
+    )
+    ELSE JSON_OBJECT()
+END AS raw_payload"""
+
 
 def _number(value):
     try:
@@ -332,6 +353,49 @@ def _identifier(name):
     return name
 
 
+SOURCE_PAGE_SIZE = 5000
+GDELT_SOURCE_LOCK = "brain:sasha_gdelt_news:model100-snapshot-v1"
+GDELT_SOURCE_LOCK_TIMEOUT_SECONDS = 300
+
+
+async def _acquire_gdelt_snapshot_lock(conn):
+    from sqlalchemy import text
+    result = await conn.execute(text("SELECT GET_LOCK(:name, :timeout)"), {
+        "name": GDELT_SOURCE_LOCK,
+        "timeout": GDELT_SOURCE_LOCK_TIMEOUT_SECONDS,
+    })
+    if result.scalar_one() != 1:
+        raise RuntimeError("GDELT_SOURCE_SNAPSHOT_LOCK_TIMEOUT")
+
+
+async def _release_gdelt_snapshot_lock(conn):
+    from sqlalchemy import text
+    result = await conn.execute(text("SELECT RELEASE_LOCK(:name)"), {
+        "name": GDELT_SOURCE_LOCK,
+    })
+    if result.scalar_one() != 1:
+        raise RuntimeError("GDELT_SOURCE_SNAPSHOT_LOCK_RELEASE_FAILED")
+
+
+def _build_source_page_sql(source, conditions, order_expression, *, has_cursor):
+    cursor = ""
+    if has_cursor:
+        cursor = (
+            f" AND ({order_expression} > :cursor_time OR "
+            f"({order_expression} = :cursor_time AND id > :cursor_id))"
+        )
+    tick = chr(96)
+    return f"""
+        SELECT id, record_key, provider, record_type, publication_id, event_id,
+               available_at, loaded_at, themes, v2_themes, v2_tone,
+               {RAW_PAYLOAD_PROJECTION_SQL}, {order_expression} AS _sort_at
+        FROM {tick}{source}{tick}
+        WHERE {conditions} AND id <= :max_id{cursor}
+        ORDER BY _sort_at, id
+        LIMIT :batch_size
+    """
+
+
 async def enrich_dataset(engine_vlad, engine_brain):
     from sqlalchemy import text
 
@@ -351,11 +415,6 @@ async def enrich_dataset(engine_vlad, engine_brain):
     if settings["availability_mode"] == "first_seen":
         conditions += " AND loaded_at IS NOT NULL"
         order = "GREATEST(TIMESTAMPADD(MICROSECOND, :lag_microseconds, available_at), loaded_at)"
-    query = text(f"""
-        SELECT record_key, provider, record_type, publication_id, event_id,
-               available_at, loaded_at, themes, v2_themes, v2_tone, raw_payload
-        FROM `{source}` WHERE {conditions} ORDER BY {order}
-    """)
     async with engine_vlad.begin() as conn:
         await conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS `{enriched}` (
@@ -378,15 +437,56 @@ async def enrich_dataset(engine_vlad, engine_brain):
             """)
             pending = []
             async with engine.connect() as conn:
-                result = await conn.stream(query, {"lag_microseconds": round(settings["publication_lag_minutes"] * 60_000_000)})
+                await _acquire_gdelt_snapshot_lock(conn)
                 try:
-                    async for row in result.mappings():
-                        pending.extend(builder.add(dict(row)))
-                        if len(pending) >= 1000:
-                            await dest.execute(insert, pending)
-                            pending.clear()
+                    await conn.commit()
+                    tick = chr(96)
+                    high_water_result = await conn.execute(
+                        text(f"SELECT COALESCE(MAX(id), 0) FROM {tick}{source}{tick}")
+                    )
+                    max_id = int(high_water_result.scalar_one())
+                    await conn.commit()
+                    cursor_time = None
+                    cursor_id = None
+                    lag_microseconds = round(settings["publication_lag_minutes"] * 60_000_000)
+                    while True:
+                        has_cursor = cursor_time is not None
+                        query = text(_build_source_page_sql(
+                            source, conditions, order, has_cursor=has_cursor
+                        ))
+                        params = {
+                            "max_id": max_id,
+                            "batch_size": SOURCE_PAGE_SIZE,
+                            "lag_microseconds": lag_microseconds,
+                        }
+                        if has_cursor:
+                            params.update(cursor_time=cursor_time, cursor_id=cursor_id)
+                        page_count = 0
+                        result = await conn.stream(query, params)
+                        try:
+                            async for row in result.mappings():
+                                row = dict(row)
+                                next_cursor = (row["_sort_at"], int(row["id"]))
+                                if cursor_time is not None and next_cursor <= (cursor_time, cursor_id):
+                                    raise RuntimeError("GDELT source page cursor did not advance")
+                                cursor_time, cursor_id = next_cursor
+                                page_count += 1
+                                pending.extend(builder.add(row))
+                                if len(pending) >= 1000:
+                                    await dest.execute(insert, pending)
+                                    pending.clear()
+                        finally:
+                            await result.close()
+                        # Each source statement is bounded; the shared advisory
+                        # lock keeps GDELT replays from revising rows until all pages finish.
+                        await conn.commit()
+                        if page_count == 0:
+                            break
                 finally:
-                    await result.close()
+                    if conn.in_transaction():
+                        await conn.rollback()
+                    await _release_gdelt_snapshot_lock(conn)
+                    await conn.commit()
             pending.extend(builder.finish())
             if pending:
                 await dest.execute(insert, pending)
