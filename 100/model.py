@@ -353,6 +353,28 @@ def _identifier(name):
     return name
 
 
+SOURCE_PAGE_SIZE = 5000
+
+
+def _build_source_page_sql(source, conditions, order_expression, *, has_cursor):
+    cursor = ""
+    if has_cursor:
+        cursor = (
+            f" AND ({order_expression} > :cursor_time OR "
+            f"({order_expression} = :cursor_time AND id > :cursor_id))"
+        )
+    tick = chr(96)
+    return f"""
+        SELECT id, record_key, provider, record_type, publication_id, event_id,
+               available_at, loaded_at, themes, v2_themes, v2_tone,
+               {RAW_PAYLOAD_PROJECTION_SQL}, {order_expression} AS _sort_at
+        FROM {tick}{source}{tick}
+        WHERE {conditions} AND id <= :max_id{cursor}
+        ORDER BY _sort_at, id
+        LIMIT :batch_size
+    """
+
+
 async def enrich_dataset(engine_vlad, engine_brain):
     from sqlalchemy import text
 
@@ -372,12 +394,6 @@ async def enrich_dataset(engine_vlad, engine_brain):
     if settings["availability_mode"] == "first_seen":
         conditions += " AND loaded_at IS NOT NULL"
         order = "GREATEST(TIMESTAMPADD(MICROSECOND, :lag_microseconds, available_at), loaded_at)"
-    query = text(f"""
-        SELECT record_key, provider, record_type, publication_id, event_id,
-               available_at, loaded_at, themes, v2_themes, v2_tone,
-               {RAW_PAYLOAD_PROJECTION_SQL}
-        FROM `{source}` WHERE {conditions} ORDER BY {order}
-    """)
     async with engine_vlad.begin() as conn:
         await conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS `{enriched}` (
@@ -400,15 +416,48 @@ async def enrich_dataset(engine_vlad, engine_brain):
             """)
             pending = []
             async with engine.connect() as conn:
-                result = await conn.stream(query, {"lag_microseconds": round(settings["publication_lag_minutes"] * 60_000_000)})
-                try:
-                    async for row in result.mappings():
-                        pending.extend(builder.add(dict(row)))
-                        if len(pending) >= 1000:
-                            await dest.execute(insert, pending)
-                            pending.clear()
-                finally:
-                    await result.close()
+                tick = chr(96)
+                high_water_result = await conn.execute(
+                    text(f"SELECT COALESCE(MAX(id), 0) FROM {tick}{source}{tick}")
+                )
+                max_id = int(high_water_result.scalar_one())
+                await conn.commit()
+                cursor_time = None
+                cursor_id = None
+                lag_microseconds = round(settings["publication_lag_minutes"] * 60_000_000)
+                while True:
+                    has_cursor = cursor_time is not None
+                    query = text(_build_source_page_sql(
+                        source, conditions, order, has_cursor=has_cursor
+                    ))
+                    params = {
+                        "max_id": max_id,
+                        "batch_size": SOURCE_PAGE_SIZE,
+                        "lag_microseconds": lag_microseconds,
+                    }
+                    if has_cursor:
+                        params.update(cursor_time=cursor_time, cursor_id=cursor_id)
+                    page_count = 0
+                    result = await conn.stream(query, params)
+                    try:
+                        async for row in result.mappings():
+                            row = dict(row)
+                            next_cursor = (row["_sort_at"], int(row["id"]))
+                            if cursor_time is not None and next_cursor <= (cursor_time, cursor_id):
+                                raise RuntimeError("GDELT source page cursor did not advance")
+                            cursor_time, cursor_id = next_cursor
+                            page_count += 1
+                            pending.extend(builder.add(row))
+                            if len(pending) >= 1000:
+                                await dest.execute(insert, pending)
+                                pending.clear()
+                    finally:
+                        await result.close()
+                    # End each bounded read transaction to release its shared
+                    # metadata lock so queued DDL is not held behind a 2.3M-row stream.
+                    await conn.commit()
+                    if page_count == 0:
+                        break
             pending.extend(builder.finish())
             if pending:
                 await dest.execute(insert, pending)

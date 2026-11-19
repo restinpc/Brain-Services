@@ -66,5 +66,27 @@ class GdeltPayloadProjectionTests(unittest.TestCase):
             self.assertEqual(projected_stats, original_stats, record_type)
 
 
+    def test_source_page_sql_is_bounded_and_has_stable_keyset_cursor(self):
+        sql = gdelt._build_source_page_sql(
+            "sasha_gdelt_news", "provider='gdelt' AND available_at IS NOT NULL",
+            "available_at", has_cursor=True,
+        )
+        self.assertIn("id <= :max_id", sql)
+        self.assertIn("LIMIT :batch_size", sql)
+        self.assertIn("ORDER BY _sort_at, id", sql)
+        self.assertIn("available_at > :cursor_time", sql)
+        self.assertIn("available_at = :cursor_time AND id > :cursor_id", sql)
+        self.assertNotIn("OFFSET", sql.upper())
+
+    def test_source_page_sql_can_start_at_snapshot_high_watermark(self):
+        sql = gdelt._build_source_page_sql(
+            "sasha_gdelt_news", "provider='gdelt' AND available_at IS NOT NULL",
+            "available_at", has_cursor=False,
+        )
+        self.assertIn("id <= :max_id", sql)
+        self.assertNotIn(":cursor_time", sql)
+        self.assertNotIn(":cursor_id", sql)
+
+
 if __name__ == "__main__":
     unittest.main()
