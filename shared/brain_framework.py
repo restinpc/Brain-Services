@@ -6384,7 +6384,7 @@ def build_app(model_module) -> FastAPI:
     async def ep_values(
         pair: int = Query(1), day: int = Query(1),
         date: str = Query(...),
-        type: int = Query(0, ge=0, le=4),
+        type: int = Query(0, ge=0, le=6),
         var:  int = Query(0),
         param: str = Query(""),
         _cache_hop: int = Query(0, ge=0, le=1, include_in_schema=False),
