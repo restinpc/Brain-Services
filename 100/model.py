@@ -39,6 +39,27 @@ DEFAULTS = {
 }
 STREAMS = {"event": "event", "mention": "mention", "article_metadata": "gkg"}
 
+# _features() consumes only these raw GDELT fields. Projecting the JSON paths
+# server-side avoids sending the full multi-kilobyte provider payload per row.
+RAW_PAYLOAD_PROJECTION_SQL = """CASE record_type
+    WHEN 'event' THEN JSON_OBJECT(
+        'EventRootCode', JSON_EXTRACT(raw_payload, '$.EventRootCode'),
+        'GoldsteinScale', JSON_EXTRACT(raw_payload, '$.GoldsteinScale'),
+        'QuadClass', JSON_EXTRACT(raw_payload, '$.QuadClass'),
+        'AvgTone', JSON_EXTRACT(raw_payload, '$.AvgTone')
+    )
+    WHEN 'mention' THEN JSON_OBJECT(
+        'Confidence', JSON_EXTRACT(raw_payload, '$.Confidence'),
+        'MentionDocTone', JSON_EXTRACT(raw_payload, '$.MentionDocTone')
+    )
+    WHEN 'article_metadata' THEN JSON_OBJECT(
+        'V2Tone', JSON_EXTRACT(raw_payload, '$.V2Tone'),
+        'Themes', JSON_EXTRACT(raw_payload, '$.Themes'),
+        'V2Themes', JSON_EXTRACT(raw_payload, '$.V2Themes')
+    )
+    ELSE JSON_OBJECT()
+END AS raw_payload"""
+
 
 def _number(value):
     try:
@@ -353,7 +374,8 @@ async def enrich_dataset(engine_vlad, engine_brain):
         order = "GREATEST(TIMESTAMPADD(MICROSECOND, :lag_microseconds, available_at), loaded_at)"
     query = text(f"""
         SELECT record_key, provider, record_type, publication_id, event_id,
-               available_at, loaded_at, themes, v2_themes, v2_tone, raw_payload
+               available_at, loaded_at, themes, v2_themes, v2_tone,
+               {RAW_PAYLOAD_PROJECTION_SQL}
         FROM `{source}` WHERE {conditions} ORDER BY {order}
     """)
     async with engine_vlad.begin() as conn:
