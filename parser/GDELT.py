@@ -17,6 +17,7 @@ import json
 import math
 import os
 import re
+import shlex
 import sys
 import tempfile
 import time
@@ -536,6 +537,19 @@ def process(args, sink):
     with http_session() as session, tempfile.TemporaryDirectory(prefix="brain_gdelt_") as temp:
         # Храним индекс на диске: HTTP-соединение не остаётся открытым во время долгого backfill.
         index = args.manifest_file
+        if index is None and args.manifest_cache:
+            index = args.manifest_cache
+            fresh = index.is_file() and (time.time() - index.stat().st_mtime) < args.manifest_cache_max_age
+            if fresh:
+                print(f"GDELT: используем кэш masterfilelist.txt ({index.stat().st_size:,} байт)", flush=True)
+            else:
+                index.parent.mkdir(parents=True, exist_ok=True)
+                partial = index.with_suffix(index.suffix + ".part")
+                partial.unlink(missing_ok=True)
+                print("GDELT: обновляем кэш masterfilelist.txt", flush=True)
+                download(session, MANIFEST, partial)
+                partial.replace(index)
+                print(f"GDELT: кэш обновлён ({index.stat().st_size:,} байт)", flush=True)
         if index is None:
             index = Path(temp) / "masterfilelist.txt"
             print("GDELT: скачивание индекса архивов masterfilelist.txt", flush=True)
@@ -573,17 +587,34 @@ def process(args, sink):
     print(f"GDELT: обработано блоков {processed}")
 
 
+def expand_registered_argument(argv):
+    """Unpack parser.php's single quoted registry argument, if present."""
+    if (len(argv) == 8 and argv[7].lstrip().startswith("--")
+            and any(char.isspace() for char in argv[7])):
+        return argv[:7] + shlex.split(argv[7], posix=True)
+    return argv
+
+
 def main():
     parser = argument_parser("GDELT 2.0 архив → MySQL")
     parser.add_argument("--streams", default="export,mentions,gkg", help="export,mentions,gkg или их подмножество")
     parser.add_argument("--manifest-file", type=Path, help="Локальный masterfilelist вместо загрузки индекса")
+    parser.add_argument("--manifest-cache", type=Path, help="Кэш masterfilelist для коротких повторных запусков")
+    parser.add_argument("--manifest-cache-max-age", type=int, default=10800,
+                        help="Максимальный возраст кэша в секундах")
     parser.add_argument("--archive-dir", type=Path, help="Локальные ZIP вместо HTTP (для повторного импорта)")
     parser.add_argument("--recent-hours", type=int, default=0, help="Bounded recent UTC window; historical checkpoints retained")
+    # parser.php shell-quotes the whole registry `argument` value as one argv
+    # item. Expand only that exact launcher shape; ordinary CLI calls already
+    # arrive as individual argv entries and remain untouched.
+    sys.argv[:] = expand_registered_argument(sys.argv)
     args = parser.parse_args()
     recent_lock = None
     if args.recent_hours:
         if not 1 <= args.recent_hours <= 48 or args.replay or args.jsonl or args.manifest_file or args.archive_dir:
             parser.error("recent mode requires 1..48 hours and no replay/alternate input")
+        if args.manifest_cache_max_age < 0 or args.manifest_cache_max_age > 86400:
+            parser.error("manifest cache age must be 0..86400 seconds")
         import fcntl
         from datetime import timedelta
         recent_lock = open("/run/lock/brain-gdelt-current.lock", "a")

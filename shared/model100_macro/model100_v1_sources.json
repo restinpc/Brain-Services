@@ -1,0 +1,11 @@
+{
+  "version": "model100-v1-minimal-20261108",
+  "allowed_sources": ["FED_FOMC", "ECB_HIST", "BLS_RELEASES", "BEA_RELEASES", "EUROSTAT_FLASH", "IFO_VINTAGE", "GDP_NOW_ATL", "ALFRED", "ZEW", "CLEVELAND_NOW", "NYFED_NOW"],
+  "actual_sources": ["FED_FOMC", "ECB_HIST", "BLS_RELEASES", "BEA_RELEASES", "EUROSTAT_FLASH"],
+  "excluded_sources": ["ECB_MID", "DEST_ATIS_CPI", "ADP_NER", "SP_GLOBAL_FLASH_PMI", "ISM_PMI", "ECB_EDP_VINTAGE", "CENSUS_RETAIL", "WHITEHOUSE_TRADE", "USTR_TRADE", "TRUFLATION", "CME_FEDWATCH", "NYFED_SME", "ECB_SPF"],
+  "day_only_policy": "NEXT_DAY_12UTC",
+  "include_revisions": false,
+  "ifo_series": ["Expectations"],
+  "alfred_series": ["ADPMNUSNERSA", "ADPWNUSNERSA"],
+  "documents_as_features": false
+}

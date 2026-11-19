@@ -4,6 +4,7 @@ async def build_index(engine_sasha, engine_brain):
     rate_hike / rate_cut / rate_unchanged, записываем индекс в sasha.
     """
     from datetime import datetime, time
+    import asyncio
     import traceback
 
     from sqlalchemy import text
@@ -89,31 +90,51 @@ async def build_index(engine_sasha, engine_brain):
 
             prev_value = v
 
-        _log("WRITE", f"Truncating `{CTX_TABLE}` and inserting context rows")
-        async with engine_sasha.begin() as conn:
-            await conn.execute(text(f"TRUNCATE TABLE `{CTX_TABLE}`"))
-            for event_type in EVENT_TYPES:
-                item = stats[event_type]
-                occ = int(item["occurrence_count"])
-                avg_value = (item["value_sum"] / occ) if occ > 0 else None
-                avg_abs_change = (item["abs_change_sum"] / occ) if occ > 0 else None
-                await conn.execute(text(f"""
-                    INSERT INTO `{CTX_TABLE}`
-                        (event_type, occurrence_count, avg_value, min_value, max_value,
-                         avg_abs_change, first_dt, last_dt)
-                    VALUES
-                        (:event_type, :cnt, :avg_value, :min_value, :max_value,
-                         :avg_abs_change, :first_dt, :last_dt)
-                """), {
-                    "event_type": event_type,
-                    "cnt": occ,
-                    "avg_value": avg_value,
-                    "min_value": item["value_min"],
-                    "max_value": item["value_max"],
-                    "avg_abs_change": avg_abs_change,
-                    "first_dt": item["first_dt"],
-                    "last_dt": item["last_dt"],
-                })
+        _log("WRITE", f"Upserting context rows into `{CTX_TABLE}`")
+        for attempt in range(3):
+            try:
+                async with engine_sasha.begin() as conn:
+                    # Context IDs are part of model weight codes. Update the
+                    # three stable categories without resetting/reallocating IDs.
+                    for event_type in EVENT_TYPES:
+                        item = stats[event_type]
+                        occ = int(item["occurrence_count"])
+                        avg_value = (item["value_sum"] / occ) if occ > 0 else None
+                        avg_abs_change = (item["abs_change_sum"] / occ) if occ > 0 else None
+                        await conn.execute(text(f"""
+                            INSERT INTO `{CTX_TABLE}`
+                                (event_type, occurrence_count, avg_value, min_value, max_value,
+                                 avg_abs_change, first_dt, last_dt)
+                            VALUES
+                                (:event_type, :cnt, :avg_value, :min_value, :max_value,
+                                 :avg_abs_change, :first_dt, :last_dt)
+                            ON DUPLICATE KEY UPDATE
+                                occurrence_count=VALUES(occurrence_count),
+                                avg_value=VALUES(avg_value),
+                                min_value=VALUES(min_value),
+                                max_value=VALUES(max_value),
+                                avg_abs_change=VALUES(avg_abs_change),
+                                first_dt=VALUES(first_dt),
+                                last_dt=VALUES(last_dt)
+                        """), {
+                            "event_type": event_type,
+                            "cnt": occ,
+                            "avg_value": avg_value,
+                            "min_value": item["value_min"],
+                            "max_value": item["value_max"],
+                            "avg_abs_change": avg_abs_change,
+                            "first_dt": item["first_dt"],
+                            "last_dt": item["last_dt"],
+                        })
+                break
+            except Exception as exc:
+                orig = getattr(exc, "orig", exc)
+                args = getattr(orig, "args", ())
+                code = getattr(orig, "errno", args[0] if args else None)
+                if code not in (1062, 1205, 1213) or attempt == 2:
+                    raise
+                _log("RETRY", f"transaction rolled back on MySQL {code}; retry {attempt + 1}/2")
+                await asyncio.sleep(0.25 * (attempt + 1))
 
         _log("DONE", "build_index finished successfully")
         total_events = sum(int(item["occurrence_count"]) for item in stats.values())

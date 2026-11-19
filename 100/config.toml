@@ -22,7 +22,7 @@ batch_model_size = 1000
 [dataset]
 parser_table = "sasha_gdelt_news"
 # GDELT.py writes to DB_* by default; brain selects MASTER_* instead.
-source_engine = "vlad"
+source_engine = "brain"
 enriched_table = "sasha_gdelt_regimes_s100"
 index_fields = ["event_type"]
 date_field = "date_dt"
