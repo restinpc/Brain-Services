@@ -8,6 +8,7 @@ text = "Polymarket prediction-market probability pressure: causal H1/H6/H24 repr
 table = "brain_rates_eur_usd"
 
 [cache]
+shared_legacy_compatible = true
 date_from = "2026-03-01"
 var_range = [0, 1, 2, 3]
 types_range = [0, 1, 2, 3, 4]
