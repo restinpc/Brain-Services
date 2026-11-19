@@ -17,6 +17,40 @@ sys.modules["news_history"] = history
 import model as gdelt
 
 
+class FakeLockResult:
+    def __init__(self, value):
+        self.value = value
+
+    def scalar_one(self):
+        return self.value
+
+
+class FakeAsyncConnection:
+    def __init__(self, values):
+        self.values = iter(values)
+        self.calls = []
+
+    async def execute(self, statement, params):
+        self.calls.append((str(statement), params))
+        return FakeLockResult(next(self.values))
+
+
+class GdeltSourceLockTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reader_acquires_and_releases_the_parser_snapshot_lock(self):
+        conn = FakeAsyncConnection([1, 1])
+        await gdelt._acquire_gdelt_snapshot_lock(conn)
+        await gdelt._release_gdelt_snapshot_lock(conn)
+        self.assertIn("GET_LOCK", conn.calls[0][0])
+        self.assertIn("RELEASE_LOCK", conn.calls[1][0])
+        self.assertEqual(conn.calls[0][1]["name"], conn.calls[1][1]["name"])
+        self.assertEqual(conn.calls[0][1]["timeout"], gdelt.GDELT_SOURCE_LOCK_TIMEOUT_SECONDS)
+
+    async def test_reader_fails_closed_if_snapshot_lock_is_not_acquired(self):
+        conn = FakeAsyncConnection([0])
+        with self.assertRaisesRegex(RuntimeError, "GDELT_SOURCE_SNAPSHOT_LOCK_TIMEOUT"):
+            await gdelt._acquire_gdelt_snapshot_lock(conn)
+
+
 class GdeltPayloadProjectionTests(unittest.TestCase):
     def test_query_uses_type_specific_projection_instead_of_full_payload(self):
         sql = gdelt.RAW_PAYLOAD_PROJECTION_SQL
@@ -77,6 +111,13 @@ class GdeltPayloadProjectionTests(unittest.TestCase):
         self.assertIn("available_at > :cursor_time", sql)
         self.assertIn("available_at = :cursor_time AND id > :cursor_id", sql)
         self.assertNotIn("OFFSET", sql.upper())
+
+    def test_reader_and_gdelt_writer_share_snapshot_lock_name(self):
+        parser_source = (ROOT / "parser" / "GDELT.py").read_text()
+        self.assertIn(
+            f'GDELT_SOURCE_LOCK = "{gdelt.GDELT_SOURCE_LOCK}"',
+            parser_source,
+        )
 
     def test_source_page_sql_can_start_at_snapshot_high_watermark(self):
         sql = gdelt._build_source_page_sql(

@@ -151,6 +151,9 @@ EXTENDED_COLUMNS = {
     "observation_id": "CHAR(64) CHARACTER SET ascii COLLATE ascii_bin",
     **{name: "JSON" for name in GKG_FEATURE_COLUMNS},
 }
+GDELT_SOURCE_LOCK = "brain:sasha_gdelt_news:model100-snapshot-v1"
+GDELT_SOURCE_LOCK_TIMEOUT_SECONDS = 300
+
 DB_COLUMNS = ("record_key", "provider", "record_type", "publication_id", "event_id", "story_id",
            "headline", "full_text", "source", "source_url", "published_at", "observed_at",
            "updated_at", "event_date", "date_iso", "entities", "themes", "relationships", "raw_payload",
@@ -263,9 +266,31 @@ class NewsSink:
         values = [tuple(json_text(row[c]) if c in JSON_COLUMNS and row.get(c) is not None
                         else row.get(c) for c in DB_COLUMNS)
                   for row in rows]
+        acquired = False
         with self.conn.cursor() as cur:
-            cur.executemany(sql, values)
-        self.conn.commit()
+            cur.execute("SELECT GET_LOCK(%s, %s)",
+                        (GDELT_SOURCE_LOCK, GDELT_SOURCE_LOCK_TIMEOUT_SECONDS))
+            result = cur.fetchone()
+            acquired = bool(result and result[0] == 1)
+        if not acquired:
+            raise RuntimeError("GDELT_SOURCE_SNAPSHOT_LOCK_TIMEOUT")
+        try:
+            with self.conn.cursor() as cur:
+                cur.executemany(sql, values)
+            self.conn.commit()
+        except BaseException:
+            self.conn.rollback()
+            raise
+        finally:
+            try:
+                with self.conn.cursor() as cur:
+                    cur.execute("SELECT RELEASE_LOCK(%s)", (GDELT_SOURCE_LOCK,))
+                    cur.fetchone()
+            except Exception:
+                # A broken connection releases its server-side advisory lock.
+                self.conn.close()
+                self.conn = None
+                raise
 
     def consume(self, unit, rows):
         count, batch = 0, []
