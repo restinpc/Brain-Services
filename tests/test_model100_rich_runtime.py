@@ -23,8 +23,20 @@ class RuntimeTests(unittest.TestCase):
         (p/'RESEARCH-verified-manifest.json').write_text(canonical(manifest))
         return q
 
+    def test_transport_ceiling_retains_full_context_and_stays_bounded(self):
+        at,schema,row,rich,record=self.fixture()
+        rich['groups']['news']['transport_test']='x'*524288
+        rich['group_sha256']['news']=digest(rich['groups']['news'])
+        encoded=encode_context(row,rich,schema,version=runtime.DATASET)
+        self.assertEqual(json.loads(encoded['rich_context']),rich)
+        self.assertEqual(encoded['rich_sha256'],digest(rich))
+        rich['groups']['news']['transport_test']='x'*1048576
+        rich['group_sha256']['news']=digest(rich['groups']['news'])
+        with self.assertRaisesRegex(ValueError,'RICH_CONTEXT_SIZE_LIMIT'):
+            encode_context(row,rich,schema,version=runtime.DATASET)
+
     def test_writer_uses_new_immutable_generation(self):
-        self.assertEqual(runtime.DATASET, 'model100-h1-v2full-20261118')
+        self.assertEqual(runtime.DATASET, 'model100-h1-v2full-20261120')
         self.assertEqual(runtime.VERSION if hasattr(runtime, 'VERSION') else contract()['version'], 'model100-rich-v2full-2')
 
     def test_verified_shard_reconstructs(self):
