@@ -286,6 +286,16 @@ class QuotesCollector:
                 snapshot_at,
             ))
 
+        # The native writer lease serializes this bounded snapshot-key probe.
+        # MySQL affected rows count updates twice; it is not a new-key count.
+        symbols = list(dict.fromkeys(q["symbol"] for q in all_quotes))
+        c.execute(
+            f"SELECT symbol FROM `{self.table_name}` WHERE snapshot_hour=%s "
+            f"AND symbol IN ({','.join(['%s'] * len(symbols))})",
+            (snapshot_hour, *symbols),
+        )
+        existing = {r[0] for r in c.fetchall()}
+        new_keys = len(set(symbols) - existing)
         c.executemany(sql, rows)
         conn.commit()
         affected = c.rowcount
@@ -293,6 +303,7 @@ class QuotesCollector:
         conn.close()
 
         print(f"   Обновлено/записано строк: {affected}")
+        print(f"   Новых ключей котировок: {new_keys}")
         print("   Пример:")
         for q in all_quotes[:5]:
             sym = q.get("symbol", "?")
