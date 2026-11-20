@@ -4206,6 +4206,9 @@ def build_app(model_module) -> FastAPI:
     _rebuild_lock = asyncio.Lock()
 
     def _rebuild_supported() -> bool:
+        # Proxy-only nodes consume the upstream result and own no local dataset.
+        if s.compute_worker is False:
+            return False
         # Keep hourly capability identical to the established /rebuild_index
         # contract; enrich_fn alone is not the complete contract.
         return bool(
