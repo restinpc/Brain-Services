@@ -166,6 +166,7 @@ def finnhub_get_quote(session, symbol, timeout=30):
                 print(f"   Нет данных для {symbol}")
                 return None
 
+            print(f"Finnhub quote HTTP={response.status_code} symbol={symbol}", flush=True)
             data["symbol"] = symbol
             return data
 
