@@ -22,6 +22,7 @@ import re
 import html
 import argparse
 import datetime as dt
+import time
 import traceback
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
@@ -256,9 +257,15 @@ def fetch_rss_xml():
         "Accept": "application/rss+xml, application/xml, text/xml, */*",
         "Cache-Control": "no-cache",
     }
-    response = requests.get(RSS_URL, headers=headers, timeout=REQUEST_TIMEOUT)
-    response.raise_for_status()
-    return response.content
+    for attempt in range(3):
+        try:
+            response = requests.get(RSS_URL, headers=headers, timeout=REQUEST_TIMEOUT)
+            response.raise_for_status()
+            return response.content
+        except (requests.Timeout, requests.ConnectionError):
+            if attempt == 2:
+                raise
+            time.sleep(2 ** attempt)
 
 
 def parse_rss_items(xml_bytes, limit=0):

@@ -49,5 +49,25 @@ class SourceFetchRetryTests(unittest.TestCase):
         sleep.assert_called_once()
 
 
+    def test_coindesk_rss_retries_transient_timeout(self):
+        ns = load_script('coindesk_crypto_news.py', 'vlad_coindesk_crypto_news')
+        response = type('Response', (), {'content': b'<rss/>', 'raise_for_status': lambda self: None})()
+        with patch.object(ns['requests'], 'get', side_effect=[ns['requests'].ReadTimeout('slow'), response]) as get, \
+             patch('time.sleep') as sleep:
+            payload = ns['fetch_rss_xml']()
+        self.assertEqual(payload, b'<rss/>')
+        self.assertEqual(get.call_count, 2)
+        sleep.assert_called_once()
+
+
+    def test_coindesk_rss_http_error_is_not_retried(self):
+        ns = load_script('coindesk_crypto_news.py', 'vlad_coindesk_crypto_news')
+        response = type('Response', (), {'content': b'', 'raise_for_status': lambda self: (_ for _ in ()).throw(ns['requests'].HTTPError('403'))})()
+        with patch.object(ns['requests'], 'get', return_value=response) as get, \
+             self.assertRaises(ns['requests'].HTTPError):
+            ns['fetch_rss_xml']()
+        get.assert_called_once()
+
+
 if __name__ == '__main__':
     unittest.main()
