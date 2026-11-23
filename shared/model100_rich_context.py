@@ -13,7 +13,9 @@ from .model100_h1_features import canonical, digest, clock, number, HOUR, EventI
 VERSION = 'model100-rich-v2full-2'
 DATASET = 'model100-h1-v2full-20261109b'
 GROUPS = ('news', 'macro', 'price', 'gdelt', 'binance', 'cftc', 'fxcm')
-MAX_BYTES = 524288
+# Bounded transport ceiling, not a feature selection rule. Full admitted
+# contexts exceeded 512 KiB without violating any per-group content bound.
+MAX_BYTES = 1048576
 
 
 def contract():

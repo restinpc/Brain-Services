@@ -1,0 +1,133 @@
+from collections import Counter
+import json
+from pathlib import Path
+import sys
+import types
+import unittest
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path[:0] = [str(ROOT), str(ROOT / "100")]
+framework = types.ModuleType("brain_framework")
+framework.get_service_config = lambda: {}
+sys.modules["brain_framework"] = framework
+history = types.ModuleType("news_history")
+history.history_for = lambda *args, **kwargs: None
+history.invalidate = lambda *args, **kwargs: None
+sys.modules["news_history"] = history
+import model as gdelt
+
+
+class FakeLockResult:
+    def __init__(self, value):
+        self.value = value
+
+    def scalar_one(self):
+        return self.value
+
+
+class FakeAsyncConnection:
+    def __init__(self, values):
+        self.values = iter(values)
+        self.calls = []
+
+    async def execute(self, statement, params):
+        self.calls.append((str(statement), params))
+        return FakeLockResult(next(self.values))
+
+
+class GdeltSourceLockTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reader_acquires_and_releases_the_parser_snapshot_lock(self):
+        conn = FakeAsyncConnection([1, 1])
+        await gdelt._acquire_gdelt_snapshot_lock(conn)
+        await gdelt._release_gdelt_snapshot_lock(conn)
+        self.assertIn("GET_LOCK", conn.calls[0][0])
+        self.assertIn("RELEASE_LOCK", conn.calls[1][0])
+        self.assertEqual(conn.calls[0][1]["name"], conn.calls[1][1]["name"])
+        self.assertEqual(conn.calls[0][1]["timeout"], gdelt.GDELT_SOURCE_LOCK_TIMEOUT_SECONDS)
+
+    async def test_reader_fails_closed_if_snapshot_lock_is_not_acquired(self):
+        conn = FakeAsyncConnection([0])
+        with self.assertRaisesRegex(RuntimeError, "GDELT_SOURCE_SNAPSHOT_LOCK_TIMEOUT"):
+            await gdelt._acquire_gdelt_snapshot_lock(conn)
+
+
+class GdeltPayloadProjectionTests(unittest.TestCase):
+    def test_query_uses_type_specific_projection_instead_of_full_payload(self):
+        sql = gdelt.RAW_PAYLOAD_PROJECTION_SQL
+        self.assertIn("JSON_OBJECT", sql)
+        for field in (
+            "EventRootCode", "GoldsteinScale", "QuadClass", "AvgTone",
+            "Confidence", "MentionDocTone", "V2Tone", "Themes", "V2Themes",
+        ):
+            self.assertIn(field, sql)
+        self.assertNotIn("full_text", sql.lower())
+        self.assertNotIn("source_url", sql.lower())
+
+    def test_projection_preserves_news_enricher_features_for_all_streams(self):
+        fixtures = [
+            ("event", {
+                "EventRootCode": "14", "GoldsteinScale": -7.5,
+                "QuadClass": "4", "AvgTone": "-2.5", "unread_blob": "x" * 10000,
+            }),
+            ("mention", {
+                "Confidence": "75", "MentionDocTone": "3.2",
+                "unread_blob": "x" * 10000,
+            }),
+            ("article_metadata", {
+                "V2Tone": "2.0,1.5,3.0,2.5", "Themes": "ECON_INFLATION;WB_442",
+                "V2Themes": "ECON_INFLATION,1;WB_442,1", "unread_blob": "x" * 10000,
+            }),
+        ]
+        fields = {
+            "event": ("EventRootCode", "GoldsteinScale", "QuadClass", "AvgTone"),
+            "mention": ("Confidence", "MentionDocTone"),
+            "article_metadata": ("V2Tone", "Themes", "V2Themes"),
+        }
+        for record_type, raw in fixtures:
+            base = {
+                "record_key": "stable-key", "provider": "gdelt",
+                "record_type": record_type, "publication_id": "publication",
+                "event_id": "event-id", "available_at": "2025-02-06T15:30:00Z",
+                "loaded_at": "2025-02-06T15:31:00Z", "themes": [],
+                "v2_themes": [], "v2_tone": None,
+            }
+            original = {**base, "raw_payload": json.dumps(raw)}
+            projected = {**base, "raw_payload": json.dumps({k: raw[k] for k in fields[record_type]})}
+            original_stats, projected_stats = Counter(), Counter()
+            original_result = gdelt._observation(original, gdelt._settings(), original_stats)
+            projected_result = gdelt._observation(projected, gdelt._settings(), projected_stats)
+            self.assertEqual(projected_result, original_result, record_type)
+            self.assertEqual(projected_stats, original_stats, record_type)
+
+
+    def test_source_page_sql_is_bounded_and_has_stable_keyset_cursor(self):
+        sql = gdelt._build_source_page_sql(
+            "sasha_gdelt_news", "provider='gdelt' AND available_at IS NOT NULL",
+            "available_at", has_cursor=True,
+        )
+        self.assertIn("id <= :max_id", sql)
+        self.assertIn("LIMIT :batch_size", sql)
+        self.assertIn("ORDER BY _sort_at, id", sql)
+        self.assertIn("available_at > :cursor_time", sql)
+        self.assertIn("available_at = :cursor_time AND id > :cursor_id", sql)
+        self.assertNotIn("OFFSET", sql.upper())
+
+    def test_reader_and_gdelt_writer_share_snapshot_lock_name(self):
+        parser_source = (ROOT / "parser" / "GDELT.py").read_text()
+        self.assertIn(
+            f'GDELT_SOURCE_LOCK = "{gdelt.GDELT_SOURCE_LOCK}"',
+            parser_source,
+        )
+
+    def test_source_page_sql_can_start_at_snapshot_high_watermark(self):
+        sql = gdelt._build_source_page_sql(
+            "sasha_gdelt_news", "provider='gdelt' AND available_at IS NOT NULL",
+            "available_at", has_cursor=False,
+        )
+        self.assertIn("id <= :max_id", sql)
+        self.assertNotIn(":cursor_time", sql)
+        self.assertNotIn(":cursor_id", sql)
+
+
+if __name__ == "__main__":
+    unittest.main()

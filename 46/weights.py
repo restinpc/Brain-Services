@@ -19,7 +19,7 @@ async def build_weights(engine_sasha):
 
     _log("START", "build_weights started")
     try:
-        _log("DDL", f"Ensuring table `{WEIGHTS_TABLE}` exists and truncating it")
+        _log("DDL", f"Ensuring table `{WEIGHTS_TABLE}` exists")
         async with engine_sasha.begin() as conn:
             await conn.execute(text(f"""
                 CREATE TABLE IF NOT EXISTS `{WEIGHTS_TABLE}` (
@@ -32,7 +32,6 @@ async def build_weights(engine_sasha):
                     UNIQUE KEY uk_wc (weight_code)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """))
-            await conn.execute(text(f"TRUNCATE TABLE `{WEIGHTS_TABLE}`"))
 
         _log("READ", f"Reading context rows from `{CTX_TABLE}`")
         async with engine_sasha.connect() as conn:
@@ -45,15 +44,19 @@ async def build_weights(engine_sasha):
         total = 0
         _log("WRITE", "Generating and inserting weight codes")
         async with engine_sasha.begin() as conn:
+            # Stable identities and one atomic publication: readers keep the
+            # previous complete set until this additive rebuild commits.
+            await conn.execute(text(f"SELECT id FROM `{WEIGHTS_TABLE}` ORDER BY id FOR UPDATE"))
             for ctx_id, occurrence_count in ctx_rows:
                 max_shift = SHIFT_WINDOW if (occurrence_count or 0) >= MIN_RECURRING else 0
                 for mode in (0, 1):
                     for shift in range(0, max_shift + 1):
                         wc = f"{ctx_id}_{mode}_{shift}"
                         await conn.execute(text(f"""
-                            INSERT IGNORE INTO `{WEIGHTS_TABLE}`
+                            INSERT INTO `{WEIGHTS_TABLE}`
                                 (weight_code, ctx_id, mode, shift)
                             VALUES (:wc, :ctx_id, :mode, :shift)
+                            ON DUPLICATE KEY UPDATE weight_code=VALUES(weight_code)
                         """), {
                             "wc": wc,
                             "ctx_id": int(ctx_id),

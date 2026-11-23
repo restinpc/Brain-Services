@@ -4206,6 +4206,9 @@ def build_app(model_module) -> FastAPI:
     _rebuild_lock = asyncio.Lock()
 
     def _rebuild_supported() -> bool:
+        # Proxy-only nodes consume the upstream result and own no local dataset.
+        if s.compute_worker is False:
+            return False
         # Keep hourly capability identical to the established /rebuild_index
         # contract; enrich_fn alone is not the complete contract.
         return bool(
@@ -4238,9 +4241,13 @@ def build_app(model_module) -> FastAPI:
                 await build_indexes(
                     s.engine_vlad, s.ENRICHED_TABLE, s.DATASET_INDEX_FIELDS
                 )
-                await parse_indexes(
+                indexes_ok = await parse_indexes(
                     s.engine_vlad, s.ENRICHED_TABLE, s.DATASET_DATE_FIELD
                 )
+                if not indexes_ok:
+                    raise RuntimeError(
+                        f"parse_indexes did not complete for {s.ENRICHED_TABLE}"
+                    )
                 stats["dataset_indexer"] = {
                     "mask_table":    f"{s.ENRICHED_TABLE}_mask",
                     "indexes_table": f"{s.ENRICHED_TABLE}_indexes",
@@ -6384,7 +6391,7 @@ def build_app(model_module) -> FastAPI:
     async def ep_values(
         pair: int = Query(1), day: int = Query(1),
         date: str = Query(...),
-        type: int = Query(0, ge=0, le=4),
+        type: int = Query(0, ge=0, le=6),
         var:  int = Query(0),
         param: str = Query(""),
         _cache_hop: int = Query(0, ge=0, le=1, include_in_schema=False),

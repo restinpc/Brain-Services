@@ -17,7 +17,7 @@ RUNTIME=Path('/brain/model100-featurebuilder-20261109/v2-runtime')
 V1='model100-h1-v1hex-20261109'
 # New writer generation. Reader defaults in model100_rich_context/store remain
 # pinned to the existing dataset until a separately approved consumer switch.
-DATASET='model100-h1-v2full-20261118'
+DATASET='model100-h1-v2full-20261120'
 
 
 def code_hash():
