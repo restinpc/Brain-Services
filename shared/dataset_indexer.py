@@ -21,6 +21,7 @@ dataset_indexer.py — Dataset indexing system for Brain Framework v1.0
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -259,7 +260,8 @@ async def parse_indexes(
     Режим date=<дата>  → дешёвый «подтяг» новых комбо за период
 
     Возвращает True  — успех.
-    Возвращает False — критическая ошибка (маски не найдены и т.п.).
+    Возвращает False — одна из требуемых выборок/вставок завершилась ошибкой.
+    Пустая таблица масок является штатным no-op и возвращает True.
     """
     mask_table    = f"{table_name}_mask"
     indexes_table = f"{table_name}_indexes"
@@ -279,7 +281,7 @@ async def parse_indexes(
 
     if not masks:
         logger.warning("parse_indexes: %s пуста, нечего индексировать", mask_table)
-        return False
+        return True
 
     # 2. Собираем union всех полей по всем маскам (для единой DDL)
     all_fields: list[str] = []
@@ -324,6 +326,7 @@ async def parse_indexes(
     date_params = {"from_date": date} if date else {}
 
     total_inserted = 0
+    had_query_error = False
     all_insert_cols = ["mask_id"] + all_fields + ["date_added", "combo_hash"]
     col_str = ", ".join(f"`{c}`" for c in all_insert_cols)
     val_str = ", ".join(f":{c}" for c in all_insert_cols)
@@ -350,6 +353,7 @@ async def parse_indexes(
             logger.error(
                 "parse_indexes: SELECT для mask_id=%d не удался: %s", mask_id, exc
             )
+            had_query_error = True
             continue
 
         if not source_rows:
@@ -377,18 +381,34 @@ async def parse_indexes(
         if not insert_rows:
             continue
 
-        try:
-            async with engine.begin() as conn:
-                r = await conn.execute(text(f"""
-                    INSERT IGNORE INTO `{indexes_table}` ({col_str})
-                    VALUES ({val_str})
-                """), insert_rows)
+        insert_sql = text(f"""
+            INSERT IGNORE INTO `{indexes_table}` ({col_str})
+            VALUES ({val_str})
+        """)
+        for attempt in range(3):
+            try:
+                async with engine.begin() as conn:
+                    r = await conn.execute(insert_sql, insert_rows)
                 total_inserted += r.rowcount
-        except Exception as exc:
-            logger.error(
-                "parse_indexes: INSERT для mask_id=%d не удался: %s", mask_id, exc
-            )
-            continue
+                break
+            except Exception as exc:
+                orig = getattr(exc, "orig", None)
+                args = getattr(orig, "args", ())
+                errno = args[0] if args and isinstance(args[0], int) else None
+                if errno in (1205, 1213) and attempt < 2:
+                    delay = 0.05 * (2 ** attempt)
+                    logger.warning(
+                        "parse_indexes: transient MySQL %s for mask_id=%d; retry %d/2 in %.2fs",
+                        errno, mask_id, attempt + 1, delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                logger.error(
+                    "parse_indexes: INSERT для mask_id=%d не удался после %d попыток: %s",
+                    mask_id, attempt + 1, exc,
+                )
+                had_query_error = True
+                break
 
     logger.info(
         "parse_indexes: %s — добавлено %d записей (режим: %s)",
@@ -396,7 +416,7 @@ async def parse_indexes(
         total_inserted,
         f"incremental from {date}" if date else "full rebuild",
     )
-    return True
+    return not had_query_error
 
 
 # ══════════════════════════════════════════════════════════════════════════════

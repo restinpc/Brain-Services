@@ -4241,9 +4241,13 @@ def build_app(model_module) -> FastAPI:
                 await build_indexes(
                     s.engine_vlad, s.ENRICHED_TABLE, s.DATASET_INDEX_FIELDS
                 )
-                await parse_indexes(
+                indexes_ok = await parse_indexes(
                     s.engine_vlad, s.ENRICHED_TABLE, s.DATASET_DATE_FIELD
                 )
+                if not indexes_ok:
+                    raise RuntimeError(
+                        f"parse_indexes did not complete for {s.ENRICHED_TABLE}"
+                    )
                 stats["dataset_indexer"] = {
                     "mask_table":    f"{s.ENRICHED_TABLE}_mask",
                     "indexes_table": f"{s.ENRICHED_TABLE}_indexes",
