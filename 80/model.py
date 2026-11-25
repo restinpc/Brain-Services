@@ -1045,6 +1045,14 @@ async def enrich_dataset(engine_vlad, engine_brain) -> dict[str, Any]:
                 index_from=index_from,
             )
             result["shared_index"] = index_stats
+            # The framework accepts source_watermark, while this model reports
+            # a five-source ID vector rather than a single source timestamp.
+            source_ids = result.get("source_max_ids")
+            if (isinstance(source_ids, dict) and set(source_ids) == set(SOURCES)
+                    and all(type(value) is int and value >= 0 for value in source_ids.values())):
+                result["source_watermark"] = ";".join(
+                    f"{press}:{source_ids[press]}" for press in sorted(source_ids)
+                )
             return result
         finally:
             try:
