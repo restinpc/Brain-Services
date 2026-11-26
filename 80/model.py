@@ -1252,16 +1252,24 @@ def _aggregate_analogs_by_var(
     analog_rows: list[dict[str, Any]],
     analog_dates: list[datetime],
     target_date: datetime,
-    current_event_time: datetime,
+    current_event_time: datetime | None,
     shift: int,
     *,
     is_daily: bool,
     np_rates: dict,
     ext_name: str,
+    start_index: int = 0,
+    stop_index: int | None = None,
+    initial_stats: dict | None = None,
 ) -> dict[int, tuple[float, float, int, float, float, float]]:
     """Aggregate historical outcomes once while maintaining all var subsets."""
     end = bisect.bisect_left(analog_dates, target_date)
-    stats = {v: [0.0, 0.0, 0, 0.0, 0.0, 0.0] for v in VAR_RANGE}
+    if stop_index is not None:
+        end = min(end, stop_index)
+    stats = (
+        {v: [0.0, 0.0, 0, 0.0, 0.0, 0.0] for v in VAR_RANGE}
+        if initial_stats is None else {v: list(initial_stats[v]) for v in VAR_RANGE}
+    )
     if end <= 0:
         return {v: tuple(x) for v, x in stats.items()}
 
@@ -1273,7 +1281,7 @@ def _aggregate_analogs_by_var(
 
     unit = timedelta(days=1) if is_daily else timedelta(hours=1)
     date_to_idx = _rate_timestamp_first_index(dates_ns)
-    for j in range(end):
+    for j in range(start_index, end):
         analog_dt = analog_dates[j]
         if analog_dt == current_event_time:
             continue
@@ -1350,6 +1358,15 @@ def _compute_all_slots_for_date(
     unit_seconds = 86400 if is_daily else 3600
     predict_max, ext_name = _previous_direction(np_rates, target_date)
     current = _current_rows(source, target_date, di, is_daily)
+    # Every excluded current event is at or after this boundary. Historical
+    # prefixes therefore have identical left-to-right sums for a type/shift.
+    earliest_current = min(
+        (dt for row in current
+         if isinstance((dt := row.get("date") or row.get("date_dt")), datetime)
+         and dt <= target_date),
+        default=target_date,
+    )
+    prefixes = {}
 
     for row in current:
         event_dt = row.get("date") or row.get("date_dt")
@@ -1373,9 +1390,20 @@ def _compute_all_slots_for_date(
         if len(analog_rows) < 3:
             continue
 
+        prefix_key = (event_type, shift)
+        if prefix_key not in prefixes:
+            prefix_end = bisect.bisect_left(analog_dates, earliest_current)
+            prefix = _aggregate_analogs_by_var(
+                analog_rows, analog_dates, target_date, None, shift,
+                is_daily=is_daily, np_rates=np_rates, ext_name=ext_name,
+                stop_index=prefix_end,
+            )
+            prefixes[prefix_key] = (prefix_end, prefix)
+        prefix_end, prefix = prefixes[prefix_key]
         by_var = _aggregate_analogs_by_var(
             analog_rows, analog_dates, target_date, event_dt, shift,
             is_daily=is_daily, np_rates=np_rates, ext_name=ext_name,
+            start_index=prefix_end, initial_stats=prefix,
         )
 
         for var in VAR_RANGE:
