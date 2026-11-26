@@ -1035,6 +1035,9 @@ class _AsyncRWGate:
                 return task
             finally:
                 self._waiting_writers = max(0, self._waiting_writers - 1)
+                # A cancelled queued writer must wake readers blocked only by
+                # writer preference, even while another reader remains active.
+                self._cond.notify_all()
 
     async def release_write(self, token):
         async with self._cond:
@@ -6364,7 +6367,10 @@ def build_app(model_module) -> FastAPI:
         pass
 
     async def _cached_snapshot_values(pair, day, date, calc_type, calc_var, param):
+        params = {'type': calc_type, 'var': calc_var, 'param': param}
         for attempt in range(3):
+            if s.dynamic_cache_stale:
+                raise RuntimeError('HISTORICAL_CACHE_STALE: invalidate historical cache before serving /values')
             revision = s.snapshot_cache_revision
             async def compute():
                 return await _call_model(pair, day, date, calc_type=calc_type,
@@ -6373,7 +6379,7 @@ def build_app(model_module) -> FastAPI:
                 response = await cached_values(
                     engine_vlad=s.engine_cache, service_url=s.service_url,
                     pair=pair, day=day, date=date,
-                    extra_params=_values_params({'type': calc_type, 'var': calc_var, 'param': param}),
+                    extra_params=_values_params(params),
                     compute_fn=compute, node=s.NODE_NAME, table_name=s.cache_table,
                     compute_on_miss=bool(s.compute_worker),
                     miss_fn=(None if s.compute_worker else lambda: _proxy_values_to_brain1(
@@ -6382,9 +6388,42 @@ def build_app(model_module) -> FastAPI:
                 )
             except _SnapshotChanged:
                 continue
-            if revision == s.snapshot_cache_revision:
+            if revision == s.snapshot_cache_revision and not s.dynamic_cache_stale:
                 return response
-        raise RuntimeError('Dataset changed repeatedly during cached prediction; retry request')
+        # A busy publisher can win every optimistic race. On a local compute
+        # worker, take the existing read lease before selecting the cache key
+        # and keep it through calculation AND cache publication. Bypass only
+        # the inner child-task singleflight (it could wait behind a queued
+        # writer while this task owns a read lease). The outer flight preserves
+        # deduplication for concurrent requests entering this slow path.
+        if not s.compute_worker:
+            raise RuntimeError('Dataset changed repeatedly during cached prediction; retry request')
+
+        async def stable_local_values():
+            target_date = _parse_date(date)
+            if target_date is not None:
+                await _refresh_rates(_rates_table(pair, day), s)
+            async with _model_state_gate.read():
+                if s.dynamic_cache_stale:
+                    raise RuntimeError('HISTORICAL_CACHE_STALE: invalidate historical cache before serving /values')
+                async def compute():
+                    return await _call_model_impl(
+                        pair, day, date, calc_type=calc_type, calc_var=calc_var,
+                        param=param, _skip_refresh=True,
+                    )
+                return await cached_values(
+                    engine_vlad=s.engine_cache, service_url=s.service_url,
+                    pair=pair, day=day, date=date,
+                    extra_params=_values_params(params), compute_fn=compute,
+                    node=s.NODE_NAME, table_name=s.cache_table,
+                    compute_on_miss=True, singleflight=False,
+                )
+
+        response = await _run_live_singleflight(
+            ('historical-stable', s.service_url, int(pair), int(day),
+             str(date), int(calc_type), int(calc_var), str(param)), stable_local_values)
+        # The endpoint attaches request-local narrative to the response.
+        return dict(response)
 
 
     @app.get("/values")
