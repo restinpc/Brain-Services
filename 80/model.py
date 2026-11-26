@@ -30,6 +30,7 @@ import re
 import bisect
 import threading
 from collections import OrderedDict, defaultdict, deque
+from concurrent.futures import Future
 from datetime import datetime, timedelta
 from typing import Any, Iterable
 
@@ -59,8 +60,10 @@ ALGO_VERSION = "tfidf-nmf-svd-hierkmeans-strict-causal-v3"
 _CACHE_LOCK = threading.RLock()
 _SINGLE_CACHE = OrderedDict()
 _SINGLE_CACHE_MAX = 32
+_SINGLE_FLIGHTS: dict[tuple, Future] = {}
 _BATCH_CACHE = OrderedDict()
 _BATCH_CACHE_MAX = 1
+_BATCH_FLIGHTS: dict[tuple, Future] = {}
 
 # Bounded cache for exact timestamp -> first index lookups in immutable
 # np_rates snapshots.  Brain Framework refreshes rates with np.append(), so a
@@ -1423,6 +1426,36 @@ def _runtime_cache_token(dataset: list[dict], dataset_index: dict, target_dates:
     return base + ((target_dates,) if target_dates is not None else ())
 
 
+def _cached_cube(cache, flights, limit, key, compute):
+    """Share one exact snapshot calculation across simultaneous type/var requests."""
+    with _CACHE_LOCK:
+        cached = cache.get(key)
+        if cached is not None:
+            cache.move_to_end(key)
+            return cached
+        flight = flights.get(key)
+        owner = flight is None
+        if owner:
+            flight = flights[key] = Future()
+    if not owner:
+        return flight.result()
+    try:
+        result = compute()
+        with _CACHE_LOCK:
+            cache[key] = result
+            cache.move_to_end(key)
+            while len(cache) > limit:
+                cache.popitem(last=False)
+        flight.set_result(result)
+        return result
+    except BaseException as error:
+        flight.set_exception(error)
+        raise
+    finally:
+        with _CACHE_LOCK:
+            flights.pop(key, None)
+
+
 def model(
     rates: list[dict],
     dataset: list[dict],
@@ -1444,18 +1477,10 @@ def model(
     # <= target_date bounds. This avoids per-call prefix construction and cannot
     # introduce future news into current/analog selection.
     token = _runtime_cache_token(dataset, di) + (int(date.timestamp()),)
-    with _CACHE_LOCK:
-        cached = _SINGLE_CACHE.get(token)
-        if cached is not None:
-            _SINGLE_CACHE.move_to_end(token)
-            return dict(cached.get((calc_type, calc_var), {}))
-
-    all_slots = _compute_all_slots_for_date(dataset, date, di)
-    with _CACHE_LOCK:
-        _SINGLE_CACHE[token] = all_slots
-        _SINGLE_CACHE.move_to_end(token)
-        while len(_SINGLE_CACHE) > _SINGLE_CACHE_MAX:
-            _SINGLE_CACHE.popitem(last=False)
+    all_slots = _cached_cube(
+        _SINGLE_CACHE, _SINGLE_FLIGHTS, _SINGLE_CACHE_MAX, token,
+        lambda: _compute_all_slots_for_date(dataset, date, di),
+    )
     return dict(all_slots.get((calc_type, calc_var), {}))
 
 
@@ -1485,26 +1510,13 @@ def batch_model(
     date_token = tuple(int(d.timestamp()) for d in dates)
     key = _runtime_cache_token(dataset, di, date_token)
 
-    with _CACHE_LOCK:
-        cached = _BATCH_CACHE.get(key)
-        if cached is not None:
-            _BATCH_CACHE.move_to_end(key)
-            selected = cached.get((calc_type, calc_var), {})
-            return {d: dict(selected.get(d, {})) for d in dates}
+    def compute_cube():
+        cube = {(t, v): {} for t in TYPES_RANGE for v in VAR_RANGE}
+        for dt in dates:
+            for slot, value in _compute_all_slots_for_date(dataset, dt, di).items():
+                cube[slot][dt] = value
+        return cube
 
-    cube: dict[tuple[int, int], dict[datetime, dict[str, float]]] = {
-        (t, v): {} for t in TYPES_RANGE for v in VAR_RANGE
-    }
-    for dt in dates:
-        slots = _compute_all_slots_for_date(dataset, dt, di)
-        for slot, value in slots.items():
-            cube[slot][dt] = value
-
-    with _CACHE_LOCK:
-        _BATCH_CACHE[key] = cube
-        _BATCH_CACHE.move_to_end(key)
-        while len(_BATCH_CACHE) > _BATCH_CACHE_MAX:
-            _BATCH_CACHE.popitem(last=False)
-
+    cube = _cached_cube(_BATCH_CACHE, _BATCH_FLIGHTS, _BATCH_CACHE_MAX, key, compute_cube)
     selected = cube.get((calc_type, calc_var), {})
     return {d: dict(selected.get(d, {})) for d in dates}

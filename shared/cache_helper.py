@@ -274,10 +274,10 @@ async def _cache_get(
                 return await _attempt()
             except Exception as e2:
                 log.warning(f"cache_get outer error: {e2}")
-                return None
+                raise
         except Exception as e:
             log.warning(f"cache_get outer error: {e}")
-            return None
+            raise
 
 
 async def _cache_set(
@@ -328,34 +328,34 @@ async def _cache_set(
                 raise
 
     sem = await get_db_sem()
-    async with sem:
-        for attempt in range(1, 4):
-            try:
+    for attempt in range(1, 4):
+        try:
+            async with sem:
                 await _attempt()
+            return
+        except InternalError as e:
+            if attempt < 3:
+                log.warning(f"cache_set InternalError attempt {attempt}, retry: {e}")
+                await asyncio.sleep(0.05 * attempt)
+            else:
+                log.warning(f"cache_set outer error: {e}")
                 return
-            except InternalError as e:
-                if attempt < 3:
-                    log.warning(f"cache_set InternalError attempt {attempt}, retry: {e}")
-                    await asyncio.sleep(0.05 * attempt)
-                else:
-                    log.warning(f"cache_set outer error: {e}")
-                    return
-            except OperationalError as e:
-                orig_args = getattr(e.orig, "args", (None,))
-                err_code  = orig_args[0] if orig_args else None
-                if err_code in (_LOCK_WAIT_TIMEOUT, _DEADLOCK) and attempt < 3:
-                    delay = 0.1 * attempt + random.uniform(0, 0.05)
-                    log.warning(
-                        f"cache_set attempt {attempt} failed (lock/deadlock), "
-                        f"retry in {delay:.2f}s: {e}"
-                    )
-                    await asyncio.sleep(delay)
-                else:
-                    log.debug(f"cache_set (ok if duplicate): {e}")
-                    return
-            except Exception as e:
+        except OperationalError as e:
+            orig_args = getattr(e.orig, "args", (None,))
+            err_code  = orig_args[0] if orig_args else None
+            if err_code in (_LOCK_WAIT_TIMEOUT, _DEADLOCK) and attempt < 3:
+                delay = 0.1 * attempt + random.uniform(0, 0.05)
+                log.warning(
+                    f"cache_set attempt {attempt} failed (lock/deadlock), "
+                    f"retry in {delay:.2f}s: {e}"
+                )
+                await asyncio.sleep(delay)
+            else:
                 log.debug(f"cache_set (ok if duplicate): {e}")
                 return
+        except Exception as e:
+            log.debug(f"cache_set (ok if duplicate): {e}")
+            return
 
 
 async def cached_values(
@@ -370,6 +370,7 @@ async def cached_values(
     table_name:   str = _DEFAULT_CACHE_TABLE,
     compute_on_miss: bool = True,
     miss_fn=None,
+    singleflight: bool = True,
 ) -> dict:
     """
     Универсальная обёртка для endpoint /values.
@@ -478,4 +479,8 @@ async def cached_values(
             _EMPTY_CHECKED.pop(flight_key, None)
         return ok_response(result)
 
+    # A caller holding a task-owned snapshot lease must execute the MISS
+    # in the same task. The caller coordinates its own outer singleflight.
+    if not singleflight:
+        return await _miss_once()
     return await _run_singleflight(flight_key, _miss_once)
