@@ -52,6 +52,7 @@ import hashlib
 import json as _json
 import os
 import random
+import weakref
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Awaitable, Callable, Literal
@@ -1269,7 +1270,8 @@ class ReverseStore:
         # In-memory cache: (pair, day_flag, control_date, params_hash) -> (universe, precision)
         # Eliminates repeated DB round-trips for the same key during fill_cache
         self._universe_cache: dict = {}
-        self._train_locks: dict[tuple, asyncio.Lock] = {}
+        # Owners/waiters retain their lock; discard only locks nobody uses.
+        self._train_locks: weakref.WeakValueDictionary[tuple, asyncio.Lock] = weakref.WeakValueDictionary()
         self._train_locks_guard = asyncio.Lock()
 
         # Separate read-only engine with NullPool for load_universe.
@@ -1299,10 +1301,6 @@ class ReverseStore:
             if lock is None:
                 lock = asyncio.Lock()
                 self._train_locks[key] = lock
-            if len(self._train_locks) > 4096:
-                for old_key in list(self._train_locks.keys())[:512]:
-                    if old_key != key:
-                        self._train_locks.pop(old_key, None)
             return lock
 
     def clear_universe_cache(self) -> None:
