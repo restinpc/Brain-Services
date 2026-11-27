@@ -2868,6 +2868,12 @@ async def _refresh_rates_unlocked(table: str, s: _State):
 
 
 async def _refresh_rates(table: str, s: _State):
+    # A throttled no-op must not queue a writer behind a long prediction.
+    # The existing inner check still arbitrates concurrent due refreshes.
+    last = s.last_rates_refresh.get(table)
+    throttle = max(2.0, float(getattr(s, "DYNAMIC_POLL_SECONDS", 60)))
+    if last and (datetime.now() - last).total_seconds() < throttle:
+        return
     gate = getattr(s, "state_gate", None)
     if gate is None:
         return await _refresh_rates_unlocked(table, s)
