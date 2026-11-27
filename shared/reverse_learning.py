@@ -1894,18 +1894,24 @@ class ReverseStore:
 
         seq_cache_key = (model_tag, seq_tuple)
         cached_seq = _seq_codes_cache.get(seq_cache_key)
-        if cached_seq is not None:
-            pre_codes, codes_key = cached_seq
-        else:
-            pre_codes: list[list[str]] = []
-            for ext_date, _ in seq:
-                # Do not cache an exceptional provider as empty training data.
-                codes = await active_codes_at(ext_date)
-                pre_codes.append(sorted(set(codes)))
-            codes_key = tuple(tuple(c) for c in pre_codes)
-            _seq_codes_cache[seq_cache_key] = (pre_codes, codes_key)
-            if len(_seq_codes_cache) > _SEQ_CODES_CACHE_MAX:
-                del _seq_codes_cache[next(iter(_seq_codes_cache))]
+        if cached_seq is None:
+            # Adjacent requests can share the same extrema before their exact
+            # training key exists. Reuse the existing locks for this cold phase.
+            seq_lock = await self._get_train_lock(("seq_codes", seq_cache_key))
+            async with seq_lock:
+                cached_seq = _seq_codes_cache.get(seq_cache_key)
+                if cached_seq is None:
+                    pre_codes: list[list[str]] = []
+                    for ext_date, _ in seq:
+                        # Publish only a complete successful sequence.
+                        codes = await active_codes_at(ext_date)
+                        pre_codes.append(sorted(set(codes)))
+                    codes_key = tuple(tuple(c) for c in pre_codes)
+                    cached_seq = (pre_codes, codes_key)
+                    _seq_codes_cache[seq_cache_key] = cached_seq
+                    if len(_seq_codes_cache) > _SEQ_CODES_CACHE_MAX:
+                        del _seq_codes_cache[next(iter(_seq_codes_cache))]
+        pre_codes, codes_key = cached_seq
 
         train_cache_key = (
             seq_tuple, codes_key, train_mode, max_iter,
