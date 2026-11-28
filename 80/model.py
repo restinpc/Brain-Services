@@ -1191,6 +1191,20 @@ def _frame_date(dt: datetime, is_daily: bool) -> datetime:
     return dt.replace(minute=0, second=0, microsecond=0)
 
 
+def _prepare_analog_metadata(end: int) -> tuple[list[datetime | None], np.ndarray] | None:
+    """Prepare reusable frame dates and lazy var masks for one analog group.
+
+    Frame datetimes and masks are filled lazily after each analog passes the
+    same early skips as the baseline. Datetimes are retained instead of epoch
+    timestamps so shift arithmetic keeps Python's local/zone-aware semantics.
+    """
+    if end <= 0:
+        return None
+    frames = [None] * end
+    masks = np.full(end, -1, dtype=np.int16)
+    return frames, masks
+
+
 def _ctx_reverse(ctx_index: dict) -> dict[str, tuple[int, dict]]:
     return {
         str(info.get("event_type") or "").strip().lower(): (int(info["id"]), info)
@@ -1261,6 +1275,7 @@ def _aggregate_analogs_by_var(
     start_index: int = 0,
     stop_index: int | None = None,
     initial_stats: dict | None = None,
+    prepared: tuple[list[datetime | None], np.ndarray] | None = None,
 ) -> dict[int, tuple[float, float, int, float, float, float]]:
     """Aggregate historical outcomes once while maintaining all var subsets."""
     end = bisect.bisect_left(analog_dates, target_date)
@@ -1280,16 +1295,27 @@ def _aggregate_analogs_by_var(
         return {v: tuple(x) for v, x in stats.items()}
 
     unit = timedelta(days=1) if is_daily else timedelta(hours=1)
+    prepared_frames, prepared_masks = prepared if prepared is not None else (None, None)
     date_to_idx = _rate_timestamp_first_index(dates_ns)
     for j in range(start_index, end):
         analog_dt = analog_dates[j]
         if analog_dt == current_event_time:
             continue
-        outcome_time = analog_dt + unit * int(shift)
-        frame = _frame_date(outcome_time, is_daily)
-        if frame + unit > target_date:
-            continue
-        ts = int(frame.timestamp())
+        if prepared_frames is not None:
+            frame = prepared_frames[j]
+            if frame is None:
+                frame = _frame_date(analog_dt, is_daily)
+                prepared_frames[j] = frame
+            frame += unit * int(shift)
+            if frame + unit > target_date:
+                continue
+            ts = int(frame.timestamp())
+        else:
+            outcome_time = analog_dt + unit * int(shift)
+            frame = _frame_date(outcome_time, is_daily)
+            if frame + unit > target_date:
+                continue
+            ts = int(frame.timestamp())
         if date_to_idx is None:
             # Exact compatibility fallback for non-framework rate arrays.
             idx = int(np.searchsorted(dates_ns, ts, side="left"))
@@ -1307,7 +1333,14 @@ def _aggregate_analogs_by_var(
         q_weight = min(max(quality / 0.65, 0.25), 2.5)
         weighted_t1 = stored_t1 * q_weight
         weighted_hit = hit * q_weight
-        eligible_vars = _VAR_MASK_TO_VARS[_var_eligibility_mask(analog)]
+        if prepared_masks is not None:
+            mask = int(prepared_masks[j])
+            if mask < 0:
+                mask = _var_eligibility_mask(analog)
+                prepared_masks[j] = mask
+        else:
+            mask = _var_eligibility_mask(analog)
+        eligible_vars = _VAR_MASK_TO_VARS[mask]
 
         for var in eligible_vars:
             st = stats[var]
@@ -1358,8 +1391,11 @@ def _compute_all_slots_for_date(
     unit_seconds = 86400 if is_daily else 3600
     predict_max, ext_name = _previous_direction(np_rates, target_date)
     current = _current_rows(source, target_date, di, is_daily)
-    # Every excluded current event is at or after this boundary. Historical
-    # prefixes therefore have identical left-to-right sums for a type/shift.
+    current_type_counts = {}
+    for row in current:
+        event_type = str(row.get("event_type") or "").strip().lower()
+        if event_type:
+            current_type_counts[event_type] = current_type_counts.get(event_type, 0) + 1
     earliest_current = min(
         (dt for row in current
          if isinstance((dt := row.get("date") or row.get("date_dt")), datetime)
@@ -1367,6 +1403,7 @@ def _compute_all_slots_for_date(
         default=target_date,
     )
     prefixes = {}
+    prepared_by_type = {}
 
     for row in current:
         event_dt = row.get("date") or row.get("date_dt")
@@ -1391,19 +1428,25 @@ def _compute_all_slots_for_date(
             continue
 
         prefix_key = (event_type, shift)
+        prepared = None
+        if current_type_counts.get(event_type, 0) > 1:
+            if event_type not in prepared_by_type:
+                end = bisect.bisect_left(analog_dates, target_date)
+                prepared_by_type[event_type] = _prepare_analog_metadata(end)
+            prepared = prepared_by_type[event_type]
         if prefix_key not in prefixes:
             prefix_end = bisect.bisect_left(analog_dates, earliest_current)
             prefix = _aggregate_analogs_by_var(
                 analog_rows, analog_dates, target_date, None, shift,
                 is_daily=is_daily, np_rates=np_rates, ext_name=ext_name,
-                stop_index=prefix_end,
+                stop_index=prefix_end, prepared=prepared,
             )
             prefixes[prefix_key] = (prefix_end, prefix)
         prefix_end, prefix = prefixes[prefix_key]
         by_var = _aggregate_analogs_by_var(
             analog_rows, analog_dates, target_date, event_dt, shift,
             is_daily=is_daily, np_rates=np_rates, ext_name=ext_name,
-            start_index=prefix_end, initial_stats=prefix,
+            start_index=prefix_end, initial_stats=prefix, prepared=prepared,
         )
 
         for var in VAR_RANGE:
