@@ -177,7 +177,8 @@ async def enrich_dataset(engine_vlad, engine_brain) -> dict:
 
     rows.sort(key=lambda row: (row["date_dt"], row["dataset_name"]))
 
-    async with engine_vlad.begin() as conn:
+    # DDL has an implicit MySQL commit, so create schema before the data transaction.
+    async with engine_vlad.connect() as conn:
         await conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS `{enriched_table}` (
                 `id`           BIGINT      NOT NULL AUTO_INCREMENT,
@@ -192,7 +193,11 @@ async def enrich_dataset(engine_vlad, engine_brain) -> dict:
                 INDEX `idx_dataset_date` (`dataset_name`, `date_dt`)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """))
-        await conn.execute(text(f"TRUNCATE TABLE `{enriched_table}`"))
+        await conn.commit()
+
+    # Replace derived rows atomically; readers see either the prior generation or the new one.
+    async with engine_vlad.begin() as conn:
+        await conn.execute(text(f"DELETE FROM `{enriched_table}`"))
         for i in range(0, len(rows), 500):
             await conn.execute(
                 text(f"""

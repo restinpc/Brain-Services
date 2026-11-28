@@ -11,6 +11,7 @@ weights.py — framework builder for brain_calendar_weights.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 
@@ -28,7 +29,6 @@ OUT_TABLE = os.getenv("OUT_TABLE", "brain_calendar_weights")
 # Имя advisory lock привязано к имени таблицы, а не к SERVICE_ID,
 # чтобы сериализовать rebuild между ВСЕМИ сервисами, делящими эту таблицу.
 REBUILD_LOCK_NAME = f"rebuild_{OUT_TABLE}"
-REBUILD_LOCK_TIMEOUT = 30  # секунд ожидания лока перед тем как пропустить цикл
 
 SHIFT_MIN = int(os.getenv("SHIFT_MIN", "-12"))
 SHIFT_MAX = int(os.getenv("SHIFT_MAX", "12"))
@@ -266,89 +266,167 @@ async def build_weights(engine_vlad) -> dict:
 
         rows.extend(_generate_rows(ctx))
 
-    # ── Сериализация rebuild через MySQL advisory lock ───────────────────────
-    # brain_calendar_weights — общая таблица для s42/s44/s49. Если их
-    # rebuild_interval совпадают по времени (например, после рестарта всех
-    # сервисов), DELETE FROM от одного блокируется строковыми/gap-локами
-    # открытой транзакции другого на ~10000 строк INSERT → 1205 Lock wait
-    # timeout exceeded (50с по умолчанию в InnoDB).
-    #
-    # GET_LOCK/RELEASE_LOCK — сессионный advisory lock: захватываем на той же
-    # connection, на которой потом делаем DELETE+INSERT, и держим ровно на
-    # время транзакции. Если другой сервис уже перестраивает таблицу —
-    # ждём до REBUILD_LOCK_TIMEOUT, и если не получили лок — пропускаем
-    # цикл (не зависаем до 1205); фреймворк повторит на следующем интервале.
+    # Fill a connection-private table before locking the published dictionary.
+    # Session lifetime preserves TEMP rows across the bounded staging commits.
+    stage = "_brain_calendar_weights_stage"
+    columns = ("weight_code", "event_id", "currency_code", "importance",
+               "forecast_dir", "surprise_dir", "revision_dir", "mode_val",
+               "hour_shift", "occurrence_count")
+    names = ", ".join("`" + name + "`" for name in columns)
     async with engine_vlad.connect() as conn:
-        got_lock = (await conn.execute(
-            text("SELECT GET_LOCK(:name, :timeout)"),
-            {"name": REBUILD_LOCK_NAME, "timeout": REBUILD_LOCK_TIMEOUT},
-        )).scalar()
-        # execute() сам открывает транзакцию (autobegin в SQLAlchemy 2.0).
-        # GET_LOCK не транзакционен (сессионный advisory lock), поэтому
-        # просто закрываем эту неявную транзакцию commit'ом — иначе
-        # следующий conn.begin() упадёт с InvalidRequestError
-        # ("already initialized a SQLAlchemy Transaction").
-        await conn.commit()
+        async def reject_warnings(context):
+            result = await conn.execute(text("SHOW WARNINGS"))
+            if result.fetchall():
+                raise RuntimeError(f"Calendar weights {context} produced SQL warnings")
 
-        if not got_lock:
-            log.warning(
-                f"[{OUT_TABLE}] build_weights: пропуск цикла — лок "
-                f"'{REBUILD_LOCK_NAME}' занят другим сервисом "
-                f"(>{REBUILD_LOCK_TIMEOUT}с ожидания)"
-            )
-            return {
-                "table": OUT_TABLE,
-                "ctx_table": CTX_TABLE,
-                "skipped": True,
-                "reason": "rebuild_lock_busy",
-                "contexts": len(ctx_rows),
-                "weights": len(rows),
-            }
-
+        got_lock = 0
         try:
-            async with conn.begin():
-                if TRUNCATE_OUT:
-                    # DELETE FROM вместо TRUNCATE TABLE — TRUNCATE = DDL = implicit commit,
-                    # что нарушает атомарность транзакции (INSERT может попасть в auto-commit).
-                    await conn.execute(text(f"DELETE FROM `{OUT_TABLE}`"))
+            # Every requested rebuild runs. Wait cooperatively for the shared
+            # dictionary publisher instead of discarding a contending cycle.
+            while True:
+                got_lock = (await conn.execute(
+                    text("SELECT GET_LOCK(:name, 0)"),
+                    {"name": REBUILD_LOCK_NAME},
+                )).scalar()
+                await conn.commit()
+                if got_lock == 1:
+                    break
+                if got_lock != 0:
+                    raise RuntimeError("Calendar weights could not acquire rebuild lock")
+                await asyncio.sleep(0.1)
 
-                if rows:
-                    await conn.execute(text(f"""
-                        INSERT INTO `{OUT_TABLE}` (
-                            weight_code,
-                            event_id,
-                            currency_code,
-                            importance,
-                            forecast_dir,
-                            surprise_dir,
-                            revision_dir,
-                            mode_val,
-                            hour_shift,
-                            occurrence_count
-                        )
-                        VALUES (
-                            :weight_code,
-                            :event_id,
-                            :currency_code,
-                            :importance,
-                            :forecast_dir,
-                            :surprise_dir,
-                            :revision_dir,
-                            :mode_val,
-                            :hour_shift,
-                            :occurrence_count
-                        )
-                        ON DUPLICATE KEY UPDATE
-                            occurrence_count = VALUES(occurrence_count)
-                    """), rows)
-        finally:
-            await conn.execute(
-                text("SELECT RELEASE_LOCK(:name)"), {"name": REBUILD_LOCK_NAME}
-            )
-            # RELEASE_LOCK снова вызывает autobegin — закрываем транзакцию,
-            # чтобы __aexit__ соединения не делал неявный rollback/commit
-            # с предупреждением.
+            await conn.execute(text(f"DROP TEMPORARY TABLE IF EXISTS `{stage}`"))
+            await conn.execute(text(f"CREATE TEMPORARY TABLE `{stage}` LIKE `{OUT_TABLE}`"))
+            await reject_warnings("staging setup")
             await conn.commit()
+            stage_statements = {}
+            for offset in range(0, len(rows), 500):
+                batch = rows[offset:offset + 500]
+                if len(batch) not in stage_statements:
+                    groups = ["(" + ", ".join(f":r{i}_{name}" for name in columns) + ")"
+                              for i in range(len(batch))]
+                    stage_statements[len(batch)] = text(f"""
+                        INSERT INTO `{stage}` ({names}) VALUES {", ".join(groups)} AS incoming
+                        ON DUPLICATE KEY UPDATE occurrence_count = incoming.occurrence_count
+                    """)
+                parameters = {f"r{i}_{name}": row[name]
+                              for i, row in enumerate(batch) for name in columns}
+                # One physical statement per batch: executemany with a row alias
+                # falls back to separate statements and loses earlier warnings.
+                await conn.execute(stage_statements[len(batch)], parameters)
+                await reject_warnings("staging insert")
+                await conn.commit()
+
+            # Discover changes with ordinary nonlocking reads. INSERT SELECT,
+            # UPDATE JOIN and DELETE JOIN can lock the whole published table
+            # even for an unchanged snapshot under InnoDB REPEATABLE READ.
+            payload = columns[1:] if TRUNCATE_OUT else ("occurrence_count",)
+            comparison = " OR ".join(
+                f"NOT (t.`{name}` <=> s.`{name}`)" for name in payload
+            )
+            old_names = ", ".join(f"t.`{name}` AS `old_{name}`" for name in columns[1:])
+            new_rows = [dict(row) for row in (await conn.execute(text(f"""
+                SELECT {", ".join(f's.`{name}`' for name in columns)}
+                FROM `{stage}` AS s LEFT JOIN `{OUT_TABLE}` AS t
+                ON t.weight_code = s.weight_code WHERE t.weight_code IS NULL
+            """))).mappings().all()]
+            updates = [dict(row) for row in (await conn.execute(text(f"""
+                SELECT {", ".join(f's.`{name}`' for name in columns)}, {old_names}
+                FROM `{stage}` AS s JOIN `{OUT_TABLE}` AS t
+                ON t.weight_code = s.weight_code WHERE {comparison}
+            """))).mappings().all()]
+            deletes = []
+            if TRUNCATE_OUT:
+                deletes = [dict(row) for row in (await conn.execute(text(f"""
+                    SELECT t.weight_code, {old_names}
+                    FROM `{OUT_TABLE}` AS t LEFT JOIN `{stage}` AS s
+                    ON s.weight_code = t.weight_code WHERE s.weight_code IS NULL
+                """))).mappings().all()]
+            await conn.commit()
+
+            # The table-scoped session lock still excludes other builders.
+            # Each permanent write is additionally guarded by its exact old
+            # payload and positive affected-row count. Unchanged definitions
+            # retain their real creation timestamp and generate no undo.
+            async with conn.begin():
+                for offset in range(0, len(new_rows), 500):
+                    batch = new_rows[offset:offset + 500]
+                    values = ["(" + ", ".join(f":n{i}_{name}" for name in columns) + ")"
+                              for i in range(len(batch))]
+                    parameters = {f"n{i}_{name}": row[name]
+                                  for i, row in enumerate(batch) for name in columns}
+                    result = await conn.execute(text(
+                        f"INSERT INTO `{OUT_TABLE}` ({names}) VALUES " + ", ".join(values)
+                    ), parameters)
+                    await reject_warnings("delta insert")
+                    if result.rowcount != len(batch):
+                        raise RuntimeError("Calendar weights insert count mismatch")
+
+                for offset in range(0, len(updates), 250):
+                    batch = updates[offset:offset + 250]
+                    parameters = {}
+                    for i, row in enumerate(batch):
+                        parameters[f"k{i}"] = row["weight_code"]
+                        for name in payload:
+                            parameters[f"v{i}_{name}"] = row[name]
+                        for name in columns[1:]:
+                            parameters[f"o{i}_{name}"] = row[f"old_{name}"]
+                    assignments = []
+                    for name in payload:
+                        cases = " ".join(f"WHEN :k{i} THEN :v{i}_{name}" for i in range(len(batch)))
+                        assignments.append(f"`{name}` = CASE weight_code {cases} ELSE `{name}` END")
+                    # created_at describes the creation of a dictionary row;
+                    # feature values and trained model bindings do not use it.
+                    predicates = []
+                    for i in range(len(batch)):
+                        old = " AND ".join(f"`{name}` <=> :o{i}_{name}" for name in columns[1:])
+                        predicates.append(f"(weight_code = :k{i} AND {old})")
+                    keys = ", ".join(f":k{i}" for i in range(len(batch)))
+                    result = await conn.execute(text(
+                        f"UPDATE `{OUT_TABLE}` SET " + ", ".join(assignments)
+                        + f" WHERE weight_code IN ({keys}) AND (" + " OR ".join(predicates) + ")"
+                    ), parameters)
+                    await reject_warnings("delta update")
+                    if result.rowcount != len(batch):
+                        raise RuntimeError("Calendar weights update preimage conflict")
+
+                for offset in range(0, len(deletes), 250):
+                    batch = deletes[offset:offset + 250]
+                    parameters = {}
+                    predicates = []
+                    for i, row in enumerate(batch):
+                        parameters[f"k{i}"] = row["weight_code"]
+                        for name in columns[1:]:
+                            parameters[f"o{i}_{name}"] = row[f"old_{name}"]
+                        old = " AND ".join(f"`{name}` <=> :o{i}_{name}" for name in columns[1:])
+                        predicates.append(f"(weight_code = :k{i} AND {old})")
+                    keys = ", ".join(f":k{i}" for i in range(len(batch)))
+                    result = await conn.execute(text(
+                        f"DELETE FROM `{OUT_TABLE}` WHERE weight_code IN ({keys}) AND ("
+                        + " OR ".join(predicates) + ")"
+                    ), parameters)
+                    await reject_warnings("delta delete")
+                    if result.rowcount != len(batch):
+                        raise RuntimeError("Calendar weights delete preimage conflict")
+        finally:
+            try:
+                if conn.in_transaction():
+                    await conn.rollback()
+                await conn.execute(text(f"DROP TEMPORARY TABLE IF EXISTS `{stage}`"))
+                await conn.commit()
+            finally:
+                try:
+                    # Also release after cancellation during GET_LOCK: the
+                    # server may have acquired it before the await was cancelled.
+                    released = (await conn.execute(text("SELECT RELEASE_LOCK(:name)"),
+                                                   {"name": REBUILD_LOCK_NAME})).scalar()
+                    await conn.commit()
+                    if got_lock == 1 and released != 1:
+                        raise RuntimeError("Calendar weights rebuild lock was not released")
+                except BaseException:
+                    # A pooled rollback does not release MySQL session locks.
+                    await conn.invalidate()
+                    raise
 
     return {
         "table": OUT_TABLE,

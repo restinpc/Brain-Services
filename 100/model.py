@@ -426,15 +426,37 @@ async def enrich_dataset(engine_vlad, engine_brain):
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """))
     stage = enriched + "_stage"
-    async with engine_vlad.begin() as dest:
-        await dest.execute(text(f"DROP TEMPORARY TABLE IF EXISTS `{stage}`"))
-        await dest.execute(text(f"CREATE TEMPORARY TABLE `{stage}` LIKE `{enriched}`"))
+    async with engine_vlad.connect() as dest:
+        insert = text(f"""
+            INSERT INTO `{stage}`
+                (date_dt, event_type, value, pct_change, source_time, observation_count)
+            VALUES (:date_dt, :event_type, :value, :pct_change, :source_time, :observation_count)
+        """)
+
+        async def reject_warnings(context):
+            warning_result = await dest.execute(text("SHOW WARNINGS"))
+            warnings = warning_result.fetchall()
+            if warnings:
+                raise RuntimeError(
+                    f"GDELT {context} produced {len(warnings)} SQL warning(s)"
+                )
+
+        async def insert_stage_rows(rows):
+            if not rows:
+                return
+            for offset in range(0, len(rows), 500):
+                batch = rows[offset:offset + 500]
+                await dest.execute(insert, batch)
+                await reject_warnings("staging insert")
+                await dest.commit()
+
         try:
-            insert = text(f"""
-                INSERT INTO `{stage}`
-                    (date_dt, event_type, value, pct_change, source_time, observation_count)
-                VALUES (:date_dt, :event_type, :value, :pct_change, :source_time, :observation_count)
-            """)
+            await dest.execute(text(f"DROP TEMPORARY TABLE IF EXISTS `{stage}`"))
+            await dest.execute(text(f"CREATE TEMPORARY TABLE `{stage}` LIKE `{enriched}`"))
+            await reject_warnings("staging table setup")
+            # Keep this session for the temporary stage table, but do not keep one
+            # REPEATABLE READ transaction open across source streaming and CPU work.
+            await dest.commit()
             pending = []
             async with engine.connect() as conn:
                 await _acquire_gdelt_snapshot_lock(conn)
@@ -472,8 +494,12 @@ async def enrich_dataset(engine_vlad, engine_brain):
                                 cursor_time, cursor_id = next_cursor
                                 page_count += 1
                                 pending.extend(builder.add(row))
-                                if len(pending) >= 1000:
-                                    await dest.execute(insert, pending)
+                                # Keep aiomysql/PyMySQL's optimized executemany
+                                # INSERT below its 1,024,000-byte multi-statement
+                                # split threshold, so SHOW WARNINGS checks the
+                                # complete staging batch, not only its last chunk.
+                                if len(pending) >= 500:
+                                    await insert_stage_rows(pending)
                                     pending.clear()
                         finally:
                             await result.close()
@@ -489,11 +515,12 @@ async def enrich_dataset(engine_vlad, engine_brain):
                     await conn.commit()
             pending.extend(builder.finish())
             if pending:
-                await dest.execute(insert, pending)
+                await insert_stage_rows(pending)
             if not builder.stats["enriched_rows"]:
                 raise ValueError("No usable GDELT observations; existing enriched data was preserved")
             # Both DML statements roll back together. Context and weight tables
             # are owned by Brain and retain their IDs across rebuilds.
+            await dest.begin()
             await dest.execute(text(f"DELETE FROM `{enriched}`"))
             await dest.execute(text(f"""
                 INSERT INTO `{enriched}`
@@ -501,8 +528,13 @@ async def enrich_dataset(engine_vlad, engine_brain):
                 SELECT date_dt, event_type, value, pct_change, source_time, observation_count
                 FROM `{stage}` ORDER BY date_dt, event_type
             """))
+            await reject_warnings("publication")
+            await dest.commit()
         finally:
+            if dest.in_transaction():
+                await dest.rollback()
             await dest.execute(text(f"DROP TEMPORARY TABLE IF EXISTS `{stage}`"))
+            await dest.commit()
     invalidate()
     return {**builder.summary(), "source_table": source, "source_engine": source_engine}
 

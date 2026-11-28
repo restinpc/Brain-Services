@@ -235,6 +235,177 @@ def _identifier(name):
     return name
 
 
+
+async def _model99_checked_execute(conn, statement, params=None):
+    """Execute one MySQL statement and fail on any server warning."""
+    result = await conn.execute(statement, params or {})
+    warnings = (await conn.exec_driver_sql("SHOW WARNINGS")).mappings().all()
+    if warnings:
+        raise RuntimeError(f"Model99 SQL warnings: {warnings[:5]!r}")
+    return result
+
+
+async def _model99_create_target(conn, statement, table):
+    """Accept only MySQL's known IF NOT EXISTS note; reject every other warning."""
+    result = await conn.execute(statement)
+    warnings = (await conn.exec_driver_sql("SHOW WARNINGS")).mappings().all()
+    for warning in warnings:
+        if int(warning["Code"]) == 1050 and str(warning["Message"]) == f"Table '{table}' already exists":
+            continue
+        raise RuntimeError(f"Unexpected Model99 target DDL warning: {warning!r}")
+    return result
+
+
+async def _model99_insert_stage_batch(conn, table, rows, offset):
+    from sqlalchemy import text
+
+    columns = ("date_dt", "event_type", "value", "pct_change", "source_time", "event_count")
+    values = []
+    params = {}
+    for row_index, row in enumerate(rows):
+        names = []
+        for column in columns:
+            key = f"r{offset + row_index}_{column}"
+            names.append(":" + key)
+            params[key] = row[column]
+        values.append("(" + ",".join(names) + ")")
+    cols = ",".join(f"`{column}`" for column in columns)
+    statement = text(f"INSERT INTO `{table}` ({cols}) VALUES " + ",".join(values))
+    return await _model99_checked_execute(conn, statement, params)
+
+
+async def _model99_validate_target(conn, table):
+    from sqlalchemy import text
+
+    meta = (await conn.execute(text("""
+        SELECT ENGINE FROM information_schema.TABLES
+        WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=:table
+    """), {"table": table})).mappings().one_or_none()
+    if not meta or str(meta["ENGINE"]).upper() != "INNODB":
+        raise RuntimeError("Model99 enriched target must exist and use InnoDB")
+    columns = (await conn.exec_driver_sql(f"SHOW COLUMNS FROM `{table}`")).mappings().all()
+    by_name = {r["Field"]: r for r in columns}
+    expected = {"id": "bigint", "date_dt": "datetime", "event_type": "varchar(96)",
+                "value": "double", "pct_change": "double", "source_time": "datetime", "event_count": "int"}
+    for name, typ in expected.items():
+        if name not in by_name or str(by_name[name]["Type"]).lower() != typ or by_name[name]["Null"] != "NO":
+            raise RuntimeError(f"Model99 target schema mismatch for {name}: {by_name.get(name)!r}")
+    if "auto_increment" not in str(by_name["id"]["Extra"]).lower():
+        raise RuntimeError("Model99 target id must be AUTO_INCREMENT")
+    indexes = (await conn.exec_driver_sql(f"SHOW INDEX FROM `{table}`")).mappings().all()
+    unique_keys = {}
+    for row in indexes:
+        if int(row["Non_unique"]) == 0:
+            unique_keys.setdefault(row["Key_name"], []).append((int(row["Seq_in_index"]), row["Column_name"]))
+    if not any([column for _, column in sorted(parts)] == ["date_dt", "event_type"] for parts in unique_keys.values()):
+        raise RuntimeError("Model99 target lacks the exact unique natural key (date_dt,event_type)")
+    if [column for _, column in sorted(unique_keys.get("PRIMARY", []))] != ["id"]:
+        raise RuntimeError("Model99 target primary key must be id")
+
+
+async def _model99_publish_delta(conn, target_name, stage_name):
+    from sqlalchemy import text
+
+    target, stage = f"`{target_name}`", f"`{stage_name}`"
+    columns = ("date_dt", "event_type", "value", "pct_change", "source_time", "event_count")
+    payload = columns[2:]
+    stage_count = int((await conn.execute(text(f"SELECT COUNT(*) FROM {stage}"))).scalar_one())
+    if stage_count <= 0:
+        raise ValueError("Refusing to publish an empty Model99 snapshot")
+    invalid = int((await conn.execute(text(f"SELECT COUNT(*) FROM {stage} WHERE date_dt IS NULL OR event_type IS NULL"))).scalar_one())
+    if invalid:
+        raise RuntimeError(f"Model99 stage has {invalid} invalid natural keys")
+
+    join = "t.`date_dt`=s.`date_dt` AND t.`event_type`=s.`event_type`"
+    different = " OR ".join(f"NOT (t.`{column}` <=> s.`{column}`)" for column in payload)
+    old_fields = ",".join(f"t.`{column}` AS old_{column}" for column in columns)
+    new_fields = ",".join(f"s.`{column}` AS new_{column}" for column in payload)
+    changed_rows = (await conn.execute(text(f"""
+        SELECT t.`id`, {old_fields}, {new_fields}
+        FROM {target} AS t JOIN {stage} AS s ON {join}
+        WHERE {different}
+    """))).mappings().all()
+    deleted_rows = (await conn.execute(text(f"""
+        SELECT t.`id`, {old_fields}
+        FROM {target} AS t LEFT JOIN {stage} AS s ON {join}
+        WHERE s.`date_dt` IS NULL
+    """))).mappings().all()
+    inserted_rows = (await conn.execute(text(f"""
+        SELECT {','.join(f's.`{column}` AS `{column}`' for column in columns)}
+        FROM {stage} AS s LEFT JOIN {target} AS t ON {join}
+        WHERE t.`id` IS NULL
+    """))).mappings().all()
+
+    updated_count = 0
+    for offset in range(0, len(changed_rows), 100):
+        batch = changed_rows[offset:offset + 100]
+        params, ids, predicates = {}, [], []
+        for row_index, row in enumerate(batch):
+            id_key = f"u{row_index}_id"
+            params[id_key] = row["id"]
+            ids.append(":" + id_key)
+            old_terms = [f"`id`=:{id_key}"]
+            for column in columns:
+                key = f"u{row_index}_old_{column}"
+                params[key] = row[f"old_{column}"]
+                if column != "id":
+                    old_terms.append(f"`{column}` <=> :{key}")
+            predicates.append("(" + " AND ".join(old_terms) + ")")
+        assignments = []
+        for column in payload:
+            branches = []
+            for row_index, row in enumerate(batch):
+                branches.append(f"WHEN :u{row_index}_id THEN :u{row_index}_new_{column}")
+                params[f"u{row_index}_new_{column}"] = row[f"new_{column}"]
+            assignments.append(f"`{column}`=CASE `id` " + " ".join(branches) + f" ELSE `{column}` END")
+        statement = text(
+            f"UPDATE {target} SET {','.join(assignments)} "
+            f"WHERE `id` IN ({','.join(ids)}) AND ({' OR '.join(predicates)})"
+        )
+        result = await _model99_checked_execute(conn, statement, params)
+        if int(result.rowcount) != len(batch):
+            raise RuntimeError(f"Model99 update CAS mismatch expected={len(batch)} actual={result.rowcount}")
+        updated_count += int(result.rowcount)
+
+    inserted_count = 0
+    for offset in range(0, len(inserted_rows), 500):
+        batch = [dict(row) for row in inserted_rows[offset:offset + 500]]
+        result = await _model99_insert_stage_batch(conn, target_name, batch, offset)
+        inserted_count += int(result.rowcount)
+    if inserted_count != len(inserted_rows):
+        raise RuntimeError(f"Model99 insert count mismatch expected={len(inserted_rows)} actual={inserted_count}")
+
+    deleted_count = 0
+    for offset in range(0, len(deleted_rows), 100):
+        batch = deleted_rows[offset:offset + 100]
+        params, ids, predicates = {}, [], []
+        for row_index, row in enumerate(batch):
+            id_key = f"d{row_index}_id"
+            params[id_key] = row["id"]
+            ids.append(":" + id_key)
+            old_terms = [f"`id`=:{id_key}"]
+            for column in columns:
+                key = f"d{row_index}_old_{column}"
+                params[key] = row[f"old_{column}"]
+                if column != "id":
+                    old_terms.append(f"`{column}` <=> :{key}")
+            predicates.append("(" + " AND ".join(old_terms) + ")")
+        result = await _model99_checked_execute(conn, text(
+            f"DELETE FROM {target} WHERE `id` IN ({','.join(ids)}) AND ({' OR '.join(predicates)})"
+        ), params)
+        if int(result.rowcount) != len(batch):
+            raise RuntimeError(f"Model99 delete CAS mismatch expected={len(batch)} actual={result.rowcount}")
+        deleted_count += int(result.rowcount)
+
+    target_count = int((await conn.execute(text(f"SELECT COUNT(*) FROM {target}"))).scalar_one())
+    mismatch = int((await conn.execute(text(f"""
+        SELECT COUNT(*) FROM {target} AS t LEFT JOIN {stage} AS s ON {join}
+        WHERE s.`date_dt` IS NULL OR {different}
+    """))).scalar_one())
+    if target_count != stage_count or mismatch:
+        raise RuntimeError(f"Model99 publication mismatch target={target_count} stage={stage_count} rows={mismatch}")
+    return {"updated": updated_count, "inserted": inserted_count,
+            "deleted": deleted_count, "rows": target_count}
 async def enrich_dataset(engine_vlad, engine_brain):
     from sqlalchemy import text
 
@@ -259,7 +430,7 @@ async def enrich_dataset(engine_vlad, engine_brain):
     if not rows:
         raise ValueError("No usable USGS events; existing enriched data was preserved")
     async with engine_vlad.begin() as conn:
-        await conn.execute(text(f"""
+        await _model99_create_target(conn, text(f"""
             CREATE TABLE IF NOT EXISTS `{enriched}` (
                 id BIGINT NOT NULL AUTO_INCREMENT,
                 date_dt DATETIME NOT NULL,
@@ -272,20 +443,28 @@ async def enrich_dataset(engine_vlad, engine_brain):
                 UNIQUE KEY uq_event (date_dt, event_type),
                 INDEX idx_event (event_type)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-        """))
-    # DELETE + INSERT are one transaction. A failed rebuild keeps the old rows.
-    # Context/weight IDs live in framework tables and are never truncated here.
-    async with engine_vlad.begin() as conn:
-        await conn.execute(text(f"DELETE FROM `{enriched}`"))
-        insert = text(f"""
-            INSERT INTO `{enriched}`
-            (date_dt, event_type, value, pct_change, source_time, event_count)
-            VALUES (:date_dt, :event_type, :value, :pct_change, :source_time, :event_count)
-        """)
-        for offset in range(0, len(rows), 1000):
-            await conn.execute(insert, rows[offset:offset + 1000])
+        """), enriched)
+    # Stage a complete source-derived snapshot, then publish only changed natural keys
+    # in one transaction. Context/weight IDs and their framework path stay untouched.
+    import secrets
+    stage_name = _identifier("tmp_m99_stage_" + secrets.token_hex(8))
+    async with engine_vlad.connect() as conn:
+        try:
+            await _model99_validate_target(conn, enriched)
+            await conn.commit()
+            await _model99_checked_execute(conn, text(f"CREATE TEMPORARY TABLE `{stage_name}` LIKE `{enriched}`"))
+            await conn.commit()
+            for offset in range(0, len(rows), 500):
+                async with conn.begin():
+                    await _model99_insert_stage_batch(conn, stage_name, rows[offset:offset + 500], offset)
+            async with conn.begin():
+                delta = await _model99_publish_delta(conn, enriched, stage_name)
+        finally:
+            if conn.in_transaction():
+                await conn.rollback()
+            await conn.exec_driver_sql(f"DROP TEMPORARY TABLE IF EXISTS `{stage_name}`")
     invalidate()
-    return {**stats, "availability_mode": _settings(cfg.get("model"))["availability_mode"]}
+    return {**stats, **delta, "availability_mode": _settings(cfg.get("model"))["availability_mode"]}
 
 
 def _runtime(dataset, dataset_index):

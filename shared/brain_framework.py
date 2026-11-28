@@ -773,6 +773,69 @@ def _hourly_rebuild_lock_path(service_identity: str) -> str:
     return f"/tmp/brain_framework_hourly_rebuild_{key}.lock"
 
 
+async def _run_serialized_dataset_pipeline(engine, lock_name: str, operation,
+                                          table_name: str):
+    """Run one target pipeline under a cancellable, session-scoped MySQL lock."""
+    async with engine.connect() as lock_conn:
+        acquired = 0
+        ownership_uncertain = False
+
+        async def execute_and_commit(statement, params):
+            result = await lock_conn.execute(text(statement), params)
+            value = result.scalar_one_or_none()
+            await lock_conn.commit()
+            return value
+
+        try:
+            while acquired == 0:
+                # Mark uncertainty before the round-trip: cancellation or a
+                # connection error can race a server-side successful grant.
+                ownership_uncertain = True
+                acquire_task = asyncio.create_task(execute_and_commit(
+                    "SELECT GET_LOCK(:lock_name, 0)", {"lock_name": lock_name}
+                ))
+                try:
+                    acquired = await asyncio.shield(acquire_task)
+                except asyncio.CancelledError:
+                    acquired = await acquire_task
+                    ownership_uncertain = acquired == 1
+                    raise
+                ownership_uncertain = acquired == 1
+                if acquired == 0:
+                    await asyncio.sleep(0.25)
+                elif acquired != 1:
+                    raise RuntimeError(
+                        "SHARED_DATASET_PIPELINE_LOCK_ACQUIRE_FAILED "
+                        f"table={table_name} result={acquired!r}"
+                    )
+            return await operation()
+        finally:
+            if acquired == 1 or ownership_uncertain:
+                release_task = asyncio.create_task(execute_and_commit(
+                    "SELECT RELEASE_LOCK(:lock_name)", {"lock_name": lock_name}
+                ))
+                cancelled_during_release = False
+                try:
+                    try:
+                        released = await asyncio.shield(release_task)
+                    except asyncio.CancelledError:
+                        released = await release_task
+                        cancelled_during_release = True
+                except BaseException:
+                    await lock_conn.invalidate()
+                    raise
+                if (acquired == 1 and released != 1) or (
+                    ownership_uncertain and acquired != 1 and released not in (1, 0, None)
+                ):
+                    await lock_conn.invalidate()
+                    raise RuntimeError(
+                        "SHARED_DATASET_PIPELINE_LOCK_RELEASE_FAILED "
+                        f"table={table_name} result={released!r}"
+                    )
+                if cancelled_during_release:
+                    raise asyncio.CancelledError
+
+
 def _hourly_rebuild_retry_decision(
     marker: dict | None, slot: str, now: datetime, max_attempts: int = 2
 ) -> tuple[int | None, str | None]:
@@ -4435,7 +4498,21 @@ def build_app(model_module) -> FastAPI:
     async def _do_rebuild() -> dict:
         async with _rebuild_lock:
             async with _snapshot_check_lock:
-                return await _do_rebuild_locked()
+                if not s.ENRICHED_TABLE or s.compute_worker is False:
+                    return await _do_rebuild_locked()
+
+                # M81/M85 can share the same enriched, mask, indexes and weights
+                # tables on one node-local MySQL instance. Serialize the whole
+                # target pipeline (including enrichment and index publication),
+                # not just the final INSERT IGNORE, on that database session.
+                lock_digest = hashlib.sha256(
+                    str(s.ENRICHED_TABLE).encode("utf-8")
+                ).hexdigest()[:40]
+                lock_name = f"brain:dataset-pipeline:{lock_digest}"
+                return await _run_serialized_dataset_pipeline(
+                    s.engine_vlad, lock_name, _do_rebuild_locked,
+                    str(s.ENRICHED_TABLE),
+                )
 
     async def _auto_build_weights() -> dict:
         """
