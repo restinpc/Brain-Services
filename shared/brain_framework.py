@@ -3769,6 +3769,48 @@ def build_app(model_module) -> FastAPI:
             s._ml_active_cache[key] = codes
             return codes
 
+        # Reuse the existing batch_model/prewarm path for precisely the
+        # ordered provider dates ReverseStore will request below. The batch
+        # model computes the same all-slot cube, so adjacent slot calls reuse it.
+        if s.batch_model_fn is not None:
+            try:
+                _provider_rates = np_r or s.np_simple_rates
+                _provider_forward = calc_type in (1, 3, 4)
+                _provider_seq = (
+                    rl.collect_extremums_forward(
+                        _provider_rates, target_date,
+                        limit=s.ML_EXTREMUM_LIMIT, extremum_interval=calc_var,
+                    )
+                    if _provider_forward else
+                    rl.collect_extremums_back(
+                        _provider_rates, target_date,
+                        limit=s.ML_EXTREMUM_LIMIT, extremum_interval=calc_var,
+                    )
+                )
+                _provider_model_tag = f"{pair}_{day}_{calc_type}_{calc_var}_{param}"
+                _provider_seq_tuple = tuple(
+                    (int(ext_dt.timestamp()), sign)
+                    for ext_dt, sign in _provider_seq
+                )
+                # maybe_retrain skips active_codes_at entirely when its complete
+                # sequence cache is already present; avoid prewarming that hit.
+                if (
+                    _provider_seq
+                    and rl._seq_codes_cache.get(
+                        (_provider_model_tag, _provider_seq_tuple)
+                    ) is None
+                ):
+                    await _prewarm_ml_active_cache(
+                        pair, day, [(calc_type, calc_var, param)],
+                        _state=s,
+                        exact_ext_dates=[ext_dt for ext_dt, _ in _provider_seq],
+                        request_context=True,
+                    )
+            except Exception as _prewarm_exc:
+                # Provider fallback below remains authoritative on any batch error.
+                log(f"   ML batch prewarm {target_date}: {_prewarm_exc}",
+                    s.NODE_NAME, level="warning")
+
         params_hash = _params_hash({
             "type": calc_type, "var": calc_var, "param": param,
         })
@@ -5137,6 +5179,8 @@ def build_app(model_module) -> FastAPI:
         dt_from: datetime | None = None,
         dt_to: datetime | None = None,
         _state=None,
+        exact_ext_dates: list[datetime] | None = None,
+        request_context: bool = False,
     ) -> int:
         """
         Прогревает _ml_active_cache для всех экстремумов пары/таймфрейма.
@@ -5154,6 +5198,9 @@ def build_app(model_module) -> FastAPI:
         Теперь фильтруем ext_dates по окну fill_cache + 90-дневный lookback-буфер.
         """
         s = _state if _state is not None else _framework_state
+        def _update_fill_status(values):
+            if not request_context:
+                s.fill_status.update(values)
         if s.batch_model_fn is None:
             return 0
 
@@ -5192,50 +5239,55 @@ def build_app(model_module) -> FastAPI:
         warmed = 0
 
         for (calc_var, calc_param), calc_types in slots_by_var.items():
-            if s.fill_cancel.is_set():
+            if not request_context and s.fill_cancel.is_set():
                 break
 
             # ── Получаем экстремумы ДЛЯ ДАННОГО ИНТЕРВАЛА через reverse_learning ──
             # np_r["ext_max"] вычислен с interval≈3 (одна свеча слева/справа).
             # Для calc_var=5/7/9 это неверный набор дат.
             # _get_all_extremums кеширует результат: O(1) для повторных вызовов.
-            try:
-                all_ext, _ = rl._get_all_extremums(np_r, interval=calc_var)
-                # FIX: фильтруем по окну fill_cache + 90-дневный lookback-буфер.
-                # collect_extremums_back с limit=50 и interval=9 смотрит назад
-                # не более ~450 свечей ≈ 18 дней ч/б. 90 дней с запасом.
-                if dt_from is not None:
-                    _lb_ts  = int((dt_from - timedelta(days=90)).timestamp())
-                    _end_ts = int((dt_to or datetime.now()).timestamp()) + 86400
-                    ext_dates = [
-                        datetime.fromtimestamp(t)
-                        for t, _ in all_ext
-                        if _lb_ts <= t <= _end_ts
-                    ]
-                else:
-                    ext_dates = [datetime.fromtimestamp(t) for t, _ in all_ext]
-            except Exception:
-                # Fallback: если rl недоступен — используем np_r["ext_max"] (interval≈3)
-                ext_max = np_r.get("ext_max")
-                ext_min = np_r.get("ext_min")
-                ext_dates_raw: list[datetime] = []
-                if ext_max is not None:
-                    ext_dates_raw += [rows[i]["date"] for i, v in enumerate(ext_max) if v]
-                if ext_min is not None:
-                    ext_dates_raw += [rows[i]["date"] for i, v in enumerate(ext_min) if v]
-                # Fallback тоже фильтруем
-                if dt_from is not None:
-                    _lb  = dt_from - timedelta(days=90)
-                    _end = dt_to or datetime.now()
-                    ext_dates_raw = [d for d in ext_dates_raw if _lb <= d <= _end + timedelta(days=1)]
-                ext_dates = sorted(set(ext_dates_raw))
+            if exact_ext_dates is not None:
+                # Direct ML requests supply ReverseStore's already bounded,
+                # ordered sequence. Do not broaden it to the fill-cache window.
+                ext_dates = list(exact_ext_dates)
+            else:
+                try:
+                    all_ext, _ = rl._get_all_extremums(np_r, interval=calc_var)
+                    # FIX: фильтруем по окну fill_cache + 90-дневный lookback-буфер.
+                    # collect_extremums_back с limit=50 и interval=9 смотрит назад
+                    # не более ~450 свечей ≈ 18 дней ч/б. 90 дней с запасом.
+                    if dt_from is not None:
+                        _lb_ts  = int((dt_from - timedelta(days=90)).timestamp())
+                        _end_ts = int((dt_to or datetime.now()).timestamp()) + 86400
+                        ext_dates = [
+                            datetime.fromtimestamp(t)
+                            for t, _ in all_ext
+                            if _lb_ts <= t <= _end_ts
+                        ]
+                    else:
+                        ext_dates = [datetime.fromtimestamp(t) for t, _ in all_ext]
+                except Exception:
+                    # Fallback: если rl недоступен — используем np_r["ext_max"] (interval≈3)
+                    ext_max = np_r.get("ext_max")
+                    ext_min = np_r.get("ext_min")
+                    ext_dates_raw: list[datetime] = []
+                    if ext_max is not None:
+                        ext_dates_raw += [rows[i]["date"] for i, v in enumerate(ext_max) if v]
+                    if ext_min is not None:
+                        ext_dates_raw += [rows[i]["date"] for i, v in enumerate(ext_min) if v]
+                    # Fallback тоже фильтруем
+                    if dt_from is not None:
+                        _lb  = dt_from - timedelta(days=90)
+                        _end = dt_to or datetime.now()
+                        ext_dates_raw = [d for d in ext_dates_raw if _lb <= d <= _end + timedelta(days=1)]
+                    ext_dates = sorted(set(ext_dates_raw))
 
             if not ext_dates:
                 continue
 
             # ── Для каждого train_mode прогреваем кеш ────────────────────────
             for calc_type in calc_types:
-                if s.fill_cancel.is_set():
+                if not request_context and s.fill_cancel.is_set():
                     break
 
                 missing = [
@@ -5255,7 +5307,7 @@ def build_app(model_module) -> FastAPI:
                     _prewarm_total = len(missing)
                     _prewarm_done = 0
                     for _j in range(0, _prewarm_total, _prewarm_bs):
-                        if s.fill_cancel.is_set():
+                        if not request_context and s.fill_cancel.is_set():
                             break
                         _missing_chunk = missing[_j:_j + _prewarm_bs]
                         rates_for_prewarm = (
@@ -5279,7 +5331,7 @@ def build_app(model_module) -> FastAPI:
                             s._ml_active_cache[key] = list(result.keys())
                             warmed += 1
                         _prewarm_done += len(_missing_chunk)
-                        s.fill_status.update({
+                        _update_fill_status({
                             "phase": "ml_prewarm",
                             "prewarm_done": _prewarm_done,
                             "prewarm_total": _prewarm_total,
